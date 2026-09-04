@@ -36,7 +36,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from keel.research.ledger import read_trials, trial_counts, verify_chain
+from keel.research.ledger import read_trials, trial_counts, verify_records
 
 
 @dataclass(frozen=True)
@@ -108,9 +108,11 @@ class TrialsReport:
     trials_run: int
     decisions: int
 
-    #: `verify_chain`'s verdict and its findings. `False` with no errors means nothing was
-    #: verified (no ledger), which is NOT the same as verified-and-intact -- so the two are
-    #: reported together and a reader is never shown a green badge for an absent file.
+    #: `verify_records`' verdict and its findings. `True` WITH NO ROWS means nothing was checked,
+    #: which is not the same as verified -- an empty sequence has no breaks in it. There are three
+    #: facts here, not two, and they are reported as three fields rather than folded into a
+    #: verdict: whether the file was there, whether it had rows, and what the check said.
+    #: `keel/web/payload.py::_chain_payload` is where they become one badge.
     chain_intact: bool
     chain_errors: tuple[str, ...]
 
@@ -174,8 +176,12 @@ def gather_trials(path: Path | str, *, now_ts: int) -> TrialsReport:
             exploration=(),
         )
 
+    # ONE read of the file, verified in memory. `verify_chain(path)` would parse it a second
+    # time, and the badge would then describe a different read of the file from the rows beside
+    # it -- a trial appended between the two reads puts a break in the verdict for a row the page
+    # never showed.
     trials = list(read_trials(ledger))
-    errors = tuple(verify_chain(ledger))
+    errors = tuple(verify_records(trials))
     ran, decided = trial_counts(trials)
 
     rows = tuple(

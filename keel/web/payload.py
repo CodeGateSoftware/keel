@@ -1878,21 +1878,34 @@ def _hash_display(row_hash: str) -> str | None:
 
 
 def _chain_payload(report: TrialsReport) -> Field:
-    """The tamper-evidence verdict, as THREE states rather than two.
+    """The tamper-evidence verdict, as FOUR states.
 
     This is the field the whole view is built to make honest, and a `flag` would be wrong here in
-    a way that matters. `chain_intact` is `False` both when a row was edited and when there was no
-    file to read, and those are opposite facts: the first is a break to investigate, the second is
-    a deployment that simply has no research repo beside it. Styling the second as BAD reports a
-    tamper that never happened; styling it as GOOD asserts a verification that never ran.
+    a way that matters. Two different facts arrive as `chain_intact=False` -- a row was edited, and
+    there was no file to read -- and a third arrives as `chain_intact=True`: an empty file, which
+    `verify_records` reports no errors for because there is nothing in it to have a break. Those
+    are not one another:
 
-    So: GOOD only after `verify_chain` actually returned no errors over rows that were actually
-    read. Nothing else is ever green.
+    * **no file** -- a deployment without the research repo beside it. Not a break.
+    * **a file with no trials** -- this deployment has run none yet. Not a verification either:
+      an empty sequence has no breaks, and calling that "chain verified — every row still hashes
+      to the next" is a positive claim about zero rows. The first cut of this function shipped
+      exactly that, which is the green-badge-over-an-unverified-file the whole view refuses.
+    * **rows, no errors** -- the one case that is green.
+    * **rows with errors** -- the break.
+
+    So GOOD requires BOTH: no errors, over rows that actually exist. Nothing else is ever green.
     """
     if not report.ledger_present:
         return label(
             "unverified",
             display="no trials ledger on this deployment — nothing was verified",
+            state=UNKNOWN,
+        )
+    if not report.rows:
+        return label(
+            "unverified",
+            display="no trials recorded yet — there is no chain to verify",
             state=UNKNOWN,
         )
     if report.chain_intact:
@@ -1906,6 +1919,24 @@ def _chain_payload(report: TrialsReport) -> Field:
         display="the chain does not verify — the rows below say which",
         state=BAD,
     )
+
+
+def _empty_note(report: TrialsReport) -> str:
+    """What to say where the trials table would be, when there is no trials table.
+
+    Two different emptinesses, said apart. The renderer had one hard-coded sentence -- "this
+    deployment has no research ledger beside it" -- and rendered it over a ledger that was present
+    and simply empty, which is a false statement about the deployment. The service already drew
+    the distinction (`test_an_empty_ledger_is_distinct_from_a_missing_one`); it stopped at the
+    service.
+
+    Written here rather than in `render.js` for the ordinary reason (Rule 2): choosing between two
+    sentences on the basis of what a report found is a judgement, and judgements are made in
+    Python. The renderer places this string and does not decide anything.
+    """
+    if not report.ledger_present:
+        return "No research ledger beside this deployment — there is no record here to read."
+    return "This ledger holds no trials yet. Nothing has been run and recorded."
 
 
 def _trial_row_payload(row: TrialRow) -> dict[str, Any]:
@@ -2004,8 +2035,14 @@ def trials_payload(report: TrialsReport) -> dict[str, Any]:
         ),
         "chain": _chain_payload(report),
         "chain_errors": [str(error) for error in report.chain_errors],
+        "empty_note": _empty_note(report),
         "trials_run": count(report.trials_run),
         "decisions": count(report.decisions),
+        # NOT a companion to `trials_run` the way `timeline_payload`'s is: nothing here caps or
+        # filters, so this equals `trials_run` by construction. It is on the wire because the
+        # renderer needs a count to put in the subtitle and Rule 6e forbids it deriving one --
+        # and it is named `shown_count` for the same reason every other view's is, so the day
+        # this route does gain a scope the key does not have to change meaning.
         "shown_count": count(report.shown_count),
         "rules": [str(rule) for rule in report.rules],
         "exploration": [_exploration_payload(row) for row in report.exploration],

@@ -360,31 +360,43 @@ def read_balances(cfg: ServeConfig, _query: Query, _state: Any, now_ts: int) -> 
     return payload.balances_payload(report)
 
 
-#: Where the trials ledger is looked for, relative to a deployment root or a checkout root.
-#: `research.ledger.DEFAULT_LEDGER_PATH` itself, kept as a name here so the two searched roots
-#: below cannot drift from it.
-_LEDGER_RELATIVE = Path("docs") / "experiments" / "trials-ledger.jsonl"
-
-
 def _ledger_path(cfg: ServeConfig) -> Path:
     """Where this process should look for the trials ledger.
 
-    Two roots, in this order, and the first that EXISTS wins:
+    **The location is READ from `research.ledger.DEFAULT_LEDGER_PATH`, never restated here.** The
+    first cut of this function hard-coded `docs/experiments/trials-ledger.jsonl` under a comment
+    claiming the literal *was* that constant. It was a copy: the day the ledger moves, this route
+    keeps looking in the old place, every deployment quietly reads "no ledger", and the comment
+    tells the next reader they need not check.
+
+    A RELATIVE default is looked for under two roots, in this order, first that EXISTS wins:
 
     1. beside the config file -- a deployment directory (`~/keel`), which is where `keel serve`
        actually runs from;
-    2. the working directory -- a repository checkout, which is what `DEFAULT_LEDGER_PATH` is
-       relative to and where a developer runs `keel serve` from.
+    2. the working directory -- a repository checkout, which is what the relative form is relative
+       to and where a developer runs `keel serve` from.
 
-    Neither is a fallback for a broken install. A deployment that never had the research repo
+    An ABSOLUTE default comes back exactly as it stands, and needs no branch to do so: `Path("/a")
+    / Path("/b")` is `/b`, so both joins below collapse to the default itself and every arm
+    returns it. An explicit `if default.is_absolute(): return default` was written first and
+    removed -- no mutation could make it fail, because it changed no answer. The property is real
+    and pinned by `test_an_absolute_default_is_used_exactly_as_it_stands`; it just does not need a
+    line of its own. (It is not hypothetical either: the autouse `_isolate_trials_ledger` fixture
+    makes the constant absolute for every test in the repo.)
+
+    Neither root is a fallback for a broken install. A deployment that never had the research repo
     beside it has no ledger to read, that is an ordinary state, and `gather_trials` reports it as
     one. When neither exists this returns the deployment path, so that anything logging the miss
-    names the location an operator would actually put the file.
+    names the location an operator would actually put the file. Nothing here reaches a browser --
+    `trials_payload` carries no path.
     """
-    deployment = Path(cfg.config_path).resolve().parent / _LEDGER_RELATIVE
+    from keel.research.ledger import DEFAULT_LEDGER_PATH
+
+    default = Path(DEFAULT_LEDGER_PATH)
+    deployment = Path(cfg.config_path).resolve().parent / default
     if deployment.exists():
         return deployment
-    checkout = Path.cwd() / _LEDGER_RELATIVE
+    checkout = Path.cwd() / default
     if checkout.exists():
         return checkout
     return deployment

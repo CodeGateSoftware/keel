@@ -217,6 +217,40 @@ def test_explored_against_declared_is_reported_without_the_refusing_helper(
     assert exploration[0].declared_cells > 0, "the rule's own declaration, from `declared_cells`"
 
 
+
+def test_the_ledger_is_read_once_and_the_verdict_covers_those_rows(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    """One read, verified in memory.
+
+    `verify_chain(path)` re-reads the file, so the first cut parsed the ledger TWICE per request
+    -- and the badge then described a different read from the rows beside it. A trial appended
+    between the two reads puts a break in the verdict for a row the page never showed, and the
+    page re-asks every 15 seconds while a tab is open, so the window is not theoretical.
+
+    Counting the reads rather than racing the file: a test that appended mid-call would pin the
+    interleaving by reproducing it, which is slow and flaky. The number of reads IS the fix, and
+    a second one cannot be added back without failing here.
+    """
+    import keel.commands.research_record as record
+
+    path = _ledger(tmp_path, _trial(trial_id="t-1"), _trial(trial_id="t-2"))
+    reads: list[Path] = []
+    real = record.read_trials
+
+    def counting(target: Any) -> Any:
+        reads.append(Path(target))
+        return real(target)
+
+    monkeypatch.setattr(record, "read_trials", counting)
+
+    report = record.gather_trials(path, now_ts=NOW_TS)
+
+    assert len(reads) == 1, f"the ledger was read {len(reads)} times"
+    # And the verdict is about the rows that came back, not about a second look at the file.
+    assert report.chain_intact is True
+    assert report.shown_count == 2
+
 # -- the rail, scanned mechanically ---------------------------------------------------------------
 
 

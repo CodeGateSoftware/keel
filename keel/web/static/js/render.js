@@ -1420,7 +1420,11 @@ export function researchView(data) {
         plain(row.summary) || "—",
         row.row_hash,
       ]),
-      "No trials recorded. This deployment has no research ledger beside it.",
+      // From the payload, never written here. There are two kinds of empty -- no ledger, and a
+      // ledger with no trials in it -- and a hard-coded sentence said the first over both, which
+      // is a false statement about a deployment that simply has not run anything yet. Choosing
+      // between them is a judgement, and judgements are made in Python (Rule 2).
+      plain(data.empty_note),
     ),
   );
 

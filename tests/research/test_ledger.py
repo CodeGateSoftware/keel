@@ -168,3 +168,40 @@ def test_summary_null_value_decodes_without_raising(tmp_path):
     assert rows[0].summary["n_folds"] == 1  # ints (and Decimals) still decode as before
     assert rows[1].summary["expectancy"] == Decimal("610")
     assert ledger.verify_chain(path) == []
+
+
+def test_verify_records_checks_the_rows_it_is_handed(tmp_path):
+    """The chain check, over records already in memory.
+
+    `verify_chain(path)` re-reads the file, which is right for `keel trials verify` and wrong for
+    any caller that has just read it: the web research view (#708) read the ledger for its rows
+    and then had `verify_chain` parse the same file a second time, so the badge described a
+    different read of the file from the rows beside it. Appending a trial between the two reads
+    would have the verdict cover a row the page never showed.
+    """
+    path = tmp_path / "trials.jsonl"
+    for i in range(3):
+        _append(path, f"t{i}")
+
+    assert ledger.verify_records(ledger.read_trials(path)) == []
+
+
+def test_verify_records_reports_the_same_breaks_verify_chain_does(tmp_path):
+    """The two must not be able to disagree -- `verify_chain` delegates to this, so a second
+    implementation is the thing being prevented rather than a thing being tested."""
+    path = tmp_path / "trials.jsonl"
+    for i in range(3):
+        _append(path, f"t{i}")
+    lines = path.read_text().splitlines()
+    lines[1] = lines[1].replace('"expectancy":"610"', '"expectancy":"99999"')
+    path.write_text("\n".join(lines) + "\n")
+
+    assert ledger.verify_records(ledger.read_trials(path)) == ledger.verify_chain(path)
+
+
+def test_verify_records_of_nothing_is_no_errors_and_not_a_verification(tmp_path):
+    """An empty ledger has no breaks, and that is NOT the same as "the chain is intact" -- the
+    caller has to hold that distinction, and `keel/web/payload.py::_chain_payload` is where it is
+    held for the web view. Pinned here so the emptiness stays the caller's problem to name rather
+    than becoming a silent green light."""
+    assert ledger.verify_records([]) == []
