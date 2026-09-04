@@ -896,3 +896,90 @@ def test_naming_the_rules_costs_one_read_however_many_orders(tmp_path: Path) -> 
 
     assert repo.rule_reads == 1
     assert {row.rule_name for row in report.rows} == {"turtle_breakout"}
+
+
+# -- review findings on the rule name and the status tabs (#700) ------------------------------
+
+
+def test_an_unresolved_map_does_not_claim_the_rule_is_gone() -> None:
+    """The docstring and the code disagreed, and the docstring was right. With no map supplied,
+    the row has not been LOOKED UP -- saying "rule 7 is no longer in the book" states the result
+    of a search nobody performed, and sends a reader hunting for a deleted rule that is sitting
+    in the table."""
+    unlooked = orders_service._row_from_dict(_order(id=1, rule_id=7))
+    searched = orders_service._row_from_dict(_order(id=1, rule_id=7), {})
+
+    assert unlooked.rule_name == ""
+    assert "no longer" not in unlooked.rule_name_detail
+    assert "unresolved" in unlooked.rule_name_detail.lower()
+    # And the genuine miss still says what it found.
+    assert "no longer" in searched.rule_name_detail
+
+
+def test_a_rule_with_no_name_is_not_reported_as_a_missing_rule() -> None:
+    """A rule row whose `kind` is empty was found -- it just has nothing to show. Reporting it as
+    absent would blame the book for a blank column."""
+    row = orders_service._row_from_dict(_order(id=1, rule_id=7), {7: ""})
+
+    assert row.rule_name == ""
+    assert "no longer" not in row.rule_name_detail
+
+
+def test_the_tab_list_is_lowercased_like_the_filter_it_is_compared_against(
+    tmp_path: Path,
+) -> None:
+    """The client highlights the active tab with `name === current`. `status` is lowercased on
+    the way in, so a tab carrying the raw column would match neither itself nor "all" -- and a
+    book holding both `Filled` and `filled` would show two tabs returning identical rows.
+
+    Not hypothetical by this module's own reasoning: `api.py` declines to refuse unknown
+    statuses precisely because venue-written and older spellings exist in real books."""
+    repo = _repo(tmp_path)
+    repo.insert_order(_order(status="Filled"))
+    repo.insert_order(_order(status="filled"))
+
+    report = gather_orders(repo, now_ts=NOW_TS, status="Filled")
+
+    assert report.statuses == ("filled",)
+    assert report.status == "filled"
+    assert report.filtered_count == 2, "both spellings are the same status"
+
+
+def test_the_cli_renderer_says_which_rule_placed_an_order(tmp_path: Path) -> None:
+    """The service resolves the name for BOTH front-ends. Rendering it only in the browser would
+    leave `keel orders` unable to answer a question the report already holds -- the asymmetry
+    this module's header exists to prevent."""
+    repo = _repo(tmp_path)
+    rule_id = repo.insert_rule("turtle_breakout", {"product_id": "BTC-USD"})
+    repo.insert_order(_order(rule_id=rule_id))
+
+    text = "\n".join(render_orders(gather_orders(repo, now_ts=NOW_TS)))
+
+    assert "turtle_breakout" in text
+
+
+def test_the_cli_renderer_explains_a_status_tab_that_matched_nothing() -> None:
+    """The fourth empty reason needs the fourth sentence here too. Without it the CLI prints its
+    header, "showing 0 of 3", and then nothing at all -- the silent blank the other two branches
+    exist to prevent. Unreachable from `keel orders` today (it has no `--status`), which is why
+    it is pinned on the renderer rather than on the command."""
+    report = OrdersReport(
+        now_ts=NOW_TS,
+        scope="all",
+        scope_start_ts=None,
+        limit=50,
+        status="rejected",
+        total_count=3,
+        scoped_count=3,
+        filtered_count=0,
+        shown_count=0,
+        modes=("live",),
+        statuses=("filled",),
+        empty_reason="status",
+        rows=(),
+    )
+
+    text = "\n".join(render_orders(report))
+
+    assert "rejected" in text
+    assert "filled" in text, "a reader must be told which statuses this book does hold"

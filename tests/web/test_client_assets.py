@@ -1414,3 +1414,84 @@ def test_an_unknown_drawdown_ceiling_draws_no_floor_line() -> None:
     assert "point.dd_floor_y !== null" in chart_code, (
         "points with no recorded drawdown floor must be filtered before the floor is drawn"
     )
+
+
+# -- every table declares as many cells as it declares headers ---------------------------------
+
+
+def _balanced_block(text: str, start: int) -> tuple[str, int]:
+    """The bracketed block beginning at `start` (which must be a `[`), and the index after it."""
+    depth = 0
+    for index in range(start, len(text)):
+        char = text[index]
+        if char in "([{":
+            depth += 1
+        elif char in ")]}":
+            depth -= 1
+            if depth == 0:
+                return text[start : index + 1], index + 1
+    raise AssertionError("unbalanced block")
+
+
+def _top_level_items(block: str) -> int:
+    """How many elements a `[...]` literal declares, counting commas at depth 1 only."""
+    inner = block[1:-1]
+    depth = 0
+    items = 0
+    seen_content = False
+    for char in inner:
+        if char in "([{":
+            depth += 1
+        elif char in ")]}":
+            depth -= 1
+        elif char == "," and depth == 0:
+            items += 1
+            seen_content = False
+            continue
+        if not char.isspace():
+            seen_content = True
+    return items + (1 if seen_content else 0)
+
+
+def _table_calls(code: str) -> list[tuple[int, int]]:
+    """`(headers, cells)` for every `table(` call in `render.js` that inlines both."""
+    pairs: list[tuple[int, int]] = []
+    cursor = 0
+    while True:
+        found = code.find("table(", cursor)
+        if found == -1:
+            return pairs
+        cursor = found + 6
+        # The columns array is the first `[` after the id argument.
+        columns_at = code.find("[", cursor)
+        if columns_at == -1:
+            continue
+        columns_block, after = _balanced_block(code, columns_at)
+        if "label:" not in columns_block:
+            continue  # not a table() call -- some other identifier ending in `table(`
+        headers = columns_block.count("label:")
+        # The cells come from a `.map(` whose arrow body is an array literal.
+        map_at = code.find(".map(", after)
+        if map_at == -1 or map_at > after + 400:
+            continue  # rows passed as a variable; nothing inline to compare
+        cells_at = code.find("[", map_at)
+        if cells_at == -1:
+            continue
+        cells_block, _ = _balanced_block(code, cells_at)
+        pairs.append((headers, _top_level_items(cells_block)))
+
+
+def test_every_table_emits_one_cell_per_declared_header() -> None:
+    """`table()` pairs `columns[index]` with `row.entries()` BY POSITION (render.js:400), so a
+    column added to the header list without a matching value silently shifts every later cell
+    one place left -- and the last column renders no `<td>` at all.
+
+    That is not a cosmetic failure. On the Orders table it put the placement timestamp under
+    "fee" and a quantity under "rule", so every money column named the wrong figure while each
+    value stayed individually true. Nothing else in this suite compares the two lists: the
+    per-view tests assert that a key is *declared*, which a header alone satisfies."""
+    pairs = _table_calls(_code_only(_source("render.js")))
+
+    assert len(pairs) >= 6, f"the table scan found only {len(pairs)} tables; it has stopped working"
+    mismatched = [(headers, cells) for headers, cells in pairs if headers != cells]
+    assert mismatched == [], f"(headers, cells) mismatches: {mismatched}"

@@ -385,6 +385,13 @@ NO_RULE_DETAIL = "no rule recorded against this order"
 #: and only the second is worth chasing.
 MISSING_RULE_DETAIL = "rule {rule_id} placed this order and is no longer in the book"
 
+#: What a row says when nobody LOOKED. A caller that passed no rule map has not searched the
+#: book, so reporting the rule as gone would state the result of a search that never ran -- and
+#: would send a reader hunting for a deleted rule that is sitting in the table. The same sentence
+#: covers a rule that WAS found and has no `kind` to show: it is present, so "no longer in the
+#: book" would be false, and the only honest report is that no name is available.
+UNRESOLVED_RULE_DETAIL = "rule {rule_id} placed this order; its name is unresolved here"
+
 
 def _venue_order_id(raw_response: Any) -> str:
     """The venue's own order id, and nothing else, out of `raw_response`.
@@ -480,11 +487,15 @@ def _row_from_dict(row: dict[str, Any], rule_names: Mapping[int, str] | None = N
     side = str(row.get("side") or "")
     confirmation = str(row.get("confirmation") or "")
     rule_id = None if row.get("rule_id") is None else int(row["rule_id"])
-    rule_name = "" if rule_id is None else (rule_names or {}).get(rule_id, "")
+    rule_name = "" if rule_id is None or rule_names is None else rule_names.get(rule_id, "")
     if rule_name:
         rule_detail = ""
     elif rule_id is None:
         rule_detail = NO_RULE_DETAIL
+    elif rule_names is None or rule_id in rule_names:
+        # Either nobody looked, or the rule was found and carries no name. Both are "present, or
+        # at least not shown to be absent" -- and neither supports the claim below.
+        rule_detail = UNRESOLVED_RULE_DETAIL.format(rule_id=rule_id)
     else:
         rule_detail = MISSING_RULE_DETAIL.format(rule_id=rule_id)
     expected = row.get("expected_fill")
@@ -602,7 +613,13 @@ def gather_orders(
         total += 1
         modes.add(str(row.get("mode") or ""))
         # From every row in the BOOK, before either narrowing -- see `statuses`' own note.
-        statuses.add(str(row.get("status") or ""))
+        # LOWERCASED, like `resolved_status` below and for the same reason: the client marks the
+        # active tab with `name === current`, so a raw `Filled` tab would send `?status=Filled`,
+        # get `filled` echoed back, and highlight neither itself nor "all" -- while a book
+        # holding both spellings would show two tabs returning identical rows. `api.py` declines
+        # to refuse unknown statuses precisely because such spellings exist in real books, so
+        # they have to be folded here rather than assumed away.
+        statuses.add(str(row.get("status") or "").strip().lower())
         created = row.get("created_at")
         if start_ts is not None and created is not None and int(created) < start_ts:
             continue
@@ -719,6 +736,18 @@ def render_orders(report: OrdersReport) -> list[str]:
             f"outside scope={report.scope}. Widen it (--scope all) to see them."
         )
         return lines
+    if report.empty_reason == "status":
+        # The fourth empty state needs the fourth sentence. Without it this renderer prints its
+        # header, "showing 0 of N", and then nothing -- the silent blank the two branches above
+        # exist to prevent, and the one a reader is most likely to read as "keel never traded".
+        # Names the statuses the book DOES hold, because the next thing a reader wants is which
+        # filter would have worked.
+        held = ", ".join(report.statuses) if report.statuses else "none"
+        lines.append(
+            f"no orders with status={report.status} in this window -- the book holds "
+            f"{report.total_count}, with statuses: {held}."
+        )
+        return lines
 
     for row in report.rows:
         placement = "AUTONOMOUS" if row.confirmation_is_autonomous else (row.confirmation or "--")
@@ -758,6 +787,12 @@ def render_orders(report: OrdersReport) -> list[str]:
             lines.append(f"      venue order id: {row.venue_order_id}")
         else:
             lines.append(f"      {row.venue_order_id_detail}")
+        # The service resolves this for BOTH front-ends; rendering it only in the browser would
+        # leave `keel orders` unable to answer a question the report already holds.
+        if row.rule_name:
+            lines.append(f"      rule: {row.rule_name}")
+        else:
+            lines.append(f"      {row.rule_name_detail}")
         rule = "--" if row.rule_id is None else str(row.rule_id)
         lines.append(
             f"      rule={rule} placed={_utc(row.created_at)} updated={_utc(row.updated_at)}"

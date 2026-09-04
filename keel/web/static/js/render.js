@@ -1186,10 +1186,12 @@ export function ordersView(data, sort, onSort, onScope, onStatus) {
   fragment.append(
     gridCard([
       kv("shown", data.shown_count),
-      // `filtered_count`, never `shown` against `in scope`: with a tab open, the
-      // denominator of "shown" has to count that tab, and the report is the only place
-      // allowed to work it out (Rule 2 keeps the subtraction out of the browser).
-      kv("in this status", data.filtered_count),
+      // Only when a status is actually on. Unfiltered, `filtered_count` equals `scoped_count`
+      // by construction, so the row would repeat the number below it under a label naming a
+      // filter that is not in force. With a tab open it is the denominator "shown" is a page
+      // of -- and the report is the only place allowed to work that out (Rule 2 keeps the
+      // subtraction out of the browser).
+      ...(plain(data.status) ? [kv("in this status", data.filtered_count)] : []),
       kv("in scope", data.scoped_count),
       kv("in this book", data.total_count),
       // Which modes this book actually holds. A deployment book holds one, and saying which
@@ -1231,6 +1233,9 @@ export function ordersView(data, sort, onSort, onScope, onStatus) {
           row.side,
           plain(row.product_id) || "—",
           row.status,
+          // Positional: `table()` pairs `columns[index]` with this array by index, so this cell
+          // sits where the "rule" header does and every later one shifts if it is missing.
+          row.rule_name,
           row.qty,
           row.filled_quantity,
           row.expected_fill,
@@ -1402,29 +1407,6 @@ export function activityView(data, sort, onSort, onScope) {
 }
 
 /**
- * The three scopes, and the one that is on.
- *
- * The order is `keel.commands.activity.ACTIVITY_SCOPES`', which is the order the TUI's `t` key
- * cycles them in.
- *
- * **All three stay buttons, including the current one**, where the rendered page makes the
- * current scope a bare `<strong>`. The rendered page is right for a LINK -- a link to the page
- * you are on is a keyboard stop that goes nowhere -- and wrong for this: pressing the current
- * scope re-reads it, which is a refresh, and taking the control away is what makes focus vanish
- * when the view is rebuilt underneath a keyboard user who just pressed it. `aria-current` and the
- * underline carry which one is on, from one attribute, so nothing is lost by keeping it pressable.
- *
- * The `label` argument arrived with #659's second caller. Two scope switches on one site
- * announcing themselves identically would leave a screen-reader user unable to tell which view's
- * window they had just landed in, and hard-coding "Activity scope" onto the Orders view would be
- * worse than no name at all.
- *
- * @param {string} current
- * @param {(scope: string) => void} onScope
- * @param {string} [label]  how the control announces itself. Defaults to Activity's wording.
- * @returns {HTMLElement}
- */
-/**
  * The Orders status tabs (#700).
  *
  * **Built from `statuses`, never from a constant.** A tab bar listing every status keel CAN
@@ -1451,12 +1433,18 @@ function statusSwitch(current, statuses, onStatus) {
   wrap.append(el("span", "k", "status"));
   const all = el("button", "scopekey", "all");
   all.setAttribute("type", "button");
+  // Pressing a tab replaces the whole view, which destroys the button that was pressed.
+  // `data-focus` is how `main.js` puts focus back on its replacement -- without it a keyboard
+  // user is returned to the top of the document on every tab press, which is exactly what the
+  // note above `sortTrigger` says this attribute exists to prevent.
+  all.setAttribute("data-focus", "status:");
   if (!current) all.setAttribute("aria-current", "true");
   all.addEventListener("click", () => onStatus(""));
   wrap.append(all);
   for (const name of statuses) {
     const button = el("button", "scopekey", name);
     button.setAttribute("type", "button");
+    button.setAttribute("data-focus", "status:".concat(name));
     if (name === current) button.setAttribute("aria-current", "true");
     button.addEventListener("click", () => onStatus(name));
     wrap.append(button);
@@ -1464,6 +1452,29 @@ function statusSwitch(current, statuses, onStatus) {
   return wrap;
 }
 
+/**
+ * The three scopes, and the one that is on.
+ *
+ * The order is `keel.commands.activity.ACTIVITY_SCOPES`', which is the order the TUI's `t` key
+ * cycles them in.
+ *
+ * **All three stay buttons, including the current one**, where the rendered page makes the
+ * current scope a bare `<strong>`. The rendered page is right for a LINK -- a link to the page
+ * you are on is a keyboard stop that goes nowhere -- and wrong for this: pressing the current
+ * scope re-reads it, which is a refresh, and taking the control away is what makes focus vanish
+ * when the view is rebuilt underneath a keyboard user who just pressed it. `aria-current` and the
+ * underline carry which one is on, from one attribute, so nothing is lost by keeping it pressable.
+ *
+ * The `label` argument arrived with #659's second caller. Two scope switches on one site
+ * announcing themselves identically would leave a screen-reader user unable to tell which view's
+ * window they had just landed in, and hard-coding "Activity scope" onto the Orders view would be
+ * worse than no name at all.
+ *
+ * @param {string} current
+ * @param {(scope: string) => void} onScope
+ * @param {string} [label]  how the control announces itself. Defaults to Activity's wording.
+ * @returns {HTMLElement}
+ */
 function scopeSwitch(current, onScope, label) {
   const wrap = el("nav", "scopes");
   wrap.setAttribute("aria-label", label || "Activity scope");
