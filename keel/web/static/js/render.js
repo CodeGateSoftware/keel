@@ -1139,6 +1139,137 @@ function jobPanel(job) {
  * @returns {DocumentFragment}
  */
 /**
+ * The Timeline view (#703): one chronology over four stores that never knew about each other.
+ *
+ * ── PROVENANCE IS A COLUMN, NOT A FOOTNOTE ───────────────────────────────────────────────────
+ *
+ * The engine's log, the orders book, an imported ledger and a human's attestation are four
+ * different kinds of evidence. Merging them into one feed is only an improvement if the feed
+ * keeps them apart -- otherwise it is four tables with their labels removed. So every row
+ * carries `provenance`, decided in `keel/commands/timeline.py` and styled by `payload.py`;
+ * `simulated` is the one that warns, because a paper fill sitting in a chronology beside real
+ * ones is the single row a reader must not skim past.
+ *
+ * ── THE CHIPS COME FROM THE WINDOW, AND FILTER ON THE SERVER ─────────────────────────────────
+ *
+ * `data.kinds` is what the SCOPED window holds, not the four kinds keel can emit and not what
+ * survived the current chip -- a bar built from the rows on screen deletes its own alternatives.
+ * Pressing one re-asks the server, because the page is capped and a client-side filter would be
+ * filtering the rows that happened to arrive.
+ *
+ * ── THE EXPORT IS A LINK, NOT A FETCH ────────────────────────────────────────────────────────
+ *
+ * A plain `<a download>` to `/api/timeline/export.csv`, carrying the same `?scope=`/`?kind=` the
+ * page is showing so the file matches the screen. It is a navigation rather than a scripted
+ * download because the response is `Content-Disposition: attachment` and the browser's own
+ * handling of that is the behaviour we want -- and because this file writes no bytes itself.
+ *
+ * @param {any} data  `/api/timeline`'s `data`.
+ * @param {any} sort
+ * @param {(column: string) => void} onSort
+ * @param {(kind: string) => void} onKind
+ * @returns {DocumentFragment}
+ */
+export function timelineView(data, sort, onSort, onKind) {
+  const fragment = document.createDocumentFragment();
+  fragment.append(el("h1", undefined, "Timeline"));
+
+  const sub = el("p", "sub");
+  sub.append(field(data.generated_at), " · ");
+  sub.append(field(data.shown_count), " of ", field(data.filtered_count), " shown");
+  fragment.append(sub);
+
+  if (onKind) fragment.append(kindSwitch(plain(data.kind), data.kinds || [], onKind));
+
+  fragment.append(
+    gridCard([
+      kv("scope", plain(data.scope)),
+      kv("since", data.scope_start_at),
+      kv("in this window", data.scoped_count),
+      kv("in this chip", data.filtered_count),
+    ]),
+  );
+
+  // The export, carrying the page's own scope and chip so the file matches the screen.
+  const actions = el("p", "note");
+  const link = el("a", "chartaction", "Export CSV");
+  link.setAttribute(
+    "href",
+    ["/api/timeline/export.csv?scope=", plain(data.scope), "&kind=", plain(data.kind)].join(""),
+  );
+  link.setAttribute("download", "");
+  actions.append(link);
+  actions.append(" — every row with its provenance; hashes are not recorded yet.");
+  fragment.append(actions);
+
+  fragment.append(heading("h-timeline", "What happened"));
+  fragment.append(
+    table(
+      "h-timeline",
+      [
+        { label: "when (UTC)", numeric: false, key: "ts" },
+        { label: "kind", numeric: false, key: "kind" },
+        { label: "how we know", numeric: false, key: "provenance" },
+        { label: "source", numeric: false, key: "source" },
+        { label: "reference", numeric: false },
+        { label: "product", numeric: false, key: "product_id" },
+        { label: "amount", numeric: true },
+        { label: "what", numeric: false },
+      ],
+      (data.rows || []).map(/** @param {any} row */ (row) => [
+        row.at,
+        plain(row.kind) || "—",
+        row.provenance,
+        plain(row.source) || "—",
+        plain(row.reference) || "—",
+        plain(row.product_id) || "—",
+        row.amount,
+        plain(row.summary) || "—",
+      ]),
+      "Nothing recorded in this window.",
+      { sort: sort, onSort: onSort },
+    ),
+  );
+
+  return fragment;
+}
+
+
+/**
+ * The Timeline's kind chips (#703).
+ *
+ * Built from `kinds` -- what the window holds -- with a leading "all" that clears the filter,
+ * the same shape `statusSwitch` takes for Orders and for the same reasons: a bar listing every
+ * kind keel can emit invites a reader into empty chips, and a filter with no way back is a trap.
+ *
+ * @param {string} current
+ * @param {string[]} kinds
+ * @param {(kind: string) => void} onKind
+ * @returns {HTMLElement}
+ */
+function kindSwitch(current, kinds, onKind) {
+  const wrap = el("nav", "scopes");
+  wrap.setAttribute("aria-label", "Timeline kind");
+  wrap.append(el("span", "k", "kind"));
+  const all = el("button", "scopekey", "all");
+  all.setAttribute("type", "button");
+  all.setAttribute("data-focus", "kind:");
+  if (!current) all.setAttribute("aria-current", "true");
+  all.addEventListener("click", () => onKind(""));
+  wrap.append(all);
+  for (const name of kinds) {
+    const button = el("button", "scopekey", name);
+    button.setAttribute("type", "button");
+    button.setAttribute("data-focus", "kind:".concat(name));
+    if (name === current) button.setAttribute("aria-current", "true");
+    button.addEventListener("click", () => onKind(name));
+    wrap.append(button);
+  }
+  return wrap;
+}
+
+
+/**
  * The Balances view (#702): what the account holds, as the last cycle recorded it.
  *
  * ── EVERY FIGURE IS STAMPED, BECAUSE EVERY FIGURE IS RECORDED ────────────────────────────────

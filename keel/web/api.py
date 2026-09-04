@@ -37,6 +37,7 @@ from __future__ import annotations
 import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 
 from keel.web import payload
@@ -358,6 +359,68 @@ def read_balances(cfg: ServeConfig, _query: Query, _state: Any, now_ts: int) -> 
     return payload.balances_payload(report)
 
 
+def _timeline_report(cfg: ServeConfig, query: Query, now_ts: int) -> Any:
+    """The merged timeline for one request. Shared by the JSON route and the CSV export so the
+    file an operator downloads is the same chronology the page showed them -- two builders would
+    be two answers to "what happened", and the export is the one that goes to an auditor."""
+    from keel.commands.activity import (
+        feed_from_lines,
+        read_log_window,
+        resolve_log_path,
+    )
+    from keel.commands.timeline import (
+        DEFAULT_TIMELINE_LIMIT,
+        MAX_TIMELINE_LIMIT,
+        gather_timeline,
+    )
+
+    config = load_config(cfg.config_path)
+    raw_limit = _first(query, "limit")
+    limit = (
+        DEFAULT_TIMELINE_LIMIT if not raw_limit else _whole_number(raw_limit, MAX_TIMELINE_LIMIT)
+    )
+
+    # The engine log is read through `activity`'s own bounded window rather than re-parsed here:
+    # that module owns finding the file, reading a bounded tail of it and turning it into cycles,
+    # and a second implementation would be a second answer to "what did the agent do".
+    cycles: tuple[Any, ...] = ()
+    try:
+        log_path = resolve_log_path(config)
+        window = read_log_window(log_path)
+        # `LogWindow` carries the lines and a read status, not the path -- `source` is the
+        # feed's own label for where the lines came from, so it is passed the path we resolved.
+        cycles = feed_from_lines(
+            window.lines, source=str(log_path), truncated=window.truncated
+        ).cycles
+    except OSError:
+        # No log yet, or an unreadable one. The timeline still has three other sources, and a
+        # missing log is not a reason to fail the whole page -- the `system` rows are simply
+        # absent, which is what an unread log honestly means.
+        cycles = ()
+
+    repo = open_repo(cfg.db_path)
+    try:
+        return gather_timeline(
+            repo,
+            now_ts=now_ts,
+            scope=_first(query, "scope") or "all",
+            kind=_first(query, "kind") or "",
+            limit=limit,
+            cycles=cycles,
+        )
+    finally:
+        close_repo(repo)
+
+
+def read_timeline(cfg: ServeConfig, query: Query, _state: Any, now_ts: int) -> dict[str, Any]:
+    """One chronology over the engine log, the orders book, the ledger and the attestations.
+
+    READ ONLY, no broker, no network -- the same posture as every route here. `?kind=` is applied
+    rather than refused, `?scope=`'s own normalisation is reused, and both are echoed back.
+    """
+    return payload.timeline_payload(_timeline_report(cfg, query, now_ts))
+
+
 def read_insights(cfg: ServeConfig, _query: Query, _state: Any, now_ts: int) -> dict[str, Any]:
     """The per-rule track records, the promotion-gate distances, and the account-equity series.
 
@@ -635,6 +698,12 @@ API_ROUTES: dict[str, ApiRoute] = {
         collection="assets",
         sortable=("product_id", "qty", "mark", "market_value"),
     ),
+    "/api/timeline": ApiRoute(
+        html_route="/timeline",
+        read=read_timeline,
+        collection="rows",
+        sortable=("ts", "kind", "provenance", "source", "product_id"),
+    ),
     "/api/rules": ApiRoute(
         html_route="/rules",
         read=read_rules,
@@ -893,3 +962,31 @@ def action_document(result: Any) -> dict[str, Any]:
 def sortable_columns() -> Mapping[str, Sequence[str]]:
     """The declared sort surface, for a test to read rather than restate."""
     return {path: route.sortable for path, route in API_ROUTES.items() if route.sortable}
+
+
+#: The one path on this server that does not answer JSON (#703).
+#:
+#: Deliberately NOT an `ApiRoute`: every entry in `API_ROUTES` is wrapped in the JSON envelope by
+#: `respond`, and `tests/web/test_api.py` parametrises the envelope, the no-JSON-number walk and
+#: the JSON MIME assertions over that table. A CSV route in it would either break those or force
+#: each of them to grow an exception -- and an exception inside a security pin is how the pin
+#: stops meaning anything. It gets its own handler branch and its own header suite instead.
+CSV_EXPORT_PATH = "/api/timeline/export.csv"
+
+
+def export_timeline_csv(cfg: ServeConfig, query: Query) -> tuple[str, str]:
+    """`(csv_text, filename)` for the timeline export.
+
+    Built from the SAME `_timeline_report` the JSON route uses, so the file an operator hands an
+    auditor is the chronology the page showed them.
+
+    Every text cell goes through `csv_safe` (see `keel/commands/timeline.py`): the file is meant
+    to be opened in Excel or Sheets, both of which execute a cell beginning `=`, `+`, `-` or `@`,
+    and several columns carry text keel did not write.
+    """
+    from keel.commands.timeline import to_csv
+
+    now_ts = int(time.time())
+    report = _timeline_report(cfg, query, now_ts)
+    stamp = datetime.fromtimestamp(now_ts, tz=UTC).strftime("%Y%m%d-%H%M%S")
+    return to_csv(report), f"keel-activity-{stamp}.csv"

@@ -145,6 +145,7 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
         SubscriptionStatusRow,
         WithdrawalAttestationStatus,
     )
+    from keel.commands.timeline import TimelineReport, TimelineRow
     from keel.venue_readiness import VenueReadinessRow
 
 
@@ -1713,6 +1714,84 @@ def balances_payload(report: BalancesReport) -> dict[str, Any]:
         ),
         "asset_count": count(report.asset_count),
         "assets": [_asset_balance_payload(row) for row in report.assets],
+    }
+
+
+#: How each provenance is styled (#703). NOT a judgement about quality -- an imported ledger line
+#: is not "worse" evidence than a venue report, it is DIFFERENT evidence -- so nothing here is
+#: `bad`. `simulated` is the one that warns, because a synthetic fill sitting in a chronology
+#: beside real ones is the single thing a reader must not skim past.
+_PROVENANCE_STATES: Mapping[str, str] = {
+    "venue-reported": NEUTRAL,
+    "simulated": WARN,
+    "imported-ledger": NEUTRAL,
+    "human-attested": NEUTRAL,
+    "engine-log": NEUTRAL,
+}
+
+#: What each provenance MEANS, spelled out. The word is a term of art; the sentence is what a
+#: reader who has not read `timeline.py` can act on -- and on an audit surface, "how do we know
+#: this happened" is the question the whole page exists to answer.
+_PROVENANCE_NOTES: Mapping[str, str] = {
+    "venue-reported": "the venue reported this fill",
+    "simulated": "the paper trader wrote this -- no venue was involved",
+    "imported-ledger": "imported from a venue CSV; nothing verified it on the way in",
+    "human-attested": "a person typed this and signed their name to it",
+    "engine-log": "the agent's own log of what it did",
+}
+
+
+def _timeline_row_payload(row: TimelineRow) -> dict[str, Any]:
+    """One event, placed.
+
+    `provenance` is a `label` and not a bare string BECAUSE it carries a judgement -- `simulated`
+    warns -- and Rule 3 keeps that judgement here rather than letting a client infer it from the
+    word. `kind`, `source` and `reference` are bare: enum words and identifiers with nothing to
+    decide.
+
+    `amount` rides with `amount_kind` for the reason the report holds them together: a fill price
+    and a cash-flow total in one column, with nothing saying which is which, is a column that
+    will be summed by someone.
+    """
+    return {
+        "at": moment(row.ts),
+        "kind": row.kind,
+        "provenance": label(
+            row.provenance,
+            display=_PROVENANCE_NOTES.get(row.provenance, row.provenance),
+            state=_PROVENANCE_STATES.get(row.provenance, UNKNOWN),
+        ),
+        "source": row.source,
+        "reference": row.reference,
+        "product_id": row.product_id,
+        "amount": money(row.amount),
+        "amount_kind": row.amount_kind,
+        "summary": row.summary,
+        # A `label`, so the "we did not check" reading carries a state a client can style rather
+        # than a bare string it might render as though it were a hash.
+        "row_hash": label(row.row_hash, state=UNKNOWN),
+    }
+
+
+def timeline_payload(report: TimelineReport) -> dict[str, Any]:
+    """`gather_timeline`'s `TimelineReport`, as JSON (#703).
+
+    `kinds_present` is the chip bar and comes off the report, built from the SCOPED set -- a bar
+    built from the rows on screen would delete its own alternatives the moment one was chosen.
+    Every count comes off the report too (Rule 6e bans `len()` here).
+    """
+    return {
+        "as_of": iso(report.now_ts),
+        "generated_at": moment(report.now_ts),
+        "scope": report.scope,
+        "scope_start_at": moment(report.scope_start_ts),
+        "kind": report.kind,
+        "kinds": [str(kind) for kind in report.kinds_present],
+        "limit": count(report.limit),
+        "scoped_count": count(report.scoped_count),
+        "filtered_count": count(report.filtered_count),
+        "shown_count": count(report.shown_count),
+        "rows": [_timeline_row_payload(row) for row in report.rows],
     }
 
 
