@@ -120,6 +120,7 @@ from keel.venue_readiness import VenueReadiness
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from keel.commands.activity import ActivityCycle, ActivityEvent, ActivityFeed
+    from keel.commands.balances import AssetBalanceRow, BalancesReport
     from keel.commands.insights import (
         AccountSummary,
         EquityCurve,
@@ -1635,6 +1636,83 @@ def positions_payload(report: PositionsReport) -> dict[str, Any]:
         "open_count": count(report.open_count),
         "products": [str(product) for product in report.products],
         "rows": [_position_row_payload(row) for row in report.rows],
+    }
+
+
+#: What the settled/unsettled split says while nothing records it (#702). A FIXED sentence, not
+#: a figure: `equity_points.cash` is `Balance.available` and only that, so the distinction is not
+#: a number this deployment has. Rendering the available figure under a "settled" label would
+#: answer the question the page exists to ask honestly.
+_SETTLED_UNRECORDED = "UNRECORDED IN CYCLE SNAPSHOT -- only the available figure is written down"
+
+
+def _asset_balance_payload(row: AssetBalanceRow) -> dict[str, Any]:
+    """One product's holding.
+
+    `qty` without a `market_value` is a real and common row: the holding is recorded, the price
+    was not observed. It is never a zero -- a worthless holding and an unpriced one look the same
+    on a page and are not the same fact.
+    """
+    return {
+        "product_id": row.product_id,
+        "qty": quantity(row.qty),
+        "mark": money(row.mark),
+        "mark_as_of": moment(row.mark_as_of),
+        "market_value": money(row.market_value),
+    }
+
+
+def balances_payload(report: BalancesReport) -> dict[str, Any]:
+    """`gather_balances`'s `BalancesReport`, as JSON (#702).
+
+    **Every figure here was recorded by a cycle, and every one carries when.** `keel serve` makes
+    no network call -- see `keel/commands/balances.py` for why that is the design and not a
+    limitation -- so the as-of stamps are what keep a recorded page honest rather than merely
+    stale-looking. A tile with no time on it is a claim about now that was made at some other now.
+
+    **No buying power, no deposit, no transfer, and no action of any kind.** #702's refusal:
+    cash is a fact, not an affordance, and this codebase is cash-spot by constitution
+    (`CashAccountRequired`, #372) -- a "buying power" figure would invite exactly the leverage the
+    engine refuses to take.
+
+    `settled_cash` and `total_cash` cross as ABSENT with `settled_breakdown` saying why, rather
+    than being omitted: a client that had to notice a missing key would be inferring from payload
+    shape, and the day a cycle records the pair this becomes a value change rather than a shape
+    change.
+    """
+    return {
+        "as_of": iso(report.now_ts),
+        "generated_at": moment(report.now_ts),
+        # A bare string, like `scope` and `mode` elsewhere: an enum word with no precision hazard
+        # and no judgement of its own.
+        "mode": report.mode,
+        "cash": money(report.cash),
+        "cash_as_of": moment(report.cash_as_of),
+        "equity": money(report.equity),
+        "unrealized": money(report.unrealized, signed=True),
+        "hwm": money(report.hwm),
+        "paper_cash": money(report.paper_cash),
+        "settled_cash": money(report.settled_cash),
+        "total_cash": money(report.total_cash),
+        "settled_breakdown": flag(
+            report.settled_breakdown_recorded,
+            on="settled and unsettled recorded",
+            off=_SETTLED_UNRECORDED,
+            on_state=NEUTRAL,
+            # UNKNOWN and not WARN: nothing is wrong, and nothing is late. The venue reports the
+            # split and no cycle writes it down, which is a gap in what keel records rather than
+            # a condition an operator can act on.
+            off_state=UNKNOWN,
+        ),
+        "recorded": flag(
+            report.has_recorded_cash,
+            on="as recorded by the last cycle",
+            off="no cycle has recorded a balance yet",
+            on_state=NEUTRAL,
+            off_state=UNKNOWN,
+        ),
+        "asset_count": count(report.asset_count),
+        "assets": [_asset_balance_payload(row) for row in report.assets],
     }
 
 

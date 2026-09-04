@@ -331,6 +331,33 @@ def read_positions(cfg: ServeConfig, _query: Query, _state: Any, now_ts: int) ->
     return payload.positions_payload(report)
 
 
+def read_balances(cfg: ServeConfig, _query: Query, _state: Any, now_ts: int) -> dict[str, Any]:
+    """What the account holds, as the last cycle recorded it (#702).
+
+    **NO BROKER CALL, and this route is the one where that had to be decided on purpose.** A
+    balances page is the obvious place to read the venue live, and doing so would put credentials
+    into the process a browser talks to and hand an operator's rate limit to every tab left open
+    on a view that re-polls every 15 seconds. `keel serve` is a loopback reader over SQLite; every
+    other route here holds that line, and this one does too. `keel/commands/balances.py` carries
+    the full reasoning.
+
+    READ ONLY, with no write route on this path and no action in the payload. #702's refusal:
+    cash is a fact, not an affordance -- no buying power, no deposit, no transfer.
+
+    No `?limit=`: an account's asset list is bounded by what it holds, and a cap here would hide
+    a holding an operator is looking for.
+    """
+    from keel.commands.balances import gather_balances
+
+    repo = open_repo(cfg.db_path)
+    try:
+        config = load_config(cfg.config_path)
+        report = gather_balances(repo, config, now_ts=now_ts)
+    finally:
+        close_repo(repo)
+    return payload.balances_payload(report)
+
+
 def read_insights(cfg: ServeConfig, _query: Query, _state: Any, now_ts: int) -> dict[str, Any]:
     """The per-rule track records, the promotion-gate distances, and the account-equity series.
 
@@ -601,6 +628,12 @@ API_ROUTES: dict[str, ApiRoute] = {
             "stop_distance",
             "stop_distance_pct",
         ),
+    ),
+    "/api/balances": ApiRoute(
+        html_route="/balances",
+        read=read_balances,
+        collection="assets",
+        sortable=("product_id", "qty", "mark", "market_value"),
     ),
     "/api/rules": ApiRoute(
         html_route="/rules",

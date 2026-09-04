@@ -45,6 +45,7 @@ import {
   insightsView,
   modeBadge,
   ordersView,
+  balancesView,
   positionsView,
   refusedView,
   rulesView,
@@ -99,6 +100,7 @@ const ROUTES = [
   { name: "activity", label: "Activity", endpoints: ["activity"] },
   { name: "orders", label: "Orders", endpoints: ["orders"] },
   { name: "positions", label: "Positions", endpoints: ["positions"] },
+  { name: "balances", label: "Balances", endpoints: ["balances"] },
   { name: "insights", label: "Insights", endpoints: ["insights", "journal"] },
   { name: "rules", label: "Rules", endpoints: ["rules"] },
   { name: "venues", label: "Venues", endpoints: ["venues"] },
@@ -427,6 +429,7 @@ function mount(route, readings) {
     );
   }
   if (route.name === "positions") return positionsView(data, primary.sort, onSort);
+  if (route.name === "balances") return balancesView(data, primary.sort, onSort);
   if (route.name === "rules") return rulesView(data, primary.sort, onSort);
   if (route.name === "venues") return venuesView(data, primary.sort, onSort);
   if (route.name === "gates") return gatesView(data);
