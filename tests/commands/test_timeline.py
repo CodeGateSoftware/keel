@@ -12,6 +12,8 @@ care more about that than about the ordering.
 
 from __future__ import annotations
 
+import csv
+import io
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
@@ -97,14 +99,36 @@ def test_the_four_sources_merge_into_one_chronology(repo: Repository, tmp_path: 
 
 def test_rows_are_newest_first(repo: Repository, tmp_path: Path) -> None:
     """One chronology, and the newest thing that happened is the thing an operator opened this
-    page to see."""
-    _attestation(repo)  # oldest
-    _transaction(repo)
-    _order(repo)  # newest
+    page to see.
+
+    The timestamps are SCRAMBLED relative to the order the sources are concatenated in
+    (`_order_rows`, then `_transaction_rows`, then `_attestation_rows`). The first version of
+    this test seeded oldest-to-newest, which happened to match that concatenation -- so deleting
+    the sort entirely left it green. Here the orders are the OLDEST and the attestation the
+    newest, so an unsorted merge comes back ascending and fails.
+    """
+    _order(repo, created_at=NOW_TS - 10_000)
+    _order(repo, created_at=NOW_TS - 9_000)
+    _transaction(repo, ts=NOW_TS - 5_000)
+    _attestation(repo, attested_at=NOW_TS - 100)
 
     timestamps = [row.ts for row in gather_timeline(repo, now_ts=NOW_TS, scope="all").rows]
 
-    assert timestamps == sorted(timestamps, reverse=True)
+    assert timestamps == [NOW_TS - 100, NOW_TS - 5_000, NOW_TS - 9_000, NOW_TS - 10_000]
+
+
+def test_two_events_at_one_instant_keep_a_stable_order(repo: Repository, tmp_path: Path) -> None:
+    """The tie-break. Without it two rows sharing a second come back in whatever order the merge
+    happened to produce, and the page reshuffles them between polls under a reader's cursor."""
+    _order(repo, created_at=NOW_TS - 60)
+    _transaction(repo, ts=NOW_TS - 60)
+    _attestation(repo, attested_at=NOW_TS - 60)
+
+    first = [row.reference for row in gather_timeline(repo, now_ts=NOW_TS, scope="all").rows]
+    again = [row.reference for row in gather_timeline(repo, now_ts=NOW_TS, scope="all").rows]
+
+    assert first == again
+    assert len(set(first)) == 3, "three distinct events, not one collapsed row"
 
 
 def test_a_live_fill_is_venue_reported_and_a_paper_fill_is_not(
@@ -276,3 +300,56 @@ def test_an_empty_book_is_an_empty_timeline(repo: Repository, tmp_path: Path) ->
 
     assert report.rows == ()
     assert report.scoped_count == 0
+
+
+# -- every cell of the export is neutralised, not only the one with a test (#703 review) --------
+
+
+def test_every_text_column_of_the_export_is_neutralised(repo: Repository, tmp_path: Path) -> None:
+    """`csv_safe` is applied to all ten cells; before this, only `reference` was pinned.
+
+    Removing it from the other nine left the whole suite green -- so the module's load-bearing
+    claim ("applied to EVERY text cell, not to a list of the risky ones") was untested for nine
+    columns, including `summary`, which carries an imported `notes` field verbatim.
+
+    Every hostile value below lands at the START of its own cell, which is the only position a
+    spreadsheet evaluates.
+    """
+    from keel.commands.timeline import to_csv
+
+    _transaction(
+        repo,
+        coinbase_id="=cmd|ref",
+        type="=cmd|kind",
+        asset="=cmd|asset",
+        notes="",
+        total=Decimal("-500.25"),
+    )
+
+    text = to_csv(gather_timeline(repo, now_ts=NOW_TS, scope="all"))
+    header, row = list(csv.reader(io.StringIO(text)))[:2]
+    cells = dict(zip(header, row, strict=True))
+
+    assert cells["reference"].startswith("'"), "reference"
+    assert cells["summary"].startswith("'"), "summary -- it begins with the transaction type"
+    # A negative amount is a formula trigger and a real figure. Quoted, and still legible.
+    assert cells["amount"] == "'-500.25", cells["amount"]
+    # And nothing that was safe got mangled.
+    assert cells["kind"] == "flow"
+    assert cells["provenance"] == "imported-ledger"
+
+
+def test_the_export_carries_one_row_per_event_plus_a_header(
+    repo: Repository, tmp_path: Path
+) -> None:
+    """The shape an auditor's spreadsheet sees."""
+    from keel.commands.timeline import to_csv
+
+    _order(repo)
+    _transaction(repo)
+    _attestation(repo)
+
+    rows = list(csv.reader(io.StringIO(to_csv(gather_timeline(repo, now_ts=NOW_TS, scope="all")))))
+
+    assert rows[0][0] == "ts"
+    assert len(rows) == 4

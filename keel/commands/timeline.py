@@ -63,7 +63,7 @@ HASH_NOT_RECORDED = "NOT RECORDED"
 #: figure gets quoted. That is the correct trade for an audit export: a spreadsheet shows
 #: `'-12.30` as text rather than evaluating it, the value is still readable and still
 #: re-importable, and losing numeric typing is a smaller harm than executing a cell.
-_FORMULA_TRIGGERS = ("=", "+", "-", "@", "\t", "\r")
+_FORMULA_TRIGGERS = ("=", "+", "-", "@", "\t", "\r", "\n")
 
 
 def csv_safe(value: Any) -> str:
@@ -85,7 +85,16 @@ def csv_safe(value: Any) -> str:
     if value is None:
         return ""
     text = str(value)
-    if text.startswith(_FORMULA_TRIGGERS):
+    # Checked against the LEADING-WHITESPACE-STRIPPED text, and the ORIGINAL is what gets quoted.
+    # A strict first-character test is defeated by one space: `" =cmd|..."` is a legal
+    # `coinbase_id` out of an imported venue CSV, it lands in a cell by itself, and Google Sheets
+    # and LibreOffice trim on import before deciding whether a cell is a formula. Excel treats a
+    # leading space as text -- but a defence that holds in one spreadsheet and not the two this
+    # file will also be opened in is not a defence.
+    # `lstrip(" ")` and not a bare `lstrip()`: tab and carriage return are TRIGGERS themselves,
+    # so stripping all whitespace would consume the very characters being looked for and let
+    # "\t=cmd" through. Spaces are the only thing skipped over.
+    if text.lstrip(" ").startswith(_FORMULA_TRIGGERS):
         return "'" + text
     return text
 
@@ -151,11 +160,24 @@ class TimelineReport:
 
 
 
-#: The cap on one merged read. Four stores, three of them unbounded, joined into one response:
-#: without a cap this route's cost is the size of the deployment's whole history. Newest-first
-#: and capped means the page always answers, and the counts below say how much it did not show.
+#: The cap on one PAGE of the merged feed -- the response slice, not the read.
+#:
+#: Stated precisely because the first version of this note was wrong: the four reads underneath
+#: are unfiltered (`get_orders`, `get_transactions` and both attestation reads are `SELECT *`,
+#: scoped in Python afterwards), so the READ cost is the deployment's whole history whatever this
+#: number says. That matches `gather_orders`' own convention and is not a regression -- but the
+#: cap bounds what crosses the wire and what a browser renders, and claiming more than that is
+#: the kind of comfortable inaccuracy this codebase's documentation standard exists to catch.
+#:
+#: Newest-first and capped means the page always answers, and the counts say how much it did not
+#: show. `export_rows` deliberately does not use it.
 DEFAULT_TIMELINE_LIMIT = 200
 MAX_TIMELINE_LIMIT = 2000
+
+#: The cap `export_rows` passes: none. Spelled as a constant rather than an `Optional` parameter
+#: so the uncapped read is a named decision at its one call site rather than a `None` that could
+#: arrive by accident from anywhere.
+_UNCAPPED = 2**31
 
 
 def _order_rows(repo: Repository, since_ts: int | None) -> list[TimelineRow]:
@@ -334,7 +356,13 @@ def gather_timeline(
     filtering the rows it happened to receive and calling the result "every flow this month".
     """
     resolved_scope = normalise_scope(scope)
-    resolved_kind = (kind or "").strip().lower()
+    # An unrecognised kind is COLLAPSED to "every kind", not applied. `?kind=trades` -- the
+    # obvious typo, since the chips read "trade" -- would otherwise return a page that looks like
+    # an empty deployment: a non-zero `scoped_count`, zero rows, and no chip marked current.
+    # That is the outcome `normalise_scope`, which this function sits beside and reuses, exists
+    # to never produce. The applied value is echoed in `kind`, so the substitution is visible.
+    requested_kind = (kind or "").strip().lower()
+    resolved_kind = requested_kind if requested_kind in TIMELINE_KINDS else ""
     resolved_limit = max(1, min(int(limit), MAX_TIMELINE_LIMIT))
     since = scope_start_ts(resolved_scope, now_ts)
 
@@ -361,6 +389,31 @@ def gather_timeline(
         filtered_count=len(filtered),
         rows=tuple(filtered[:resolved_limit]),
         kinds_present=tuple(kind for kind in TIMELINE_KINDS if kind in present),
+    )
+
+
+def export_rows(
+    repo: Repository,
+    *,
+    now_ts: int,
+    scope: str = "all",
+    kind: str = "",
+    cycles: Sequence[Any] = (),
+) -> TimelineReport:
+    """The whole scope, uncapped -- what the CSV export reads.
+
+    **Deliberately not `gather_timeline`'s cap.** That cap exists because the console polls the
+    JSON route every 15 seconds; an export is a deliberate download, requested once, of a record
+    an operator may hand to an auditor or a tax preparer. Inheriting the page's limit made the
+    file 200 rows of a 5,000-event deployment with nothing in it saying so -- a partial record
+    that reads as complete, which is worse than no export at all.
+
+    The SCOPE still bounds it: `?scope=today|7d|all` is the operator's own choice about how much
+    they are asking for, and `all` on a long-lived deployment is a large file by request rather
+    than by accident.
+    """
+    return gather_timeline(
+        repo, now_ts=now_ts, scope=scope, kind=kind, limit=_UNCAPPED, cycles=cycles
     )
 
 

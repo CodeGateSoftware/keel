@@ -54,6 +54,24 @@ def test_ordinary_text_is_left_exactly_as_it_is(ordinary: str) -> None:
     assert csv_safe(ordinary) == ordinary
 
 
+@pytest.mark.parametrize(
+    "dangerous",
+    [" =SUM(A1:A10)", "   @malicious", "  -1+1"],
+)
+def test_leading_whitespace_does_not_smuggle_a_formula_past(dangerous: str) -> None:
+    """A strict first-character test is defeated by one space, and `" =cmd|..."` is a legal
+    `coinbase_id` out of an imported venue CSV that lands in a cell by itself. Google Sheets and
+    LibreOffice trim leading whitespace before deciding whether a cell is a formula.
+
+    The ORIGINAL text is what gets quoted: an audit record must not have its cells silently
+    reformatted, only made inert.
+    """
+    escaped = csv_safe(dangerous)
+
+    assert escaped.startswith("'"), f"{dangerous!r} slipped past the trigger check"
+    assert escaped[1:] == dangerous, "the original text, unaltered, after the quote"
+
+
 def test_a_negative_number_is_still_neutralised_and_still_readable() -> None:
     """`-12.30` is a formula trigger AND a real figure this export carries. Quoting it is the
     correct trade: a spreadsheet shows `-12.30` as text rather than evaluating it, and the value

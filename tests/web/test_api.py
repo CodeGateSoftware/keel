@@ -531,12 +531,20 @@ def test_every_declared_sort_column_is_a_column_the_rows_actually_have(
     and then order every row identically -- an accepted request that silently does nothing, which
     is exactly what refusing an unknown column exists to prevent.
 
-    Checked over the two endpoints this test can seed rows into. A collection with no rows proves
-    nothing here, which is why the seeding is not optional."""
+    Checked over every endpoint this test can seed rows into. A collection with no rows proves
+    nothing here, which is why the seeding is not optional.
+
+    `/api/timeline` (#703) joined this list after shipping with `sortable=("ts", ...)` while its
+    payload emits `at` -- accepted, echoed back as applied, and ordering nothing. That is the
+    exact rot this pin exists for, and it went unnoticed because the route was not in it."""
     _seed_positions(running.db_path, (("BTC-USD", "0.01", "50000"),))
     _seed_rules(running.db_path, ("breakout",))
 
-    for path, collection in (("/api/status", "open_positions"), ("/api/rules", "rules")):
+    for path, collection in (
+        ("/api/status", "open_positions"),
+        ("/api/rules", "rules"),
+        ("/api/timeline", "rows"),
+    ):
         _status, _headers, document = _json(running, path)
         rows = document["data"][collection]
 
