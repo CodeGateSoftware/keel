@@ -1330,3 +1330,62 @@ def test_the_status_key_scan_found_the_keys_it_claims_to_check() -> None:
     # And the scan is bounded: `data.build` belongs to `/api/config` and is read by `buildLine`,
     # which lives BELOW `statusView` in the same file.
     assert "build" not in keys, keys
+
+
+# -- the account-equity series, stacked above the curve (#698) ---------------------------------
+
+
+def test_paper_and_live_are_told_apart_by_dash_not_only_by_colour() -> None:
+    """The same constraint the losing segment above answers, for the other pair of lines a reader
+    has to tell apart. Paper and live are unrelated accounts drawn on one canvas, so if the only
+    difference between their lines were a hue, a reader with red-green colour deficiency -- or
+    anyone on e-ink or a greyscale printout -- would see one continuous account."""
+    css = staticfiles.STATIC_ROOT.joinpath("css", "keel.css").read_text(encoding="utf-8")
+    paper_rule = re.search(r"\.chart svg\.series \.line\.paper\s*\{([^}]*)\}", css)
+    assert paper_rule is not None, "the paper equity line has no rule of its own"
+    assert "stroke-dasharray" in paper_rule.group(1), (
+        "the paper line must be dashed so the synthetic account survives greyscale"
+    )
+    # And live must NOT be dashed, or dash stops being the thing that separates them.
+    live_rule = re.search(r"\.chart svg\.series \.line\.live\s*\{([^}]*)\}", css)
+    assert live_rule is None or "stroke-dasharray" not in live_rule.group(1), (
+        "the live line must stay solid -- if both are dashed, dash is no longer the signal"
+    )
+
+
+def test_the_series_canvas_does_not_answer_to_the_curves_selector() -> None:
+    """`main.js`'s #602 wheel-zoom, drag-to-pan and cursor legend bind to `svg.curve` and reach
+    for it with `querySelector`, which takes the FIRST match in the DOM. The series is rendered
+    ABOVE the curve, so if it also called itself `curve` every one of those gestures would
+    silently retarget onto a chart they were not written for."""
+    chart_code = _source("chart.js")
+    assert 'class: "series"' in chart_code, "the series canvas must not be class 'curve'"
+
+    render_code = _source("render.js")
+    series_at = render_code.index("equitySeriesChart(")
+    curve_at = render_code.index("equityChart(journal.curve")
+    assert series_at < curve_at, "the equity series is stacked ABOVE the closed-trade curve"
+
+
+def test_the_series_draws_each_mode_as_its_own_polyline() -> None:
+    """The one thing this chart must never do is join two accounts into one line. It is checked
+    on the source rather than a rendered DOM because a browser cannot run here: the loop over
+    `segments` IS the guarantee, and a `points` attribute built from a flattened list would be
+    the bug."""
+    chart_code = _source("chart.js")
+    assert "for (const segment of series.segments)" in chart_code, (
+        "the series must be drawn one segment at a time, never as one flat list of points"
+    )
+    assert ".flat(" not in chart_code and "concat(" not in chart_code, (
+        "flattening the segments would draw the paper/live flip as a single continuous line"
+    )
+
+
+def test_an_unknown_drawdown_ceiling_draws_no_floor_line() -> None:
+    """`dd_floor_y` is `null` when the rail setting is unknown, and a `null` coordinate must be
+    filtered out rather than drawn: SVG's zero is the TOP of the box, so a floor placed there
+    reads as a ceiling in force above every reading -- the opposite of "not known"."""
+    chart_code = _source("chart.js")
+    assert "point.dd_floor_y !== null" in chart_code, (
+        "points with no recorded drawdown floor must be filtered before the floor is drawn"
+    )

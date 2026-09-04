@@ -292,6 +292,35 @@ class EquitySeries:
         """
         return sum(len(segment.points) for segment in self.segments)
 
+    @property
+    def modes(self) -> list[str]:
+        """The distinct accounts this series spans, in the order they first appear.
+
+        NOT the segment list: paper, live, paper is three segments and two modes. The segments
+        are what the chart draws; this is what a sentence about the chart names, and conflating
+        them would have a spoken summary announce the same account twice.
+
+        It lives on the report for the reason `point_count` does -- `keel/web/payload.py` may
+        not call `len()` (Rule 6e), and the serialiser deriving its own mode list would be a
+        second answer to a question the report already answers.
+        """
+        seen: list[str] = []
+        for segment in self.segments:
+            if segment.mode not in seen:
+                seen.append(segment.mode)
+        return seen
+
+    @property
+    def is_partitioned(self) -> bool:
+        """Whether this series spans more than one account.
+
+        The thing the chart's text equivalent turns on: the sentence explaining that each mode
+        is drawn as its own line must be said only when there IS a split. Told to a deployment
+        that has only ever run paper, it sends a reader looking for a second line that is not
+        there -- the same false continuity the segments prevent, pointing the other way.
+        """
+        return len(self.modes) > 1
+
 
 def _plot_y(value: Decimal, *, low: Decimal, span: Decimal) -> Decimal:
     """`value` mapped into `0..PLOT_HEIGHT`, with the top of the box being `low + span`."""

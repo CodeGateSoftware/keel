@@ -43,6 +43,40 @@ def _reading(
     )
 
 
+def test_the_series_names_the_modes_it_spans_in_the_order_they_appear() -> None:
+    """The report holds this, not the serialiser. `keel/web/payload.py` may not call `len()`
+    (Rule 6e of `tests/commands/test_console_thinness.py`), and the sentence it writes for a
+    reader who cannot see the chart has to name the accounts -- so the list and the count are
+    the report's own statement about itself, exactly like `point_count`."""
+    series = build_equity_series(
+        [
+            _reading(NOW, "10000", mode="paper"),
+            _reading(NOW + DAY, "250", mode="live"),
+            _reading(NOW + 2 * DAY, "10100", mode="paper"),
+        ]
+    )
+    # Three SEGMENTS, two MODES: the run order is the chart's, the mode set is the sentence's.
+    assert [segment.mode for segment in series.segments] == ["paper", "live", "paper"]
+    assert series.modes == ["paper", "live"]
+    assert series.is_partitioned is True
+
+
+def test_a_single_mode_series_is_not_partitioned() -> None:
+    """What the sentence turns on: with one account there is no split to explain, and telling a
+    reader the lines are separate accounts would send them looking for a line that is not there."""
+    series = build_equity_series([_reading(NOW, "10000", mode="paper")])
+
+    assert series.modes == ["paper"]
+    assert series.is_partitioned is False
+
+
+def test_an_empty_series_spans_no_modes() -> None:
+    series = build_equity_series([])
+
+    assert series.modes == []
+    assert series.is_partitioned is False
+
+
 def test_no_readings_is_a_real_answer_not_an_empty_chart() -> None:
     """A deployment that has not run a cycle since v19 has no series. Distinct from a flat
     line, which is what an account that did not move looks like."""

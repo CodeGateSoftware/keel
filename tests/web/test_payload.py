@@ -37,6 +37,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from keel_core.types import EquityReading
 
 from keel.capabilities import CAPABILITIES, GATES
 from keel.commands.activity import ActivityCycle, ActivityEvent, ActivityFeed
@@ -48,6 +49,7 @@ from keel.commands.insights import (
     JournalReport,
     RuleTrackRecord,
     build_equity_curve,
+    build_equity_series,
 )
 from keel.commands.jobs import JobStatus
 from keel.commands.setup import ACTIONS, STEPS, DeploymentState, StepState
@@ -399,7 +401,12 @@ def _every_payload() -> dict[str, Any]:
     second copy to drift."""
     return {
         "status": payload.status_payload(_status_report()),
-        "insights": payload.insights_payload(_insights_report()),
+        "insights": payload.insights_payload(
+            _insights_report(),
+            series=build_equity_series(
+                _equity_readings(), max_total_dd_pct=Decimal("0.20")
+            ),
+        ),
         "journal": _journal_json(),
         "activity": payload.activity_payload(_activity_feed()),
         "config": payload.config_payload(
@@ -805,7 +812,9 @@ def test_a_win_rate_float_is_re_encoded_not_recomputed() -> None:
     """`RuleTrackRecord.win_rate` is a `float` upstream -- a statistic, never money. It reaches the
     wire through its own shortest round-trip repr, so the figure on the wire is the figure the
     report held and nothing was recomputed on the way."""
-    built = payload.insights_payload(_insights_report())
+    built = payload.insights_payload(
+        _insights_report(), series=build_equity_series(_equity_readings())
+    )
 
     assert built["rules"][0]["win_rate"]["value"] == "41.5"
     assert built["rules"][0]["win_rate"]["display"] == "41.5%"
@@ -1316,7 +1325,10 @@ def test_every_builder_survives_a_completely_empty_report() -> None:
     )
     documents = {
         "status": payload.status_payload(empty_status),
-        "insights": payload.insights_payload(_insights_report(rules=[], closed_trade_count=0)),
+        "insights": payload.insights_payload(
+            _insights_report(rules=[], closed_trade_count=0),
+            series=build_equity_series([]),
+        ),
         "journal": _journal_json(entries=[], total_count=0, filters={}),
         "activity": payload.activity_payload(
             ActivityFeed(status="missing", source="/tmp/nope.log")
@@ -1336,6 +1348,16 @@ def test_every_payload_is_json_serialisable_without_a_custom_encoder(builder: st
     matters beyond tidiness: `json.dumps(Decimal(...))` raises, and the natural fix a hurried
     author reaches for is `default=float`, which is the contract's exact failure mode installed as
     a convenience."""
+    if builder == "insights_payload":
+        # A second builder with a required keyword, for the same reason: a default
+        # `series` would serve an insights view with no chart.
+        json.dumps(
+            payload.insights_payload(
+                _insights_report(), series=build_equity_series(_equity_readings())
+            )
+        )
+        return
+
     if builder == "journal_payload":
         # The one builder with a second required argument. Spelled out rather than folded into
         # the table below, because folding it in would mean a default somewhere -- and the whole
@@ -1346,8 +1368,156 @@ def test_every_payload_is_json_serialisable_without_a_custom_encoder(builder: st
 
     other = {
         "status_payload": _status_report(),
-        "insights_payload": _insights_report(),
         "activity_payload": _activity_feed(),
     }[builder]
 
     json.dumps(getattr(payload, builder)(other))  # no cls=, no default=
+
+
+# -- the account-equity series (#698) ---------------------------------------------------------
+#
+# Serialised beside the closed-trade curve, never instead of it: the two answer different
+# questions (what the ACCOUNT was worth, whichever cycles ran; what the closed TRADES did, in the
+# order they closed). The rules below are the ones the contract already applies to the curve --
+# money as strings, coordinates bare, judgements written here -- plus the one this chart adds:
+# a mode is a partition, and the payload must never let a client join across it.
+
+
+def _equity_readings() -> list[EquityReading]:
+    """Two modes, a rebased high-water mark, and a cycle whose split was never recorded."""
+    return [
+        EquityReading(
+            ts=NOW_TS - 3 * 86_400,
+            mode="paper",
+            equity=Decimal("10000.55"),
+            cash=Decimal("9000.25"),
+            unrealized=Decimal("-12.30"),
+            hwm=Decimal("10500.00"),
+        ),
+        EquityReading(
+            ts=NOW_TS - 2 * 86_400,
+            mode="paper",
+            equity=Decimal("10600"),
+            cash=None,
+            unrealized=None,
+            hwm=Decimal("10600"),
+        ),
+        EquityReading(
+            ts=NOW_TS,
+            mode="live",
+            equity=Decimal("250.10"),
+            cash=Decimal("250.10"),
+            unrealized=Decimal("0"),
+            hwm=Decimal("250.10"),
+        ),
+    ]
+
+
+def _series_json(max_total_dd_pct: Decimal | None = Decimal("0.20")) -> dict[str, Any]:
+    return payload.equity_series_payload(
+        build_equity_series(_equity_readings(), max_total_dd_pct=max_total_dd_pct)
+    )
+
+
+def test_the_series_crosses_as_one_run_of_points_per_mode() -> None:
+    """The partition, on the wire. Two paper cycles then a live one is two segments, and a client
+    handed one flat list would draw a line from $10,600 of paper money to $250 of real money and
+    call the drop a drawdown."""
+    modes = [segment["mode"] for segment in _series_json()["segments"]]
+    counts = [len(segment["points"]) for segment in _series_json()["segments"]]
+
+    assert modes == ["paper", "live"]
+    assert counts == [2, 1]
+
+
+def test_a_segments_mode_is_a_bare_string_not_a_field() -> None:
+    """`mode` is an identifier, like `product_id` and `rule_name`: no precision hazard, no
+    rounding, no judgement. WHAT IS NOT A FIELD, in the module docstring."""
+    assert _series_json()["segments"][0]["mode"] == "paper"
+
+
+def test_coordinates_are_bare_strings_and_the_figures_beside_them_are_fields() -> None:
+    """The same split `_equity_point_payload` documents: `x`/`y` are positions inside a viewBox,
+    with nothing to format and no judgement to carry, while everything a reader is TOLD arrives
+    as a field."""
+    point = _series_json()["segments"][0]["points"][0]
+
+    assert point["x"] == "0.00"
+    assert isinstance(point["y"], str)
+    assert point["equity"]["display"] == "$10,000.55"
+    assert point["equity"]["value"] == "10000.55"
+    assert point["at"]["value"].endswith("Z")
+
+
+def test_an_unrecorded_split_crosses_as_absent_not_as_zero() -> None:
+    """A cycle that knew its total but not its split. `$0.00` would state a flat cash balance
+    and a flat unrealized P&L, and neither was observed -- the same distinction `pnl_net` draws
+    for a trade with no recorded net."""
+    point = _series_json()["segments"][0]["points"][1]
+
+    assert point["cash"]["state"] == "unknown"
+    assert point["unrealized"]["state"] == "unknown"
+    assert point["equity"]["state"] == "neutral"
+
+
+def test_the_unrealized_leg_carries_its_own_sign_as_a_state() -> None:
+    """Rule 3: a client must never decide "this is bad" from a minus sign. Unrealized P&L is a
+    gain-or-loss figure, so it is the one leg of the split that carries a verdict."""
+    point = _series_json()["segments"][0]["points"][0]
+
+    assert point["unrealized"]["state"] == "bad"
+    assert point["unrealized"]["display"].startswith("\u25bc")
+
+
+def test_the_drawdown_floor_is_absent_rather_than_zero_when_the_rail_is_unknown() -> None:
+    """A caller that did not supply `max_total_dd_pct` has not said the ceiling is zero. The
+    coordinate goes `null` for the same reason: a `"0"` would place the line at the top of the
+    box, where it reads as a ceiling in force."""
+    point = _series_json(max_total_dd_pct=None)["segments"][0]["points"][0]
+
+    assert point["dd_floor"]["state"] == "unknown"
+    assert point["dd_floor_y"] is None
+
+
+def test_the_drawdown_floor_crosses_with_a_coordinate_when_the_rail_is_known() -> None:
+    point = _series_json()["segments"][0]["points"][0]
+
+    # 10500.00 * (1 - 0.20), exact: the payload never rounds a source Decimal.
+    assert point["dd_floor"]["value"] == "8400.0000"
+    assert point["dd_floor"]["display"] == "$8,400.00"
+    assert isinstance(point["dd_floor_y"], str)
+
+
+def test_the_reading_says_what_the_chart_shows_including_the_flip() -> None:
+    """The chart's text equivalent, written HERE for the reason every other sentence on this wire
+    is. It has to name the mode split: a reader who cannot see the two separate lines is
+    otherwise told a single account went from ten thousand dollars to two hundred."""
+    reading = _series_json()["reading"]
+
+    assert "paper" in reading["display"]
+    assert "live" in reading["display"]
+    assert reading["state"] in ("good", "warn", "bad", "neutral", "unknown")
+
+
+def test_a_single_mode_is_not_told_it_is_two_separate_accounts() -> None:
+    """The sentence explaining the split is what a reader who cannot see the chart is told about
+    the mode partition -- so it must not be said when there is no partition. A deployment that
+    has only ever run paper hears "they are separate accounts" and goes looking for a second line
+    that is not there, which is the same false continuity the segments prevent, inverted."""
+    only_paper = payload.equity_series_payload(build_equity_series(_equity_readings()[:2]))
+
+    assert "paper" in only_paper["reading"]["display"]
+    assert "separate accounts" not in only_paper["reading"]["display"]
+    # And the two-mode case still explains itself.
+    assert "separate accounts" in _series_json()["reading"]["display"]
+
+
+def test_an_empty_series_says_so_rather_than_describing_an_empty_chart() -> None:
+    """Not "the account was flat", and not an empty string. A deployment that has not completed a
+    cycle since the upgrade has no readings at all, and which of those two a reader is looking at
+    is the whole difference between an empty chart and a broken one."""
+    empty = payload.equity_series_payload(build_equity_series([]))
+
+    assert empty["segments"] == []
+    assert empty["point_count"]["value"] == "0"
+    assert "no" in empty["reading"]["display"].lower()

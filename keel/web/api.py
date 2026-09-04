@@ -279,21 +279,39 @@ def read_orders(cfg: ServeConfig, query: Query, _state: Any, _now_ts: int) -> di
 
 
 def read_insights(cfg: ServeConfig, _query: Query, _state: Any, now_ts: int) -> dict[str, Any]:
-    """The per-rule track records and the promotion-gate distances.
+    """The per-rule track records, the promotion-gate distances, and the account-equity series.
 
     The journal the HTML `/insights` page renders below these is `/api/journal` instead of a second
     table here. One sortable collection per endpoint keeps `?sort=` unambiguous without a
     `?table=` beside it, and it gives the journal somewhere to carry its own `?limit=` -- the cap
-    the HTML page apologises for in a comment ("a cap, not a paginator")."""
-    from keel.commands.insights import build_insights_report
+    the HTML page apologises for in a comment ("a cap, not a paginator").
+
+    The equity series (#698) is read here rather than on `/api/journal`, next to the curve it is
+    drawn above, because it describes the ACCOUNT and not the closed trades. The journal's curve
+    narrows with that endpoint's `?limit=`; this does not narrow with anything, and two charts
+    that answer a query differently must not share one payload where a reader would assume they
+    agree.
+
+    `max_total_dd_pct` comes off the SAME loaded config `build_insights_report` reads, so the
+    drawdown floor drawn under the curve and the ceiling quoted in the account card beside it are
+    one setting rather than two reads that can disagree.
+    """
+    from keel.commands.insights import build_equity_series, build_insights_report
 
     repo = open_repo(cfg.db_path)
     try:
         config = load_config(cfg.config_path)
         report = build_insights_report(repo, config, _status_report(cfg, now_ts), now_ts)
+        # Every reading, not a window: the series is the long record the 7-day rolling window in
+        # `agent_state` never was, and cutting it to a default span here would reintroduce the
+        # exact horizon #698 exists to remove. A span control is a client asking for new bounds,
+        # which `insights.py`'s own note says would make the builder a service -- not today.
+        series = build_equity_series(
+            repo.get_equity_points(), max_total_dd_pct=config.money_mgmt.max_total_dd_pct
+        )
     finally:
         close_repo(repo)
-    return payload.insights_payload(report)
+    return payload.insights_payload(report, series=series)
 
 
 def read_journal(cfg: ServeConfig, query: Query, _state: Any, now_ts: int) -> dict[str, Any]:
