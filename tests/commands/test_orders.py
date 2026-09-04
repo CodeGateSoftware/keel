@@ -99,6 +99,11 @@ class _RecordingRepo:
         self.calls.append((args, kwargs))
         return list(self.rows)
 
+    def get_rules(self, *args: Any, **kwargs: Any) -> list[dict[str, Any]]:
+        # `gather_orders` resolves rule NAMES off this (#700). Recorded nowhere: this stub
+        # exists to pin how `get_orders` is called, and that pin is unchanged.
+        return []
+
 
 def test_gather_passes_no_filter_of_any_kind_to_get_orders() -> None:
     """THE pin the operator's scope note asked for.
@@ -664,12 +669,230 @@ def _report_with(**overrides: Any) -> OrdersReport:
         "scope": "all",
         "scope_start_ts": None,
         "limit": DEFAULT_ORDERS_LIMIT,
+        "status": "",
         "total_count": len(rows),
         "scoped_count": len(rows),
+        "filtered_count": len(rows),
         "shown_count": len(rows),
         "modes": ("live",),
+        "statuses": ("filled",),
         "empty_reason": "",
         "rows": rows,
     }
     base.update(overrides)
     return OrdersReport(**base)
+
+
+# -- the status filter, server-side (#700) ----------------------------------------------------
+#
+# The Orders view's tabs. Filtered HERE and not in the browser, for the reason `?sort=` is: a
+# client that filtered a capped page would be filtering the 50 rows it happened to receive and
+# calling the result "every rejected order", which is a different and false claim.
+#
+# It does NOT reach `get_orders()`. The unfiltered-read pin above is unchanged and still the
+# load-bearing one -- the status narrowing happens in the same pass as the scope, over rows the
+# repository handed back whole.
+
+
+def test_a_status_filter_keeps_only_that_status(tmp_path: Path) -> None:
+    repo = _repo(tmp_path)
+    repo.insert_order(_order(status="filled"))
+    repo.insert_order(_order(status="canceled"))
+    repo.insert_order(_order(status="pending"))
+
+    report = gather_orders(repo, now_ts=NOW_TS, status="canceled")
+
+    assert [row.status for row in report.rows] == ["canceled"]
+
+
+def test_no_status_filter_keeps_every_row(tmp_path: Path) -> None:
+    """The default is the whole book. A tabbed view opens on "All", and a report that quietly
+    defaulted to one status would answer a question nobody asked."""
+    repo = _repo(tmp_path)
+    repo.insert_order(_order(status="filled"))
+    repo.insert_order(_order(status="canceled"))
+
+    assert len(gather_orders(repo, now_ts=NOW_TS).rows) == 2
+    assert len(gather_orders(repo, now_ts=NOW_TS, status="").rows) == 2
+
+
+def test_the_status_filter_is_matched_without_case(tmp_path: Path) -> None:
+    """`?status=FILLED` from a hand-typed URL is the same question as `?status=filled`. The
+    stored word is lowercase; matching on the caller's casing would make the tab work from the
+    UI and fail from the address bar."""
+    repo = _repo(tmp_path)
+    repo.insert_order(_order(status="filled"))
+
+    assert len(gather_orders(repo, now_ts=NOW_TS, status="FILLED").rows) == 1
+
+
+def test_the_status_filter_composes_with_the_scope(tmp_path: Path) -> None:
+    """Both narrowings apply, and the scope still comes first: a filled order from last month is
+    not in today's book, whichever tab is open."""
+    repo = _repo(tmp_path)
+    repo.insert_order(_order(status="filled", created_at=TODAY_START + 60))
+    repo.insert_order(_order(status="filled", created_at=TODAY_START - 86_400))
+    repo.insert_order(_order(status="canceled", created_at=TODAY_START + 60))
+
+    report = gather_orders(repo, now_ts=NOW_TS, scope="today", status="filled")
+
+    assert report.shown_count == 1
+
+
+def test_the_report_names_every_status_in_the_whole_book(tmp_path: Path) -> None:
+    """What the tabs are built from -- the statuses this deployment ACTUALLY recorded, not a
+    hardcoded list of the ones keel can write. `modes` is carried for the same reason: a reader
+    must never have to conclude which tabs exist from which ones came back empty.
+
+    From the WHOLE book, deliberately: scoped to today, a tab bar would lose the Canceled tab on
+    a quiet day and reappear it tomorrow, and a control that comes and goes is worse than one
+    that is sometimes empty."""
+    repo = _repo(tmp_path)
+    repo.insert_order(_order(status="filled", created_at=TODAY_START - 86_400))
+    repo.insert_order(_order(status="canceled", created_at=TODAY_START + 60))
+    repo.insert_order(_order(status="filled", created_at=TODAY_START + 60))
+
+    report = gather_orders(repo, now_ts=NOW_TS, scope="today")
+
+    assert report.statuses == ("canceled", "filled")
+
+
+def test_the_resolved_status_is_echoed_back(tmp_path: Path) -> None:
+    """Same contract as `scope`: what the report actually applied, so a client rendering the
+    active tab reads it back rather than trusting what it asked for."""
+    repo = _repo(tmp_path)
+    repo.insert_order(_order(status="filled"))
+
+    assert gather_orders(repo, now_ts=NOW_TS, status="FILLED").status == "filled"
+    assert gather_orders(repo, now_ts=NOW_TS).status == ""
+
+
+def test_an_empty_status_tab_is_not_an_empty_book(tmp_path: Path) -> None:
+    """The three ways this table comes back empty are three different facts, and a reader who
+    cannot tell them apart learns the wrong one. "keel has never traded", "nothing in this
+    window", and "nothing with this status" all render as zero rows."""
+    repo = _repo(tmp_path)
+    repo.insert_order(_order(status="filled", created_at=TODAY_START + 60))
+
+    assert gather_orders(repo, now_ts=NOW_TS, status="rejected").empty_reason == "status"
+    assert gather_orders(repo, now_ts=NOW_TS, scope="today", status="filled").empty_reason == ""
+
+
+def test_an_out_of_scope_row_still_reports_the_scope_as_the_reason(tmp_path: Path) -> None:
+    """Scope is checked before status, so a book whose only row is outside the window says so
+    rather than blaming the tab -- the scope is the narrowing the reader chose first."""
+    repo = _repo(tmp_path)
+    repo.insert_order(_order(status="filled", created_at=TODAY_START - 86_400))
+
+    report = gather_orders(repo, now_ts=NOW_TS, scope="today", status="filled")
+    assert report.empty_reason == "scope"
+
+
+def test_the_filtered_count_is_what_the_shown_rows_are_a_page_of(tmp_path: Path) -> None:
+    """`scoped_count` keeps its meaning -- rows inside the SCOPE -- so a filtered view needs its
+    own denominator. Without it a tab showing 1 of 3 would be counting rows from other tabs, and
+    "1 of 3 canceled orders" would be false while every number in it was true."""
+    repo = _repo(tmp_path)
+    repo.insert_order(_order(status="filled"))
+    repo.insert_order(_order(status="filled"))
+    repo.insert_order(_order(status="canceled"))
+
+    report = gather_orders(repo, now_ts=NOW_TS, status="filled")
+
+    assert report.total_count == 3
+    assert report.scoped_count == 3
+    assert report.filtered_count == 2
+    assert report.shown_count == 2
+
+
+def test_the_filtered_count_reflects_the_cap_being_a_cap(tmp_path: Path) -> None:
+    repo = _repo(tmp_path)
+    for _ in range(4):
+        repo.insert_order(_order(status="filled"))
+
+    report = gather_orders(repo, now_ts=NOW_TS, status="filled", limit=2)
+
+    assert report.filtered_count == 4
+    assert report.shown_count == 2
+
+# -- the rule that placed it (#700) -----------------------------------------------------------
+#
+# `orders.rule_id` is a foreign key, and a foreign key on a page is a number a reader cannot act
+# on. The NAME is `rules.kind` -- the same string `build_rule_track_record` calls `rule_name`, so
+# the Orders view and the track-record table name the same rule the same way.
+
+
+class _RuleCountingRepo:
+    """Records how often each read is made, so the resolution cannot be N+1 unnoticed."""
+
+    def __init__(self, orders: list[dict[str, Any]], rules: list[dict[str, Any]]) -> None:
+        self._orders = orders
+        self._rules = rules
+        self.order_reads = 0
+        self.rule_reads = 0
+
+    def get_orders(self, *args: Any, **kwargs: Any) -> list[dict[str, Any]]:
+        self.order_reads += 1
+        return list(self._orders)
+
+    def get_rules(self, *args: Any, **kwargs: Any) -> list[dict[str, Any]]:
+        self.rule_reads += 1
+        return list(self._rules)
+
+
+def test_the_rule_that_placed_an_order_is_named(tmp_path: Path) -> None:
+    repo = _repo(tmp_path)
+    rule_id = repo.insert_rule("turtle_breakout", {"product_id": "BTC-USD"})
+    repo.insert_order(_order(rule_id=rule_id))
+
+    report = gather_orders(repo, now_ts=NOW_TS)
+
+    assert report.rows[0].rule_name == "turtle_breakout"
+
+
+def test_an_order_with_no_rule_says_so_rather_than_showing_a_blank(tmp_path: Path) -> None:
+    """A `NULL` rule_id is a real state -- a manual order, or one placed before the column was
+    written. It is not the same as a rule that has gone missing, and the sentence is what keeps
+    the two apart on a page where both render as no name."""
+    repo = _repo(tmp_path)
+    repo.insert_order(_order(rule_id=None))
+
+    row = gather_orders(repo, now_ts=NOW_TS).rows[0]
+
+    assert row.rule_name == ""
+    assert "no rule" in row.rule_name_detail.lower()
+
+
+def test_a_rule_that_is_no_longer_in_the_book_is_named_as_missing() -> None:
+    """The distinction that matters for an audit trail: "nothing placed this" and "rule 7 placed
+    this and rule 7 is gone" are different facts, and only the second is worth chasing. Rendering
+    both as an empty cell would hide it.
+
+    Driven through `_row_from_dict` rather than a repository, because `orders.rule_id` carries a
+    FOREIGN KEY to `rules(id)` and `db.connect` enables `PRAGMA foreign_keys = ON` -- so keel
+    cannot write this row, and a test that tried would be refused by SQLite rather than by the
+    code under test. The branch is defensive and stays: the map can also miss for a row written
+    by an older keel, by an external sqlite3 session with the pragma off, or by a caller passing
+    a partial map."""
+    row = orders_service._row_from_dict(_order(id=1, rule_id=7), {})
+
+    assert row.rule_name == ""
+    assert "7" in row.rule_name_detail
+    assert row.rule_name_detail != orders_service._row_from_dict(
+        _order(id=2, rule_id=None), {}
+    ).rule_name_detail
+
+
+def test_naming_the_rules_costs_one_read_however_many_orders(tmp_path: Path) -> None:
+    """The pin against an N+1. A per-row lookup would be invisible on a fixture of two and would
+    be one query per row on a real book -- `MAX_ORDERS_LIMIT` of them, on a route with no proxy
+    in front of it (`api.py`'s own note)."""
+    repo = _RuleCountingRepo(
+        [_order(id=i, rule_id=1) for i in range(1, 26)],
+        [{"id": 1, "kind": "turtle_breakout", "params": {}, "status": "live"}],
+    )
+
+    report = gather_orders(repo, now_ts=NOW_TS)  # type: ignore[arg-type]
+
+    assert repo.rule_reads == 1
+    assert {row.rule_name for row in report.rows} == {"turtle_breakout"}

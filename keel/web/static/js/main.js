@@ -392,10 +392,22 @@ function mount(route, readings) {
     // The same server-side scope switch Activity uses, and deliberately the same control: two
     // views over one deployment whose "how far back" behaved differently would be a thing an
     // operator has to learn twice.
-    return ordersView(data, primary.sort, onSort, (scope) => {
-      paramsFor(route.endpoints[0]).scope = scope;
-      void paint(route, true, true);
-    });
+    return ordersView(
+      data,
+      primary.sort,
+      onSort,
+      (scope) => {
+        paramsFor(route.endpoints[0]).scope = scope;
+        void paint(route, true, true);
+      },
+      // #700: the status tab re-asks the SERVER. Filtering the received page here would filter
+      // the rows that happened to arrive under `?limit=` and present the result as every
+      // canceled order -- the same argument that puts `?sort=` on the server.
+      (status) => {
+        paramsFor(route.endpoints[0]).status = status;
+        void paint(route, true, true);
+      },
+    );
   }
   if (route.name === "insights") {
     const journal = readings[1];

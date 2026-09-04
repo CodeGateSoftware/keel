@@ -1342,6 +1342,13 @@ _EMPTY_NOTES: dict[str, str] = {
         "no orders in this window. The book holds orders, all of them outside this scope -- "
         "widen it to see them."
     ),
+    # A FIXED sentence that does not name the status asked for (#700). `?status=` is
+    # caller-controlled text; it crosses in `status`, which the client places as a value, and
+    # keeping it out of the prose means an unrecognised word cannot arrive as a sentence.
+    "status": (
+        "no orders with this status in this window. The book holds orders with other statuses "
+        "-- switch tabs to see them."
+    ),
 }
 
 #: The two `mode` words, styled. `live` is `warn` not because live trading is wrong but because
@@ -1373,6 +1380,15 @@ def _order_row_payload(row: OrderRow) -> dict[str, Any]:
     `OrdersReport` does not carry the column; `venue_order_id` is the short scalar the service
     read out of it. A reader wanting the blob opens SQLite, which is the right amount of
     friction for unbounded venue JSON.
+
+    **#700 asked for a per-row disclosure exposing that blob, and it was REFUSED.** Not on
+    layout grounds: the column is whatever the venue chose to send, so it can carry session
+    metadata, internal identifiers, and error schemas nobody here has read, and a page that
+    renders it wholesale publishes all of that to anyone who can open the console. The
+    reduction to `venue_order_id` happens in the service precisely so that emitting the rest is
+    an impossible mistake here rather than a one-line one. What would reverse this: a curated,
+    named set of venue fields worth showing -- which is a different feature, with its own
+    review of what each field contains, and not "render the blob".
 
     **`fee` is a figure, never a rate.** No percentage appears in this payload. Deriving one
     would be arithmetic Rule 3 forbids here, and would put a number on the page that the report
@@ -1460,6 +1476,12 @@ def _order_row_payload(row: OrderRow) -> dict[str, Any]:
         # a paper row shows a sentence rather than a blank that reads as missing data.
         "venue_order_id": row.venue_order_id,
         "venue_order_id_note": row.venue_order_id_detail,
+        # The NAME first, the id after it (#700). A foreign key is not something a reader can
+        # act on; `rules.kind` is the same string the track-record table names the rule by, so
+        # the two views cannot call one rule two things. `rule_note` tells the two absences
+        # apart -- no rule recorded, versus a rule that has left the book.
+        "rule_name": label(row.rule_name or "unattributed", state=NEUTRAL),
+        "rule_note": row.rule_name_detail,
         "rule_id": count(row.rule_id),
         "created_at": moment(row.created_at),
         "updated_at": moment(row.updated_at),
@@ -1487,8 +1509,15 @@ def orders_payload(report: OrdersReport) -> dict[str, Any]:
         "scope": report.scope,
         "scope_start_at": moment(report.scope_start_ts),
         "limit": count(report.limit),
+        # The status FILTER as applied, and the tab bar to build (#700). Both bare strings, like
+        # `scope` and `modes` beside them: a status is an enum word with no precision hazard and
+        # no judgement -- the judgement is `_ORDER_STATUS_STATES`, and it is made per ROW, where
+        # a reader meets it.
+        "status": report.status,
+        "statuses": [str(status) for status in report.statuses],
         "total_count": count(report.total_count),
         "scoped_count": count(report.scoped_count),
+        "filtered_count": count(report.filtered_count),
         "shown_count": count(report.shown_count),
         "modes": [str(mode) for mode in report.modes],
         "empty_reason": report.empty_reason,

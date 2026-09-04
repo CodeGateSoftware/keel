@@ -1168,7 +1168,7 @@ function jobPanel(job) {
  * @param {(scope: string) => void} onScope
  * @returns {DocumentFragment}
  */
-export function ordersView(data, sort, onSort, onScope) {
+export function ordersView(data, sort, onSort, onScope, onStatus) {
   const fragment = document.createDocumentFragment();
   fragment.append(el("h1", undefined, "Orders"));
 
@@ -1177,10 +1177,19 @@ export function ordersView(data, sort, onSort, onScope) {
   fragment.append(sub);
 
   fragment.append(scopeSwitch(plain(data.scope), onScope, "Orders scope"));
+  // Guarded, so a caller that has not wired the tabs renders the view unchanged rather
+  // than a bar whose buttons do nothing.
+  if (onStatus) {
+    fragment.append(statusSwitch(plain(data.status), data.statuses || [], onStatus));
+  }
 
   fragment.append(
     gridCard([
       kv("shown", data.shown_count),
+      // `filtered_count`, never `shown` against `in scope`: with a tab open, the
+      // denominator of "shown" has to count that tab, and the report is the only place
+      // allowed to work it out (Rule 2 keeps the subtraction out of the browser).
+      kv("in this status", data.filtered_count),
       kv("in scope", data.scoped_count),
       kv("in this book", data.total_count),
       // Which modes this book actually holds. A deployment book holds one, and saying which
@@ -1202,6 +1211,10 @@ export function ordersView(data, sort, onSort, onScope) {
         { label: "side", numeric: false, key: "side" },
         { label: "product", numeric: false, key: "product_id" },
         { label: "status", numeric: false, key: "status" },
+        // The rule's NAME, beside the status rather than buried in the disclosure: on a
+        // book with several rules live, which one placed an order is a scanning
+        // question, and a foreign key in a detail panel does not answer it.
+        { label: "rule", numeric: false, key: "rule_name" },
         { label: "qty", numeric: true, key: "qty" },
         { label: "filled", numeric: true, key: "filled_quantity" },
         { label: "expected", numeric: true, key: "expected_fill" },
@@ -1301,7 +1314,11 @@ function orderDetail(row) {
         "venue order id",
         plain(row.venue_order_id) || plain(row.venue_order_id_note) || "—",
       ),
-      kv("rule", row.rule_id),
+      // The name is in the table; this is the id it resolved from, plus the sentence
+      // that tells the two absences apart -- no rule recorded at all, versus a rule
+      // that has left the book. A blank cell would collapse them.
+      kv("rule", plain(row.rule_note) || field(row.rule_name)),
+      kv("rule id", row.rule_id),
       kv("last updated", row.updated_at),
     ]),
   );
@@ -1407,6 +1424,46 @@ export function activityView(data, sort, onSort, onScope) {
  * @param {string} [label]  how the control announces itself. Defaults to Activity's wording.
  * @returns {HTMLElement}
  */
+/**
+ * The Orders status tabs (#700).
+ *
+ * **Built from `statuses`, never from a constant.** A tab bar listing every status keel CAN
+ * write would invite a reader to click into four empty tabs and conclude something about the
+ * engine from what is really a list of possibilities. `statuses` is what this book actually
+ * recorded, which is why the service carries it and why it comes from the whole book rather than
+ * the open scope -- a tab that vanishes on a quiet day is worse than one that is empty.
+ *
+ * **`current` is what the report APPLIED**, not what the client last asked for. If the two ever
+ * disagree the report is right, and a bar drawn from the request would show a filter that is not
+ * in force.
+ *
+ * The leading "all" tab is not decoration: without it, a reader who has clicked into a status has
+ * no way back short of knowing that the empty string means every status.
+ *
+ * @param {string} current  `data.status` -- `""` when unfiltered.
+ * @param {string[]} statuses  `data.statuses`.
+ * @param {(status: string) => void} onStatus
+ * @returns {HTMLElement}
+ */
+function statusSwitch(current, statuses, onStatus) {
+  const wrap = el("nav", "scopes");
+  wrap.setAttribute("aria-label", "Order status");
+  wrap.append(el("span", "k", "status"));
+  const all = el("button", "scopekey", "all");
+  all.setAttribute("type", "button");
+  if (!current) all.setAttribute("aria-current", "true");
+  all.addEventListener("click", () => onStatus(""));
+  wrap.append(all);
+  for (const name of statuses) {
+    const button = el("button", "scopekey", name);
+    button.setAttribute("type", "button");
+    if (name === current) button.setAttribute("aria-current", "true");
+    button.addEventListener("click", () => onStatus(name));
+    wrap.append(button);
+  }
+  return wrap;
+}
+
 function scopeSwitch(current, onScope, label) {
   const wrap = el("nav", "scopes");
   wrap.setAttribute("aria-label", label || "Activity scope");
