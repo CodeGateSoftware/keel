@@ -38,6 +38,7 @@ import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from keel.web import payload
@@ -357,6 +358,59 @@ def read_balances(cfg: ServeConfig, _query: Query, _state: Any, now_ts: int) -> 
     finally:
         close_repo(repo)
     return payload.balances_payload(report)
+
+
+#: Where the trials ledger is looked for, relative to a deployment root or a checkout root.
+#: `research.ledger.DEFAULT_LEDGER_PATH` itself, kept as a name here so the two searched roots
+#: below cannot drift from it.
+_LEDGER_RELATIVE = Path("docs") / "experiments" / "trials-ledger.jsonl"
+
+
+def _ledger_path(cfg: ServeConfig) -> Path:
+    """Where this process should look for the trials ledger.
+
+    Two roots, in this order, and the first that EXISTS wins:
+
+    1. beside the config file -- a deployment directory (`~/keel`), which is where `keel serve`
+       actually runs from;
+    2. the working directory -- a repository checkout, which is what `DEFAULT_LEDGER_PATH` is
+       relative to and where a developer runs `keel serve` from.
+
+    Neither is a fallback for a broken install. A deployment that never had the research repo
+    beside it has no ledger to read, that is an ordinary state, and `gather_trials` reports it as
+    one. When neither exists this returns the deployment path, so that anything logging the miss
+    names the location an operator would actually put the file.
+    """
+    deployment = Path(cfg.config_path).resolve().parent / _LEDGER_RELATIVE
+    if deployment.exists():
+        return deployment
+    checkout = Path.cwd() / _LEDGER_RELATIVE
+    if checkout.exists():
+        return checkout
+    return deployment
+
+
+def read_trials_ledger(cfg: ServeConfig, _query: Query, _state: Any, now_ts: int) -> dict[str, Any]:
+    """The research record: every trial run, the rejected ones included (#708).
+
+    **The one endpoint in this table that reads no database.** Its source is
+    `docs/experiments/trials-ledger.jsonl` -- a hash-chained, append-only file -- which is why
+    `needs_database=False`: a machine with no deployment on it can still have a research record,
+    and answering "keel isn't running here" to a question about experiments would be false.
+
+    The chain is verified on EVERY read rather than cached. The badge's whole value is that it
+    describes the file as it is right now; a cached verdict would go on saying "intact" about a
+    file somebody had since edited, which is precisely the event the chain exists to catch.
+
+    No `?sort=`, no `?limit=` and no `?rule=`. The rail
+    (`keel/commands/research_record.py`) is that this
+    is a RECORD, in the order it was run -- and a cap would be worse than a sort here, because the
+    rows a cap drops are the rejected ones at the bottom, which are the rows that make the record
+    worth publishing.
+    """
+    from keel.commands.research_record import gather_trials
+
+    return payload.trials_payload(gather_trials(_ledger_path(cfg), now_ts=now_ts))
 
 
 def _log_cycles(config: Any) -> tuple[tuple[Any, ...], str]:
@@ -721,6 +775,27 @@ API_ROUTES: dict[str, ApiRoute] = {
         # naming a key the rows do not carry is accepted, echoed back as applied, and silently
         # does nothing -- which is the failure refusing an unknown column exists to prevent.
         sortable=("at", "kind", "provenance", "source", "product_id"),
+    ),
+    "/api/research/trials": ApiRoute(
+        html_route="/research",
+        read=read_trials_ledger,
+        # The ledger is a FILE. A machine with no deployment on it can still carry a research
+        # record, and answering "keel isn't running here" to a question about experiments would
+        # be false.
+        needs_database=False,
+        # ── NO SORTABLE COLLECTION, AND THAT IS THE WHOLE POINT ──────────────────────────────
+        #
+        # Not "no performance columns" -- NONE. `_sort_request` refuses a column a route does not
+        # declare, so leaving both of these empty makes every `?sort=` a 400 and leaves LEDGER
+        # ORDER the only order this endpoint has.
+        #
+        # Declaring the harmless ones (`at`, `rule`, `kind`) was the tempting middle road and is
+        # refused. A sortable collection invites the next column, the next column is
+        # `profit_factor`, and at that point the research record is a leaderboard -- which turns
+        # a record of what was TRIED into an argument for what to TRADE, the exact reversal the
+        # trials ledger exists to prevent. See `keel/commands/research_record.py` on the rail.
+        collection="",
+        sortable=(),
     ),
     "/api/rules": ApiRoute(
         html_route="/rules",

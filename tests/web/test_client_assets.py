@@ -1266,6 +1266,7 @@ _VIEW_ENDPOINTS: tuple[tuple[str, str, str], ...] = (
     ("timelineView", "data", "/api/timeline"),
     ("insightsView", "insights", "/api/insights"),
     ("insightsView", "journal", "/api/journal"),
+    ("researchView", "data", "/api/research/trials"),
     ("rulesView", "data", "/api/rules"),
     ("venuesView", "data", "/api/venues"),
     ("gatesView", "data", "/api/gates"),

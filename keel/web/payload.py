@@ -135,6 +135,7 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
     )
     from keel.commands.orders import OrderRow, OrdersReport
     from keel.commands.positions import PositionRow, PositionsReport
+    from keel.commands.research_record import RuleExploration, TrialRow, TrialsReport
     from keel.commands.status import (
         AutonomyStatus,
         MarketSessionStatus,
@@ -1792,6 +1793,223 @@ def timeline_payload(report: TimelineReport) -> dict[str, Any]:
         "filtered_count": count(report.filtered_count),
         "shown_count": count(report.shown_count),
         "rows": [_timeline_row_payload(row) for row in report.rows],
+    }
+
+
+# -- the research record (#708) -------------------------------------------------------------------
+#
+# THE STRATHERN RAIL, ON THE WIRE. Nothing below carries a rank, a score or an ordering key, and
+# `/api/research/trials` declares no sortable column at all. The reasoning is in
+# `keel/commands/research_record.py`: a research record that can be sorted best-first is a
+# leaderboard,
+# and a leaderboard turns a record of what was tried into an argument for what to trade.
+#
+# The one judgement this section DOES make is about evidence rather than performance -- a `fitted`
+# parameter is weaker evidence than an `a_priori` one -- and that is the ledger's own vocabulary
+# being styled, not a verdict invented here.
+
+
+#: How each provenance is styled. `fitted` warns because a parameter chosen by looking at the data
+#: is the one a reader must not mistake for a prediction; `a_priori` is neutral rather than GOOD,
+#: because declaring a parameter in advance is the baseline expectation and not an achievement.
+_TRIAL_PROVENANCE_STATES: Mapping[str, str] = {"a_priori": NEUTRAL, "fitted": WARN}
+
+_TRIAL_PROVENANCE_NOTES: Mapping[str, str] = {
+    "a_priori": "declared before the data was seen",
+    "fitted": "chosen by fitting — weaker evidence",
+}
+
+#: How each decision is styled, and the reason NONE of them is `good` or `bad`. A rejected trial
+#: is not a failure; it is the evidence that the selected one was not cherry-picked. Colouring
+#: `selected` green and `rejected` red would rank the table by CSS, which is the same leaderboard
+#: the endpoint refuses to serve, drawn with a palette instead of an `ORDER BY`.
+#:
+#: `diagnostic_only` is UNKNOWN and that is not styling: it is the row saying no decision was
+#: reached, which is exactly what `trial_counts` means when it leaves the row out of N.
+_DECISION_STATES: Mapping[str, str] = {
+    "selected": NEUTRAL,
+    "rejected": NEUTRAL,
+    "diagnostic_only": UNKNOWN,
+}
+
+_DECISION_NOTES: Mapping[str, str] = {
+    "selected": "selected",
+    "rejected": "rejected",
+    "diagnostic_only": "diagnostic — no decision",
+}
+
+#: How much of a hash is shown. The full 64 characters cross as `value` so a reader can compare
+#: one against the file; twelve is what fits a table cell and is what `verify_chain`'s own error
+#: lines quote, so the page and the error message name a row the same way.
+_HASH_DISPLAY_CHARS = 12
+
+
+def _mapping_text(mapping: Mapping[str, Any]) -> str:
+    """An open-ended mapping as one already-written line: `entry_lookback=20, exit_lookback=10`.
+
+    Rule 2, in its awkward case. `params` and `summary` have no fixed schema -- their shape is
+    the driver's and varies by trial kind -- so there is no set of named fields to project them
+    onto. Handing the raw mapping to the client instead would make the CLIENT join keys to values
+    to display it, which is derivation, and would put `Object.entries` and a template literal into
+    a module that has neither and is scanned to make sure it never does.
+
+    `Decimal` goes through `_plain` rather than `str`: a summary figure small enough to trigger
+    exponent notation would otherwise reach a table cell as `1E-8`.
+    """
+    parts: list[str] = []
+    for key in mapping:
+        value = mapping[key]
+        if value is None:
+            shown = ABSENT
+        elif isinstance(value, Decimal):
+            shown = _plain(value)
+        else:
+            shown = str(value)
+        parts.append(f"{key}={shown}")
+    return ", ".join(parts)
+
+
+def _hash_display(row_hash: str) -> str | None:
+    """A row hash, shortened for a table cell. `None` when there is no hash to shorten, which
+    `label` turns into `absent()`."""
+    if not row_hash:
+        return None
+    return row_hash[:_HASH_DISPLAY_CHARS] + "…"
+
+
+def _chain_payload(report: TrialsReport) -> Field:
+    """The tamper-evidence verdict, as THREE states rather than two.
+
+    This is the field the whole view is built to make honest, and a `flag` would be wrong here in
+    a way that matters. `chain_intact` is `False` both when a row was edited and when there was no
+    file to read, and those are opposite facts: the first is a break to investigate, the second is
+    a deployment that simply has no research repo beside it. Styling the second as BAD reports a
+    tamper that never happened; styling it as GOOD asserts a verification that never ran.
+
+    So: GOOD only after `verify_chain` actually returned no errors over rows that were actually
+    read. Nothing else is ever green.
+    """
+    if not report.ledger_present:
+        return label(
+            "unverified",
+            display="no trials ledger on this deployment — nothing was verified",
+            state=UNKNOWN,
+        )
+    if report.chain_intact:
+        return label(
+            "intact",
+            display="chain verified — every row still hashes to the next",
+            state=GOOD,
+        )
+    return label(
+        "broken",
+        display="the chain does not verify — the rows below say which",
+        state=BAD,
+    )
+
+
+def _trial_row_payload(row: TrialRow) -> dict[str, Any]:
+    """One trial, placed.
+
+    `trial_id`, `session`, `rule` and `kind` are bare strings: identifiers and enum words with
+    nothing to decide. `provenance`, `decision` and `series` are fields because each carries a
+    judgement, and Rule 3 keeps judgements here.
+    """
+    return {
+        "at": moment(row.timestamp),
+        "trial_id": row.trial_id,
+        "session": row.session,
+        "rule": row.rule,
+        "kind": row.kind,
+        "decision": label(
+            row.decision,
+            display=_DECISION_NOTES.get(row.decision, row.decision),
+            state=_DECISION_STATES.get(row.decision, UNKNOWN),
+        ),
+        "provenance": label(
+            row.provenance,
+            display=_TRIAL_PROVENANCE_NOTES.get(row.provenance, row.provenance),
+            state=_TRIAL_PROVENANCE_STATES.get(row.provenance, UNKNOWN),
+        ),
+        "params": _mapping_text(row.params),
+        "summary": _mapping_text(row.summary),
+        # WARN, because `cscv` and `deflate` REFUSE a series-missing trial. Without the chip the
+        # row reads as an ordinary trial that happened to score nothing, and a reader comparing
+        # two of them would not know the statistics could only be computed for one.
+        "series": flag(
+            row.series_missing,
+            on="no P&L series — the gauntlet refuses this trial",
+            off="series recorded",
+            on_state=WARN,
+            off_state=NEUTRAL,
+        ),
+        # The FULL hash as `value` so a reader can compare a row against the file, and the first
+        # twelve characters as `display` -- the same prefix `verify_chain`'s own error lines
+        # quote, so a break named in `chain_errors` can be matched to a row on screen by eye.
+        #
+        # `or None` rather than passing `""` straight through: `label` turns None into `absent()`,
+        # and a row whose hash could not be read must reach the page as "not recorded" rather than
+        # as an empty string that renders like a hash of zero length.
+        "row_hash": label(row.row_hash or None, display=_hash_display(row.row_hash)),
+    }
+
+
+def _exploration_payload(row: RuleExploration) -> dict[str, Any]:
+    """Trials held against cells declared -- two numbers, never a ratio.
+
+    `keel/commands/research_record.py` records why the ratio is absent: pricing the swept box
+    against
+    its declaration is a judgement `research.tuning.explored_vs_declared` makes by RAISING, and a
+    read path that computed a coverage percentage here would be inventing the verdict that helper
+    refuses to give quietly.
+    """
+    return {
+        "rule": row.rule,
+        "trials": count(row.trials),
+        # `unknown` at zero, not a plain `0`: the rule declares nothing this deployment can read
+        # -- usually because it has since been renamed or removed -- and a neutral zero would read
+        # as "this rule declares an empty space", which is a different claim.
+        "declared_cells": count(
+            row.declared_cells, state=NEUTRAL if row.declared_cells else UNKNOWN
+        ),
+    }
+
+
+def trials_payload(report: TrialsReport) -> dict[str, Any]:
+    """`gather_trials`'s `TrialsReport`, as JSON (#708).
+
+    **The rejected rows are the payload's reason for existing.** No broker, platform or
+    open-source competitor ships its rejected trials to a screen, because their pitch depends on
+    trading looking easy. This one does, in ledger order, with the selected ones in the same
+    table -- which is what makes the selected one evidence rather than a claim.
+
+    Counts come off the report (Rule 6e bans `len()` here), and `trials_run` and `decisions` cross
+    separately: M is the multiple-comparisons denominator DSR corrects against, and folding it
+    into one "trials" figure would delete the number the page exists to publish.
+
+    **No path crosses.** `ledger_present` says whether the file was there; it never says where it
+    was looked for. A filesystem path in a browser payload is disclosure with no reader benefit.
+    """
+    return {
+        "as_of": iso(report.now_ts),
+        "generated_at": moment(report.now_ts),
+        "ledger": flag(
+            report.ledger_present,
+            on="trials ledger read",
+            off="no trials ledger beside this deployment",
+            on_state=NEUTRAL,
+            # UNKNOWN and not WARN: a deployment without the research repo next to it is an
+            # ordinary state, not a broken one, and nothing an operator can act on.
+            off_state=UNKNOWN,
+        ),
+        "chain": _chain_payload(report),
+        "chain_errors": [str(error) for error in report.chain_errors],
+        "trials_run": count(report.trials_run),
+        "decisions": count(report.decisions),
+        "shown_count": count(report.shown_count),
+        "rules": [str(rule) for rule in report.rules],
+        "exploration": [_exploration_payload(row) for row in report.exploration],
+        "rows": [_trial_row_payload(row) for row in report.rows],
     }
 
 
