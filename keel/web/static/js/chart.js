@@ -110,7 +110,23 @@ function svg(tag, attributes) {
  * @returns {string}
  */
 function polylinePoints(points) {
-  return points.map(/** @param {any} point */ (point) => [point.x, point.y].join(",")).join(" ");
+  return polylineOn(points, "y");
+}
+
+/**
+ * The `points` attribute of a polyline over one named vertical coordinate.
+ *
+ * `key` picks which line a point contributes to -- its equity (`"y"`), the high-water mark in
+ * force at that instant (`"hwm_y"`), or the drawdown floor beneath it (`"dd_floor_y"`). All
+ * three arrive finished from `build_equity_series`; choosing between them is a lookup, not the
+ * arithmetic this file is not allowed to do.
+ *
+ * @param {any[]} points
+ * @param {string} key
+ * @returns {string}
+ */
+function polylineOn(points, key) {
+  return points.map(/** @param {any} point */ (point) => [point.x, point[key]].join(",")).join(" ");
 }
 
 /**
@@ -214,6 +230,124 @@ function outcomeOf(point) {
  * @param {string} id  the id given to the caption, which names the chart for a screen reader.
  * @returns {HTMLElement|null}
  */
+/**
+ * The account-equity series over time (#698), drawn ABOVE the closed-trade curve.
+ *
+ * ── WHY IT IS A SECOND CHART AND NOT A REPLACEMENT ───────────────────────────────────────────
+ *
+ * `equityChart` plots cumulative net P&L over closed TRADES, on a trade-order axis, and
+ * `build_equity_curve` argues for that axis on its own terms: a quiet week must not carry the
+ * visual weight of fifty trades when the subject is statistical expectancy. This plots what the
+ * ACCOUNT was worth every cycle, traded or not, where the quiet week is the information. Two
+ * questions, two charts, stacked -- portfolio reality above, expectancy below.
+ *
+ * ── ONE POLYLINE PER SEGMENT, NEVER ONE PER SERIES ───────────────────────────────────────────
+ *
+ * Paper and live are unrelated accounts that share a database and flip within it. The payload
+ * hands this file `segments`, already split by `build_equity_series`, precisely so that joining
+ * them is not something this file can do by accident: a single line from a $10,000 paper account
+ * to a $250 live one would draw a collapse that never happened. The modes are told apart by
+ * DASH as well as by colour, the same rule the losing-trade segment below follows -- paper is
+ * dashed because it is the synthetic one.
+ *
+ * ── THE TWO OVERLAYS ARE READ, NOT DERIVED ───────────────────────────────────────────────────
+ *
+ * Each point carries `hwm_y` (the rail-11 high-water mark in force when the agent acted) and
+ * `dd_floor_y` (the equity at which rail 11 starts vetoing entries). Both are computed in
+ * Python from the recorded row, never here -- and `dd_floor_y` is `null` rather than `"0"` when
+ * the rail setting is unknown, because a zero coordinate is the TOP of the box and would draw a
+ * ceiling that is in force above every reading.
+ *
+ * ── NO ZOOM, NO PAN, NO CURSOR LEGEND ────────────────────────────────────────────────────────
+ *
+ * `main.js`'s #602 gestures bind to `svg.curve`, and this canvas is `svg.series` on purpose: the
+ * two would otherwise fight over `contentNode.querySelector("svg.curve")`, which takes the FIRST
+ * match and would find this chart instead of the one the gestures were written for. Adding them
+ * here is a separate piece of work with its own arithmetic to place in `main.js`.
+ *
+ * @param {any} series  `/api/insights`'s `data.equity_series`.
+ * @param {string} id  the `<figcaption>` id this chart is named by.
+ * @returns {HTMLElement|null}
+ */
+export function equitySeriesChart(series, id) {
+  if (!series || !Array.isArray(series.segments) || series.segments.length === 0) return null;
+
+  const canvas = svg("svg", {
+    viewBox: ["0", "0", series.width, series.height].join(" "),
+    preserveAspectRatio: "none",
+    class: "series",
+    role: "img",
+    "aria-labelledby": id,
+  });
+
+  for (const segment of series.segments) {
+    // The floor first, then the ceiling, then the account: the equity line is the subject and
+    // sits over both rails rather than under them.
+    const floored = segment.points.filter(
+      /** @param {any} point */ (point) => point.dd_floor_y !== null,
+    );
+    // `!== 0`, never `> 0`: `test_render_never_judges_a_value_itself` bans relational operators
+    // in this file, and an emptiness check has no business needing an ordering anyway.
+    if (floored.length !== 0) {
+      canvas.append(
+        svg("polyline", {
+          class: ["floor", segment.mode].join(" "),
+          points: polylineOn(floored, "dd_floor_y"),
+        }),
+      );
+    }
+    canvas.append(
+      svg("polyline", {
+        class: ["hwm", segment.mode].join(" "),
+        points: polylineOn(segment.points, "hwm_y"),
+      }),
+    );
+    const line = svg("polyline", {
+      class: ["line", segment.mode].join(" "),
+      points: polylinePoints(segment.points),
+    });
+    // Names the account this line belongs to on hover. Redundant for a screen reader -- the
+    // `role="img"` above flattened this subtree and `aria-labelledby` names the modes in a
+    // sentence -- which is why it is a convenience and not the accessible name.
+    const lineTip = svg("title", {});
+    lineTip.textContent = [segment.mode, "equity"].join(" ");
+    line.append(lineTip);
+    canvas.append(line);
+
+    // A marker per reading. Same reason `equityChart` draws them: a segment of one point is a
+    // polyline with nothing to draw between, so the first cycle after an upgrade -- or the
+    // first live cycle after a flip -- would otherwise render as empty space.
+    for (const point of segment.points) {
+      const dot = svg("circle", {
+        class: ["dot", segment.mode].join(" "),
+        cx: point.x,
+        cy: point.y,
+        r: "3",
+      });
+      const tip = svg("title", {});
+      tip.textContent = [point.at.display, point.equity.display, point.mode].join(" · ");
+      dot.append(tip);
+      canvas.append(dot);
+    }
+  }
+
+  const figure = document.createElement("figure");
+  // `"chart series"`, never a bare `"chart"`. `svg.series` keeps the #602 POINTER gestures off
+  // this canvas, but `main.js` also reaches for the WRAPPER twice -- `highlightJournalRow` and
+  // the chart-action handler -- with `querySelector`, which takes the first match in document
+  // order, and this figure is appended ABOVE the curve's. Left as a bare `figure.chart` it
+  // intercepts both: `highlightTrade` finds no `.highlight` group here, returns early, and
+  // hovering a journal row silently stops highlighting anything. The second half of the fix is
+  // the `:not(.series)` in those two selectors.
+  figure.className = "chart series";
+  const caption = document.createElement("figcaption");
+  caption.className = "note";
+  caption.id = id;
+  caption.textContent = series.reading.display;
+  figure.append(canvas, caption);
+  return figure;
+}
+
 export function equityChart(curve, id) {
   if (!curve || !Array.isArray(curve.points) || curve.points.length === 0) return null;
 

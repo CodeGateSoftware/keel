@@ -506,6 +506,52 @@ def test_paper_equity_seed_and_mark(repo):
     assert eq > Decimal("29000")
 
 
+def test_paper_unrealized_is_none_under_exactly_the_same_condition_as_equity(repo):
+    """Unseeded means there is no synthetic account to mark. The two must answer `None`
+    together, or `equity_points` would file a total with a split from a different account
+    state (#698)."""
+    trader = PaperTrader(repo)
+    assert trader.equity({"BTC-USD": Decimal("100")}) is None
+    assert trader.unrealized({"BTC-USD": Decimal("100")}) is None
+
+
+def test_paper_unrealized_and_cash_reconcile_against_the_marked_equity(repo):
+    """The row-level invariant on the paper side: `cash + cost basis + unrealized == equity`,
+    all four read off one account state. The fill price is whatever slippage and fees made it,
+    which is exactly why the cost basis is read back from the trader rather than assumed."""
+    trader = PaperTrader(repo)
+    trader.seed_cash(Decimal("30000"), now_ts=1_700_000_000)
+    trader.on_signal(
+        _enter_signal(setup=_setup(entry="100", stop="90", target="130")), qty=Decimal("5")
+    )
+
+    marks = {"BTC-USD": Decimal("120")}
+    equity = trader.equity(marks)
+    cash = trader.get_cash()
+    unrealized = trader.unrealized(marks)
+
+    entry_fill = repo.get_orders(mode="paper")[0]["actual_fill"]
+    cost_basis = Decimal("5") * entry_fill
+
+    assert unrealized == Decimal("5") * (Decimal("120") - entry_fill)
+    assert cash + cost_basis + unrealized == equity
+
+
+def test_paper_unrealized_excludes_a_position_nothing_paid_for(repo):
+    """`equity()` drops an uncosted position (opened before cash was seeded) because marking it
+    would inflate equity with a position nothing paid for. Its gain has to be dropped for the
+    same reason -- otherwise the split reports a P&L the equity does not contain."""
+    trader = PaperTrader(repo)
+    trader.on_signal(
+        _enter_signal(setup=_setup(entry="100", stop="90", target="130")), qty=Decimal("5")
+    )
+    trader.seed_cash(Decimal("30000"), now_ts=1_700_000_000)
+
+    marks = {"BTC-USD": Decimal("120")}
+    assert trader.equity(marks) == Decimal("30000")
+    assert trader.unrealized(marks) == Decimal("0")
+
+
 def test_paper_funding_check_rejects_when_cash_insufficient(repo):
     trader = PaperTrader(repo)
     trader.seed_cash(Decimal("50"), now_ts=1_700_000_000)

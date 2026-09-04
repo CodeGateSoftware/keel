@@ -54,6 +54,23 @@ DEFAULT_JOURNAL_LIMIT = 50
 #: journal` is, and it runs in the operator's own process against their own machine's limits.
 MAX_JOURNAL_LIMIT = 1000
 
+#: How many equity readings `/api/insights` draws, newest first (#698).
+#:
+#: A fixed cap rather than a `?limit=`: this route carries no collection a caller sorts or pages,
+#: and a chart is not a bulk export -- the whole series is on disk for anyone who wants it.
+#:
+#: 1000 because the plot box is `PLOT_WIDTH` = 1000 units wide, so past one reading per unit the
+#: extra rows land on coordinates the chart has already drawn: cost with nothing on screen to
+#: show for it. Measured at 580 bytes per point in the rendered payload, this caps the response
+#: near 580 KB; the page re-polls every 15 seconds (`main.js`'s `POLL_MS`), which is what makes
+#: an unbounded read here a recurring cost rather than a one-off one. At the default
+#: `auto_trade.interval_sec` of 900 the table passes this cap in about ten days.
+#:
+#: What it would take to change: a chart the operator can pan or zoom over a range they choose.
+#: That makes the range a client concern and this builder a service the client re-asks with new
+#: bounds -- the same condition `insights.py`'s own module note already names.
+EQUITY_POINT_LIMIT = 1000
+
 #: The two directions, and no third spelling. `desc`/`descending`/`down` would all have to be
 #: accepted forever once accepted once, and a client reading `sort.direction` back off the
 #: response needs one word to compare against.
@@ -279,21 +296,44 @@ def read_orders(cfg: ServeConfig, query: Query, _state: Any, _now_ts: int) -> di
 
 
 def read_insights(cfg: ServeConfig, _query: Query, _state: Any, now_ts: int) -> dict[str, Any]:
-    """The per-rule track records and the promotion-gate distances.
+    """The per-rule track records, the promotion-gate distances, and the account-equity series.
 
     The journal the HTML `/insights` page renders below these is `/api/journal` instead of a second
     table here. One sortable collection per endpoint keeps `?sort=` unambiguous without a
     `?table=` beside it, and it gives the journal somewhere to carry its own `?limit=` -- the cap
-    the HTML page apologises for in a comment ("a cap, not a paginator")."""
-    from keel.commands.insights import build_insights_report
+    the HTML page apologises for in a comment ("a cap, not a paginator").
+
+    The equity series (#698) is read here rather than on `/api/journal`, next to the curve it is
+    drawn above, because it describes the ACCOUNT and not the closed trades. The journal's curve
+    narrows with that endpoint's `?limit=`; this does not narrow with anything, and two charts
+    that answer a query differently must not share one payload where a reader would assume they
+    agree.
+
+    `max_total_dd_pct` comes off the SAME loaded config `build_insights_report` reads, so the
+    drawdown floor drawn under the curve and the ceiling quoted in the account card beside it are
+    one setting rather than two reads that can disagree.
+
+    The series read is BOUNDED (`EQUITY_POINT_LIMIT`) and says so. `equity_points` is
+    append-only and grows one row per cycle forever, so an unbounded read here would be this
+    route's memory cost rising without limit for the life of the deployment -- the exact hazard
+    `MAX_JOURNAL_LIMIT`'s note names, on a route with no `?limit=` for an operator to moderate
+    it with. `count_equity_points` is passed alongside so the chart can state what it is not
+    showing rather than quietly beginning wherever the cap fell.
+    """
+    from keel.commands.insights import build_equity_series, build_insights_report
 
     repo = open_repo(cfg.db_path)
     try:
         config = load_config(cfg.config_path)
         report = build_insights_report(repo, config, _status_report(cfg, now_ts), now_ts)
+        series = build_equity_series(
+            repo.get_equity_points(limit=EQUITY_POINT_LIMIT),
+            max_total_dd_pct=config.money_mgmt.max_total_dd_pct,
+            total_recorded=repo.count_equity_points(),
+        )
     finally:
         close_repo(repo)
-    return payload.insights_payload(report)
+    return payload.insights_payload(report, series=series)
 
 
 def read_journal(cfg: ServeConfig, query: Query, _state: Any, now_ts: int) -> dict[str, Any]:

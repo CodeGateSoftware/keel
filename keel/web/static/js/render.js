@@ -55,7 +55,7 @@
  * the fix is in `keel/web/payload.py`. There is nowhere in this file to put it.
  */
 
-import { equityChart } from "./chart.js";
+import { equityChart, equitySeriesChart } from "./chart.js";
 import { termLink } from "./docs.js";
 import { instant } from "./format.js";
 
@@ -1675,6 +1675,38 @@ export function insightsView(insights, journal, sort, onSort, journalSort, onJou
   const shown = el("p", "note");
   shown.append(field(journal.shown_count), " of ", field(journal.total_count), " closed trade(s)");
   fragment.append(shown);
+
+  // #698: portfolio reality above statistical expectancy. The account-equity series is what the
+  // account was WORTH each cycle; the curve below it is what the closed trades DID. Stacked
+  // rather than merged because they are different quantities on different axes -- see
+  // `chart.js::equitySeriesChart`.
+  //
+  // It comes off `/api/insights`, not `/api/journal`, so it is NOT narrowed by the journal's
+  // `?limit=`. The note below says so: a reader looking at two stacked charts would otherwise
+  // reasonably assume the row cap above applies to both.
+  const series = equitySeriesChart(insights.equity_series, "h-series");
+  if (series) {
+    // What the top chart's span actually is, in words, next to the chart. `is_truncated` is a
+    // `flag` whose `display` already says which case this is -- the client never compares
+    // `point_count` against `total_recorded` to find out, because that comparison is arithmetic
+    // and the answer is a claim about how much of the record is on screen.
+    const scope = el("p", "note");
+    scope.append(
+      field(insights.equity_series.point_count),
+      " of ",
+      field(insights.equity_series.total_recorded),
+      " recorded cycle(s) — ",
+      field(insights.equity_series.is_truncated),
+      ". Not narrowed by the journal row cap below.",
+    );
+    fragment.append(series, scope);
+  } else if (insights.equity_series) {
+    fragment.append(el("p", "empty", plain(insights.equity_series.reading.display)));
+  }
+  // No `else` for a payload with no `equity_series` at all. That is not a deployment with no
+  // readings -- it is a RESPONSE FROM BEFORE THIS FIELD EXISTED, which the service worker can
+  // still be holding after an upgrade. Reading `.reading.display` off it would throw and blank
+  // the whole insights view over a stale cache entry the next refresh fixes on its own.
 
   const chart = equityChart(journal.curve, "h-curve");
   if (chart) {

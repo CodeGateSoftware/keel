@@ -977,7 +977,11 @@ function reapplyChartView() {
  * @param {HTMLElement|null} row
  */
 function highlightJournalRow(row) {
-  const figure = contentNode.querySelector("figure.chart");
+  // `:not(.series)` because /insights renders TWO `figure.chart`s and the account-equity series
+  // (#698) is the first in document order. Without it this lookup returns that figure, which
+  // carries no `.highlight` group, and `highlightTrade` returns early -- the highlight silently
+  // stops working, with nothing in the console to say why.
+  const figure = contentNode.querySelector("figure.chart:not(.series)");
   if (!(figure instanceof HTMLElement)) return;
 
   if (!row || !activeCurve) {
@@ -1111,7 +1115,11 @@ contentNode.addEventListener("click", (event) => {
   if (!button || !activeCurve) return;
 
   const canvas = contentNode.querySelector("svg.curve");
-  const figure = contentNode.querySelector("figure.chart");
+  // Paired with the canvas above, so both must name the SAME chart: `svg.curve` already
+  // excludes the #698 series canvas, and `:not(.series)` is what keeps the wrapper lookup in
+  // step with it. Mismatched, "Save as image" would read its background colour off one figure
+  // and its geometry off another.
+  const figure = contentNode.querySelector("figure.chart:not(.series)");
   if (!(canvas instanceof SVGSVGElement) || !(figure instanceof HTMLElement)) return;
 
   const action = button.getAttribute("data-chart-action");

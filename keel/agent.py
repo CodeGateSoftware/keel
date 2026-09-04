@@ -415,6 +415,22 @@ def _position_state(repo: Repository, product_id: str) -> dict[str, Any] | None:
     return raw
 
 
+@dataclass(frozen=True)
+class _EquityParts:
+    """One read of the live account, split into the pieces `equity_points` records (#698).
+
+    `equity` is the whole reading; `cash` and `unrealized` are two of its legs (the third, the
+    cost basis of open positions, is implied: `cash + cost + unrealized == equity`). They come
+    out of ONE pass over ONE set of balances and marks, which is the point -- reading the total
+    and the split separately would let a price tick between them and file a row that does not
+    reconcile.
+    """
+
+    equity: Decimal
+    cash: Decimal
+    unrealized: Decimal
+
+
 def _mark_to_market_equity(
     repo: Repository,
     broker: Any,
@@ -424,6 +440,9 @@ def _mark_to_market_equity(
 ) -> Decimal | None:
     """Quote balance + mark-to-market value of every open position, or `None` if the quote
     balance could not be read.
+
+    The scalar face of `_mark_to_market_parts`, kept because most callers want only the total.
+    Every word below describes that function's single pass; nothing is computed twice.
 
     Unrealized P&L is included on purpose: a breaker that saw only realized P&L would read 0%
     while a position bled and would notice only after the loss was booked -- backwards for a
@@ -452,6 +471,27 @@ def _mark_to_market_equity(
     simply unknowable then, and a wrong one corrupts the high-water mark PERMANENTLY (an HWM
     never falls, so an under-read arms the breaker on a phantom drawdown from then on).
     """
+    parts = _mark_to_market_parts(repo, broker, products, price_by_product, quote_currency)
+    return None if parts is None else parts.equity
+
+
+def _mark_to_market_parts(
+    repo: Repository,
+    broker: Any,
+    products: list[str],
+    price_by_product: dict[str, Decimal],
+    quote_currency: str,
+) -> _EquityParts | None:
+    """`_mark_to_market_equity`'s single pass, returning the split as well as the total (#698).
+
+    See that function's docstring for every rule this implements -- the FX bound, the
+    cost-basis fallback, the product union, and why an unreadable balance is `None` rather than
+    a partial total. This is the same computation; it just keeps the legs it was already
+    computing instead of discarding them.
+
+    `unrealized` follows `equity.unrealized_on_marks`: a position valued at cost (no fresh
+    price) contributes ZERO, because the equity in the same record valued it at cost too.
+    """
     currencies: list[str] = []
     scanned = (*products, *repo.held_products())
     for candidate in (quote_currency, *(quote_currency_of(p) for p in scanned)):
@@ -477,6 +517,7 @@ def _mark_to_market_equity(
     # is still open would otherwise drop that holding out of equity in a single step.
     valued: set[str] = set()
     total = quote
+    unrealized = Decimal("0")
     for product_id in (*products, *repo.held_products()):
         if product_id in valued:
             continue
@@ -489,13 +530,17 @@ def _mark_to_market_equity(
         # A held product with no fresh price is valued at its cost basis rather than dropped:
         # dropping it understates equity and would trip rail 11 on a DATA GAP rather than on a
         # loss. `avg_cost` comes from the same audit log as `qty`, so the two always agree.
-        mark = price_by_product.get(product_id)
-        if mark is None:
-            mark = avg_cost
+        fresh = price_by_product.get(product_id)
+        mark = avg_cost if fresh is None else fresh
         if mark <= 0:
             continue
         total += qty * mark
-    return total
+        # Only a FRESH price books a gain or loss. On the fallback the mark IS the basis, so
+        # `qty * (mark - avg_cost)` would be zero anyway -- but stating it as a branch keeps the
+        # meaning ("nothing was observed") rather than leaning on the arithmetic.
+        if fresh is not None and fresh > 0:
+            unrealized += qty * (fresh - avg_cost)
+    return _EquityParts(equity=total, cash=quote, unrealized=unrealized)
 
 
 def _seed_paper_account_if_needed(
@@ -1707,15 +1752,28 @@ def run_once(
                     equity_mod.record_external_flow(repo, amount=contribution)
                     repo.set_state("paper_last_contribution_month", month_start)
             equity_now = paper_trader.equity(latest_price_by_product)
+            # The same reading, split for the `equity_points` row (#698). `None` when the paper
+            # account is unseeded -- there is nothing to split -- and never derived from
+            # `equity_now`, which would invent the split rather than record it.
+            equity_cash = paper_trader.get_cash()
+            equity_unrealized = (
+                None if equity_cash is None else paper_trader.unrealized(latest_price_by_product)
+            )
         else:
             # Mirrors `_seed_paper_account_if_needed`'s clear: unconditional, at the top of the
             # branch, BEFORE the broker-equity read, so an unreadable broker on the first live
             # cycle after a paper->live flip can't skip the clear (see
             # `_clear_live_mode_if_needed`'s docstring).
             _clear_live_mode_if_needed(repo)
-            equity_now = _mark_to_market_equity(
+            # One pass, three numbers (#698): the total rail 11 reads, and the cash/unrealized
+            # legs the series records. Read together so a price cannot tick between them and
+            # file a row whose parts contradict its own total.
+            live_parts = _mark_to_market_parts(
                 repo, broker, products, latest_price_by_product, config.quote_currency
             )
+            equity_now = None if live_parts is None else live_parts.equity
+            equity_cash = None if live_parts is None else live_parts.cash
+            equity_unrealized = None if live_parts is None else live_parts.unrealized
         # Task 9: paper-forward observability -- the synthetic equity + drawdown scalars this
         # cycle advanced, surfaced on `LoopResult` (rendered by
         # `keel.commands.trading.render_loop_result` + this log line) instead
@@ -1735,7 +1793,13 @@ def run_once(
             # The live-side mode clear now happens up-front in the live branch above (see
             # `_clear_live_mode_if_needed`), symmetrically with the paper-side clear in
             # `_seed_paper_account_if_needed`. Nothing left to stamp/clear here.
-            equity_mod.update_drawdown(repo, equity=equity_now, now_ts=now_ts)
+            equity_mod.update_drawdown(
+                repo,
+                equity=equity_now,
+                now_ts=now_ts,
+                cash=equity_cash,
+                unrealized=equity_unrealized,
+            )
 
             if paper_trader is not None:
                 result_paper_equity = equity_now

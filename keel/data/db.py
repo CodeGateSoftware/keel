@@ -20,7 +20,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
-SCHEMA_VERSION = 18
+SCHEMA_VERSION = 19
 
 # Creation order matters for readability (and for backends that validate FK targets eagerly);
 # SQLite itself only checks FK targets at DML time, but we still declare referenced tables first.
@@ -369,6 +369,30 @@ _SCHEMA_STATEMENTS: tuple[str, ...] = (
         updated_ts  INTEGER NOT NULL
     )
     """,
+    """
+    CREATE TABLE IF NOT EXISTS equity_points (
+        id          INTEGER PRIMARY KEY AUTOINCREMENT,
+        -- Epoch seconds, INTEGER, like every other timestamp in this schema (`positions.
+        -- opened_at`, `asset_attestations.attested_at`) and like the `now_ts` the agent passes
+        -- down its whole cycle. TEXT would order an epoch LEXICALLY, so a `ts >= ?` window --
+        -- which is how the chart reads this table -- would silently return the wrong rows.
+        ts          INTEGER NOT NULL,
+        -- 'paper' | 'live'. NO `profile` column: the database is already one-per-profile
+        -- (ADR 0002), while paper and live flip WITHIN one database -- so mode is the
+        -- partition that actually needs storing, and the one a reader must never blend.
+        mode        TEXT NOT NULL,
+        equity      TEXT NOT NULL,
+        -- NULL is "not recorded", never zero: a cycle can know its total while the split is
+        -- unavailable (`orders.filled_quantity`'s convention, and for the same reason).
+        cash        TEXT,
+        unrealized  TEXT,
+        -- The high-water mark AFTER this reading, so the row carries the rail-11 ceiling that
+        -- was in force rather than one a reader recomputes -- `record_external_flow` rebases
+        -- the HWM on a declared deposit, and a recomputed maximum would miss that.
+        hwm         TEXT NOT NULL
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_equity_points_mode_ts ON equity_points(mode, ts)",
 )
 
 
@@ -816,6 +840,23 @@ def _migrate_v18_venue_cash_postures(conn: sqlite3.Connection) -> None:
     """
 
 
+def _migrate_v19_equity_points(conn: sqlite3.Connection) -> None:
+    """v19 adds `equity_points`. Table creation is handled by `_SCHEMA_STATEMENTS`; there is
+    deliberately NO backfill, and what could be backfilled is exactly what must not be.
+
+    Two sources look like history. `agent_state["equity_history"]` holds at most 7 days, and it
+    is a RAIL's working set, not a record: `record_external_flow` shifts every point in it by a
+    declared deposit so the weekly drawdown keeps measuring trading performance. Replaying those
+    shifted numbers as observations would publish equities the account never had. The `orders`
+    ledger could reconstruct a curve, but only for closed trades, only at trade resolution, and
+    with no cash leg -- a different quantity wearing this table's name.
+
+    An empty table means "not observed before v19", which is true: nothing wrote it down. The
+    chart starts at the first cycle after the upgrade and says so, rather than opening on a
+    fabricated past.
+    """
+
+
 _MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
     2: _migrate_v2_broker_subscriptions,
     3: _migrate_v3_trade_outcomes,
@@ -834,6 +875,7 @@ _MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
     16: _migrate_v16_orders_submit_book,
     17: _migrate_v17_candle_series_feed,
     18: _migrate_v18_venue_cash_postures,
+    19: _migrate_v19_equity_points,
 }
 
 

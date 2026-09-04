@@ -18,7 +18,7 @@ from keel_core.cash_posture import CashPostureState, VenueCashPosture
 from keel_core.subscription import BrokerSubscription, SubscriptionStatus
 from keel_core.trade_scope import TradeScopeState, VenueTradeScope
 
-from keel.types import Candle, Granularity, Profile
+from keel.types import Candle, EquityReading, Granularity, Profile
 
 _TRANSACTION_COLUMNS = (
     "coinbase_id",
@@ -151,6 +151,24 @@ def _cash_posture_from_row(row: Any) -> VenueCashPosture:
         refuted_reason=row["refuted_reason"],
         credential_fingerprint=row["credential_fingerprint"],
     )
+
+
+def _equity_point_from_row(row: Any) -> EquityReading:
+    """Map an `equity_points` row to the domain record (#698).
+
+    `cash` and `unrealized` stay `None` when the column is NULL rather than becoming
+    `Decimal("0")`: the column means "not recorded", and a reader must be able to tell an
+    unobserved split from an observed flat one.
+    """
+    return EquityReading(
+        ts=int(row["ts"]),
+        mode=row["mode"],
+        equity=Decimal(row["equity"]),
+        cash=_text_to_dec(row["cash"]),
+        unrealized=_text_to_dec(row["unrealized"]),
+        hwm=Decimal(row["hwm"]),
+    )
+
 
 def _json_default(obj: Any) -> Any:
     if isinstance(obj, Decimal):
@@ -695,6 +713,98 @@ class Repository:
         """Every recorded cash posture, ordered by venue."""
         rows = self._conn.execute("SELECT * FROM venue_cash_postures ORDER BY venue").fetchall()
         return [_cash_posture_from_row(row) for row in rows]
+
+    # -- equity points (the mark-to-market series; #698) --------------------
+
+    def record_equity_point(self, point: EquityReading) -> None:
+        """Append one cycle's mark-to-market reading. Append-only: never updated, never deleted.
+
+        There is no uniqueness constraint on `(ts, mode)` and deliberately so. This is an
+        observation log, not a keyed record: two readings that genuinely happened at the same
+        epoch second are two observations, and silently collapsing them with an upsert would
+        hide a double-run of the cycle -- exactly the operational fact an operator would want
+        the series to show. `update_drawdown` calls this once per cycle; anything more is a
+        symptom worth seeing.
+        """
+        self._conn.execute(
+            """
+            INSERT INTO equity_points (ts, mode, equity, cash, unrealized, hwm)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                point.ts,
+                point.mode,
+                _dec_to_text(point.equity),
+                _dec_to_text(point.cash),
+                _dec_to_text(point.unrealized),
+                _dec_to_text(point.hwm),
+            ),
+        )
+        self._conn.commit()
+
+    def get_equity_points(
+        self,
+        mode: str | None = None,
+        since_ts: int | None = None,
+        limit: int | None = None,
+    ) -> list[EquityReading]:
+        """The series, oldest first, optionally narrowed to one mode, a time window, or a count.
+
+        `mode=None` returns paper AND live rows interleaved by time. That is the honest raw
+        read, but it is NOT a curve: a caller drawing it as one line joins two unrelated
+        accounts across the flip. Readers that plot must group by `mode` (`insights` does).
+
+        `limit` keeps the MOST RECENT `limit` readings and still returns them oldest first. Two
+        halves of one decision:
+
+        * **Most recent, not first.** This table is append-only and grows one row per cycle
+          forever -- at the default `auto_trade.interval_sec` of 900 that is ~35,000 rows a
+          year. A cap that kept the OLDEST rows would answer "where is this account now?" with
+          the readings furthest from the answer, and would freeze the chart the day the cap was
+          reached.
+        * **Still oldest first.** The ordering is the caller's contract, not an artefact of how
+          the rows were selected. `ORDER BY ts DESC LIMIT n` in a subquery, re-ordered outside
+          it, so a bounded read and an unbounded one differ only in how much they return.
+
+        A caller that bounds a read is showing a WINDOW of the record and must say so:
+        `count_equity_points` is how it learns what it is leaving out.
+        """
+        clauses: list[str] = []
+        params: list[object] = []
+        if mode is not None:
+            clauses.append("mode = ?")
+            params.append(mode)
+        if since_ts is not None:
+            clauses.append("ts >= ?")
+            params.append(since_ts)
+        where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
+        # `id` breaks the tie so two readings at the same epoch second keep insertion order --
+        # `ts` alone leaves that to SQLite, and a chart would draw them in an arbitrary one. It
+        # is applied in BOTH directions below so the newest-N and the oldest-first re-order
+        # agree about which of two same-second readings is the newer.
+        if limit is None:
+            query = f"SELECT * FROM equity_points{where} ORDER BY ts, id"
+        else:
+            query = (
+                f"SELECT * FROM (SELECT * FROM equity_points{where} "
+                "ORDER BY ts DESC, id DESC LIMIT ?) ORDER BY ts, id"
+            )
+            params.append(limit)
+        return [_equity_point_from_row(row) for row in self._conn.execute(query, params)]
+
+    def count_equity_points(self, mode: str | None = None) -> int:
+        """How many readings the table holds -- the total a bounded read is a window ONTO.
+
+        A `COUNT(*)`, never `len(get_equity_points())`: the entire point is to learn the size
+        without paying to materialise the rows, which is what the caller just declined to do.
+        """
+        query = "SELECT COUNT(*) AS n FROM equity_points"
+        params: list[object] = []
+        if mode is not None:
+            query += " WHERE mode = ?"
+            params.append(mode)
+        row = self._conn.execute(query, params).fetchone()
+        return int(row["n"])
 
     # -- trade outcomes (closed round-trips; rails 11 and 16) ---------------
 

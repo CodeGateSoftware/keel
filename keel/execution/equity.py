@@ -16,6 +16,7 @@ import logging
 from decimal import Decimal
 
 from keel_core.telemetry import log_event
+from keel_core.types import EquityReading
 
 from keel.compliance.purification import build_report
 from keel.data.repository import Repository
@@ -53,6 +54,40 @@ def mark_positions(
         if mark <= 0:
             continue
         total += qty * mark
+    return total
+
+
+def unrealized_on_marks(
+    positions: list[tuple[Decimal, Decimal]],
+    price_by_product: dict[str, Decimal],
+    product_ids: list[str],
+) -> Decimal:
+    """Unrealized P&L = Σ qty·(mark − cost_basis), on the SAME marks `mark_positions` used (#698).
+
+    Deliberately a sibling of `mark_positions` with an identical shape and identical guards: the
+    two are written into one `equity_points` row for one cycle, so a position the equity valued
+    at cost must contribute ZERO here. A helper that skipped the unpriced position instead, or
+    marked it differently, would file a `cash`/`unrealized`/`equity` triple that does not add up
+    -- and the row is only worth keeping if it reconciles (see
+    `test_cash_plus_cost_basis_plus_unrealized_reconstructs_the_equity`).
+
+    Signed: negative while a position is under water, which is the direction that matters, since
+    the whole reason equity is marked to market is to see a loss WHILE it is happening.
+    """
+    total = Decimal("0")
+    for (qty, cost_basis), product_id in zip(positions, product_ids):
+        if qty <= 0:
+            continue
+        mark = price_by_product.get(product_id)
+        if mark is None or mark <= 0:
+            # Valued at cost by `mark_positions`, so there is no observed gain or loss to book.
+            # (When the basis is non-positive too, `mark_positions` drops the position outright
+            # and this `continue` has already matched it -- the two stay in step either way.)
+            continue
+        # No guard on a non-positive `cost_basis`: `mark_positions` values a fresh-priced
+        # position at `qty * mark` whatever it cost, so a zero-basis holding is ALL unrealized
+        # gain. Skipping it here would leave the row's parts short of its own equity.
+        total += qty * (mark - cost_basis)
     return total
 
 
@@ -140,8 +175,27 @@ def record_external_flow(repo: Repository, *, amount: Decimal) -> None:
     )
 
 
-def update_drawdown(repo: Repository, *, equity: Decimal, now_ts: int) -> None:
-    """Record `equity` and refresh the drawdown scalars rail 11 consumes."""
+def update_drawdown(
+    repo: Repository,
+    *,
+    equity: Decimal,
+    now_ts: int,
+    cash: Decimal | None = None,
+    unrealized: Decimal | None = None,
+) -> None:
+    """Record `equity` and refresh the drawdown scalars rail 11 consumes.
+
+    Also appends one row to the durable `equity_points` series (#698). The two records are NOT
+    redundant: `equity_history` below is a 7-day window that `record_external_flow` REWRITES on
+    a declared deposit, because the weekly rail must keep measuring trading performance. That
+    makes it a working set, not a record -- so the series is written alongside it rather than
+    derived from it, and neither is reconstructable from the other.
+
+    `cash` and `unrealized` are the optional split of `equity`. They are passed, never derived
+    here: this function has a total and no positions, and inventing the split from the total is
+    exactly the fabrication `None` exists to avoid. Callers that know it (the agent's paper and
+    live branches both do) pass it; callers that do not leave it unrecorded.
+    """
     _warn_on_unexplained_jump(repo, equity=equity)
 
     hwm = repo.get_state("equity_high_water_mark")
@@ -168,6 +222,51 @@ def update_drawdown(repo: Repository, *, equity: Decimal, now_ts: int) -> None:
         Decimal("0")
         if weekly_peak <= 0
         else max((weekly_peak - equity) / weekly_peak, Decimal("0")),
+    )
+
+    _append_equity_point(
+        repo, equity=equity, now_ts=now_ts, hwm=hwm, cash=cash, unrealized=unrealized
+    )
+
+
+def _append_equity_point(
+    repo: Repository,
+    *,
+    equity: Decimal,
+    now_ts: int,
+    hwm: Decimal,
+    cash: Decimal | None,
+    unrealized: Decimal | None,
+) -> None:
+    """Append this cycle's reading to the durable series, stamped with the mode that produced it.
+
+    The mode comes from `equity_state_mode` -- the SAME stamp `agent._clear_live_mode_if_needed`
+    and `agent._seed_paper_account_if_needed` read before wiping the shared HWM on a flip.
+    Deriving it a second way here (from a passed flag, say) would let two answers to one question
+    drift apart, and the failure would be silent: a row filed under the wrong mode does not go
+    missing, it lands in the other account's curve.
+
+    An UNSTAMPED mode writes nothing, and does not raise. Every agent path stamps it
+    unconditionally before this runs, so the unstamped case is not a real cycle (a direct call in
+    a test, a caller yet to be written). Two things it must not do: guess a mode -- that is the
+    mislabelling above, manufactured -- or fail the call, which would take rail 11's scalars down
+    with the chart. The drawdown scalars are already written by the time this is reached, so a
+    skipped point costs a gap in a chart and nothing else.
+
+    LAST in `update_drawdown` for that reason: the rail is served before the record is kept.
+    """
+    mode = repo.get_state("equity_state_mode")
+    if mode is None:
+        return
+    repo.record_equity_point(
+        EquityReading(
+            ts=now_ts,
+            mode=str(mode),
+            equity=equity,
+            cash=cash,
+            unrealized=unrealized,
+            hwm=hwm,
+        )
     )
 
 

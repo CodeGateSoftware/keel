@@ -1393,6 +1393,118 @@ def test_run_once_computes_a_real_equity_that_moves_rail_11(repo: Repository) ->
     assert repo.get_state("drawdown_total_pct") == Decimal("0.3")
 
 
+# -- the persisted equity series (#698) --------------------------------------------------------
+
+
+def test_a_live_cycle_records_the_equity_point_with_its_cash_and_unrealized(
+    repo: Repository,
+) -> None:
+    """The agent already computed all three every cycle and persisted none of them. The point
+    has to carry the SPLIT, not just the total: a chart that can only draw one line cannot show
+    whether an equity move was a position marking up or cash arriving."""
+    _seed_open_position(repo, PRODUCT, Decimal("2"), Decimal("100"), ts=1_000)
+    series = {(PRODUCT, Granularity.ONE_DAY): [_candle(1_000 + i * 86_400) for i in range(30)]}
+    broker = FakeBroker(series=series)
+    now = 1_000 + 29 * 86_400
+
+    run_once(broker, repo, _config(), now_ts=now)
+
+    points = repo.get_equity_points()
+    assert len(points) == 1
+    point = points[0]
+    assert point.mode == "live"
+    assert point.ts == now
+    # FakeBroker's cash, and 2 units bought at 100 now marked at the candle close of 100.
+    assert point.cash == Decimal("1000000")
+    assert point.unrealized == Decimal("0")
+    assert point.equity == Decimal("1000000") + Decimal("2") * Decimal("100")
+
+
+def test_a_paper_cycle_records_the_split_off_the_synthetic_account(repo, monkeypatch) -> None:
+    """The paper branch's wiring, through the real loop rather than on `PaperTrader` alone.
+
+    The two are different code: `tests/strategy/test_paper.py` proves `get_cash()` and
+    `unrealized()` agree with `equity()` on one account state, and this proves the AGENT hands
+    those two to `update_drawdown` for the same cycle it read the equity from -- a paper account
+    that seeds itself DURING this cycle is exactly where the total and the split could come from
+    two different states of the account.
+    """
+    from keel.strategy.paper import PaperTrader
+
+    _seed_rule(repo, monkeypatch, _AlwaysEnterRule(PRODUCT), status="paper")
+    cfg = _paper_config(paper=PaperConfig(starting_equity_usd=Decimal("10000")))
+
+    trader = PaperTrader(repo)
+    trader.seed_cash(Decimal("10000"), now_ts=0)
+    repo.set_state("equity_state_mode", "paper")
+    trader.on_signal(
+        _paper_enter_signal(
+            product_id=PRODUCT, entry=Decimal("100"), stop=Decimal("50"), target=Decimal("200"),
+            ts=0,
+        ),
+        qty=Decimal("10"),
+    )
+
+    broker = _MarketDataOnlyBroker(
+        series={(PRODUCT, Granularity.ONE_DAY): [_candle(0, "100"), _candle(86_400, "120")]}
+    )
+    repo.set_state("kill_switch", False)
+    repo.set_state("last_feed_ts", 86_400)
+
+    run_once(broker, repo, cfg, now_ts=86_400)
+
+    point = repo.get_equity_points()[0]
+    assert point.mode == "paper"
+    assert point.cash == trader.get_cash()
+    assert point.cash is not None and point.unrealized is not None
+    # The reconciliation invariant, on the paper side and through the loop: the recorded parts
+    # add back to the recorded total. The entry fill is whatever slippage and fees made it, so
+    # the cost basis is read back rather than assumed.
+    entry_fill = repo.get_orders(mode="paper")[0]["actual_fill"]
+    assert point.cash + Decimal("10") * entry_fill + point.unrealized == point.equity
+
+
+def test_the_live_split_reconciles_against_the_equity_it_was_read_with(repo: Repository) -> None:
+    """`cash + cost basis + unrealized == equity`, on ONE read of the account.
+
+    Called directly with an explicit price map, like its neighbours below: through `run_once`
+    the map only covers products with a LIVE RULE, so a held-only position takes the cost-basis
+    fallback and the marked-up case -- the one where the parts can disagree -- never arises.
+    """
+    _seed_open_position(repo, PRODUCT, Decimal("2"), Decimal("100"), ts=1_000)
+    broker = FakeBroker()
+
+    parts = agent._mark_to_market_parts(
+        repo, broker, [PRODUCT], {PRODUCT: Decimal("150")}, "USD"
+    )
+
+    assert parts is not None
+    cost_basis = Decimal("2") * Decimal("100")
+    assert parts.unrealized == Decimal("2") * (Decimal("150") - Decimal("100"))
+    assert parts.cash + cost_basis + parts.unrealized == parts.equity
+    # And the total is exactly what the existing scalar path reports for the same read.
+    assert parts.equity == agent._mark_to_market_equity(
+        repo, broker, [PRODUCT], {PRODUCT: Decimal("150")}, "USD"
+    )
+
+
+def test_an_unreadable_equity_records_no_point(repo: Repository) -> None:
+    """`_mark_to_market_equity` returns `None` when NO balance could be read -- equity is
+    genuinely unknown, and the cycle already declines to touch rail 11's scalars for exactly
+    that reason. The series must decline too: a gap in the chart is honest, a point carrying
+    last cycle's number dressed as this cycle's reading is not."""
+
+    class _MuteBroker(FakeBroker):
+        def get_balances(self) -> list[Balance]:
+            return []
+
+    series = {(PRODUCT, Granularity.ONE_DAY): [_candle(1_000 + i * 86_400) for i in range(30)]}
+
+    run_once(_MuteBroker(series=series), repo, _config(), now_ts=1_000 + 29 * 86_400)
+
+    assert repo.get_equity_points() == []
+
+
 # -- rail 11: equity must be valued from the ORDERS LOG, not from position_rule ----------------
 
 

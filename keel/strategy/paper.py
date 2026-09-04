@@ -242,6 +242,21 @@ class PaperTrader:
         positions = [(self._open[p].qty, self._open[p].entry_fill) for p in product_ids]
         return mark_positions(self._cash, positions, price_by_product, product_ids)
 
+    def unrealized(self, price_by_product: dict[str, Decimal]) -> Decimal | None:
+        """The unrealized leg of the SAME reading `equity()` reports (#698).
+
+        `None` under exactly `equity()`'s condition -- unseeded cash -- so the two are recorded
+        together or not at all, and the same `costed=False` exclusion applies: a position
+        nothing paid for is not in the equity, so its gain must not be in the P&L either.
+        """
+        if self._cash is None:
+            return None
+        from keel.execution.equity import unrealized_on_marks
+
+        product_ids = [p for p in self._open if self._open[p].costed]
+        positions = [(self._open[p].qty, self._open[p].entry_fill) for p in product_ids]
+        return unrealized_on_marks(positions, price_by_product, product_ids)
+
     def on_signal(
         self, signal: Signal, candle: Candle | None = None, qty: Decimal = _QTY
     ) -> int | None:

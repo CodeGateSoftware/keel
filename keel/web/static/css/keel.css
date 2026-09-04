@@ -712,6 +712,45 @@ pre.joblines {
 .chart .dot { fill: var(--accent); opacity: 0.55; }
 .chart figcaption { margin: 0.6rem 0 0; }
 
+/* ── the account-equity series (#698) ─────────────────────────────────────────────────────────
+ *
+ * The chart stacked ABOVE the closed-trade curve: what the account was worth each cycle, on a
+ * time axis. No `cursor: crosshair` and no `touch-action: none`, because `main.js`'s #602
+ * gestures deliberately bind to `svg.curve` and not to this canvas.
+ *
+ * PAPER IS DASHED, LIVE IS SOLID, and that is not decoration. The two modes are unrelated
+ * accounts drawn on one canvas, so the distinction has to survive greyscale, e-ink and
+ * red-green colour deficiency exactly as the ▲/▼ glyphs do for the figures -- the same rule
+ * `chart.js::outcomeOf` follows for a losing segment. Solid reads as the real one.
+ *
+ * Both rails are drawn beneath the account line in `--muted`, the token the baseline already
+ * uses: they are the context the equity is read against, never the subject. The floor is dashed
+ * more finely than the high-water mark so the pair are told apart without colour either.
+ */
+.chart svg.series {
+  display: block;
+  width: 100%;
+  height: 14rem;
+  overflow: visible;
+}
+.chart svg.series .line.paper { stroke-dasharray: 7 4; }
+.chart svg.series .hwm {
+  fill: none;
+  stroke: var(--muted);
+  stroke-width: 1;
+  stroke-dasharray: 5 3;
+  vector-effect: non-scaling-stroke;
+}
+.chart svg.series .floor {
+  fill: none;
+  stroke: var(--muted);
+  stroke-width: 1;
+  stroke-dasharray: 2 3;
+  opacity: 0.75;
+  vector-effect: non-scaling-stroke;
+}
+.chart svg.series .dot { r: 3; }
+
 /* ── the cursor legend and the trade highlight (#602) ────────────────────────────────────────
  *
  * Every colour below is one of the tokens `tests/web/test_palette_contrast.py` already measures

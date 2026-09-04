@@ -124,6 +124,8 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
         AccountSummary,
         EquityCurve,
         EquityPoint,
+        EquitySeries,
+        EquitySeriesPoint,
         GateDistance,
         InsightsReport,
         JournalEntry,
@@ -907,13 +909,25 @@ def _track_record_payload(record: RuleTrackRecord) -> dict[str, Any]:
     }
 
 
-def insights_payload(report: InsightsReport) -> dict[str, Any]:
-    """`build_insights_report`'s `InsightsReport`, as JSON."""
+def insights_payload(report: InsightsReport, *, series: EquitySeries) -> dict[str, Any]:
+    """`build_insights_report`'s `InsightsReport`, as JSON, with the equity series beside it.
+
+    `series` is a REQUIRED keyword for the reason `journal_payload`'s `curve` is: a default would
+    quietly serve an insights view with no chart, and the caller is the one place that knows
+    which readings and which rail setting the chart is drawn from.
+
+    It rides the insights payload rather than the journal's because it describes the ACCOUNT, not
+    the closed trades. The distinction is load-bearing at the other end: the journal's curve is
+    built from `report.entries` and therefore narrows with a `?limit=`, while this series does
+    not narrow with anything the journal does. Two charts that respond differently to the same
+    query belong to two different payloads.
+    """
     return {
         "as_of": iso(report.now_ts),
         "generated_at": moment(report.now_ts),
         "account": _account_payload(report.account),
         "closed_trade_count": count(report.closed_trade_count),
+        "equity_series": equity_series_payload(series),
         "rules": [_track_record_payload(r) for r in report.rules],
     }
 
@@ -1023,6 +1037,106 @@ def equity_curve_payload(curve: EquityCurve) -> dict[str, Any]:
         "net": net,
         "reading": label("curve", display=reading, state=net["state"]),
         "points": [_equity_point_payload(point) for point in curve.points],
+    }
+
+
+def _equity_series_point_payload(point: EquitySeriesPoint) -> dict[str, Any]:
+    """One cycle's reading: where to draw it, and what it says (#698).
+
+    `x`, `y`, `hwm_y` and `dd_floor_y` are BARE STRINGS for the reason `_equity_point_payload`
+    gives -- they are positions inside a viewBox, not figures a human reads. `dd_floor_y` is
+    `null`, not `"0"`, when the rail setting is unknown: a zero coordinate is the TOP of an SVG
+    box, so it would draw a ceiling line in force above every reading rather than none at all.
+
+    `unrealized` is the one leg that carries a verdict, because it is the one that is a
+    gain-or-loss figure. `equity`, `cash` and `hwm` are magnitudes -- an account balance is not
+    good or bad on its own, and `money(signed=True)` would put a ▲ on a number that has no
+    direction. `dd_floor` is a magnitude too: it is the rail's ceiling, not a judgement about
+    how close this reading sits to it.
+    """
+    return {
+        "x": _plain(point.x),
+        "y": _plain(point.y),
+        "hwm_y": _plain(point.hwm_y),
+        "dd_floor_y": None if point.dd_floor_y is None else _plain(point.dd_floor_y),
+        "at": moment(point.ts),
+        "mode": point.mode,
+        "equity": money(point.equity),
+        "cash": money(point.cash),
+        "unrealized": money(point.unrealized, signed=True),
+        "hwm": money(point.hwm),
+        "dd_floor": money(point.dd_floor),
+    }
+
+
+def equity_series_payload(series: EquitySeries) -> dict[str, Any]:
+    """`build_equity_series`'s `EquitySeries`, as JSON (#698).
+
+    **Segments cross as segments, never as one flat list of points.** The mode partition is the
+    whole reason this shape exists: paper and live are unrelated accounts that share a database,
+    and a client handed one list would join them into a polyline showing a collapse that never
+    happened. Flattening is the one operation the wire must not make easy.
+
+    `reading` is the chart's text equivalent, written here for the reason
+    `equity_curve_payload`'s is: summarising a chart is a judgement, and a reader who cannot see
+    it must be told the same thing in words. It NAMES THE MODES, because the mode split is the
+    part a spoken summary would otherwise flatten -- a sentence saying an account went from ten
+    thousand dollars to two hundred and fifty is exactly the false continuity the segments exist
+    to prevent, and it would be no less false for being spoken.
+
+    `state` on that sentence is `neutral`, unlike the curve's. The curve closes on a cumulative
+    net P&L, which is a verdict; a series closes on an account balance, which is not one. Taking
+    the state from the last reading's sign would call an account "good" for holding money.
+    """
+    low, high = money(series.low), money(series.high)
+    cycles = count(series.point_count)
+    truncated_from = count(series.total_recorded)
+    if series.segments:
+        # `series.modes` and `series.is_partitioned`, never a mode list assembled here: Rule 6e
+        # bans `len()` in this module precisely so a count on the wire is one the report already
+        # holds, and a serialiser deriving its own answer is how two answers start to differ.
+        span = " and ".join(series.modes)
+        # "the most recent N", never a bare N, when the read was bounded. The sentence is the
+        # whole of what a reader who cannot see the chart is told about its span, so a window
+        # described as a history is a lie by omission that every individual point survives.
+        scope = "the most recent " if series.is_truncated else ""
+        reading = (
+            f"Account equity over time across {scope}{cycles['display']} cycle(s) in {span}, "
+            f"ranging from {low['display']} to {high['display']}."
+        )
+        if series.is_truncated:
+            reading += f" {truncated_from['display']} readings are recorded in total."
+        # Said only when there IS a partition. A deployment that has only ever run paper would
+        # otherwise be told about a second line that is not on the chart -- the same false
+        # continuity the segments exist to prevent, pointing the other way.
+        if series.is_partitioned:
+            reading += " Each mode is drawn as its own line; they are separate accounts."
+    else:
+        # Not "the account was flat", and not an empty string. A deployment that has not run a
+        # cycle since the series began recording has no readings at all, and telling those two
+        # apart is the whole difference between an empty chart and a broken one.
+        reading = "No equity readings recorded yet, so there is no series to draw."
+    return {
+        "width": _plain(series.width),
+        "height": _plain(series.height),
+        "point_count": cycles,
+        "total_recorded": truncated_from,
+        # A `flag`, not a bare boolean: a client must not have to compare `point_count` against
+        # `total_recorded` to learn this. That comparison is arithmetic, and the answer is a
+        # statement about how much of the record the chart is showing -- a judgement, made here.
+        "is_truncated": flag(
+            series.is_truncated, on="a window onto a longer record", off="the whole record"
+        ),
+        "low": low,
+        "high": high,
+        "reading": label("series", display=reading, state=NEUTRAL),
+        "segments": [
+            {
+                "mode": segment.mode,
+                "points": [_equity_series_point_payload(p) for p in segment.points],
+            }
+            for segment in series.segments
+        ],
     }
 
 
