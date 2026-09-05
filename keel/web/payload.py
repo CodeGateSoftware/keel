@@ -1258,9 +1258,6 @@ def journal_payload(
     }
 
 
-#: The word that must appear beside every self-reported figure on this page. Read from the command
-#: module rather than restated, so the CLI and the console cannot come to use two different words
-#: for the one record neither of them can verify.
 def _discretionary_journal_payload(notes: DiscretionaryJournal) -> dict[str, Any]:
     """The operator's own account of their own conduct (#705).
 
@@ -1279,6 +1276,8 @@ def _discretionary_journal_payload(notes: DiscretionaryJournal) -> dict[str, Any
     impact it becomes a ranking of the operator's own worst days: the Strathern rail, in the one
     place where the thing being ranked is a person.
     """
+    # The marker word is READ from the command module rather than restated here, so the CLI and
+    # the console cannot come to use two different words for the one record neither can verify.
     from keel.commands.journal import SELF_REPORTED
 
     return {
@@ -1290,7 +1289,19 @@ def _discretionary_journal_payload(notes: DiscretionaryJournal) -> dict[str, Any
             on_state=NEUTRAL,
             off_state=UNKNOWN,
         ),
+        # BOTH counts, and a sentence that already says which is which. A journal is capped on
+        # this page, and a short list with nothing beside it reads as a complete one -- the
+        # failure `Repository.get_equity_points`' docstring names ("a caller that bounds a read is
+        # showing a WINDOW of the record and must say so"). The sentence is composed here rather
+        # than by the client, because choosing between "3 entries" and "50 of 301 (newest)" is a
+        # judgement (Rule 2) and the client may not count (Rule 6e).
         "shown_count": count(notes.entry_count),
+        "total_count": count(notes.total_count),
+        "window": label(
+            "page" if notes.truncated else "all",
+            display=_notes_window_display(notes),
+            state=WARN if notes.truncated else NEUTRAL,
+        ),
         "entries": [
             {
                 "at": moment(entry.ts),
@@ -1324,6 +1335,20 @@ def _discretionary_journal_payload(notes: DiscretionaryJournal) -> dict[str, Any
             for entry in notes.entries
         ],
     }
+
+
+def _notes_window_display(notes: DiscretionaryJournal) -> str:
+    """What the page says about how much of the journal it is showing.
+
+    `WARN` on a truncated window rather than `NEUTRAL`, because the reader is looking at an
+    incomplete record of their own conduct and the whole point of the sentence is that they
+    notice.
+    """
+    if not notes.any_recorded:
+        return "nothing recorded"
+    if notes.truncated:
+        return f"showing the {notes.entry_count} most recent of {notes.total_count}"
+    return f"showing all {notes.entry_count}"
 
 
 def _rules_followed_display(value: bool | None) -> str:

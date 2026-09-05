@@ -56,23 +56,41 @@ def test_adding_an_entry_off_a_terminal_is_refused(deployment, monkeypatch) -> N
     assert _entries(deployment) == []
 
 
-def test_the_add_command_takes_no_value_options_at_all(deployment) -> None:
+def test_the_add_command_takes_no_value_options_at_all() -> None:
     """Not merely "it prompts": a `--emotion 3` would make the whole entry scriptable, and the
-    TTY gate would then guard a ceremony that no longer needed a human to supply anything."""
-    result = _run(deployment, ["journal", "add", "--help"])
-    for smuggled in ("--emotion", "--rules-followed", "--errors", "--impact", "--note", "--json"):
-        assert smuggled not in result.output, f"`journal add` accepts {smuggled}"
+    TTY gate would then guard a ceremony that no longer needed a human to supply anything.
+
+    Asserted as the PROPERTY -- click's own parameter list is empty -- rather than as a blocklist
+    of six names I happened to think of. The first version scanned `--help` for `--emotion`,
+    `--impact` and four others, which a `--feeling 3` or a `--score 3` walks straight past while
+    defeating exactly what the docstring defends.
+    """
+    from keel.commands.journal import journal_add
+
+    assert [param.name for param in journal_add.params] == []
 
 
 def test_nothing_outside_the_cli_can_reach_the_writer() -> None:
-    """No web write path, by construction. `keel serve` has one write surface (`/api/setup`), and
-    the journal is not on it -- pinned here rather than trusted, because the day someone adds a
-    "quick note" box to the console is the day this record stops being an attestation."""
+    """No web write path, by construction.
+
+    The FIRST version of this guarded `keel/web/api.py`, where a write could not have lived: that
+    module's own docstring says "Reads only. Not one route below answers a POST". The real surface
+    is `keel.commands.setup.ACTIONS` -- the only thing `server.do_POST` will route to -- and it
+    ALREADY carries a human-attestation writer (`attest_asset`), which is exactly why a "quick
+    note" box is the plausible next addition. Demonstrated: adding a journal writer to `setup.py`
+    passed the old test untouched.
+    """
+    import inspect
+
+    from keel.commands import setup
     from keel.web import api
 
-    source = (api.__file__ or "").replace(".pyc", ".py")
-    text = open(source, encoding="utf-8").read()
-    assert "append_journal_entry" not in text
+    for module in (setup, api):
+        text = inspect.getsource(module)
+        assert "append_journal_entry" not in text, (
+            f"{module.__name__} can reach the journal writer; the console's write surface is "
+            "`setup.ACTIONS` and the journal must not be on it"
+        )
 
 
 # -- what it writes ----------------------------------------------------------------------------

@@ -1989,12 +1989,24 @@ def _comments_stripped(source: str) -> str:
 
 
 def _function_body(source: str, name: str) -> str:
-    """One exported function's body, comments stripped and string literals kept."""
+    """One top-level function's body, comments stripped and string literals kept.
+
+    Exported OR module-private: `notesSection` (#705) is private, and a helper that only knew how
+    to find exports raised `ValueError` on it -- which at least fails loudly, unlike the shape
+    where a scan silently finds nothing. Bounded at the next top-level function of either kind, so
+    the next function's body cannot be read as this one's.
+    """
     code = _comments_stripped(source)
-    start = code.index("export function " + name + "(")
+    for prefix in ("export function ", "function "):
+        marker = prefix + name + "("
+        if marker in code:
+            start = code.index(marker)
+            break
+    else:
+        raise AssertionError(f"render.js declares no top-level function {name}")
     rest = code[start + 1 :]
-    end = rest.find("\nexport function ")
-    return rest if end == -1 else rest[:end]
+    ends = [at for at in (rest.find("\nexport function "), rest.find("\nfunction ")) if at != -1]
+    return rest if not ends else rest[: min(ends)]
 
 
 def test_the_clickable_scan_can_actually_see_a_string_literal() -> None:
@@ -2125,3 +2137,41 @@ def test_the_chip_separators_the_comments_describe_actually_ship() -> None:
     css = (_STATIC / "css" / "keel.css").read_text(encoding="utf-8")
     for selector in ("#session-profile:not(:empty)::after", "#session-equity:not(:empty)::before"):
         assert selector in css, f"no separator rule for {selector}"
+
+
+# -- the discretionary journal's own section (#705) -----------------------------------------------
+#
+# Every other pin on `notesSection` asks what it WOULD draw. None asked whether anything draws it,
+# or whether the marker survives -- so deleting the call, or the `SELF-REPORTED` pill, left the
+# whole 6,000-test suite green while the console lost the section and the acceptance criterion the
+# issue names. The parity scan cannot catch either: an uncalled function still reads the keys it
+# reads.
+
+
+def test_the_insights_view_actually_renders_the_journal_section() -> None:
+    body = _function_body(_source("render.js"), "insightsView")
+    assert "notesSection(" in body, "insightsView never draws the discretionary journal"
+
+
+def test_the_journal_section_shows_the_self_reported_marker() -> None:
+    """The issue's acceptance criterion, on the surface it names. The marker is what keeps a
+    self-assessment from being read as a venue fact, and it is one deleted line away from gone."""
+    body = _function_body(_source("render.js"), "notesSection")
+    assert "notes.marker" in body
+
+
+def test_the_journal_section_says_how_much_of_the_journal_it_is_showing() -> None:
+    """A capped list with nothing beside it reads as a complete one. The payload composes the
+    sentence; this asserts the client places it."""
+    body = _function_body(_source("render.js"), "notesSection")
+    assert "notes.window" in body
+
+
+def test_the_journal_section_offers_no_sort_control() -> None:
+    """Not an omission. A journal reads forwards, and sorted by dollar impact it becomes a ranking
+    of the operator's own worst days -- the Strathern rail where the thing ranked is a person.
+    `table()` draws a sort control only when handed a `sort`/`onSort` pair, so the refusal is the
+    absence of that argument."""
+    body = _function_body(_source("render.js"), "notesSection")
+    assert "onSort" not in body
+    assert "sort:" not in body

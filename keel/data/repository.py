@@ -322,24 +322,52 @@ class Repository:
         rather than which way they read. `id` breaks a timestamp tie, so two notes written in one
         second keep a stable order across reads.
         """
-        query = "SELECT * FROM journal WHERE 1=1"
+        where, params = self._journal_where(since_ts, until_ts)
+        if limit is None:
+            query = f"SELECT * FROM journal{where} ORDER BY ts, id"
+        else:
+            # The SUBQUERY, not a DESC read reversed in Python -- the identical shape
+            # `get_equity_points` and `get_cycle_balances` use, and `get_equity_points`' docstring
+            # is where the reasoning lives: the ordering is the caller's contract rather than an
+            # artefact of how the rows were selected, so a bounded read and an unbounded one
+            # differ only in how much they return. `id` breaks the tie in BOTH directions, so the
+            # newest-N and the oldest-first re-order agree about which of two same-second entries
+            # is the newer.
+            query = (
+                f"SELECT * FROM (SELECT * FROM journal{where} "
+                "ORDER BY ts DESC, id DESC LIMIT ?) ORDER BY ts, id"
+            )
+            params = [*params, limit]
+        rows = self._conn.execute(query, params).fetchall()
+        return [self._journal_row_to_dict(row) for row in rows]
+
+    def count_journal_entries(
+        self, *, since_ts: int | None = None, until_ts: int | None = None
+    ) -> int:
+        """How many entries the window holds, BEFORE any `limit` truncated it.
+
+        The sibling `count_equity_points` exists for the same reason and its docstring states the
+        rule: a caller that bounds a read is showing a WINDOW of the record and must say so. The
+        console showed a capped journal with nothing on the page distinguishing it from a complete
+        one, which is the failure that rule exists to prevent.
+        """
+        where, params = self._journal_where(since_ts, until_ts)
+        row = self._conn.execute(f"SELECT COUNT(*) AS n FROM journal{where}", params).fetchone()
+        return int(row["n"])
+
+    @staticmethod
+    def _journal_where(since_ts: int | None, until_ts: int | None) -> tuple[str, list[Any]]:
+        """The half-open window, shared by the read and the count so the two cannot disagree
+        about which entries are in it."""
+        clauses: list[str] = []
         params: list[Any] = []
         if since_ts is not None:
-            query += " AND ts >= ?"
+            clauses.append("ts >= ?")
             params.append(since_ts)
         if until_ts is not None:
-            query += " AND ts < ?"
+            clauses.append("ts < ?")
             params.append(until_ts)
-        if limit is None:
-            rows = self._conn.execute(query + " ORDER BY ts, id", params).fetchall()
-        else:
-            # Newest `limit` in the database, then re-read forwards in Python. Ordering DESC in
-            # SQL and reversing here keeps the cap on the right end without a subquery.
-            newest = self._conn.execute(
-                query + " ORDER BY ts DESC, id DESC LIMIT ?", [*params, limit]
-            ).fetchall()
-            rows = list(reversed(newest))
-        return [self._journal_row_to_dict(row) for row in rows]
+        return ((" WHERE " + " AND ".join(clauses)) if clauses else "", params)
 
     def _journal_row_to_dict(self, row: sqlite3.Row) -> dict[str, Any]:
         entry = dict(row)

@@ -710,7 +710,7 @@ def read_journal(cfg: ServeConfig, query: Query, _state: Any, now_ts: int) -> di
     redrawn in `pnl` order would be a cumulative total of a sequence that never happened.
     """
     from keel.commands.insights import build_equity_curve, build_journal_report
-    from keel.commands.journal import gather_journal
+    from keel.commands.journal import DEFAULT_NOTES_LIMIT, gather_journal
 
     limit = _journal_limit(query)
     repo = open_repo(cfg.db_path)
@@ -726,7 +726,13 @@ def read_journal(cfg: ServeConfig, query: Query, _state: Any, now_ts: int) -> di
         # alone -- and that is a refusal, not an omission. A journal reads forwards; sorted by
         # dollar impact it becomes a ranking of your own worst days, which is the shape this
         # codebase refuses everywhere else it appears.
-        notes = gather_journal(repo, now_ts=now_ts, limit=limit)
+        #
+        # ITS OWN CAP, not the trades' `?limit=`. The first cut passed `limit` through, so
+        # narrowing to one closed trade silently hid 300 of an operator's 301 notes -- one
+        # record's page control truncating a different record, by the coincidence of their
+        # sharing a route. `total_count` rides the payload either way, so the page can say what
+        # it is not showing.
+        notes = gather_journal(repo, now_ts=now_ts, limit=DEFAULT_NOTES_LIMIT)
     finally:
         close_repo(repo)
     return payload.journal_payload(

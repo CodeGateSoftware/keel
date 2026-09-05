@@ -168,3 +168,104 @@ def test_there_is_no_way_to_edit_or_delete_an_entry(repo: Repository) -> None:
     for a later contributor to add beside two existing methods is a third that updates."""
     for forbidden in ("update_journal_entry", "delete_journal_entry", "set_journal_entry"):
         assert not hasattr(repo, forbidden), f"Repository grew {forbidden}"
+
+    # And the SQL, over the whole package -- a name sweep misses `amend_`, `edit_`, a generic
+    # executor, and anything that reaches the table without a method at all. This is the property;
+    # the names above are the readable half of it.
+    import pathlib
+
+    root = pathlib.Path(__file__).resolve().parents[2] / "keel"
+    offenders = [
+        path
+        for path in root.rglob("*.py")
+        for text in [path.read_text(encoding="utf-8")]
+        if "UPDATE journal" in text or "DELETE FROM journal" in text
+    ]
+    assert offenders == [], f"the journal is mutated in {offenders}"
+
+
+def test_the_limit_breaks_a_timestamp_tie_by_id(repo: Repository) -> None:
+    """With three entries in one second and a cap of two, "newest" means the two written LAST.
+
+    **This test's own blind spot, named.** It pins the OUTCOME, not the `id DESC` clause that
+    guarantees it: measured on this SQLite build, dropping `id DESC` from the subquery returns the
+    same two rows, because a bare `ORDER BY ts DESC` happens to fall back to rowid order. That is
+    an implementation detail of one engine and not a promise, so the clause stays -- the sibling
+    `get_equity_points` states the reasoning ("applied in BOTH directions so the newest-N and the
+    oldest-first re-order agree about which of two same-second readings is the newer") -- but no
+    test in this suite can currently make its absence fail, and saying so beats implying otherwise.
+    """
+    for note in ("first", "second", "third"):
+        repo.append_journal_entry(ts=1_000, chart_note=note)
+
+    assert [e["chart_note"] for e in repo.get_journal_entries(limit=2)] == ["second", "third"]
+
+
+def test_the_count_is_the_window_before_the_limit(repo: Repository) -> None:
+    """What lets a bounded read SAY what it left out -- the rule `get_equity_points`' docstring
+    states and `count_equity_points` exists to serve."""
+    for ts in (100, 200, 300):
+        repo.append_journal_entry(ts=ts)
+
+    assert repo.count_journal_entries() == 3
+    assert len(repo.get_journal_entries(limit=1)) == 1
+    assert repo.count_journal_entries(since_ts=200) == 2
+    assert repo.count_journal_entries(since_ts=200, until_ts=300) == 1
+
+
+def test_an_empty_string_is_read_back_as_unsaid(repo: Repository) -> None:
+    """`label(None)` is `absent()` and `label("")` is an empty cell, so a column holding `""`
+    would render as a second, different-looking spelling of "did not say"."""
+    from keel.commands.journal import gather_journal
+
+    repo.append_journal_entry(ts=1, chart_note="", errors_made="", emotion_score="")
+    (entry,) = gather_journal(repo, now_ts=2).entries
+
+    assert entry.chart_note is None
+    assert entry.errors_made is None
+    assert entry.emotion_score is None
+
+
+def test_a_zero_or_negative_limit_is_refused_rather_than_obeyed(repo: Repository) -> None:
+    """SQLite reads a NEGATIVE `LIMIT` as unbounded, so `--limit -1` would silently print
+    everything; a zero returns no rows, and an empty result is indistinguishable from an empty
+    journal on both front-ends. That is the hazard `keel/web/api.py::_journal_limit` was written
+    to name, and refusing is the only reading that cannot lie.
+
+    Refused in `gather_journal` rather than only at the click option, so the guard travels with
+    the function instead of with one of its callers.
+    """
+    from keel.commands.journal import gather_journal
+
+    repo.append_journal_entry(ts=1)
+    for bad in (0, -1):
+        with pytest.raises(ValueError, match="limit"):
+            gather_journal(repo, now_ts=2, limit=bad)
+
+
+def test_a_report_knows_when_it_is_a_page_of_a_longer_journal(repo: Repository) -> None:
+    """The flag that lets both front-ends say "50 of 301" instead of showing a short list that
+    reads as a complete one."""
+    from keel.commands.journal import gather_journal
+
+    for ts in (100, 200, 300):
+        repo.append_journal_entry(ts=ts)
+
+    whole = gather_journal(repo, now_ts=400)
+    assert whole.truncated is False
+    assert (whole.entry_count, whole.total_count) == (3, 3)
+
+    page = gather_journal(repo, now_ts=400, limit=2)
+    assert page.truncated is True
+    assert (page.entry_count, page.total_count) == (2, 3)
+
+
+def test_an_empty_window_is_not_the_same_as_an_empty_journal(repo: Repository) -> None:
+    """`any_recorded` reads `total_count`, not `entries`. A cap or a date bound that excluded
+    everything is not a deployment with no journal, and the renderers say different things."""
+    from keel.commands.journal import JournalReport, gather_journal
+
+    assert gather_journal(repo, now_ts=1).any_recorded is False
+    repo.append_journal_entry(ts=100)
+    assert gather_journal(repo, now_ts=200).any_recorded is True
+    assert JournalReport(now_ts=1, entries=(), total_count=7).any_recorded is True

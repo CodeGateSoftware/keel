@@ -23,8 +23,17 @@ vocabulary rather than a reuse of `human-attested`.
 Attestations are human-sourced or refused. `keel journal add` prompts, requires a terminal, and
 accepts NO value options -- not merely "it prompts by default". A `--emotion 3` would make the
 whole entry scriptable, and the TTY gate would then be guarding a ceremony that no longer needed a
-human to supply anything. There is no web write path, and a test asserts `keel/web/api.py` never
-reaches the writer.
+human to supply anything. There is no web write path, and a test asserts it over
+`keel.commands.setup.ACTIONS` -- the only surface `server.do_POST` will route to, and one that
+already carries an attestation writer (`attest_asset`), which is precisely why a journal box is
+the plausible next addition.
+
+**WHAT THE TERMINAL CHECK IS AND IS NOT.** `sys.stdin.isatty()` refuses a pipe, a redirect and a
+cron job as ordinarily written. It does NOT refuse a determined script: a `pty.fork()` driver
+allocates a real terminal and feeds the prompts, and this command answers it. That is true of
+every gate in this codebase built on the same predicate, and it is the honest boundary -- the
+check makes automated entry a thing someone has to MEAN, not a thing they can do by accident. A
+record whose whole value is that a person wrote it cannot be enforced by software beyond that.
 
 ── AND THERE IS NO EDIT ─────────────────────────────────────────────────────────────────────────
 
@@ -84,10 +93,26 @@ class JournalEntry:
     screenshot_ref: str | None
 
 
+#: How many entries the console shows without being asked for more.
+#:
+#: The journal has its OWN cap and is deliberately not paged by `/api/journal`'s `?limit=`. That
+#: parameter is the closed-trade table's page control; applying it here was a coincidence of the
+#: two records sharing a route, and it meant narrowing to one trade silently hid 300 of an
+#: operator's 301 notes.
+DEFAULT_NOTES_LIMIT = 50
+
+
 @dataclass(frozen=True)
 class JournalReport:
     now_ts: int
     entries: tuple[JournalEntry, ...]
+    #: How many entries the window holds BEFORE `limit` truncated `entries`.
+    #:
+    #: Carried, not derived, because a caller that bounds a read is showing a WINDOW of the record
+    #: and must say so -- the rule `Repository.get_equity_points` states and `count_equity_points`
+    #: exists to serve. The first cut shipped `shown_count` alone, so a capped journal was
+    #: indistinguishable on the page from a complete one.
+    total_count: int = 0
 
     @property
     def entry_count(self) -> int:
@@ -97,17 +122,37 @@ class JournalReport:
 
     @property
     def any_recorded(self) -> bool:
-        """Whether this deployment has a journal at all. The renderers say two different things
-        over an empty table and a missing one, and only this can tell them apart."""
-        return bool(self.entries)
+        """Whether this deployment has a journal at all.
+
+        Reads `total_count`, not `entries`: a window that returned nothing because a cap or a date
+        bound excluded everything is not a deployment with no journal, and the renderers say
+        different things about the two.
+        """
+        return self.total_count > 0
+
+    @property
+    def truncated(self) -> bool:
+        """Whether this report is a PAGE of a longer journal. What the page says "50 of 301"
+        from, and the flag a renderer needs to say anything at all rather than showing a short
+        list that looks complete."""
+        return self.total_count > self.entry_count
 
 
 def gather_journal(repo: Repository, *, now_ts: int, limit: int | None = None) -> JournalReport:
     """Every entry, oldest first -- a journal reads forwards.
 
-    `limit` keeps the NEWEST entries and still returns them forwards, so a capped page changes how
-    much of the journal a reader sees and never which way it reads.
+    `limit` keeps the NEWEST entries and still returns them forwards, so a cap changes how much of
+    the journal a reader sees and never which way it reads. `total_count` comes off a separate
+    COUNT over the same window, so the report always knows what the cap left out.
+
+    A NEGATIVE OR ZERO LIMIT IS REFUSED rather than obeyed. SQLite reads a negative `LIMIT` as
+    unbounded, so `--limit -1` would silently print everything; a zero returns no rows, and an
+    empty result is indistinguishable from an empty journal on both front-ends -- which is exactly
+    the hazard `keel/web/api.py::_journal_limit` was written to name. Refusing is the only reading
+    that cannot lie.
     """
+    if limit is not None and limit < 1:
+        raise ValueError(f"limit must be 1 or more (or omitted for all); got {limit}")
     entries = tuple(
         JournalEntry(
             id=int(row["id"]),
@@ -121,7 +166,9 @@ def gather_journal(repo: Repository, *, now_ts: int, limit: int | None = None) -
         )
         for row in repo.get_journal_entries(limit=limit)
     )
-    return JournalReport(now_ts=now_ts, entries=entries)
+    return JournalReport(
+        now_ts=now_ts, entries=entries, total_count=repo.count_journal_entries()
+    )
 
 
 def _optional_text(value: object) -> str | None:
@@ -216,7 +263,10 @@ def render_human(report: JournalReport) -> str:
         lines.append(f"  chart note    : {entry.chart_note or 'not said'}")
         lines.append(f"  screenshot    : {entry.screenshot_ref or 'not said'}")
         lines.append("")
-    lines.append(f"{report.entry_count} entr{'y' if report.entry_count == 1 else 'ies'}.")
+    if report.truncated:
+        lines.append(f"{report.entry_count} of {report.total_count} entries (newest).")
+    else:
+        lines.append(f"{report.entry_count} entr{'y' if report.entry_count == 1 else 'ies'}.")
     return "\n".join(lines)
 
 
@@ -303,7 +353,7 @@ def journal_add(ctx: click.Context) -> None:
 @journal_group.command("list")
 @click.option(
     "--limit",
-    type=int,
+    type=click.IntRange(min=1),
     default=None,
     help="Show only the most recent N entries. They still read forwards.",
 )

@@ -423,9 +423,10 @@ def _journal_rows(
     attestation nothing outside the operator's head produced. The chip groups it with the asset
     and instrument attestations; the provenance column is what keeps it from being read as one.
 
-    The summary leads with whichever sentence the operator actually wrote. An entry whose only
-    content is an emotion score still says something, and a row reading only "journal entry"
-    would make the feed's densest human content its least legible.
+    The summary carries EVERY sentence the operator wrote, in a fixed order, because this row is
+    the journal's whole representation in the CSV -- there is no other column any of it could
+    reappear in. An entry whose only content is an emotion score still says something, and a row
+    reading only "journal entry" would make the feed's densest human content its least legible.
     """
     rows: list[TimelineRow] = []
     for raw in repo.get_journal_entries(since_ts=since_ts):
@@ -461,12 +462,14 @@ def _journal_summary(raw: dict[str, Any]) -> str:
     parts: list[str] = []
     if raw.get("rules_followed") is False:
         parts.append("BROKE RULES")
-    note = str(raw.get("chart_note") or "").strip()
-    errors = str(raw.get("errors_made") or "").strip()
-    if errors:
-        parts.append(errors)
-    elif note:
-        parts.append(note)
+    # EVERY sentence the operator wrote, not the first one found. The first cut used `elif`, so an
+    # entry carrying both an error and a chart note exported only the error -- and this row is the
+    # journal's whole representation in a file an operator hands to an auditor. There is no other
+    # column it could reappear in.
+    for field in ("errors_made", "chart_note", "screenshot_ref"):
+        written = str(raw.get(field) or "").strip()
+        if written:
+            parts.append(written)
     emotion = str(raw.get("emotion_score") or "").strip()
     if emotion:
         parts.append(f"emotion {emotion}")

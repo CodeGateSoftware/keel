@@ -2571,7 +2571,11 @@ function notesSection(notes) {
   fragment.append(heading("h-notes", "Your own account"));
   const sub = el("p", "sub");
   sub.append(pill(plain(notes.marker), "warn"), " ");
-  sub.append(field(notes.recorded));
+  sub.append(field(notes.recorded), " · ");
+  // How much of the journal this is. A capped list with nothing beside it reads as a complete
+  // one, and the sentence comes off the payload -- choosing between "showing all 3" and "showing
+  // the 50 most recent of 301" is a judgement, and this file may not count either.
+  sub.append(field(notes.window));
   fragment.append(sub);
 
   fragment.append(

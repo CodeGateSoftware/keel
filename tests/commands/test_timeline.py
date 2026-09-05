@@ -712,3 +712,33 @@ def test_the_journal_respects_the_scope_window(repo: Repository) -> None:
                 if r.source == "journal"]) == 1
     assert len([r for r in gather_timeline(repo, now_ts=NOW_TS, scope="all").rows
                 if r.source == "journal"]) == 2
+
+
+def test_the_export_row_carries_every_sentence_the_operator_wrote(repo: Repository) -> None:
+    """This row is the journal's WHOLE representation in the CSV -- there is no other column any
+    of it could reappear in. The first cut used `elif`, so an entry carrying both an error and a
+    chart note exported only the error, and `screenshot_ref` reached the file nowhere at all."""
+    _journal(
+        repo,
+        errors_made="entered early",
+        chart_note="range top",
+        screenshot_ref="~/shot.png",
+        emotion_score="2",
+    )
+    text = timeline.to_csv(timeline.export_rows(repo, now_ts=NOW_TS))
+    (line,) = [row for row in text.splitlines() if "journal" in row]
+
+    for written in ("entered early", "range top", "~/shot.png", "emotion 2"):
+        assert written in line, f"{written!r} is in no column and in no summary"
+
+
+def test_a_hostile_journal_note_cannot_execute_in_a_spreadsheet(repo: Repository) -> None:
+    """Journal text is operator-typed free text and it lands in a cell of a file an auditor
+    opens. `csv_safe` applies to every cell, and the summary's `.strip()` means a note beginning
+    with a tab or a newline still reaches it starting with the trigger."""
+    _journal(repo, errors_made="=cmd|' /C calc'!A0", chart_note=None)
+    text = timeline.to_csv(timeline.export_rows(repo, now_ts=NOW_TS))
+    (line,) = [row for row in text.splitlines() if "cmd" in row]
+
+    assert "'=cmd" in line
+    assert ",=cmd" not in line and not line.startswith("=cmd")
