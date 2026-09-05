@@ -1328,10 +1328,11 @@ function kindSwitch(current, kinds, onKind) {
  * behind a control on the same screen.
  *
  * @param {any} data      the `/api/research/trials` payload.
+ * @param {any} gauntlet  the `/api/research/gauntlet` payload, or `null` if that read failed.
  * @param {any} slippage  the `/api/research/slippage` payload, or `null` if that read failed.
  * @returns {DocumentFragment}
  */
-export function researchView(data, slippage) {
+export function researchView(data, gauntlet, slippage) {
   const fragment = document.createDocumentFragment();
   fragment.append(el("h1", undefined, "Research"));
 
@@ -1429,7 +1430,104 @@ export function researchView(data, slippage) {
     ),
   );
 
+  fragment.append(gauntletSection(gauntlet));
   fragment.append(slippageSection(slippage));
+
+  return fragment;
+}
+
+
+/**
+ * The Promotion Gauntlet scorecard (#708, view 3) -- as RECORDED, never as computed.
+ *
+ * ── WHY THIS SECTION COMPUTES NOTHING ────────────────────────────────────────────────────────
+ *
+ * Every part of the gauntlet needs work a page cannot do, measured before this was written: DSR
+ * needs a `--sharpe` the ledger does not store, CSCV costs 12-14 s per session and raises over
+ * the ledger as a whole, and Monte Carlo runs a backtest. `keel/commands/gauntlet.py` carries the
+ * figures; #726 is the engine issue for persisting the distributions.
+ *
+ * So a gauntlet run is an IMMUTABLE HISTORICAL ARTIFACT here. What is on this table is what an
+ * operator's run wrote into the append-only ledger, seed included, at the moment they ran it --
+ * not a fresh answer computed for this page load, and not one that changes between polls.
+ *
+ * ── THREE STATES ─────────────────────────────────────────────────────────────────────────────
+ *
+ * Ran, attempted-and-refused, and never run. The third is a COUNT rather than eighty-seven empty
+ * rows: a table of blanks would present the gauntlet as having covered the whole record.
+ *
+ * @param {any} gauntlet  the `/api/research/gauntlet` payload, or `null`.
+ * @returns {DocumentFragment}
+ */
+function gauntletSection(gauntlet) {
+  const fragment = document.createDocumentFragment();
+  fragment.append(heading("h-gauntlet", "The promotion gauntlet, as it was run"));
+
+  if (!gauntlet) {
+    fragment.append(note("The gauntlet record could not be read for this deployment."));
+    return fragment;
+  }
+
+  fragment.append(
+    note(
+      "Recorded outcomes, not fresh calculations. Each row is what an operator's run wrote ".concat(
+        "into the append-only ledger at the time — seed included, so it can be repeated.",
+      ),
+    ),
+  );
+
+  fragment.append(
+    gridCard([
+      kv("trials in the record", gauntlet.trials_total),
+      kv("gauntlet attempted", gauntlet.recorded_count),
+      kv("gauntlet ran", gauntlet.available_count),
+      kv("no gauntlet record", gauntlet.not_run_count),
+      kv("passed the gate", gauntlet.gate_passed_count),
+    ]),
+  );
+
+  fragment.append(
+    table(
+      "h-gauntlet",
+      [
+        { label: "when (UTC)", numeric: false },
+        { label: "trial", numeric: false },
+        { label: "rule", numeric: false },
+        // A PBO is only defined WITHIN a session -- `build_matrix` requires synchronous
+        // columns -- so the session is context, not decoration.
+        { label: "session", numeric: false },
+        { label: "ran", numeric: false },
+        { label: "PBO", numeric: true },
+        { label: "train expectancy", numeric: true },
+        { label: "held out", numeric: true },
+        { label: "bars", numeric: true },
+        { label: "seed", numeric: true },
+        { label: "gate", numeric: false },
+      ],
+      (gauntlet.rows || []).map(/** @param {any} row */ (row) => [
+        row.at,
+        plain(row.trial_id) || "—",
+        plain(row.rule) || "—",
+        plain(row.session) || "—",
+        row.ran,
+        row.pbo,
+        row.train_expectancy,
+        row.held_out_expectancy,
+        row.bars,
+        row.seed,
+        row.gate_passed,
+      ]),
+      "No gauntlet has been run against this ledger.",
+    ),
+  );
+
+  fragment.append(
+    note(
+      "Read PBO beside the degradation slope, never alone: a high PBO over a flat, positive ".concat(
+        "out-of-sample scatter is the good outcome. The slope is not recorded yet — see #726.",
+      ),
+    ),
+  );
 
   return fragment;
 }

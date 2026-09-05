@@ -611,7 +611,7 @@ def test_the_slippage_section_is_wired_into_the_research_view() -> None:
 
     assert '"research/slippage"' in main_code
     assert "function slippageSection" in _code("render.js")
-    assert "export function researchView(data, slippage)" in _code("render.js")
+    assert "export function researchView(data, gauntlet, slippage)" in _code("render.js")
 
 
 def test_the_slippage_section_states_the_basis_and_declares_no_sort_key() -> None:
@@ -696,3 +696,167 @@ def test_the_slippage_table_makes_no_claim_about_an_empty_allowlist() -> None:
     body = after if end == -1 else after[:end]
 
     assert "empty allowlist" not in body
+
+
+# -- the recorded gauntlet (#708, view 3) ---------------------------------------------------------
+
+
+def _gauntlet(tmp_path: Path, *rows: dict[str, Any]) -> Any:
+    from keel.commands.gauntlet import gather_gauntlet
+    from tests.commands.test_gauntlet import _ledger as build
+
+    return web_payload.gauntlet_payload(
+        gather_gauntlet(build(tmp_path, *rows), now_ts=RESEARCH_NOW_TS)
+    )
+
+
+def test_no_wire_value_in_the_gauntlet_payload_is_ever_a_json_number(tmp_path: Path) -> None:
+    """Rule 1. `pbo` is stored in the ledger as a STRING (`"pbo":"0.7"`) and decodes to an exact
+    `Decimal`; a payload that let it cross as a float would undo that on the last hop."""
+    from tests.commands.test_gauntlet import _ran, _refused
+
+    document = json.loads(json.dumps(_gauntlet(tmp_path, _ran("t-1"), _refused("t-2"))))
+    numbers = [
+        path
+        for path, leaf in _walk(document)
+        if not isinstance(leaf, bool) and isinstance(leaf, (int, float))
+    ]
+
+    assert numbers == [], f"JSON numbers on the wire: {numbers}"
+
+
+def test_a_failed_gate_is_not_styled_as_a_fault(tmp_path: Path) -> None:
+    """THE styling decision on this page. Every recorded run in the real ledger failed the gate,
+    and that is the exhibit rather than an incident -- a table of red rows would read as a list
+    of things that went wrong instead of as evidence of a discipline being applied."""
+    from tests.commands.test_gauntlet import _ran
+
+    document = _gauntlet(tmp_path, _ran("t-1"))
+    row = document["rows"][0]
+
+    assert row["gate_passed"]["state"] == web_payload.NEUTRAL
+    assert row["gate_passed"]["state"] != web_payload.BAD
+
+
+def test_pbo_carries_no_judgement(tmp_path: Path) -> None:
+    """`trials pbo`'s own closing note: "a high PBO with a flat, positive OOS scatter is the GOOD
+    outcome -- a broad plateau of near-identical configurations produces high PBO by
+    construction". It must be read beside the degradation slope, which the ledger does not record
+    (#726). Colouring it here would supply a verdict the number cannot carry alone."""
+    from tests.commands.test_gauntlet import _ran
+
+    document = _gauntlet(tmp_path, _ran("t-high", pbo="0.95"), _ran("t-low", pbo="0.05"))
+
+    assert [row["pbo"]["state"] for row in document["rows"]] == [
+        web_payload.NEUTRAL,
+        web_payload.NEUTRAL,
+    ]
+
+
+def test_an_attempted_run_that_could_not_go_ahead_is_unknown_not_a_warning(
+    tmp_path: Path,
+) -> None:
+    """A refusal is the machinery working: `cscv` REFUSES a series-missing column rather than
+    scoring nothing, and that refusal is what makes the rest of the record trustworthy."""
+    from tests.commands.test_gauntlet import _refused
+
+    document = _gauntlet(tmp_path, _refused("t-1"))
+    row = document["rows"][0]
+
+    assert row["ran"]["state"] == web_payload.UNKNOWN
+    assert row["pbo"]["display"] == web_payload.ABSENT
+
+
+def test_the_not_run_count_crosses_so_six_rows_are_not_read_as_the_whole_record(
+    tmp_path: Path,
+) -> None:
+    """The field that keeps the scorecard honest. 87 of the real ledger's 93 trials have no
+    gauntlet record, and a table of six rows with no denominator would read as though six trials
+    were everything that had been tried."""
+    from tests.commands.test_gauntlet import _ran, _trial
+
+    document = _gauntlet(tmp_path, _ran("t-1"), _trial(trial_id="t-2"), _trial(trial_id="t-3"))
+
+    assert document["trials_total"]["value"] == "3"
+    assert document["recorded_count"]["value"] == "1"
+    assert document["not_run_count"]["value"] == "2"
+
+
+def test_the_expectancies_carry_the_same_precision_as_every_other_one(tmp_path: Path) -> None:
+    """`places=4`, matching `payload.py`'s other expectancy sites. At the default 2 the ledger's
+    real `-1.337906...` reads `-$1.34` here and `-$1.3379` on /insights -- the two front-ends
+    disagreeing about one number, which is what this layer exists to prevent."""
+    from tests.commands.test_gauntlet import _ran
+
+    document = _gauntlet(tmp_path, _ran("t-1", train_expectancy="-1.337906173823760233469"))
+    row = document["rows"][0]
+
+    assert row["train_expectancy"]["display"].endswith("1.3379")
+
+
+def test_a_missing_seed_is_absent_and_never_zero(tmp_path: Path) -> None:
+    """Zero is a VALID seed. A row that recorded a PBO without one must not reach the page
+    looking reproducible."""
+    from tests.commands.test_gauntlet import _trial
+
+    document = _gauntlet(
+        tmp_path, _trial(trial_id="t-1", summary={"pbo": "0.7", "pbo_available": 1})
+    )
+    row = document["rows"][0]
+
+    assert row["seed"]["display"] == web_payload.ABSENT
+    assert row["bars"]["display"] == web_payload.ABSENT
+
+
+def test_the_gauntlet_endpoint_declares_no_sortable_column_either() -> None:
+    """The rail across the whole surface. Ordering this table by PBO would rank by exactly the
+    score `cscv.py`'s own source forbids as a ranking key."""
+    from keel.web import api as web_api
+
+    route = web_api.API_ROUTES["/api/research/gauntlet"]
+
+    assert route.sortable == ()
+    assert route.collection == ""
+
+
+def test_the_gauntlet_section_is_wired_into_the_research_view() -> None:
+    main_code = _code("main.js")
+
+    assert '"research/gauntlet"' in main_code
+    assert "function gauntletSection" in _code("render.js")
+    assert "export function researchView(data, gauntlet, slippage)" in _code("render.js")
+
+
+def test_the_gauntlet_section_shows_the_seed_and_both_expectancies() -> None:
+    """The seed is what makes a resampled statistic reproducible rather than a number to trust,
+    and the two expectancies are only a measurement as a pair -- the gap between them is the
+    finding."""
+    body = _section_body("gauntletSection")
+
+    for key in ("seed", "train_expectancy", "held_out_expectancy", "not_run_count"):
+        assert key in body, f"the gauntlet section must show {key}"
+
+
+def test_the_gauntlet_section_computes_nothing_and_declares_no_sort_key() -> None:
+    """No arithmetic, no sort control. The section renders recorded scalars and nothing else --
+    every gauntlet computation was measured as impossible or 12-14 s before this was written."""
+    body = _section_body("gauntletSection")
+
+    assert "key:" not in body, "no gauntlet column may declare a sort key"
+    assert "onSort" not in body
+
+
+def _section_body(name: str) -> str:
+    """One helper function's body, bounded at the next function of ANY kind.
+
+    `export function` was the bound at first and it was too wide: `slippageSection` is not
+    exported, so the window for `gauntletSection` ran through all of it and the assertions
+    were quietly covering two sections. Not wrong yet -- it would have failed for the wrong
+    reason, which is the same trap `_view_keys` records having fallen into.
+    """
+    after = _code("render.js").split(f"function {name}")[1]
+    end = after.find("\nfunction ")
+    exported = after.find("\nexport function ")
+    if exported != -1 and (end == -1 or exported < end):
+        end = exported
+    return after if end == -1 else after[:end]

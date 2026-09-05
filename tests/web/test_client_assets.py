@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import json
 import re
+from pathlib import Path
 
 import pytest
 
@@ -1267,6 +1268,7 @@ _VIEW_ENDPOINTS: tuple[tuple[str, str, str], ...] = (
     ("insightsView", "insights", "/api/insights"),
     ("insightsView", "journal", "/api/journal"),
     ("researchView", "data", "/api/research/trials"),
+    ("researchView", "gauntlet", "/api/research/gauntlet"),
     ("researchView", "slippage", "/api/research/slippage"),
     ("rulesView", "data", "/api/rules"),
     ("venuesView", "data", "/api/venues"),
@@ -1737,6 +1739,7 @@ _ROW_ENDPOINTS: tuple[tuple[str, str, str, str, str], ...] = (
     ("timelineView", "data", "rows", "/api/timeline", "orders"),
     ("rulesView", "data", "rules", "/api/rules", "rules"),
     ("researchView", "slippage", "rows", "/api/research/slippage", "none"),
+    ("researchView", "gauntlet", "rows", "/api/research/gauntlet", "gauntlet"),
 )
 
 #: Mapped collections this test does NOT cover, each with the reason. Named rather than omitted:
@@ -1764,10 +1767,47 @@ _ROW_ENDPOINTS_UNCOVERED: dict[tuple[str, str, str], str] = {
 }
 
 
+def _seed_ledger(tmp_path: Path) -> None:
+    """A trials ledger holding one recorded gauntlet run, where the API will look for it.
+
+    `tests/conftest.py::_isolate_trials_ledger` is autouse and already points
+    `research.ledger.DEFAULT_LEDGER_PATH` at an absolute path under `tmp_path`, so writing there
+    is exactly what `api._ledger_path` will resolve -- no monkeypatching, and the resolution
+    under test is the real one.
+    """
+    from decimal import Decimal
+
+    from keel.research import ledger as trials_ledger
+
+    trials_ledger.append_trial(
+        trials_ledger.DEFAULT_LEDGER_PATH,
+        trial_id="row-key-scan",
+        session="row-key-scan-session",
+        rule="turtle_breakout",
+        params={"entry_lookback": 20},
+        provenance="a_priori",
+        kind="sweep_node",
+        decision="rejected",
+        summary={
+            "pbo": "0.7",
+            "pbo_available": 1,
+            "gate_passed": 0,
+            "train_expectancy": "-1.33",
+            "held_out_expectancy": "-1.82",
+            "seed": 476,
+            "bars": 17520,
+        },
+        per_trade_pnl=[Decimal("1.5"), Decimal("-2.0")],
+        timestamp=1_700_000_000,
+    )
+
+
 def _seed_for(kind: str, db_path: str) -> None:
     from tests.web.test_api import _seed_orders, _seed_positions, _seed_rules
 
-    if kind == "positions":
+    if kind == "gauntlet":
+        _seed_ledger(Path(db_path).parent)
+    elif kind == "positions":
         _seed_positions(db_path, (("BTC-USD", "0.01", "50000"),))
     elif kind == "orders":
         _seed_orders(db_path, (("BTC-USD", "buy", "50000"),))
