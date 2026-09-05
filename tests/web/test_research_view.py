@@ -501,17 +501,22 @@ def test_the_resolved_path_never_reaches_the_browser(tmp_path: Path) -> None:
 def _slippage(tmp_path: Path, **volumes: str) -> Any:
     """A slippage payload over the fixture allowlist, with `volumes` naming the priced products.
 
-    Keyword names are ASSET codes (`BTC=...`), turned into product ids here, so a test reads as
-    "BTC at the anchor" rather than repeating the `-USD` derivation the report is meant to own.
+    Keyword names are ASSET codes (`BTC=...`). The product id comes from
+    `_products._default_sim_products` -- the derivation the report itself uses -- rather than
+    from an `f"{asset}-USD"` here: a test that hard-codes the settlement currency passes on a
+    `quote_currency: USDC` deployment while the report under test would read nothing.
     """
+    from keel.commands._products import _default_sim_products
     from keel.commands.slippage import gather_slippage
     from tests.commands.test_slippage import _config, _daily, _repo
 
+    config = _config(tmp_path)
+    ids = {product.split("-")[0]: product for product in _default_sim_products(config)}
     repo = _repo(tmp_path)
     for asset, volume in volumes.items():
-        _daily(repo, f"{asset}-USD", volume_usd=volume)
+        _daily(repo, ids[asset], volume_usd=volume)
     return web_payload.slippage_payload(
-        gather_slippage(repo, _config(tmp_path), now_ts=RESEARCH_NOW_TS)
+        gather_slippage(repo, config, now_ts=RESEARCH_NOW_TS)
     )
 
 
@@ -546,8 +551,8 @@ def test_the_model_parameters_cross_so_any_row_can_be_recomputed(tmp_path: Path)
     recovered is not evidence"."""
     document = _slippage(tmp_path, BTC="500000000")
 
-    assert document["floor_bp"]["display"] == "5.0"
-    assert document["cap_bp"]["display"] == "183.8"
+    assert document["floor_bp"]["display"] == "5.0bp"
+    assert document["cap_bp"]["display"] == "183.8bp"
     assert document["anchor_quote_volume"]["value"] == "500000000"
 
 
@@ -558,7 +563,7 @@ def test_a_capped_row_warns_that_it_is_a_lower_bound(tmp_path: Path) -> None:
     row = next(r for r in document["rows"] if r["product_id"] == "PAXG-USD")
 
     assert row["capped"]["state"] == web_payload.WARN
-    assert row["slippage_bp"]["display"] == "183.8"
+    assert row["slippage_bp"]["display"] == "183.8bp"
 
 
 def test_a_fallback_row_warns_and_shows_no_multiple(tmp_path: Path) -> None:
@@ -568,7 +573,7 @@ def test_a_fallback_row_warns_and_shows_no_multiple(tmp_path: Path) -> None:
     document = _slippage(tmp_path, BTC="500000000")
     row = next(r for r in document["rows"] if r["product_id"] == "ETH-USD")
 
-    assert row["priced_from"]["state"] == web_payload.WARN
+    assert row["fallback"]["state"] == web_payload.WARN
     assert row["floor_multiple"]["display"] == web_payload.ABSENT
     assert row["median_daily_quote_volume"]["display"] == web_payload.ABSENT
     assert row["bars"]["value"] == "0"
@@ -620,3 +625,74 @@ def test_the_slippage_section_states_the_basis_and_declares_no_sort_key() -> Non
     assert "basis" in body
     assert "key:" not in body, "no slippage column may declare a sort key"
     assert "measured" not in body.lower(), "these figures are an assumption, never a measurement"
+
+
+# -- units on the wire -----------------------------------------------------------------------------
+
+
+def test_a_rate_in_basis_points_carries_its_unit(tmp_path: Path) -> None:
+    """The bug this fixes: `ratio` emits a bare `5.0`, and the summary tiles have no column
+    header to supply the unit -- so the floor, the cap and every rate read as unitless numbers
+    on a page whose entire subject is a cost in basis points.
+
+    `basis_points` is `percent`'s sibling and nothing more: it SUFFIXES, it does not rescale. The
+    x10000 stays in `keel/commands/slippage.py`, where `ratio`'s own docstring says a units change
+    belongs -- and a suffix is not a units change, which is why `percent` has one.
+    """
+    document = _slippage(tmp_path, BTC="500000000")
+
+    assert document["floor_bp"]["display"] == "5.0bp"
+    assert document["cap_bp"]["display"] == "183.8bp"
+    assert document["rows"][0]["slippage_bp"]["display"].endswith("bp")
+
+
+def test_a_floor_multiple_carries_its_unit_too(tmp_path: Path) -> None:
+    """`1.1` in a cell headed "vs floor" is readable; `1.1x` is unambiguous, and the tile it may
+    end up in tomorrow has no header at all."""
+    repo_document = _slippage(tmp_path, BTC="125000000")
+    row = next(r for r in repo_document["rows"] if r["product_id"] == "BTC-USD")
+
+    assert row["floor_multiple"]["display"] == "2.0x"
+
+
+def test_the_wire_value_of_a_suffixed_field_stays_a_bare_number(tmp_path: Path) -> None:
+    """`display` carries the unit; `value` never does. A client that compared `value` against a
+    threshold would otherwise be parsing "5.0bp" -- and `_plain`'s no-exponent guarantee is
+    about the value, not the label."""
+    document = _slippage(tmp_path, BTC="500000000")
+
+    assert document["floor_bp"]["value"] == "5"
+    assert document["cap_bp"]["value"] == "183.8"
+
+
+# -- the flag says what its name says --------------------------------------------------------------
+
+
+def test_the_fallback_flag_is_true_when_the_row_fell_back(tmp_path: Path) -> None:
+    """It was named `priced_from`, whose `value` was `"true"` when the product was NOT priced
+    from its own liquidity -- a key reading as the opposite of what it carried. Nothing rendered
+    wrong, because Rule 3 clients read `display` and `state`; it was a trap for the next consumer
+    that read `value`. Named `fallback` now, matching `SlippageRow` and `SlippageAssumption`."""
+    from tests.commands.test_slippage import AT_ANCHOR
+
+    document = _slippage(tmp_path, BTC=str(AT_ANCHOR))
+    priced = next(r for r in document["rows"] if r["product_id"] == "BTC-USD")
+    fell_back = next(r for r in document["rows"] if r["product_id"] == "ETH-USD")
+
+    assert priced["fallback"]["value"] == "false"
+    assert fell_back["fallback"]["value"] == "true"
+    assert fell_back["fallback"]["state"] == web_payload.WARN
+
+
+# -- the empty state describes a state that can happen ---------------------------------------------
+
+
+def test_the_slippage_table_makes_no_claim_about_an_empty_allowlist() -> None:
+    """`config._parse_allowlist` raises on a missing or empty allowlist, so "this deployment has
+    an empty allowlist" describes a deployment that cannot load. Same class as the empty-ledger
+    sentence #724 fixed: an unreachable message asserting something impossible."""
+    after = _code("render.js").split("function slippageSection")[1]
+    end = after.find("export function ")
+    body = after if end == -1 else after[:end]
+
+    assert "empty allowlist" not in body

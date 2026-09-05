@@ -475,6 +475,46 @@ def percent(
     return {"value": _plain(figure), "display": display, "state": resolved}
 
 
+def basis_points(value: Decimal | float | None, *, places: int = 1, state: str = NEUTRAL) -> Field:
+    """A figure ALREADY IN BASIS POINTS (`5` meaning 5bp), suffixed with `bp`.
+
+    `percent`'s sibling, and the same rule applies: this SUFFIXES, it never rescales. A rate held
+    as the fraction `0.0005` is converted where the report is built (`keel/commands/slippage.py`),
+    for the reason `ratio` below states about the identical temptation -- rescaling here would be
+    "the serialiser computing a figure the report never held".
+
+    It exists because the alternative was `ratio`, which emits a bare `5.0`. In a table the
+    column header can supply the unit; in a summary tile nothing can, so the floor and the cap of
+    a cost model rendered as unitless numbers on the one page whose whole subject is a cost in
+    basis points.
+    """
+    figure = _decimalise(value)
+    if figure is None:
+        return absent()
+    negative, magnitude = _is_negative(figure), _magnitude(figure, places)
+    display = f"{MINUS}{magnitude}bp" if negative else f"{magnitude}bp"
+    return {"value": _plain(figure), "display": display, "state": state}
+
+
+def multiple(value: Decimal | float | None, *, places: int = 1, state: str = NEUTRAL) -> Field:
+    """A figure that is a MULTIPLE of something named elsewhere (`2` meaning 2x), suffixed `x`.
+
+    Distinct from `ratio`, which is for a dimensionless figure that is not a multiple OF
+    anything -- an R-multiple, a profit factor. The `x` is what stops `1.1` in a cell from being
+    read as an absolute rate rather than as "1.1 times the floor".
+
+    A plain `x`, not the multiplication sign: this string is read by `_plain`-adjacent code paths
+    and copied into terminals, and one non-ASCII character here would be the kind of thing that
+    survives review and breaks a paste.
+    """
+    figure = _decimalise(value)
+    if figure is None:
+        return absent()
+    negative, magnitude = _is_negative(figure), _magnitude(figure, places)
+    display = f"{MINUS}{magnitude}x" if negative else f"{magnitude}x"
+    return {"value": _plain(figure), "display": display, "state": state}
+
+
 def ratio(
     value: Decimal | float | None,
     *,
@@ -2069,14 +2109,19 @@ def _slippage_row_payload(row: SlippageRow) -> dict[str, Any]:
     """
     return {
         "product_id": row.product_id,
-        "slippage_bp": ratio(row.slippage_bp, places=1),
+        "slippage_bp": basis_points(row.slippage_bp),
         "median_daily_quote_volume": money(row.median_daily_quote_volume),
         # ABSENT on a fallback row, never `1.0x`: the rate is the floor, but a multiple in that
         # cell would read "as cheap as the most liquid asset in the corpus" about an asset with
         # no cached history at all.
-        "floor_multiple": ratio(row.floor_multiple, places=1),
+        "floor_multiple": multiple(row.floor_multiple),
         "bars": count(row.bars),
-        "priced_from": flag(
+        # `fallback`, matching `SlippageRow` and `SlippageAssumption`. It was `priced_from`,
+        # whose `value` was `"true"` when the product was NOT priced from its own liquidity -- a
+        # key reading as the opposite of what it carried. Nothing rendered wrong (Rule 3 clients
+        # read `display` and `state`), but a name that inverts its value is a trap laid for
+        # whoever reads it next.
+        "fallback": flag(
             row.fallback,
             on="no cached liquidity — flat floor rate applied",
             off="this product's own cached liquidity",
@@ -2121,8 +2166,8 @@ def slippage_payload(report: SlippageReport) -> dict[str, Any]:
             # train a reader to stop reading it.
             state=UNKNOWN,
         ),
-        "floor_bp": ratio(report.floor_bp, places=1),
-        "cap_bp": ratio(report.cap_bp, places=1),
+        "floor_bp": basis_points(report.floor_bp),
+        "cap_bp": basis_points(report.cap_bp),
         "anchor_quote_volume": money(report.anchor_quote_volume),
         "product_count": count(report.product_count),
         "priced_count": count(report.priced_count),

@@ -1513,10 +1513,13 @@ function slippageSection(slippage) {
         row.floor_multiple,
         row.median_daily_quote_volume,
         row.bars,
-        row.priced_from,
+        row.fallback,
         row.capped,
       ]),
-      "No products configured — this deployment has an empty allowlist.",
+      // Not "an empty allowlist": `config._parse_allowlist` raises on a missing or empty one,
+      // so that sentence would describe a deployment which cannot load. The reachable emptiness
+      // is a table whose rows the report could not build.
+      "No products to price.",
     ),
   );
 

@@ -48,6 +48,21 @@ from keel.data.repository import Repository
 BASIS_POINTS = Decimal(10_000)
 
 
+def _bp(fraction: Decimal) -> Decimal:
+    """A rate as a fraction, in basis points, with the multiply's scale artifact removed.
+
+    `Decimal("0.01838") * 10000` is `Decimal("183.80000")` -- equal to `183.8` under `==`, which
+    is why a test asserting equality cannot see the difference, but NOT equal to it on the wire:
+    `payload._plain` renders the value as `183.80000`, and a reader comparing two deployments'
+    payloads would see spurious precision that came from an arithmetic scale rather than from
+    anything measured. `normalize()` strips it.
+
+    Safe against exponent form here in a way it would not be for money: these values are small,
+    and `_plain`'s `format(value, "f")` would flatten one anyway.
+    """
+    return (fraction * BASIS_POINTS).normalize()
+
+
 @dataclass(frozen=True)
 class SlippageRow:
     """One product's assumed per-leg cost, with everything needed to check it.
@@ -107,11 +122,11 @@ class SlippageReport:
 
     @property
     def floor_bp(self) -> Decimal:
-        return self.floor_pct * BASIS_POINTS
+        return _bp(self.floor_pct)
 
     @property
     def cap_bp(self) -> Decimal:
-        return self.cap_pct * BASIS_POINTS
+        return _bp(self.cap_pct)
 
     @property
     def product_count(self) -> int:
@@ -164,7 +179,7 @@ def _row_for(repo: Repository, product_id: str, floor_pct: Decimal) -> SlippageR
             product_id=product_id,
             median_daily_quote_volume=None,
             slippage_pct=floor_pct,
-            slippage_bp=floor_pct * BASIS_POINTS,
+            slippage_bp=_bp(floor_pct),
             floor_multiple=None,
             bars=0,
             fallback=True,
@@ -179,7 +194,7 @@ def _row_for(repo: Repository, product_id: str, floor_pct: Decimal) -> SlippageR
         product_id=product_id,
         median_daily_quote_volume=assumption.median_daily_quote_volume,
         slippage_pct=assumption.slippage_pct,
-        slippage_bp=assumption.slippage_pct * BASIS_POINTS,
+        slippage_bp=_bp(assumption.slippage_pct),
         floor_multiple=assumption.slippage_pct / floor_pct,
         bars=len(daily),
         # From `SlippageAssumption`'s own derived properties rather than recomputed: the class's
