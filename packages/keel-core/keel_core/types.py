@@ -70,6 +70,33 @@ class EquityReading:
 
 
 @dataclass(frozen=True)
+class CycleBalance:
+    """One cycle's OBSERVED available/total balance for ONE currency, straight off the venue
+    (#719).
+
+    Per CURRENCY and deliberately not folded into `EquityReading.cash`: that field is already a
+    cross-currency SUM (`agent._mark_to_market_parts`'s stated no-FX bound), and adding a second
+    currency's balance into it 1:1 is exactly the mistake that bound exists to name. This type
+    keeps every currency's own reading separate so a caller never has to un-sum one to get here.
+
+    `mode` is the same `"paper"`/`"live"` partition `EquityReading.mode` carries -- written from
+    the SAME `equity_state_mode` read as that cycle's equity point (see
+    `execution.equity._append_equity_point`), so one cycle cannot answer "which mode" two
+    different ways.
+
+    `available` and `total` are `None` for NOT OBSERVED, never zero -- `EquityReading.cash`'s own
+    convention, extended per field: the venue can answer one leg of a currency's balance and not
+    the other, and writing zero for the unread side would assert a balance nobody saw.
+    """
+
+    ts: int
+    mode: str
+    currency: str
+    available: Decimal | None
+    total: Decimal | None
+
+
+@dataclass(frozen=True)
 class Profile:
     """The user's own settings, as opposed to operational state or file configuration.
 
@@ -98,4 +125,4 @@ class Profile:
         return now_ts < self.autonomous_until
 
 
-__all__ = ["Granularity", "Side", "Candle", "EquityReading", "Profile"]
+__all__ = ["Granularity", "Side", "Candle", "EquityReading", "CycleBalance", "Profile"]

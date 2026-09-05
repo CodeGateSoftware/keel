@@ -13,10 +13,11 @@ why this lives agent-side (the agent has prices; `guards.check` does not).
 from __future__ import annotations
 
 import logging
+from collections.abc import Sequence
 from decimal import Decimal
 
 from keel_core.telemetry import log_event
-from keel_core.types import EquityReading
+from keel_core.types import CycleBalance, EquityReading
 
 from keel.compliance.purification import build_report
 from keel.data.repository import Repository
@@ -182,6 +183,7 @@ def update_drawdown(
     now_ts: int,
     cash: Decimal | None = None,
     unrealized: Decimal | None = None,
+    balances: Sequence[tuple[str, Decimal | None, Decimal | None]] = (),
 ) -> None:
     """Record `equity` and refresh the drawdown scalars rail 11 consumes.
 
@@ -195,6 +197,13 @@ def update_drawdown(
     here: this function has a total and no positions, and inventing the split from the total is
     exactly the fabrication `None` exists to avoid. Callers that know it (the agent's paper and
     live branches both do) pass it; callers that do not leave it unrecorded.
+
+    `balances` is the per-CURRENCY detail behind `cash` (#719): `(currency, available, total)`
+    tuples, one per currency the caller observed this cycle. Written to `cycle_balances` in the
+    SAME call as the `equity_points` row below, under the SAME mode read -- see
+    `_append_equity_point` for why that matters. The paper branch never has a venue balance to
+    observe and so never passes this; the default `()` writes nothing, which is the correct
+    answer for paper, not a special case of it.
     """
     _warn_on_unexplained_jump(repo, equity=equity)
 
@@ -225,7 +234,13 @@ def update_drawdown(
     )
 
     _append_equity_point(
-        repo, equity=equity, now_ts=now_ts, hwm=hwm, cash=cash, unrealized=unrealized
+        repo,
+        equity=equity,
+        now_ts=now_ts,
+        hwm=hwm,
+        cash=cash,
+        unrealized=unrealized,
+        balances=balances,
     )
 
 
@@ -237,6 +252,7 @@ def _append_equity_point(
     hwm: Decimal,
     cash: Decimal | None,
     unrealized: Decimal | None,
+    balances: Sequence[tuple[str, Decimal | None, Decimal | None]] = (),
 ) -> None:
     """Append this cycle's reading to the durable series, stamped with the mode that produced it.
 
@@ -254,6 +270,11 @@ def _append_equity_point(
     skipped point costs a gap in a chart and nothing else.
 
     LAST in `update_drawdown` for that reason: the rail is served before the record is kept.
+
+    `balances` (#719) is written AFTER the `equity_points` row, off the SAME `mode` local this
+    function already read for it -- one `get_state` call, two tables, so a cycle cannot record
+    its equity under one mode and its balances under another. Same unstamped-mode rescue as the
+    equity point: an unstamped call writes neither.
     """
     mode = repo.get_state("equity_state_mode")
     if mode is None:
@@ -268,6 +289,16 @@ def _append_equity_point(
             hwm=hwm,
         )
     )
+    for currency, available, total in balances:
+        repo.record_cycle_balance(
+            CycleBalance(
+                ts=now_ts,
+                mode=str(mode),
+                currency=currency,
+                available=available,
+                total=total,
+            )
+        )
 
 
 def _warn_on_unexplained_jump(repo: Repository, *, equity: Decimal) -> None:

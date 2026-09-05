@@ -18,7 +18,7 @@ from keel_core.cash_posture import CashPostureState, VenueCashPosture
 from keel_core.subscription import BrokerSubscription, SubscriptionStatus
 from keel_core.trade_scope import TradeScopeState, VenueTradeScope
 
-from keel.types import Candle, EquityReading, Granularity, Profile
+from keel.types import Candle, CycleBalance, EquityReading, Granularity, Profile
 
 _TRANSACTION_COLUMNS = (
     "coinbase_id",
@@ -174,6 +174,22 @@ def _equity_point_from_row(row: Any) -> EquityReading:
         cash=_text_to_dec(row["cash"]),
         unrealized=_text_to_dec(row["unrealized"]),
         hwm=Decimal(row["hwm"]),
+    )
+
+
+def _cycle_balance_from_row(row: Any) -> CycleBalance:
+    """Map a `cycle_balances` row to the domain record (#719).
+
+    `available` and `total` stay `None` when the column is NULL rather than becoming
+    `Decimal("0")`: the column means "not observed", and a reader must be able to tell an
+    unobserved leg from an observed flat one -- `_equity_point_from_row`'s own rule, per field.
+    """
+    return CycleBalance(
+        ts=int(row["ts"]),
+        mode=row["mode"],
+        currency=row["currency"],
+        available=_text_to_dec(row["available"]),
+        total=_text_to_dec(row["total"]),
     )
 
 
@@ -812,6 +828,85 @@ class Repository:
             params.append(mode)
         row = self._conn.execute(query, params).fetchone()
         return int(row["n"])
+
+    # -- cycle balances (the per-currency available/total pair a cycle observed; #719) -----
+
+    def record_cycle_balance(self, reading: CycleBalance) -> None:
+        """Append one currency's observed balance for one cycle. Append-only: never updated,
+        never deleted -- the same discipline `record_equity_point` follows, for the same reason.
+
+        No uniqueness constraint on `(ts, mode, currency)`, deliberately: this is an observation
+        log, not a keyed record, and the DDL comment beside `cycle_balances` in `db.py` says so
+        in more detail. Two readings genuinely taken at the same epoch second for the same
+        currency are two observations, not a collision to resolve.
+        """
+        self._conn.execute(
+            """
+            INSERT INTO cycle_balances (ts, mode, currency, available, total)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (
+                reading.ts,
+                reading.mode,
+                reading.currency,
+                _dec_to_text(reading.available),
+                _dec_to_text(reading.total),
+            ),
+        )
+        self._conn.commit()
+
+    def get_cycle_balances(
+        self,
+        mode: str | None = None,
+        currency: str | None = None,
+        since_ts: int | None = None,
+        limit: int | None = None,
+    ) -> list[CycleBalance]:
+        """The series, oldest first, optionally narrowed to one mode, one currency, a time
+        window, or a count.
+
+        `mode=None` returns every mode interleaved by time -- the raw read, not a curve; a
+        caller wanting one currency's story for one account passes both `mode` and `currency`.
+
+        `limit` keeps the MOST RECENT `limit` readings and still returns them oldest first, via
+        the identical `ORDER BY ts DESC, id DESC LIMIT ?` subquery re-ordered outside it that
+        `get_equity_points` uses -- see that method's docstring for why (a bounded read answers
+        "where is this account now", and the ordering is the caller's contract either way).
+
+        A missing `cycle_balances` TABLE (not merely a locked one) reads as an empty list rather
+        than raising: `mcp.tools._open_readonly_repo` deliberately never migrates, so a database
+        still at v19 or earlier -- from before this table existed at all -- is a real shape a
+        shared read seam must tolerate, the same rescue `get_series_feeds` applies for
+        `candle_series_feed`. `sqlite3.OperationalError` is also what a lock timeout raises, so
+        only "no such table" is swallowed; anything else still propagates.
+        """
+        clauses: list[str] = []
+        params: list[object] = []
+        if mode is not None:
+            clauses.append("mode = ?")
+            params.append(mode)
+        if currency is not None:
+            clauses.append("currency = ?")
+            params.append(currency)
+        if since_ts is not None:
+            clauses.append("ts >= ?")
+            params.append(since_ts)
+        where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
+        if limit is None:
+            query = f"SELECT * FROM cycle_balances{where} ORDER BY ts, id"
+        else:
+            query = (
+                f"SELECT * FROM (SELECT * FROM cycle_balances{where} "
+                "ORDER BY ts DESC, id DESC LIMIT ?) ORDER BY ts, id"
+            )
+            params.append(limit)
+        try:
+            rows = self._conn.execute(query, params).fetchall()
+        except sqlite3.OperationalError as exc:
+            if "no such table" not in str(exc):
+                raise
+            return []
+        return [_cycle_balance_from_row(row) for row in rows]
 
     # -- trade outcomes (closed round-trips; rails 11 and 16) ---------------
 

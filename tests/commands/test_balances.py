@@ -18,7 +18,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from keel_core.types import Candle, EquityReading, Granularity
+from keel_core.types import Candle, CycleBalance, EquityReading, Granularity
 
 from keel.commands.balances import gather_balances
 from keel.config import Config
@@ -54,6 +54,22 @@ def _reading(ts: int, mode: str, cash: str | None, equity: str = "10000") -> Equ
         cash=None if cash is None else Decimal(cash),
         unrealized=Decimal("0"),
         hwm=Decimal(equity),
+    )
+
+
+def _cycle_balance(
+    ts: int,
+    mode: str,
+    currency: str = "USD",
+    available: str | None = "9000.25",
+    total: str | None = "9500.50",
+) -> CycleBalance:
+    return CycleBalance(
+        ts=ts,
+        mode=mode,
+        currency=currency,
+        available=None if available is None else Decimal(available),
+        total=None if total is None else Decimal(total),
     )
 
 
@@ -148,13 +164,13 @@ def test_the_recorded_equity_and_unrealized_ride_along(repo: Repository, tmp_pat
 # -- what is NOT recorded -------------------------------------------------------------------------
 
 
-def test_the_settled_breakdown_is_reported_as_unrecorded(
+def test_the_settled_breakdown_is_reported_as_unrecorded_when_no_cycle_wrote_one(
     repo: Repository, tmp_path: Path
 ) -> None:
-    """#702's centrepiece, and the honest answer to it today. `equity_points.cash` comes from
-    `_fetch_available_quote`, which reads `Balance.available` and nothing else -- the venue's
-    settled-versus-total pair is never written down. The report says so rather than presenting
-    the available figure under a label that implies the distinction was checked."""
+    """#702's original centrepiece, still true for a deployment no live cycle has updated since
+    #719 shipped the writer: `cycle_balances` has no row for this mode/currency yet, so the
+    report says so rather than presenting the equity-point cash figure under a label that implies
+    the settled/total distinction was checked."""
     repo.set_state("equity_state_mode", "live")
     repo.record_equity_point(_reading(NOW_TS - 60, "live", "250.10"))
 
@@ -163,6 +179,82 @@ def test_the_settled_breakdown_is_reported_as_unrecorded(
     assert report.settled_cash is None
     assert report.total_cash is None
     assert report.settled_breakdown_recorded is False
+
+
+# -- the settled/total split, once a cycle has recorded one (#719) --------------------------------
+
+
+def test_settled_and_total_cash_come_from_the_newest_cycle_balance_for_the_settlement_currency(
+    repo: Repository, tmp_path: Path
+) -> None:
+    """`_config(tmp_path)`'s `quote_currency` is USD -- the settlement currency this report reads,
+    per `BalancesReport.settled_cash`'s docstring (never a cross-currency sum)."""
+    repo.set_state("equity_state_mode", "live")
+    repo.record_equity_point(_reading(NOW_TS - 60, "live", "250.10"))
+    repo.record_cycle_balance(
+        _cycle_balance(NOW_TS - 3600, "live", "USD", available="200", total="250")
+    )
+    repo.record_cycle_balance(
+        _cycle_balance(NOW_TS - 60, "live", "USD", available="250.10", total="300")
+    )
+
+    report = gather_balances(repo, _config(tmp_path), now_ts=NOW_TS)
+
+    assert report.settled_cash == Decimal("250.10")
+    assert report.total_cash == Decimal("300")
+    assert report.settled_breakdown_recorded is True
+
+
+def test_a_total_never_observed_reports_as_absent_not_zero(
+    repo: Repository, tmp_path: Path
+) -> None:
+    """NULL means NOT OBSERVED, never zero -- the `cycle_balances` DDL comment, carried all the
+    way to the report."""
+    repo.set_state("equity_state_mode", "live")
+    repo.record_cycle_balance(
+        _cycle_balance(NOW_TS - 60, "live", "USD", available="250.10", total=None)
+    )
+
+    report = gather_balances(repo, _config(tmp_path), now_ts=NOW_TS)
+
+    assert report.settled_cash == Decimal("250.10")
+    assert report.total_cash is None
+
+
+def test_the_settled_split_never_mixes_modes(repo: Repository, tmp_path: Path) -> None:
+    """The same partition `equity_points` enforces: a live report must never surface a paper
+    cycle's settled/total split, even when the paper row is the newer one."""
+    repo.set_state("equity_state_mode", "live")
+    repo.record_cycle_balance(
+        _cycle_balance(NOW_TS - 3600, "live", "USD", available="250.10", total="300")
+    )
+    repo.record_cycle_balance(
+        _cycle_balance(NOW_TS - 60, "paper", "USD", available="9000", total="9500")
+    )
+
+    report = gather_balances(repo, _config(tmp_path), now_ts=NOW_TS)
+
+    assert report.settled_cash == Decimal("250.10")
+    assert report.total_cash == Decimal("300")
+
+
+def test_the_settled_split_reads_only_the_settlement_currency(
+    repo: Repository, tmp_path: Path
+) -> None:
+    """A second currency's balance (say USDC, funding a different product) must not leak into the
+    scalar settled/total figures -- the no-FX bound `agent._mark_to_market_parts` documents."""
+    repo.set_state("equity_state_mode", "live")
+    repo.record_cycle_balance(
+        _cycle_balance(NOW_TS - 60, "live", "USD", available="250.10", total="300")
+    )
+    repo.record_cycle_balance(
+        _cycle_balance(NOW_TS - 60, "live", "USDC", available="7", total="9")
+    )
+
+    report = gather_balances(repo, _config(tmp_path), now_ts=NOW_TS)
+
+    assert report.settled_cash == Decimal("250.10")
+    assert report.total_cash == Decimal("300")
 
 
 # -- paper mode ------------------------------------------------------------------------------------
@@ -389,3 +481,31 @@ def test_balances_does_not_pay_for_the_entry_gate_it_never_renders(
     assert reads["candles"] == 3, (
         f"one mark read per product and no more; got {reads['candles']} for 3 products"
     )
+
+
+def test_a_paper_deployment_never_reads_a_live_cycle_s_balances(
+    repo: Repository, tmp_path: Path
+) -> None:
+    """The mode-switch case, and the reason the read is scoped by mode rather than just by
+    currency.
+
+    A deployment that traded live and is now on paper still has live `cycle_balances` rows on
+    disk. Reading the newest row for the settlement currency WITHOUT the mode filter would put a
+    real venue's settled and total cash on a paper account's page — the operator would be looking
+    at money the paper account does not have, on the one screen whose entire job is saying what
+    is actually there.
+
+    Pinned because it survived mutation: hard-coding `mode="live"` in the read passed the whole
+    suite, which means nothing exercised any mode but live.
+    """
+    repo.record_cycle_balance(
+        _cycle_balance(NOW_TS - 60, "live", "USD", available="250.10", total="300")
+    )
+    repo.set_state("equity_state_mode", "paper")
+
+    report = gather_balances(repo, _config(tmp_path), now_ts=NOW_TS)
+
+    assert report.settled_cash is None, "a live row is not this paper account's balance"
+    assert report.total_cash is None
+    assert report.settled_breakdown_recorded is False
+

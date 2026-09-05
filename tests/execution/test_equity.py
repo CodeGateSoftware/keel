@@ -330,3 +330,79 @@ def test_an_unstamped_mode_writes_no_point_and_still_updates_the_rail() -> None:
     equity.update_drawdown(repo, equity=Decimal("10000"), now_ts=NOW)
     assert repo.get_equity_points() == []
     assert repo.get_state("equity_high_water_mark") == Decimal("10000")
+
+
+# -- the persisted cycle_balances series (#719) -------------------------------------------------
+
+
+def test_a_cycle_writes_one_cycle_balance_row_per_currency() -> None:
+    """The write site's whole point: two currencies observed in the same cycle become two rows,
+    `available` and `total` kept separate per currency -- never summed (that would cross the
+    no-FX bound `agent._mark_to_market_parts` already states it will not cross)."""
+    repo = _repo()
+    repo.set_state("equity_state_mode", "live")
+    equity.update_drawdown(
+        repo,
+        equity=Decimal("10000"),
+        now_ts=NOW,
+        cash=Decimal("9007"),
+        balances=[
+            ("USD", Decimal("1000"), Decimal("1000")),
+            ("USDC", Decimal("7"), Decimal("9")),
+        ],
+    )
+    rows = {b.currency: b for b in repo.get_cycle_balances()}
+    assert set(rows) == {"USD", "USDC"}
+    assert rows["USD"].available == Decimal("1000")
+    assert rows["USD"].total == Decimal("1000")
+    assert rows["USDC"].available == Decimal("7")
+    assert rows["USDC"].total == Decimal("9")
+
+
+def test_a_currency_with_no_observed_total_writes_it_as_none_not_zero() -> None:
+    """NULL means NOT OBSERVED, never zero -- the `cycle_balances` DDL comment. A venue that
+    answered `available` and not `total` must not have a zero total invented for it."""
+    repo = _repo()
+    repo.set_state("equity_state_mode", "live")
+    equity.update_drawdown(
+        repo,
+        equity=Decimal("10000"),
+        now_ts=NOW,
+        balances=[("USD", Decimal("1000"), None)],
+    )
+    row = repo.get_cycle_balances()[0]
+    assert row.available == Decimal("1000")
+    assert row.total is None
+
+
+def test_cycle_balances_carry_the_same_mode_stamp_as_the_equity_point() -> None:
+    """Written under the SAME `equity_state_mode` read -- so one cycle cannot answer "which mode"
+    two different ways."""
+    repo = _repo()
+    repo.set_state("equity_state_mode", "live")
+    equity.update_drawdown(
+        repo, equity=Decimal("10000"), now_ts=NOW, balances=[("USD", Decimal("1000"), None)]
+    )
+    point = repo.get_equity_points()[0]
+    balance = repo.get_cycle_balances()[0]
+    assert balance.mode == point.mode == "live"
+    assert balance.ts == point.ts == NOW
+
+
+def test_an_unstamped_mode_writes_no_cycle_balance_either() -> None:
+    """Mirrors the equity-point rescue directly above: an unstamped call is not a real cycle, and
+    a row labelled with a guessed mode would land in the wrong currency's curve."""
+    repo = _repo()
+    equity.update_drawdown(
+        repo, equity=Decimal("10000"), now_ts=NOW, balances=[("USD", Decimal("1000"), None)]
+    )
+    assert repo.get_cycle_balances() == []
+
+
+def test_no_balances_argument_writes_no_rows() -> None:
+    """The paper branch never passes `balances=` at all (paper has no venue to observe) --
+    proved here at the level `update_drawdown` itself can guarantee: the default writes nothing."""
+    repo = _repo()
+    repo.set_state("equity_state_mode", "paper")
+    equity.update_drawdown(repo, equity=Decimal("10000"), now_ts=NOW)
+    assert repo.get_cycle_balances() == []

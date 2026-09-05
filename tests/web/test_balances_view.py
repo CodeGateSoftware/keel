@@ -12,12 +12,34 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
+from keel_core.types import CycleBalance
+
 from keel.commands.balances import gather_balances
 from keel.data.db import connect, migrate
 from keel.data.repository import Repository
 from keel.web import payload as web_payload
 
 BAL_NOW_TS = 1_800_000_000
+
+
+def _record_cycle_balance(
+    repo: Repository,
+    ts: int,
+    mode: str,
+    *,
+    currency: str = "USD",
+    available: str | None,
+    total: str | None,
+) -> None:
+    repo.record_cycle_balance(
+        CycleBalance(
+            ts=ts,
+            mode=mode,
+            currency=currency,
+            available=None if available is None else Decimal(available),
+            total=None if total is None else Decimal(total),
+        )
+    )
 
 
 def _walk(node: Any, path: str = "$") -> list[tuple[str, Any]]:
@@ -73,15 +95,59 @@ def test_every_recorded_figure_carries_the_instant_it_was_recorded(tmp_path: Pat
 def test_the_settled_breakdown_says_it_is_unrecorded_rather_than_showing_available_as_settled(
     tmp_path: Path,
 ) -> None:
-    """#702's centrepiece. `equity_points.cash` is the AVAILABLE figure and nothing else, so the
-    settled/unsettled split is not a number this deployment has. Labelling the available figure
-    "settled" would answer the question the page was built to ask honestly."""
+    """#702's centrepiece, still true when no cycle has written `cycle_balances` (`_report` here
+    seeds only an `equity_points` row): the settled/unsettled split is not a number this specific
+    deployment has. Labelling the available figure "settled" would answer the question the page
+    was built to ask honestly."""
     built = web_payload.balances_payload(_report(tmp_path))
 
     assert built["settled_cash"]["state"] == "unknown"
     assert built["total_cash"]["state"] == "unknown"
     assert "UNRECORDED" in built["settled_breakdown"]["display"].upper()
     assert built["settled_breakdown"]["state"] == "unknown"
+
+
+def test_a_recorded_settled_split_crosses_to_the_wire(tmp_path: Path) -> None:
+    """#719: once a live cycle has recorded a `cycle_balances` row for the settlement currency,
+    the page shows it -- the one case #702's original centrepiece test above could not reach."""
+    conn = connect(str(tmp_path / "balances.db"))
+    migrate(conn)
+    repo = Repository(conn)
+    repo.set_state("equity_state_mode", "live")
+
+    from tests.commands.test_balances import _config, _reading
+
+    repo.record_equity_point(_reading(BAL_NOW_TS - 3600, "live", "250.10"))
+    _record_cycle_balance(repo, BAL_NOW_TS - 3600, "live", available="250.10", total="300.00")
+
+    built = web_payload.balances_payload(
+        gather_balances(repo, _config(tmp_path), now_ts=BAL_NOW_TS)
+    )
+
+    assert built["settled_cash"]["value"] == "250.10"
+    assert built["total_cash"]["value"] == "300.00"
+    assert built["settled_breakdown"]["state"] != "unknown"
+
+
+def test_a_total_never_observed_reports_as_absent_all_the_way_to_the_payload(
+    tmp_path: Path,
+) -> None:
+    """NULL means NOT OBSERVED, never zero -- checked at the wire, not just at the report."""
+    conn = connect(str(tmp_path / "balances.db"))
+    migrate(conn)
+    repo = Repository(conn)
+    repo.set_state("equity_state_mode", "live")
+    _record_cycle_balance(repo, BAL_NOW_TS - 3600, "live", available="250.10", total=None)
+
+    from tests.commands.test_balances import _config
+
+    built = web_payload.balances_payload(
+        gather_balances(repo, _config(tmp_path), now_ts=BAL_NOW_TS)
+    )
+
+    assert built["settled_cash"]["value"] == "250.10"
+    assert built["total_cash"]["state"] == "unknown"
+    assert built["total_cash"]["value"] == ""
 
 
 def test_a_deployment_with_no_recorded_cycle_says_so(tmp_path: Path) -> None:

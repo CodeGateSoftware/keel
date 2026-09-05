@@ -4656,3 +4656,55 @@ class TestProvenanceCannotBlockAPlacement:
             est_quote_size = Decimal("NaN")
 
         assert provenance_of(_Nan()) == UNREADABLE
+
+
+class TestTheTwoBalanceReadersCannotDrift:
+    """`_fetch_available_quote` and `_fetch_quote_balance_pair` read the SAME venue endpoint the
+    same way, and #719 deliberately duplicated the second rather than refactor the first — because
+    the first is rail 13's input and its `None` contract decides whether an order is placed.
+
+    Duplication was the right trade. What it buys has to be paid for here: two functions that
+    answer one question can disagree, and if they do, the balance rail 13 gates on and the balance
+    a cycle RECORDS stop being the same number — a divergence nothing else in the system would
+    surface, because each looks self-consistent.
+
+    The codebase already names this failure: `screen.median_daily_quote_volume`'s docstring
+    refuses a second copy of one statistic because "a sweep that proposes an asset the screen then
+    rejects" is what drift looks like from the outside.
+    """
+
+    @staticmethod
+    def _brokers():
+        from keel_broker_api.results import Balance
+
+        class _Two:
+            def get_balances(self):
+                return [
+                    Balance(currency="USD", available=Decimal("250.10"), total=Decimal("300.00")),
+                    Balance(currency="EUR", available=Decimal("10"), total=Decimal("10")),
+                ]
+
+        class _Raising:
+            def get_balances(self):
+                raise RuntimeError("venue down")
+
+        class _Empty:
+            def get_balances(self):
+                return []
+
+        return _Two(), _Raising(), _Empty()
+
+    def test_both_report_the_same_available_for_every_case(self) -> None:
+        from keel.execution import executor
+
+        two, raising, empty = self._brokers()
+        cases = [
+            (two, "USD"), (two, "usd"), (two, "EUR"), (two, "GBP"),
+            (raising, "USD"), (empty, "USD"), (None, "USD"), (two, ""),
+        ]
+
+        for broker, currency in cases:
+            scalar = executor._fetch_available_quote(broker, currency)
+            paired, _total = executor._fetch_quote_balance_pair(broker, currency)
+            assert scalar == paired, f"drifted on {currency!r}: {scalar!r} vs {paired!r}"
+

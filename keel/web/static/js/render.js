@@ -1293,11 +1293,13 @@ function kindSwitch(current, kinds, onKind) {
  * would be this page's version of the close button the Positions view also does not have.
  * Pinned by `tests/web/test_balances_view.py`.
  *
- * ── THE SETTLED SPLIT IS NAMED AS MISSING, NOT OMITTED ───────────────────────────────────────
+ * ── THE SETTLED SPLIT IS NAMED AS MISSING WHEN IT IS, NOT OMITTED ────────────────────────────
  *
- * `settled_breakdown` is a field whose whole content is "unrecorded". Leaving the tiles out
- * would let a reader assume the available figure IS the settled one; saying so is the only
- * rendering that cannot be misread.
+ * `settled_breakdown` says whether `cycle_balances` (#719) has recorded the pair for this
+ * mode/currency yet -- it renders "unrecorded" until a live cycle has, and the venue's actual
+ * settled/total figures once one has. Leaving the tiles out before that would let a reader
+ * assume the available figure IS the settled one; saying so is the only rendering that cannot
+ * be misread either way.
  *
  * @param {any} data  `/api/balances`'s `data`.
  * @param {any} sort

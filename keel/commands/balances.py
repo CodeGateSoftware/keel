@@ -15,10 +15,21 @@ with when it read it. A fresher number the engine never saw would explain nothin
 did what it did.
 
 WHAT IS NOT RECORDED IS SAID, NOT GUESSED. `equity_points.cash` comes from
-`executor._fetch_available_quote`, which reads `Balance.available` and stops there; the venue's
-settled-versus-total pair is never written down. This report carries that absence explicitly
-rather than presenting the available figure under a label implying the distinction was checked
-(see `settled_breakdown_recorded`). When a cycle records the pair, this becomes a read.
+`agent._mark_to_market_parts`, which sums `Balance.available` across every currency in play (the
+no-FX bound that function documents) and stops there. The venue's settled-versus-total pair for
+ONE currency is a different table: `cycle_balances` (#719), written by the same live cycle under
+the same mode stamp. This report reads the newest `cycle_balances` row for `config.
+quote_currency` -- the account's settlement currency -- and says so plainly when no cycle has
+recorded one yet, rather than presenting the available figure under a label implying the
+distinction was checked (see `settled_breakdown_recorded`).
+
+WHY ONE CURRENCY, NOT A SUM. `settled_cash`/`total_cash` are SCALARS, but `cycle_balances` is
+PER CURRENCY. Summing every observed currency into one figure would add them 1:1 -- exactly the
+no-FX bound `agent._mark_to_market_parts` refuses to cross for `cash` above. Rather than repeat
+that mistake here, this report reads ONLY the settlement currency's own row (`config.
+quote_currency`); an account funding a second product in a different currency has that
+currency's own balance recorded in `cycle_balances` (queryable directly), just not folded into
+this page's scalar tiles.
 """
 
 from __future__ import annotations
@@ -103,12 +114,25 @@ class BalancesReport:
     #: the most confusing thing this page could show.
     paper_cash: Decimal | None
 
-    #: The venue's settled/total split. Both `None` and `settled_breakdown_recorded` False,
-    #: always, today -- see the module docstring. They are fields rather than an omission so the
-    #: page can SAY the distinction is unrecorded, and so that recording it later is a change to
-    #: the producer rather than to this shape.
+    #: The venue's settled (available) / total split for `config.quote_currency` ONLY -- the
+    #: settlement currency -- from the newest `cycle_balances` row for this mode and that
+    #: currency (#719). SCALARS reading a PER-CURRENCY table, deliberately narrowed to one
+    #: currency rather than summed across every one observed: `cash` above already states the
+    #: no-FX bound (`agent._mark_to_market_parts`) that summing here would repeat. An account
+    #: whose products settle in more than one currency has the others' splits recorded too, just
+    #: not folded into these two fields -- see the module docstring.
+    #:
+    #: `None` when no `cycle_balances` row exists yet for this mode/currency (see
+    #: `settled_breakdown_recorded`), and independently `None` per-field when a row exists but
+    #: that ONE leg was never observed (`cycle_balances.total`/`.available`'s own NULL
+    #: convention) -- never zero either way.
     settled_cash: Decimal | None
     total_cash: Decimal | None
+
+    #: Whether a `cycle_balances` row was recorded for this mode/currency at all -- distinct from
+    #: `settled_cash is None`/`total_cash is None`, which can each be absent even when this is
+    #: `True` (a row that observed one leg and not the other). Mirrors `has_recorded_cash`'s own
+    #: "was anything written" vs "is this particular figure known" split.
     settled_breakdown_recorded: bool
 
     assets: tuple[AssetBalanceRow, ...]
@@ -130,11 +154,19 @@ def gather_balances(repo: Repository, config: Config, *, now_ts: int) -> Balance
     mode = str(repo.get_state("equity_state_mode") or "")
 
     reading = None
+    balance = None
     if mode:
         recorded = repo.get_equity_points(mode=mode, limit=1)
         # `limit=1` keeps the MOST RECENT reading (`get_equity_points`' own contract), so this is
         # one row off an index rather than the whole series read to take its last element.
         reading = recorded[-1] if recorded else None
+
+        # Same `limit=1`-keeps-the-newest contract, narrowed to the SETTLEMENT currency (#719) --
+        # see the module docstring for why this reads one currency and not every one observed.
+        recorded_balances = repo.get_cycle_balances(
+            mode=mode, currency=config.quote_currency, limit=1
+        )
+        balance = recorded_balances[-1] if recorded_balances else None
 
     # `with_readiness=False`: this page shows quantity, mark and value and never the entry
     # gate, so computing one would be three of every four candle reads plus a rules read and
@@ -150,9 +182,9 @@ def gather_balances(repo: Repository, config: Config, *, now_ts: int) -> Balance
         hwm=None if reading is None else reading.hwm,
         has_recorded_cash=reading is not None,
         paper_cash=repo.get_state("paper_cash_usdc") if mode == "paper" else None,
-        settled_cash=None,
-        total_cash=None,
-        settled_breakdown_recorded=False,
+        settled_cash=None if balance is None else balance.available,
+        total_cash=None if balance is None else balance.total,
+        settled_breakdown_recorded=balance is not None,
         assets=_assets_from(positions.rows, positions.products),
     )
 

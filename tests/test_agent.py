@@ -1505,6 +1505,112 @@ def test_an_unreadable_equity_records_no_point(repo: Repository) -> None:
     assert repo.get_equity_points() == []
 
 
+# -- the persisted cycle_balances series (#719) --------------------------------------------------
+
+
+def test_a_live_cycle_writes_one_cycle_balance_row_per_currency(repo: Repository) -> None:
+    """The engine write site. `FakeBroker.get_balances()` funds both USD and USDC; configuring
+    `quote_currency=USDC` while `PRODUCT` (BTC-USD) settles in USD puts both currencies into the
+    same cycle's currency set (`agent._mark_to_market_parts`' own union), so a real live cycle
+    through `run_once` genuinely has two currencies to observe. Seeding an OPEN POSITION in
+    `PRODUCT` (rather than a live rule) puts it into the currency scan via `repo.held_products()`,
+    the same path `test_the_live_split_reconciles_against_...` and its neighbours use."""
+    _seed_open_position(repo, PRODUCT, Decimal("2"), Decimal("100"), ts=1_000)
+    series = {(PRODUCT, Granularity.ONE_DAY): [_candle(1_000 + i * 86_400) for i in range(30)]}
+    broker = FakeBroker(series=series)
+    now = 1_000 + 29 * 86_400
+
+    run_once(broker, repo, _config(quote_currency="USDC"), now_ts=now)
+
+    rows = {b.currency: b for b in repo.get_cycle_balances()}
+    assert set(rows) == {"USD", "USDC"}
+    assert rows["USD"].available == Decimal("1000000")
+    assert rows["USD"].total == Decimal("1000000")
+    assert rows["USDC"].available == Decimal("1000000")
+    assert rows["USDC"].total == Decimal("1000000")
+
+
+def test_the_cycle_balance_rows_carry_the_same_mode_stamp_as_the_equity_point(
+    repo: Repository,
+) -> None:
+    series = {(PRODUCT, Granularity.ONE_DAY): [_candle(1_000 + i * 86_400) for i in range(30)]}
+    broker = FakeBroker(series=series)
+    now = 1_000 + 29 * 86_400
+
+    run_once(broker, repo, _config(), now_ts=now)
+
+    point = repo.get_equity_points()[0]
+    balances = repo.get_cycle_balances()
+    assert balances, "the live cycle must have written at least one row"
+    assert all(b.mode == point.mode == "live" for b in balances)
+    assert all(b.ts == point.ts == now for b in balances)
+
+
+def test_a_paper_cycle_writes_no_cycle_balances(repo, monkeypatch) -> None:
+    """Paper has no venue balance to observe -- the paper branch never fetches one, so it must
+    never write one either."""
+    from keel.strategy.paper import PaperTrader
+
+    _seed_rule(repo, monkeypatch, _AlwaysEnterRule(PRODUCT), status="paper")
+    cfg = _paper_config(paper=PaperConfig(starting_equity_usd=Decimal("10000")))
+
+    trader = PaperTrader(repo)
+    trader.seed_cash(Decimal("10000"), now_ts=0)
+    repo.set_state("equity_state_mode", "paper")
+    trader.on_signal(
+        _paper_enter_signal(
+            product_id=PRODUCT, entry=Decimal("100"), stop=Decimal("50"), target=Decimal("200"),
+            ts=0,
+        ),
+        qty=Decimal("10"),
+    )
+
+    broker = _MarketDataOnlyBroker(
+        series={(PRODUCT, Granularity.ONE_DAY): [_candle(0, "100"), _candle(86_400, "120")]}
+    )
+    repo.set_state("kill_switch", False)
+    repo.set_state("last_feed_ts", 86_400)
+
+    run_once(broker, repo, cfg, now_ts=86_400)
+
+    assert repo.get_equity_points(), "the paper cycle must have recorded an equity point"
+    assert repo.get_cycle_balances() == []
+
+
+def test_a_currency_with_no_observed_total_carries_it_as_none_in_the_equity_parts(
+    repo: Repository,
+) -> None:
+    """`_mark_to_market_parts`' new `balances` field relays whatever the matched `Balance`
+    itself reports for each leg, `None` included -- it does not invent a number for a leg the
+    venue never populated."""
+
+    class _NoTotalBroker:
+        def get_balances(self) -> list[Balance]:
+            return [Balance(currency="USDC", available=Decimal("500"), total=None)]  # type: ignore[arg-type]
+
+    parts = agent._mark_to_market_parts(repo, _NoTotalBroker(), ["BTC-USD"], {}, "USDC")
+
+    assert parts is not None
+    by_currency = {c: (a, t) for c, a, t in parts.balances}
+    assert by_currency["USDC"] == (Decimal("500"), None)
+
+
+def test_the_equity_parts_carry_one_balance_entry_per_currency_in_play(repo: Repository) -> None:
+    class TwoCurrencyBroker:
+        def get_balances(self) -> list[Balance]:
+            return [
+                Balance(currency="USD", available=Decimal("1000"), total=Decimal("1000")),
+                Balance(currency="USDC", available=Decimal("7"), total=Decimal("9")),
+            ]
+
+    parts = agent._mark_to_market_parts(repo, TwoCurrencyBroker(), ["BTC-USD"], {}, "USDC")
+
+    assert parts is not None
+    by_currency = {c: (a, t) for c, a, t in parts.balances}
+    assert by_currency["USD"] == (Decimal("1000"), Decimal("1000"))
+    assert by_currency["USDC"] == (Decimal("7"), Decimal("9"))
+
+
 # -- rail 11: equity must be valued from the ORDERS LOG, not from position_rule ----------------
 
 
