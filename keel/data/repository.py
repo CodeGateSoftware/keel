@@ -58,6 +58,13 @@ _ORDER_COLUMNS = (
     # preview at all).
     "submit_best_bid",
     "submit_best_ask",
+    # WHERE this order's price came from (v20, #715), one of `keel_core.quote_provenance`'s four
+    # tokens -- NOT money, so it is deliberately absent from `_ORDER_MONEY_FIELDS` below. NULL is
+    # "not recorded": every paper row (no venue preview at all) and every row written before v20.
+    "quote_provenance",
+    # The id the adapter actually SENT the venue for this order (v20, #715), from
+    # `PlaceResult.client_order_id` -- also not money. NULL when an adapter never populated it.
+    "client_order_id",
     "raw_response",
     "confirmation",
     "rule_id",

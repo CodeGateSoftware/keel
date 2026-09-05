@@ -86,18 +86,27 @@ _SCHEMA_STATEMENTS: tuple[str, ...] = (
         -- linkage direction that exists.
         submit_best_bid TEXT,
         submit_best_ask TEXT,
-        -- How the price on THIS order was arrived at (v20, #715) -- e.g. "mid", "last_trade",
-        -- "limit_input", whatever label the caller that priced it used. Schema only: nothing in
-        -- this release writes it or reads it back. NULL on every row written before v20, and
-        -- forever on a row nobody ever labelled -- "not recorded", never a guessed provenance
-        -- invented after the fact from `limit_price` or `submit_best_bid`/`submit_best_ask`.
+        -- How the price on THIS order was arrived at (v20, #715):
+        -- one of `keel_core.quote_provenance`'s four tokens, written by
+        -- `executor._order_row` from the same `Preview` the confirmation gate reads (#715).
+        -- A property of the PREVIEW, so it is recorded in autonomous mode too.
+        --
+        -- NULL on every row written before v20, and on every `mode='paper'` row: paper fills
+        -- synthetically with no venue preview at all, and a fabricated provenance sharing a
+        -- column with a real one would poison the measurement this column exists for -- the
+        -- same posture `submit_best_bid`/`submit_best_ask` take above. Never a provenance
+        -- inferred after the fact from `limit_price` or the submit book.
         quote_provenance TEXT,
         -- The id the adapter actually SENT the venue for this order (v20, #715), as distinct
         -- from `id` (this table's own PK) and from a broker-returned `raw_response`/
         -- `confirmation` id that only exists after acceptance. `resolve_client_order_id`
-        -- (`keel_broker_api.port`) already mints one per placement attempt; this column is
-        -- schema only -- nothing here persists that value yet. NULL on every row written before
-        -- v20, and on every row whose adapter call this database never captured.
+        -- (`keel_broker_api.port`) mints one per placement attempt, and since #715 `PlaceResult`
+        -- reports the id the adapter ACTUALLY sent so the executor can write it here.
+        --
+        -- Recording only: nothing passes `idempotency_key` into `place_order`, because a
+        -- per-attempt id is a deliberate default and changing it would change venue-side
+        -- deduplication -- a behaviour change wearing a recording change's clothes. NULL on
+        -- every row written before v20, and on every row whose adapter reported no id.
         client_order_id TEXT,
         raw_response TEXT,
         confirmation TEXT,
@@ -947,11 +956,15 @@ def _migrate_v20_provenance_and_attest_windows(conn: sqlite3.Connection) -> None
     #715 (the two order columns), #718 (the two windows), #719 (`cycle_balances`) and #721
     (`audit_events`), batched into one bump so a database is atomically v19 or v20.
 
-    SCHEMA ONLY. Nothing in this release writes any of the four new columns, and nothing reads
-    them back -- this migration exists to make the columns and tables available, not to change
-    what any existing writer or rail does. See the DDL comments beside each column in
-    `_SCHEMA_STATEMENTS` for what each one is for and why `audit_events.ts` is INTEGER rather
-    than the `TEXT` #721's own comment specifies.
+    SCHEMA ONLY AS SHIPPED: this migration makes the columns and tables available and changes
+    nothing any existing writer or rail does. The writers arrive in follow-up work, issue by
+    issue -- #715's two order columns are written by `executor._order_row` and the placement
+    `update_order` as of that PR; `attest_due_ts`, `cycle_balances` and `audit_events` still
+    have none, and `commands/balances.py` and `commands/timeline.py` go on reporting their
+    fields as unrecorded until they do.
+
+    See the DDL comments beside each column in `_SCHEMA_STATEMENTS` for what each one is for,
+    and why `audit_events.ts` is INTEGER rather than the `TEXT` #721's own comment specifies.
 
     `cycle_balances` and `audit_events` are brand new, so their creation is a genuine no-op here
     -- the `_migrate_v9_screen_exceptions`/`_migrate_v19_equity_points` pattern: `migrate()` runs

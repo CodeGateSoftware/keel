@@ -211,6 +211,39 @@ def test_update_order_updates_fields_and_round_trips_decimal(repo):
     assert stored["qty"] == Decimal("0.5")
 
 
+def test_insert_order_round_trips_quote_provenance_and_client_order_id(repo):
+    """#715: both are plain TEXT, not money -- round-tripped verbatim, unlike `qty`/`fee`/etc
+    which go through `_dec_to_text`/`_text_to_dec`. NULL (the `_order()` default) is "not
+    recorded", never a guessed value."""
+    order_id = repo.insert_order(
+        _order(quote_provenance="venue_quoted", client_order_id="coid-xyz")
+    )
+
+    stored = repo.get_order(order_id)
+    assert stored["quote_provenance"] == "venue_quoted"
+    assert stored["client_order_id"] == "coid-xyz"
+
+
+def test_insert_order_defaults_quote_provenance_and_client_order_id_to_null(repo):
+    order_id = repo.insert_order(_order())
+
+    stored = repo.get_order(order_id)
+    assert stored["quote_provenance"] is None
+    assert stored["client_order_id"] is None
+
+
+def test_update_order_round_trips_quote_provenance_and_client_order_id(repo):
+    order_id = repo.insert_order(_order())
+
+    repo.update_order(
+        order_id, quote_provenance="synthetic_estimate", client_order_id="coid-updated"
+    )
+
+    stored = repo.get_order(order_id)
+    assert stored["quote_provenance"] == "synthetic_estimate"
+    assert stored["client_order_id"] == "coid-updated"
+
+
 # -- agent_state -------------------------------------------------------------
 
 

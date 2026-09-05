@@ -1061,7 +1061,8 @@ class RobinhoodAdapter:
         sized = self._preflight(spec, symbol)
         if isinstance(sized, PlaceResult):
             return sized
-        body = to_order_body(sized, client_order_id=resolve_client_order_id(idempotency_key))
+        client_order_id = resolve_client_order_id(idempotency_key)
+        body = to_order_body(sized, client_order_id=client_order_id)
         try:
             response = self._require_transport().create_order(body)
         except Exception as exc:
@@ -1081,6 +1082,7 @@ class RobinhoodAdapter:
                 success=False,
                 broker_order_id=None,
                 reason="robinhood accepted the request but returned no order id",
+                client_order_id=client_order_id,
             )
         state = str(_field(response, "state", "") or "")
         if state in _REJECTED_PLACEMENT_STATES:
@@ -1095,8 +1097,11 @@ class RobinhoodAdapter:
                     f"robinhood returned order {order_id} in state {state!r}: the venue rejected "
                     f"this order, so it is not resting and must not be recorded as placed"
                 ),
+                client_order_id=client_order_id,
             )
-        return PlaceResult(success=True, broker_order_id=str(order_id))
+        return PlaceResult(
+            success=True, broker_order_id=str(order_id), client_order_id=client_order_id
+        )
 
     def get_fee_summary(self) -> FeeSummary:
         """Map v2's `fee_tier_status` to a `FeeSummary`, with `fees_usd` summed from order history.

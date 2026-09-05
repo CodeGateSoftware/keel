@@ -23,6 +23,7 @@ import pytest
 from keel_broker_api.orders import BracketGTC, LimitGTC, OrderSpec
 from keel_broker_api.port import TradeScopeDenied
 from keel_broker_api.results import Balance, OrderStatus, PlaceResult, Preview
+from keel_core.quote_provenance import SYNTHETIC_ESTIMATE, UNPRICED, UNREADABLE, VENUE_QUOTED
 from keel_core.subscription import SubscriptionStatus
 from keel_core.telemetry import bind_venue, unbind_venue
 from keel_core.trade_scope import READ_ONLY, TRADING, TradeScopeState
@@ -4444,3 +4445,214 @@ class TestBookAtSubmit:
         assert order["status"] == "rejected"
         assert order["submit_best_bid"] == Decimal("49990")
         assert order["submit_best_ask"] == Decimal("50000")
+
+
+# -- #715: quote_provenance -- WHERE the price on this order came from --------------------------
+
+
+class TestQuoteProvenance:
+    """`_order_row` records `quote_provenance` (#715) from the SAME preview that already drives
+    `submit_best_bid`/`submit_best_ask` above -- a property of the PREVIEW, not of the confirm
+    gate, so it is recorded in `mode="autonomous"` exactly like every test below runs.
+    `tests/test_confirm_gate.py::test_the_recorded_token_and_the_rendered_banner_correspond` pins
+    the token against the banner a human would have read at the confirm gate for the same
+    preview, so the two cannot silently disagree.
+    """
+
+    def test_a_venue_quoted_preview_records_venue_quoted(self, repo) -> None:
+        broker = FakeBroker(
+            preview={
+                **_book_preview(Decimal("49990"), Decimal("50000")),
+                "base_size": "0.002",
+                "quote_size": "100",
+            }
+        )
+
+        result = execute(_enter_signal(), broker, repo, _config(), "autonomous", now_ts=NOW_TS)
+
+        assert result.placed is True
+        order = repo.get_order(result.order_id)
+        assert order["quote_provenance"] == VENUE_QUOTED
+
+    def test_a_synthetic_preview_records_synthetic_estimate(self, repo) -> None:
+        broker = FakeBroker(preview=_book_preview(Decimal("49990"), Decimal("50000")))
+        synthetic_preview = Preview(
+            product_id="BTC-USD",
+            side=Side.BUY,
+            est_base_size=Decimal("0.002"),
+            est_quote_size=Decimal("100"),
+            est_fee=Decimal("0.30"),
+            synthetic=True,
+            detail={"best_bid": "49990", "best_ask": "50000"},
+        )
+        broker.preview_order = lambda *a, **k: synthetic_preview  # type: ignore[method-assign]
+
+        result = execute(_enter_signal(), broker, repo, _config(), "autonomous", now_ts=NOW_TS)
+
+        assert result.placed is True
+        order = repo.get_order(result.order_id)
+        assert order["quote_provenance"] == SYNTHETIC_ESTIMATE
+
+    def test_an_unpriced_preview_records_unpriced(self, repo) -> None:
+        """The default `_book_preview` carries no `base_size`/`quote_size` -- exactly the shape
+        most of this module's fakes already use, and exactly what an unpriced preview is: a
+        readable, non-synthetic preview whose size could not be determined."""
+        broker = FakeBroker(preview=_book_preview(Decimal("49990"), Decimal("50000")))
+
+        result = execute(_enter_signal(), broker, repo, _config(), "autonomous", now_ts=NOW_TS)
+
+        assert result.placed is True
+        order = repo.get_order(result.order_id)
+        assert order["quote_provenance"] == UNPRICED
+
+    def test_an_unreadable_preview_records_unreadable(self, repo) -> None:
+        """Exercised at `_order_row` directly, not through `execute()`: every broker the `Broker`
+        protocol admits answers `preview_order` with a real `Preview` (`confirm.py`'s own
+        docstring makes the same point -- the dict shape is a pre-port relic nothing on the live
+        path produces anymore), so `execute()` never actually hands `_order_row` anything other
+        than a `Preview`. `_order_row`'s own signature still types `preview` as `Preview | None`,
+        and `provenance_of` must still answer something sane for that case -- this pins it
+        directly, the same isolation `test_build_intent_uses_equity_override` above uses for
+        other private helpers.
+        """
+        from keel.execution import executor
+
+        intent = executor._build_intent(_enter_signal(), None, repo, _config(), now_ts=NOW_TS)
+        assert intent is not None
+
+        row = executor._order_row(intent, "autonomous", NOW_TS, preview=None)
+
+        assert row["quote_provenance"] == UNREADABLE
+
+    def test_a_paper_order_records_no_provenance(self, repo) -> None:
+        """Paper has no venue preview at all (`keel.strategy.paper` builds its own row and never
+        calls `_order_row`) -- NULL, never a guessed provenance, the same posture
+        `submit_best_bid` already takes for paper rows."""
+        order_id = repo.insert_order(
+            {
+                "mode": "paper",
+                "product_id": "BTC-USD",
+                "side": "BUY",
+                "order_type": "market",
+                "qty": Decimal("0.001"),
+                "limit_price": Decimal("50000"),
+                "status": "filled",
+                "fee": Decimal("0.03"),
+                "expected_fill": Decimal("50000"),
+                "actual_fill": Decimal("50000"),
+                "raw_response": "{}",
+                "confirmation": "paper",
+                "rule_id": None,
+                "created_at": NOW_TS,
+                "updated_at": NOW_TS,
+            }
+        )
+
+        order = repo.get_order(order_id)
+        assert order["quote_provenance"] is None
+
+
+# -- #715: client_order_id -- the id the adapter actually SENT the venue ------------------------
+
+
+class TestClientOrderId:
+    """`PlaceResult.client_order_id` (#715) round-trips into `orders.client_order_id` through the
+    `repo.update_order` call that follows placement -- the id `resolve_client_order_id` minted for
+    THIS attempt, not a fresh value invented afterwards.
+    """
+
+    def test_the_placed_client_order_id_is_recorded(self, repo) -> None:
+        class _Broker(FakeBroker):
+            def place_order(self, spec, *, idempotency_key=None):  # noqa: ANN001, ANN202
+                self.place_calls.append({"spec": spec})
+                return PlaceResult(
+                    success=True, broker_order_id="venue-1", client_order_id="coid-abc-123"
+                )
+
+        result = execute(_enter_signal(), _Broker(), repo, _config(), "autonomous", now_ts=NOW_TS)
+
+        assert result.placed is True
+        order = repo.get_order(result.order_id)
+        assert order["client_order_id"] == "coid-abc-123"
+
+    def test_a_rejected_placement_still_records_the_client_order_id(self, repo) -> None:
+        """The id was still sent to the venue even though the venue refused the order -- the
+        column records what was SENT, not what succeeded."""
+
+        class _Broker(FakeBroker):
+            def place_order(self, spec, *, idempotency_key=None):  # noqa: ANN001, ANN202
+                self.place_calls.append({"spec": spec})
+                return PlaceResult(
+                    success=False,
+                    broker_order_id=None,
+                    reason="no funds",
+                    client_order_id="coid-rejected-1",
+                )
+
+        result = execute(_enter_signal(), _Broker(), repo, _config(), "autonomous", now_ts=NOW_TS)
+
+        assert result.placed is False
+        order = repo.get_order(result.order_id)
+        assert order["client_order_id"] == "coid-rejected-1"
+
+    def test_an_adapter_that_reports_no_client_order_id_stores_null_not_empty_string(
+        self, repo
+    ) -> None:
+        """`PlaceResult.client_order_id` defaults to `None` -- an adapter that never populates it
+        must round-trip to NULL, never `''`, which this repository's convention reserves for "not
+        recorded" and nothing else."""
+        broker = FakeBroker()
+        result = execute(_enter_signal(), broker, repo, _config(), "autonomous", now_ts=NOW_TS)
+
+        assert result.placed is True
+        order = repo.get_order(result.order_id)
+        assert order["client_order_id"] is None
+
+
+class TestProvenanceCannotBlockAPlacement:
+    """`_order_row` runs BEFORE `broker.place_order`, so anything raising in it aborts an order
+    that would otherwise have gone through.
+
+    `_submit_book` states the rule thirty lines away: "a DIAGNOSTIC column must never be able to
+    decide whether an order is placed." `provenance_of` is defensive too -- it maps an
+    incomparable size to `unreadable` rather than raising -- but a classifier is not the last
+    line here: this test uses a preview whose attribute access itself explodes, which no amount
+    of care inside `provenance_of` can catch, and which the wrapper must.
+    """
+
+    def test_a_preview_whose_fields_raise_records_nothing_and_builds_the_row_anyway(
+        self, repo
+    ) -> None:
+        """Through `_order_row`, not through the helper: the guard has to be AT THE CALL SITE to
+        be worth anything, and a test that called `_safe_provenance` directly passed just as well
+        with the call site left unguarded."""
+        from keel.execution import executor as executor_mod
+
+        class _Exploding:
+            synthetic = False
+            est_quote_size = Decimal("100")
+
+            @property
+            def est_base_size(self):  # type: ignore[no-untyped-def]
+                raise RuntimeError("this venue's preview object is broken")
+
+        intent = executor_mod._build_intent(
+            _enter_signal(), None, repo, _config(), now_ts=NOW_TS
+        )
+        assert intent is not None
+
+        row = executor_mod._order_row(intent, "autonomous", NOW_TS, preview=_Exploding())
+
+        assert row["quote_provenance"] is None
+
+    def test_a_non_finite_size_is_unreadable_rather_than_an_exception(self) -> None:
+        """`Decimal("NaN") <= 0` raises `InvalidOperation`. A venue that returns a NaN size must
+        not be able to stop a placement with it."""
+        from keel_core.quote_provenance import UNREADABLE, provenance_of
+
+        class _Nan:
+            synthetic = False
+            est_base_size = Decimal("NaN")
+            est_quote_size = Decimal("NaN")
+
+        assert provenance_of(_Nan()) == UNREADABLE

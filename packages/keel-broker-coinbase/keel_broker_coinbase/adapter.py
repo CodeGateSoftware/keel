@@ -350,9 +350,10 @@ class CoinbaseAdapter:
         default for the reasons `resolve_client_order_id` sets out.
         """
         self._reject_unsupported(spec)
+        client_order_id = resolve_client_order_id(idempotency_key)
         try:
             response = self._require_transport().create_order(
-                client_order_id=resolve_client_order_id(idempotency_key),
+                client_order_id=client_order_id,
                 product_id=spec.product_id,
                 side=spec.side.value,
                 order_configuration=to_order_configuration(spec),
@@ -373,10 +374,13 @@ class CoinbaseAdapter:
             return PlaceResult(
                 success=True,
                 broker_order_id=_field(success_response, "order_id"),
+                client_order_id=client_order_id,
             )
         error_response = _field(response, "error_response") or {}
         reason = _field(error_response, "message") or _field(error_response, "error")
-        return PlaceResult(success=False, broker_order_id=None, reason=reason)
+        return PlaceResult(
+            success=False, broker_order_id=None, reason=reason, client_order_id=client_order_id
+        )
 
     def verify_cash_account(self) -> None:
         """Refuse an account with derivative capability. **Refutes only; never proves (#666).**

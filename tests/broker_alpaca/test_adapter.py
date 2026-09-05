@@ -1182,3 +1182,44 @@ def test_declares_no_credential_defect_hook() -> None:
     no locally-provable shape worth checking, so the readiness derivation reads the
     `getattr(..., None)` default here rather than a stub."""
     assert getattr(AlpacaAdapter, "credential_defect", None) is None
+
+
+# -- #715: the id we sent must come back with the result ----------------------------------------
+#
+# Alpaca is one of only two venues in `brokers.WIRED_FOR_DEPLOYMENT`, and it was the adapter this
+# feature's first pass missed -- it minted and SENT a `client_order_id` while every `PlaceResult`
+# it returned omitted one, so every Alpaca order would have recorded NULL under a DDL comment
+# reading "NULL on every row whose adapter reported no id". A miss that reads as an honest
+# absence is the exact failure #715 exists to prevent, so all four return paths are pinned.
+
+
+def test_a_placement_reports_the_client_order_id_it_actually_sent() -> None:
+    """The id reported must be the id TRANSMITTED, not a second one minted for the report: a
+    plausible-but-wrong id would be reconciled against the venue and never match, which is worse
+    than NULL."""
+    transport = _full_transport()
+    adapter = AlpacaAdapter(transport)
+
+    result = adapter.place_order(
+        MarketIOCByQuote(product_id=_PRODUCT, side=Side.BUY, quote_size=Decimal("100"))
+    )
+
+    assert result.success is True
+    assert result.client_order_id == transport.create_order_bodies[0]["client_order_id"]
+
+
+def test_a_venue_refusal_still_reports_the_id_it_sent() -> None:
+    """A rejection is exactly when an operator most needs to know what went to the venue."""
+    transport = _RejectingCreateTransport(
+        AlpacaAPIError(403, "insufficient buying power"),
+        placed=load_fixture("alpaca_order_placed.json"),
+    )
+    adapter = AlpacaAdapter(transport)
+
+    result = adapter.place_order(
+        MarketIOCByQuote(product_id=_PRODUCT, side=Side.BUY, quote_size=Decimal("100"))
+    )
+
+    assert result.success is False
+    assert result.client_order_id is not None
+    assert result.client_order_id == transport.calls["create_order"]["body"]["client_order_id"]

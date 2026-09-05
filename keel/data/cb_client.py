@@ -313,8 +313,9 @@ class CoinbaseClient:
         before the parameter existed and remains the default. Two identical orders a strategy
         genuinely meant to place are two orders.
         """
+        client_order_id = idempotency_key or str(uuid.uuid4())
         response = self._transport.create_order(
-            client_order_id=idempotency_key or str(uuid.uuid4()),
+            client_order_id=client_order_id,
             product_id=spec.product_id,
             side=spec.side.value,
             order_configuration=to_order_configuration(spec),
@@ -332,6 +333,7 @@ class CoinbaseClient:
                 or _field(error_response, "error")
                 or "the venue refused the order without stating a reason"
             ),
+            client_order_id=client_order_id,
         )
 
     def get_order(self, order_id: str) -> OrderStatus:

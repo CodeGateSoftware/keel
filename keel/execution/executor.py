@@ -123,6 +123,7 @@ from keel_broker_api.results import (
 )
 from keel_core.credential_identity import current_credential_fingerprint
 from keel_core.products import parse_spot_product_id, quote_currency_of
+from keel_core.quote_provenance import provenance_of
 from keel_core.telemetry import current_venue, log_event, log_exception, log_venue_failure
 from keel_core.trade_scope import TradeScopeState, VenueTradeScope
 
@@ -1058,6 +1059,12 @@ def _run_order(
         # the id was dug out of that blob afterwards. `PlaceResult.broker_order_id` names it
         # directly, so the column now stores the one field anything ever read from it.
         raw_response=json.dumps({"order_id": place_result.broker_order_id}),
+        # #715: the id the adapter actually SENT the venue for this attempt (`PlaceResult`'s own
+        # docstring names the distinction from `broker_order_id` above), recorded whether or not
+        # the venue accepted the order -- see `status`/`success` above, computed before this call
+        # and unaffected by it. `None` when the adapter never populated it, never a guessed or
+        # empty-string value.
+        client_order_id=place_result.client_order_id,
         updated_at=now_ts,
     )
 
@@ -1415,6 +1422,27 @@ def _submit_book(preview: Preview | None) -> tuple[Decimal | None, Decimal | Non
         return None, None
 
 
+def _safe_provenance(preview: Preview | None) -> str | None:
+    """`provenance_of(preview)`, wrapped so it can never decide whether an order is placed.
+
+    `_order_row` runs BEFORE `broker.place_order`, so anything that raises here aborts a
+    placement that would otherwise have gone through. `provenance_of` compares a venue-supplied
+    size against zero, and `Decimal("NaN") <= 0` raises `InvalidOperation` -- so a single
+    malformed field in a preview could have stopped a live entry.
+
+    The rule is `_submit_book`'s, thirty lines up, and it is quoted rather than re-derived:
+    "a DIAGNOSTIC column must never be able to decide whether an order is placed." `None` is the
+    same "not recorded" this column already means for every paper row, and the failure is logged
+    rather than swallowed, because a preview shape that stopped being classifiable is a venue
+    change an operator needs to see.
+    """
+    try:
+        return provenance_of(preview)
+    except Exception:
+        log_exception(logger, "executor.quote_provenance_unreadable")
+        return None
+
+
 def _warn_if_market_routing_overrides_entry(
     intent: OrderIntent,
     preview: Preview | None,
@@ -1691,6 +1719,13 @@ def _order_row(
         # column comment in `data/db.py` for why a derivation would be the lossy choice.
         submit_best_bid=submit_best_bid,
         submit_best_ask=submit_best_ask,
+        # #715: WHERE this order's price came from, classified off the same `preview` above --
+        # `provenance_of` is pure and lives in `keel_core` precisely so this module can call it
+        # without importing `keel.commands.confirm` (which pulls in `click`). A property of the
+        # PREVIEW, not of the confirm gate, so it is written here regardless of `mode` -- an
+        # autonomous order gets exactly the same classification a confirm-gate banner would have
+        # shown for it. `tests/test_confirm_gate.py` pins the two against each other.
+        quote_provenance=_safe_provenance(preview),
         raw_response=None,
         # NOTE: rows written before 2026-07-21 carry `confirmation='bypass'` for what is now
         # called `'autonomous'`. Nothing reads this column back -- it is an audit trail only --
