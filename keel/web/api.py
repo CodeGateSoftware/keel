@@ -360,6 +360,31 @@ def read_balances(cfg: ServeConfig, _query: Query, _state: Any, now_ts: int) -> 
     return payload.balances_payload(report)
 
 
+def read_slippage(cfg: ServeConfig, _query: Query, _state: Any, now_ts: int) -> dict[str, Any]:
+    """What a fill is assumed to cost, per product (#708, view 4).
+
+    **No network, and here the temptation is a live order book.** A slippage page is the obvious
+    place to ask the venue what the spread is right now -- and that is precisely the data keel
+    does not have and does not claim: `slippage_for_quote_volume` is an assumption scaled from
+    cached candle volume, and the honest page is the one that says so rather than the one that
+    goes and looks. `keel serve` is a loopback reader over SQLite on every route, this one
+    included.
+
+    One `get_candles(product, ONE_DAY)` per configured product. Bounded by the allowlist, which
+    is why there is no `?limit=`: a cap here would hide the very asset an operator came to check,
+    and the universe is a config file's worth of rows, not a table scan.
+    """
+    from keel.commands.slippage import gather_slippage
+
+    repo = open_repo(cfg.db_path)
+    try:
+        config = load_config(cfg.config_path)
+        report = gather_slippage(repo, config, now_ts=now_ts)
+    finally:
+        close_repo(repo)
+    return payload.slippage_payload(report)
+
+
 def _ledger_path(cfg: ServeConfig) -> Path:
     """Where this process should look for the trials ledger.
 
@@ -806,6 +831,15 @@ API_ROUTES: dict[str, ApiRoute] = {
         # `profit_factor`, and at that point the research record is a leaderboard -- which turns
         # a record of what was TRIED into an argument for what to TRADE, the exact reversal the
         # trials ledger exists to prevent. See `keel/commands/research_record.py` on the rail.
+        collection="",
+        sortable=(),
+    ),
+    "/api/research/slippage": ApiRoute(
+        html_route="/research",
+        read=read_slippage,
+        # Same empty sort surface as its sibling. A cost table ordered cheapest-first reads as a
+        # shortlist of what to trade, and `/research` is under the Strathern rail end to end --
+        # `keel/commands/slippage.py` records why alphabetical is the order.
         collection="",
         sortable=(),
     ),

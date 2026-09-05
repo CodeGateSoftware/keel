@@ -1327,10 +1327,11 @@ function kindSwitch(current, kinds, onKind) {
  * whose entire argument is that selection happened under a discipline must not put the selection
  * behind a control on the same screen.
  *
- * @param {any} data  the `/api/research/trials` payload.
+ * @param {any} data      the `/api/research/trials` payload.
+ * @param {any} slippage  the `/api/research/slippage` payload, or `null` if that read failed.
  * @returns {DocumentFragment}
  */
-export function researchView(data) {
+export function researchView(data, slippage) {
   const fragment = document.createDocumentFragment();
   fragment.append(el("h1", undefined, "Research"));
 
@@ -1425,6 +1426,97 @@ export function researchView(data) {
       // is a false statement about a deployment that simply has not run anything yet. Choosing
       // between them is a judgement, and judgements are made in Python (Rule 2).
       plain(data.empty_note),
+    ),
+  );
+
+  fragment.append(slippageSection(slippage));
+
+  return fragment;
+}
+
+
+/**
+ * The Slippage Universe (#708, view 4), as a section of the Research page.
+ *
+ * A SECTION and not a route of its own, following `insightsView`'s precedent: one client route
+ * whose two endpoints are read concurrently and rendered under one page. Tabs become worth
+ * building when there are four of these; two under headings is navigable and needs no sub-router
+ * that `staticfiles.CLIENT_ROUTES` would then have to learn about.
+ *
+ * `null` when the read failed -- `mount` leaves the primary view standing when a SECONDARY
+ * endpoint errors, so this says the section is missing rather than taking the trials table down
+ * with it.
+ *
+ * ── EVERY NUMBER IN HERE IS AN ASSUMPTION ────────────────────────────────────────────────────
+ *
+ * The `basis` field says so and is rendered first, before any rate. keel stores no order books
+ * and no realised spreads; these figures are scaled from cached candle volume. #708's own scope
+ * note calls them "measured", which is the mistake this section is written not to repeat.
+ *
+ * @param {any} slippage  the `/api/research/slippage` payload, or `null`.
+ * @returns {DocumentFragment}
+ */
+function slippageSection(slippage) {
+  const fragment = document.createDocumentFragment();
+  fragment.append(heading("h-slippage", "What a fill is assumed to cost"));
+
+  if (!slippage) {
+    fragment.append(note("The slippage figures could not be read for this deployment."));
+    return fragment;
+  }
+
+  const basis = el("p", "note");
+  basis.append(field(slippage.basis));
+  fragment.append(basis);
+
+  fragment.append(
+    gridCard([
+      kv("products", slippage.product_count),
+      kv("priced from cached candles", slippage.priced_count),
+      kv("reaching the floor", slippage.at_floor_count),
+      kv("at the cap", slippage.capped_count),
+      kv("no liquidity statistic", slippage.fallback_count),
+    ]),
+  );
+
+  fragment.append(
+    note(
+      "Every experiment document in this repository prices its fills at the floor rate. ".concat(
+        "The count above is how many products actually reach it.",
+      ),
+    ),
+  );
+
+  fragment.append(
+    gridCard([
+      kv("floor", slippage.floor_bp),
+      kv("cap", slippage.cap_bp),
+      kv("anchor volume", slippage.anchor_quote_volume),
+    ]),
+  );
+
+  fragment.append(
+    table(
+      "h-slippage",
+      [
+        { label: "product", numeric: false },
+        { label: "assumed bp per leg", numeric: true },
+        { label: "vs floor", numeric: true },
+        { label: "median daily quote volume", numeric: true },
+        { label: "daily bars", numeric: true },
+        { label: "priced from", numeric: false },
+        { label: "cap", numeric: false },
+      ],
+      (slippage.rows || []).map(/** @param {any} row */ (row) => [
+        plain(row.product_id) || "—",
+        row.slippage_bp,
+        row.floor_multiple,
+        row.median_daily_quote_volume,
+        row.bars,
+        row.priced_from,
+        row.capped,
+      ]),
+      "No products configured — this deployment has an empty allowlist.",
     ),
   );
 

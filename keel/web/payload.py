@@ -136,6 +136,7 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
     from keel.commands.orders import OrderRow, OrdersReport
     from keel.commands.positions import PositionRow, PositionsReport
     from keel.commands.research_record import RuleExploration, TrialRow, TrialsReport
+    from keel.commands.slippage import SlippageReport, SlippageRow
     from keel.commands.status import (
         AutonomyStatus,
         MarketSessionStatus,
@@ -2047,6 +2048,88 @@ def trials_payload(report: TrialsReport) -> dict[str, Any]:
         "rules": [str(rule) for rule in report.rules],
         "exploration": [_exploration_payload(row) for row in report.exploration],
         "rows": [_trial_row_payload(row) for row in report.rows],
+    }
+
+
+# -- what a fill is assumed to cost (#708, view 4) -------------------------------------------------
+
+
+def _slippage_row_payload(row: SlippageRow) -> dict[str, Any]:
+    """One product's assumed per-leg cost, placed.
+
+    `slippage_bp` arrives already in basis points -- `keel/commands/slippage.py` does that
+    conversion, because `ratio`'s docstring above refuses the identical rescale here.
+
+    Both flags are `flag`s and both are WARN when set, which needs saying because it looks
+    asymmetric next to the rest of this file: neither means an error. Both mean the number shown
+    is understated in the FLATTERING direction -- a fallback row got the model's cheapest rate for
+    having no evidence, and a capped row hit the bound before its own liquidity was allowed to
+    decide. A reader skimming a cost table for the big numbers is exactly the reader those two
+    rows are hiding from.
+    """
+    return {
+        "product_id": row.product_id,
+        "slippage_bp": ratio(row.slippage_bp, places=1),
+        "median_daily_quote_volume": money(row.median_daily_quote_volume),
+        # ABSENT on a fallback row, never `1.0x`: the rate is the floor, but a multiple in that
+        # cell would read "as cheap as the most liquid asset in the corpus" about an asset with
+        # no cached history at all.
+        "floor_multiple": ratio(row.floor_multiple, places=1),
+        "bars": count(row.bars),
+        "priced_from": flag(
+            row.fallback,
+            on="no cached liquidity — flat floor rate applied",
+            off="this product's own cached liquidity",
+            on_state=WARN,
+            off_state=NEUTRAL,
+        ),
+        "capped": flag(
+            row.capped,
+            on="at the model's thin-end cap — a lower bound on the real cost",
+            off="within the model's bounds",
+            on_state=WARN,
+            off_state=NEUTRAL,
+        ),
+    }
+
+
+def slippage_payload(report: SlippageReport) -> dict[str, Any]:
+    """`gather_slippage`'s `SlippageReport`, as JSON (#708).
+
+    **`basis` is not decoration and must not be dropped.** Every figure on this page is an
+    ASSUMPTION scaled from a liquidity proxy, because keel stores no book snapshots and no
+    realised spreads -- `slippage_for_quote_volume` says so in its first line, and #708's own
+    scope note gets it wrong by calling these figures "measured". A cost table read as a
+    measurement is a page inventing evidence, so the correction crosses as a field rather than
+    living in a comment nobody ships.
+
+    The floor, cap and anchor cross for the reason `sim/report.py` states about its own table:
+    "a number whose assumptions cannot be recovered is not evidence". Everything needed to
+    recompute any row is on the page.
+
+    Every count comes off the report (Rule 6e bans `len()` here), including `at_floor_count`,
+    whose exclusion of fallback rows is the honesty of the headline -- see the report property.
+    """
+    return {
+        "as_of": iso(report.now_ts),
+        "generated_at": moment(report.now_ts),
+        "basis": label(
+            "assumption",
+            display="an assumption, not a measurement — keel stores no spreads or book snapshots",
+            # UNKNOWN rather than WARN: nothing is wrong and nothing is late. It is a statement
+            # about what kind of number this is, and a warning triangle beside every rate would
+            # train a reader to stop reading it.
+            state=UNKNOWN,
+        ),
+        "floor_bp": ratio(report.floor_bp, places=1),
+        "cap_bp": ratio(report.cap_bp, places=1),
+        "anchor_quote_volume": money(report.anchor_quote_volume),
+        "product_count": count(report.product_count),
+        "priced_count": count(report.priced_count),
+        "at_floor_count": count(report.at_floor_count),
+        "capped_count": count(report.capped_count),
+        "fallback_count": count(report.fallback_count),
+        "rows": [_slippage_row_payload(row) for row in report.rows],
     }
 
 

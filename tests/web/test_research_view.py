@@ -493,3 +493,130 @@ def test_the_resolved_path_never_reaches_the_browser(tmp_path: Path) -> None:
     text = json.dumps(document)
     assert str(tmp_path) not in text
     assert "trials-ledger" not in text
+
+
+# -- the slippage universe (#708, view 4) ----------------------------------------------------------
+
+
+def _slippage(tmp_path: Path, **volumes: str) -> Any:
+    """A slippage payload over the fixture allowlist, with `volumes` naming the priced products.
+
+    Keyword names are ASSET codes (`BTC=...`), turned into product ids here, so a test reads as
+    "BTC at the anchor" rather than repeating the `-USD` derivation the report is meant to own.
+    """
+    from keel.commands.slippage import gather_slippage
+    from tests.commands.test_slippage import _config, _daily, _repo
+
+    repo = _repo(tmp_path)
+    for asset, volume in volumes.items():
+        _daily(repo, f"{asset}-USD", volume_usd=volume)
+    return web_payload.slippage_payload(
+        gather_slippage(repo, _config(tmp_path), now_ts=RESEARCH_NOW_TS)
+    )
+
+
+def test_no_wire_value_in_the_slippage_payload_is_ever_a_json_number(tmp_path: Path) -> None:
+    """Rule 1, and this payload is full of the values that tempt it: a rate, a multiple, a
+    volume in dollars. `0.01838 * 10000` is `183.79999999999998` as a float."""
+    from tests.commands.test_slippage import AT_ANCHOR
+
+    document = json.loads(json.dumps(_slippage(tmp_path, BTC=str(AT_ANCHOR), PAXG="1000")))
+    numbers = [
+        path
+        for path, leaf in _walk(document)
+        if not isinstance(leaf, bool) and isinstance(leaf, (int, float))
+    ]
+
+    assert numbers == [], f"JSON numbers on the wire: {numbers}"
+
+
+def test_the_payload_says_these_figures_are_an_assumption(tmp_path: Path) -> None:
+    """THE correction this view exists to carry, and the one #708's own scope note gets wrong by
+    calling these figures "measured". keel stores no order books and no realised spreads;
+    `slippage_for_quote_volume` opens by saying so. A cost table read as a measurement is a page
+    inventing evidence, so the word crosses as a field rather than living in a comment."""
+    document = _slippage(tmp_path, BTC="500000000")
+
+    assert document["basis"]["value"] == "assumption"
+    assert "not a measurement" in document["basis"]["display"]
+
+
+def test_the_model_parameters_cross_so_any_row_can_be_recomputed(tmp_path: Path) -> None:
+    """`sim/report.py`'s rule about its own table: "a number whose assumptions cannot be
+    recovered is not evidence"."""
+    document = _slippage(tmp_path, BTC="500000000")
+
+    assert document["floor_bp"]["display"] == "5.0"
+    assert document["cap_bp"]["display"] == "183.8"
+    assert document["anchor_quote_volume"]["value"] == "500000000"
+
+
+def test_a_capped_row_warns_that_it_is_a_lower_bound(tmp_path: Path) -> None:
+    """Where the cap fires, the model's bound decided rather than the asset's liquidity, so the
+    real cost is at least this. Flattering direction, so it warns."""
+    document = _slippage(tmp_path, PAXG="1000")
+    row = next(r for r in document["rows"] if r["product_id"] == "PAXG-USD")
+
+    assert row["capped"]["state"] == web_payload.WARN
+    assert row["slippage_bp"]["display"] == "183.8"
+
+
+def test_a_fallback_row_warns_and_shows_no_multiple(tmp_path: Path) -> None:
+    """The cheapest rate in the model, handed to the asset keel knows least about. The rate is
+    the floor, but the "vs floor" cell is ABSENT rather than `1.0` -- a multiple there would read
+    "as cheap as the most liquid asset in the corpus" about an asset with no cached history."""
+    document = _slippage(tmp_path, BTC="500000000")
+    row = next(r for r in document["rows"] if r["product_id"] == "ETH-USD")
+
+    assert row["priced_from"]["state"] == web_payload.WARN
+    assert row["floor_multiple"]["display"] == web_payload.ABSENT
+    assert row["median_daily_quote_volume"]["display"] == web_payload.ABSENT
+    assert row["bars"]["value"] == "0"
+
+
+def test_the_floor_count_is_reported_against_the_products_actually_priced(
+    tmp_path: Path,
+) -> None:
+    """The headline, with an honest denominator. `product_count` would flatter it by counting
+    rows that were never priced at all -- a deployment that had cached nothing would read "0 of
+    3 reach the floor" as though three assets had been checked and found expensive."""
+    from tests.commands.test_slippage import AT_ANCHOR
+
+    document = _slippage(tmp_path, BTC=str(AT_ANCHOR), PAXG="1000")
+
+    assert document["product_count"]["value"] == "3"
+    assert document["priced_count"]["value"] == "2"
+    assert document["at_floor_count"]["value"] == "1"
+    assert document["fallback_count"]["value"] == "1"
+
+
+def test_the_slippage_endpoint_declares_no_sortable_column_either(tmp_path: Path) -> None:
+    """The rail across the whole `/research` surface, not just its first view. A cost table
+    ordered cheapest-first reads as a shortlist of what to trade."""
+    from keel.web import api as web_api
+
+    route = web_api.API_ROUTES["/api/research/slippage"]
+
+    assert route.sortable == ()
+    assert route.collection == ""
+
+
+def test_the_slippage_section_is_wired_into_the_research_view() -> None:
+    main_code = _code("main.js")
+
+    assert '"research/slippage"' in main_code
+    assert "function slippageSection" in _code("render.js")
+    assert "export function researchView(data, slippage)" in _code("render.js")
+
+
+def test_the_slippage_section_states_the_basis_and_declares_no_sort_key() -> None:
+    """Both rails at once: the assumption notice is rendered, and the cost table carries no
+    sort control -- `researchView`'s own body is already scanned for `key:`, and this section
+    lives inside it."""
+    after = _code("render.js").split("function slippageSection")[1]
+    end = after.find("export function ")
+    body = after if end == -1 else after[:end]
+
+    assert "basis" in body
+    assert "key:" not in body, "no slippage column may declare a sort key"
+    assert "measured" not in body.lower(), "these figures are an assumption, never a measurement"
