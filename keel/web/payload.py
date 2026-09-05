@@ -503,9 +503,12 @@ def multiple(value: Decimal | float | None, *, places: int = 1, state: str = NEU
     anything -- an R-multiple, a profit factor. The `x` is what stops `1.1` in a cell from being
     read as an absolute rate rather than as "1.1 times the floor".
 
-    A plain `x`, not the multiplication sign: this string is read by `_plain`-adjacent code paths
-    and copied into terminals, and one non-ASCII character here would be the kind of thing that
-    survives review and breaks a paste.
+    A plain `x` rather than a multiplication sign, and NOT for the ASCII reason a first draft of
+    this docstring gave: `MINUS` is U+2212 and the line below interpolates it, so a rule about
+    non-ASCII in display strings would be a rule this function breaks and `ABSENT`, `UP` and
+    `DOWN` break beside it. The real reason is narrower -- `1.1x` is what the terminal reports
+    already write (`simulate.render_slippage_assumptions`, `sim/report.py`), and the two
+    front-ends saying the same figure two different ways is the drift this file exists to stop.
     """
     figure = _decimalise(value)
     if figure is None:

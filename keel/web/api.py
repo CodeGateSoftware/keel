@@ -374,19 +374,24 @@ def read_slippage(cfg: ServeConfig, _query: Query, _state: Any, now_ts: int) -> 
     is why there is no `?limit=`: a cap here would hide the very asset an operator came to check,
     and the universe is a config file's worth of rows, not a table scan.
 
-    **MEASURED COST: ~124 ms per request** at 24 products x 3000 daily bars (roughly eight years
-    of history on the corpus universe), against 3.6 ms for the `setup.inspect` liveness probe
-    this module's own note already calls expensive and 0.07 ms for `gather_status`. This is the
-    dearest read in the table by a wide margin, and the page re-polls every 15 seconds while a
-    tab is visible.
+    **MEASURED COST: ~124 ms per request on this machine**, against a SYNTHETIC database of 24
+    products x 3000 daily bars -- roughly the corpus universe with eight years of history, not a
+    reading taken from a live deployment. Stated that way because the note at the top of this
+    module states its own figure the same way ("3.6 ms per call on this machine"), and a timing
+    whose conditions are not recoverable is the sort of number this codebase declines to treat as
+    evidence. For scale: 3.6 ms for the `setup.inspect` liveness probe that note already calls
+    expensive, 0.07 ms for `gather_status`. This is the dearest read in the table by a wide
+    margin, and the page re-polls every 15 seconds while a tab is visible.
 
     **Why it is not fixed by reading a window.** The obvious cure -- last 180 days rather than
     all cached bars -- would change the number. `rules.backtest_slippage` and
     `assets.market_facts` both compute this statistic over the FULL cached daily series, so a
     windowed figure here would put a different liquidity number on the page from the one the
     admission gate applies, which is precisely the drift
-    `screen.median_daily_quote_volume`'s docstring exists to prevent. (The ledger's own
-    `zec_liquidity_ratio_180d_over_full_history` records that the two differ materially.)
+    `screen.median_daily_quote_volume`'s docstring exists to prevent. How much they differ is on
+    record rather than asserted: the trials ledger's `zec_liquidity_ratio_180d_over_full_history`
+    is **30.9** (trial `hourly-turtle-param-sweep-2026-08-11`), so for that asset the windowed
+    statistic and the full-history one are a factor of thirty apart.
 
     What WOULD change it: caching the report against the candles table's last write, so a page
     polling an idle deployment re-reads nothing. Worth doing when a second route needs the same

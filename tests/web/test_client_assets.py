@@ -1659,3 +1659,174 @@ def test_the_call_scanner_can_fail() -> None:
 
     assert "b" in called, "the call scanner does not find calls"
     assert "a" in called or "a" in set(re.findall(r"\bfunction\s+([A-Za-z_$][\w$]*)", code))
+
+
+# -- row-level keys, which the scan above declares out of scope ------------------------------------
+#
+# `_view_keys` reads only `<root>.<key>` paths and says so, with a reason: row keys "live inside
+# collections that are empty on a fresh deployment, so there is nothing to check them against
+# here. They are covered by `tests/web/test_payload.py`, which builds populated reports."
+#
+# **The first half of that is true and the second half is not.** `test_payload.py` verifies that
+# the payload EMITS a key. Nothing verified that `render.js` READS the same one. So the two sides
+# could be renamed apart independently, and were: #725 renamed `priced_from` to `fallback` in the
+# payload and in the view, and reverting only the view's half left the entire 630-test web suite
+# green while that cell rendered `?` forever. That is the `data.hwm` failure of #702 exactly, one
+# level down, in the gap the note above declared and then mis-named the cover for.
+#
+# The fix for "collections are empty on a fresh deployment" is to stop having a fresh deployment:
+# `_ROW_ENDPOINTS` seeds each collection and REQUIRES a row, the same discipline
+# `test_api.py::test_every_declared_sort_column_is_a_column_the_rows_actually_have` uses ("a
+# collection with no rows proves nothing here, which is why the seeding is not optional").
+
+
+def _row_reads(view: str) -> dict[tuple[str, str], set[str]]:
+    """Every `<param>.<key>` a view reads inside a `.map()` over a root collection.
+
+    Returns `{(root, collection): {keys}}`. Handles the three receiver shapes `render.js` uses:
+    `(root.coll || []).map(`, `root.coll.map(`, and a local `const name = root.coll || [];`
+    followed by `name.map(` -- plus one further hop for `positionsView`, which narrows a bound
+    collection with `.filter()` before mapping it.
+    """
+    source = _code_only(_source("render.js"))
+    start = source.index(f"export function {view}(")
+    rest = source[start + 1 :]
+    end = rest.find("\nexport function ")
+    body = rest if end == -1 else rest[:end]
+
+    # Local aliases: `const assets = data.assets || [];` and `const held = rows.filter(...)`.
+    aliases: dict[str, tuple[str, str]] = {}
+    for name, root, collection in re.findall(
+        r"const\s+(\w+)\s*=\s*(\w+)\.(\w+)\s*(?:\|\|\s*\[\])?\s*;", body
+    ):
+        aliases[name] = (root, collection)
+    for name, source_name in re.findall(r"const\s+(\w+)\s*=\s*(\w+)\.filter\(", body):
+        if source_name in aliases:
+            aliases[name] = aliases[source_name]
+
+    found: dict[tuple[str, str], set[str]] = {}
+    for match in re.finditer(r"(?:\((\w+)\.(\w+)\s*\|\|\s*\[\]\)|(\w+)\.(\w+)|(\w+))\.map\(", body):
+        direct_root, direct_coll, plain_root, plain_coll, alias = match.groups()
+        if direct_root:
+            target = (direct_root, direct_coll)
+        elif plain_root:
+            target = (plain_root, plain_coll)
+        elif alias in aliases:
+            target = aliases[alias]
+        else:
+            continue
+
+        call, _after = _balanced_block(body, body.index("(", match.end() - 1))
+        param = re.search(r"\(\s*(\w+)\s*\)\s*=>", call)
+        if not param:
+            continue
+        keys = set(re.findall(rf"\b{re.escape(param.group(1))}\.(\w+)", call))
+        found.setdefault(target, set()).update(keys)
+    return found
+
+
+#: Which endpoint each mapped collection comes from, and how to give it a row.
+#:
+#: Hand-written like `_VIEW_ENDPOINTS` beside it, and for the same reason: a table derived from
+#: the client would agree with the client by construction, which is the disagreement this test
+#: exists to find.
+_ROW_ENDPOINTS: tuple[tuple[str, str, str, str, str], ...] = (
+    ("ordersView", "data", "rows", "/api/orders", "orders"),
+    ("positionsView", "data", "rows", "/api/positions", "positions"),
+    ("balancesView", "data", "assets", "/api/balances", "positions"),
+    ("timelineView", "data", "rows", "/api/timeline", "orders"),
+    ("rulesView", "data", "rules", "/api/rules", "rules"),
+    ("researchView", "slippage", "rows", "/api/research/slippage", "none"),
+)
+
+#: Mapped collections this test does NOT cover, each with the reason. Named rather than omitted:
+#: an uncovered collection that nobody wrote down is indistinguishable from one nobody noticed,
+#: and `test_every_mapped_collection_is_either_checked_or_named` fails on anything in neither set.
+_ROW_ENDPOINTS_UNCOVERED: dict[tuple[str, str, str], str] = {
+    ("statusView", "data", "open_positions"): "covered by test_api's sort-column pin, same rows",
+    ("statusView", "data", "live_rules"): "needs a promoted rule; no seeder in this module yet",
+    ("statusView", "data", "data_freshness"): "needs cached candles per configured product",
+    ("statusView", "data", "subscriptions"): "needs a venue subscription record",
+    ("setupView", "data", "not_automated"): "the checklist is config-derived, not row-seeded",
+    ("setupView", "data", "actions"): "the checklist is config-derived, not row-seeded",
+    ("researchView", "data", "exploration"): "needs a trials ledger; #708 view 1 seeds one",
+    ("researchView", "data", "rows"): "needs a trials ledger; #708 view 1's own tests seed one",
+    ("activityView", "data", "cycles"): "needs a cycle log file beside the deployment",
+    ("insightsView", "insights", "rules"): "needs closed trades to build a track record",
+    ("insightsView", "journal", "entries"): "needs journal entries",
+    ("venuesView", "data", "venues"): "config-derived; no rows to seed",
+    ("venuesView", "data", "readiness"): "config-derived; no rows to seed",
+    # Nested one level down: the root is a ROW variable, not a payload root, so the check above
+    # cannot address them by `(root, collection)` at all. Naming them is what stops the scan from
+    # looking complete while quietly skipping every nested collection in the client.
+    ("gatesView", "gate", "actions"): "nested under a gate row; root is a loop variable",
+    ("activityView", "cycle", "events"): "nested under a cycle row; root is a loop variable",
+}
+
+
+def _seed_for(kind: str, db_path: str) -> None:
+    from tests.web.test_api import _seed_orders, _seed_positions, _seed_rules
+
+    if kind == "positions":
+        _seed_positions(db_path, (("BTC-USD", "0.01", "50000"),))
+    elif kind == "orders":
+        _seed_orders(db_path, (("BTC-USD", "buy", "50000"),))
+    elif kind == "rules":
+        _seed_rules(db_path, ("breakout",))
+
+
+@pytest.mark.parametrize(("view", "root", "collection", "endpoint", "seed"), _ROW_ENDPOINTS)
+def test_every_row_key_a_view_reads_is_a_key_its_endpoint_sends(
+    view: str,
+    root: str,
+    collection: str,
+    endpoint: str,
+    seed: str,
+    running,  # type: ignore[no-untyped-def]
+) -> None:
+    """The check `_view_keys` declares out of scope, done one level down.
+
+    Reverting `row.fallback` to `row.priced_from` in `slippageSection` -- the rename #725 made on
+    both sides -- passes the whole web suite without this test and fails here.
+    """
+    _seed_for(seed, running.db_path)
+
+    status, _headers, body = _request(running, endpoint, cookie=_session(running))
+    assert status == 200, endpoint
+    document = json.loads(body)
+    assert document["engine"]["value"] == "running", document
+    rows = document["data"][collection]
+
+    # A collection with no rows proves nothing, so an empty one is the failure rather than a pass.
+    assert rows, f"{endpoint} sent no {collection} to check {view}'s row reads against"
+    reads = _row_reads(view).get((root, collection), set())
+    assert reads, f"the scan found no row keys in {view} -- it would pass against any payload"
+
+    for row in rows:
+        missing = reads - set(row)
+        assert not missing, f"{view} reads {sorted(missing)}; {endpoint} does not send them"
+
+
+def test_every_mapped_collection_is_either_checked_or_named() -> None:
+    """No mapped collection may be silently uncovered.
+
+    Without this, the table above is a list of what somebody happened to get round to, and a view
+    added later inherits the exact hole #725 fell into. With it, a new `.map()` over a payload
+    collection fails the build until it is either checked or written down with a reason.
+    """
+    checked = {(view, root, collection) for view, root, collection, _e, _s in _ROW_ENDPOINTS}
+    views = {view for view, _root, _endpoint in _VIEW_ENDPOINTS} | {"statusView", "gatesView"}
+
+    mapped = {
+        (view, root, collection)
+        for view in views
+        for (root, collection) in _row_reads(view)
+    }
+
+    unaccounted = mapped - checked - set(_ROW_ENDPOINTS_UNCOVERED)
+    assert not unaccounted, f"mapped collections neither checked nor named: {sorted(unaccounted)}"
+
+    # And the other direction: an exemption for a collection nothing maps any more is a note that
+    # has outlived its subject, and would quietly excuse a future collection of the same name.
+    stale = set(_ROW_ENDPOINTS_UNCOVERED) - mapped
+    assert not stale, f"exemptions for collections nothing maps: {sorted(stale)}"
