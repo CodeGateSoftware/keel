@@ -1178,3 +1178,64 @@ def test_cycle_balances_accepts_null_and_round_trips_a_decimal_string() -> None:
     assert row["available"] == "123.456789"
     assert Decimal(row["available"]) == Decimal("123.456789")
     assert row["total"] is None
+
+
+def _columns(conn: sqlite3.Connection, table: str) -> dict[str, tuple[str, int]]:
+    """`{name: (declared_type, notnull)}` for `table`."""
+    return {
+        row["name"]: (str(row["type"]).upper(), int(row["notnull"]))
+        for row in conn.execute(f"PRAGMA table_info({table})")
+    }
+
+
+def test_audit_events_stores_its_timestamp_as_an_integer() -> None:
+    """The one deliberate deviation in v20, and the only change in it that nothing tested.
+
+    #721's comment specifies `ts TEXT`. It is INTEGER here because every other timestamp in this
+    schema is, and because TEXT orders an epoch LEXICALLY: with a TEXT column, `ORDER BY ts` puts
+    '10000000000' BEFORE '9999999999' -- the reverse of the numeric truth -- so a `ts >= ?` range
+    read over an audit trail silently returns the wrong rows once the digit count changes.
+
+    Without this test the deviation was free to be reverted: flipping the column back to TEXT
+    passed the entire suite. A deviation from a written decision that nothing pins is a deviation
+    the next reader will undo in good faith.
+    """
+    conn = db.connect(":memory:")
+    db.migrate(conn)
+
+    assert _columns(conn, "audit_events")["ts"][0] == "INTEGER"
+
+
+def test_the_audit_chain_columns_exist_and_are_all_required() -> None:
+    """A hash chain with a nullable link is not a chain. Every field is NOT NULL because the
+    table is append-only from v20 forward -- there are no pre-existing rows to be honest about,
+    which is exactly why it can afford constraints the ALTERed columns cannot."""
+    conn = db.connect(":memory:")
+    db.migrate(conn)
+    columns = _columns(conn, "audit_events")
+
+    for name in ("ts", "event_type", "entity_id", "payload_json", "prev_hash", "row_hash"):
+        assert name in columns, f"audit_events is missing {name}"
+        assert columns[name][1] == 1, f"audit_events.{name} must be NOT NULL"
+
+
+def test_the_audit_trail_can_be_read_by_time_range_without_a_table_scan() -> None:
+    """The comment names `ts >= ?` as how this table gets queried, and `cycle_balances` two
+    statements earlier gets its index. An index the schema is missing is a migration later."""
+    conn = db.connect(":memory:")
+    db.migrate(conn)
+
+    indexes = {row["name"] for row in conn.execute("PRAGMA index_list(audit_events)")}
+
+    assert any("ts" in name for name in indexes), f"no ts index on audit_events: {indexes}"
+
+
+def test_the_recorded_balance_columns_are_text_and_nullable() -> None:
+    """Money as TEXT, never REAL -- and nullable, because a cycle that read the total but not the
+    available split must leave the unread side NULL rather than have a writer invent a figure."""
+    conn = db.connect(":memory:")
+    db.migrate(conn)
+    columns = _columns(conn, "cycle_balances")
+
+    for name in ("available", "total"):
+        assert columns[name] == ("TEXT", 0), f"cycle_balances.{name} is {columns[name]}"

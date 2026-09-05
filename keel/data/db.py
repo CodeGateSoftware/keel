@@ -415,10 +415,17 @@ _SCHEMA_STATEMENTS: tuple[str, ...] = (
     )
     """,
     "CREATE INDEX IF NOT EXISTS idx_equity_points_mode_ts ON equity_points(mode, ts)",
-    # One row per (cycle, currency) -- the per-currency settled/available/total pair a cycle
+    # One row per currency per RECORDED READING -- the settled/available/total pair a cycle
     # observed (v20, #719). Per CURRENCY and not one scalar pair, because folding several
     # currencies into one figure would add them 1:1, which is the no-FX bound
     # `agent._mark_to_market_parts` already states it will not cross.
+    #
+    # Deliberately NOT unique on (mode, currency, ts), and the wording above is careful because
+    # of it: there is no cycle identifier here, only a stamp, so the schema cannot express "one
+    # row per cycle" and a comment claiming it would be describing a constraint that does not
+    # exist. `equity_points` beside it takes the same shape for the same reason -- an append-only
+    # series of readings, deduplicated by nobody. A reader wanting the current balance takes the
+    # newest row per (mode, currency), exactly as `gather_balances` already does for equity.
     #
     # Schema only in this release: nothing writes these rows yet, and
     # `commands/balances.py` still reports the split as unrecorded.
@@ -442,14 +449,21 @@ _SCHEMA_STATEMENTS: tuple[str, ...] = (
     CREATE TABLE IF NOT EXISTS audit_events (
         seq_id        INTEGER PRIMARY KEY AUTOINCREMENT,
         -- Epoch seconds, INTEGER -- deliberately NOT `ts TEXT` as issue #721's comment specifies.
-        -- Every other timestamp in this schema is INTEGER (see `positions.opened_at`,
-        -- `asset_attestations.attested_at`, and the comment on `equity_points.ts` above, which
-        -- spells out why: TEXT orders an epoch LEXICALLY, so a `ts >= ?` range read -- exactly
-        -- how an audit trail gets queried -- would silently return the wrong rows once the
-        -- second-digit count changes, e.g. "9999999999" sorting before "10000000000". That is
-        -- the one bug `equity_points.ts` exists to document and this table would walk straight
-        -- into by following the issue text literally. INTEGER matches this schema's own
-        -- established convention over the issue's literal wording.
+        -- Every other timestamp in this schema is INTEGER (`positions.opened_at`,
+        -- `asset_attestations.attested_at`, and `equity_points.ts` above, which spells out why).
+        --
+        -- TEXT orders an epoch LEXICALLY. Run it: a TEXT column holding '9999999999' and
+        -- '10000000000' returns them from `ORDER BY ts` as ['10000000000', '9999999999'] --
+        -- the REVERSE of the numeric truth, because '1' sorts before '9'. So a `ts >= ?` range
+        -- read, which is exactly how an audit trail gets queried, would silently return the
+        -- wrong rows the moment the epoch gains a digit. That is the bug `equity_points.ts`
+        -- exists to document, and this table would have walked into it by following the issue
+        -- text literally.
+        --
+        -- Pinned by `test_audit_events_stores_its_timestamp_as_an_integer`: without a test the
+        -- deviation was free -- flipping this column back to TEXT passed the entire suite, and
+        -- a deviation from a written decision that nothing pins is one the next reader undoes
+        -- in good faith.
         ts            INTEGER NOT NULL,
         event_type    TEXT NOT NULL,
         entity_id     TEXT NOT NULL,
@@ -461,6 +475,7 @@ _SCHEMA_STATEMENTS: tuple[str, ...] = (
         row_hash      TEXT NOT NULL
     )
     """,
+    "CREATE INDEX IF NOT EXISTS idx_audit_events_ts ON audit_events(ts)",
 )
 
 
@@ -928,7 +943,9 @@ def _migrate_v19_equity_points(conn: sqlite3.Connection) -> None:
 def _migrate_v20_provenance_and_attest_windows(conn: sqlite3.Connection) -> None:
     """v20 adds four columns and two tables (#721): `orders.quote_provenance`,
     `orders.client_order_id`, `asset_attestations.attest_due_ts`,
-    `instrument_attestations.attest_due_ts`, plus `cycle_balances` and `audit_events`.
+    `instrument_attestations.attest_due_ts`, plus `cycle_balances` and `audit_events` --
+    #715 (the two order columns), #718 (the two windows), #719 (`cycle_balances`) and #721
+    (`audit_events`), batched into one bump so a database is atomically v19 or v20.
 
     SCHEMA ONLY. Nothing in this release writes any of the four new columns, and nothing reads
     them back -- this migration exists to make the columns and tables available, not to change
