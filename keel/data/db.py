@@ -360,9 +360,14 @@ _SCHEMA_STATEMENTS: tuple[str, ...] = (
         attested_at  INTEGER NOT NULL,
         -- When this attestation's window closes (v20, #718), the same nullable shape as
         -- `venue_cash_postures.attest_due_ts` -- unlike `broker_subscriptions.attest_due_ts`,
-        -- which is required because every insert there sets one. Schema only: nothing yet
-        -- writes or reads this column, so it is NULL for every row, existing or new, until a
-        -- later change wires an actual expiry policy through it.
+        -- which is required because every insert there sets one. NULL means "no window
+        -- recorded", never "expired" and never "valid forever". Written by
+        -- `Repository.upsert_asset_attestation` (optional `--attest-due` on `keel assets
+        -- attest`, cleared rather than carried forward on a re-attestation that omits it) and
+        -- READ ONLY by `keel doctor` (`asset_attestation_window_findings`), which reports a
+        -- passed or approaching window -- it does not veto. `keel assets screen` /
+        -- `screen_asset` deliberately never reads this column: an expired window recording is
+        -- not an admission decision (#718's own scope boundary).
         attest_due_ts INTEGER
     )
     """,
@@ -374,8 +379,11 @@ _SCHEMA_STATEMENTS: tuple[str, ...] = (
         source       TEXT NOT NULL,
         attested_by  TEXT NOT NULL,
         attested_at  INTEGER NOT NULL,
-        -- Same column, same meaning, same "schema only, always NULL for now" caveat as
-        -- `asset_attestations.attest_due_ts` above (v20, #718).
+        -- Same column, same meaning, same writer/reader split as
+        -- `asset_attestations.attest_due_ts` above (v20, #718): written optionally by
+        -- `Repository.upsert_instrument_attestation` / `keel assets attest-instrument
+        -- --attest-due`, read only by `keel doctor`'s
+        -- `instrument_attestation_window_findings`, never by the screen.
         attest_due_ts INTEGER,
         PRIMARY KEY (venue, product_id)
     )
@@ -959,9 +967,12 @@ def _migrate_v20_provenance_and_attest_windows(conn: sqlite3.Connection) -> None
     SCHEMA ONLY AS SHIPPED: this migration makes the columns and tables available and changes
     nothing any existing writer or rail does. The writers arrive in follow-up work, issue by
     issue -- #715's two order columns are written by `executor._order_row` and the placement
-    `update_order` as of that PR; `attest_due_ts`, `cycle_balances` and `audit_events` still
-    have none, and `commands/balances.py` and `commands/timeline.py` go on reporting their
-    fields as unrecorded until they do.
+    `update_order` as of that PR; `attest_due_ts`'s writer arrived in #718
+    (`Repository.upsert_asset_attestation`/`upsert_instrument_attestation` gain an optional
+    `attest_due_ts` kwarg, surfaced as `--attest-due` on `keel assets attest`/
+    `attest-instrument` and read only by `keel doctor`, never by the screen); `cycle_balances`
+    and `audit_events` still have none, and `commands/balances.py` and `commands/timeline.py`
+    go on reporting their fields as unrecorded until they do.
 
     See the DDL comments beside each column in `_SCHEMA_STATEMENTS` for what each one is for,
     and why `audit_events.ts` is INTEGER rather than the `TEXT` #721's own comment specifies.

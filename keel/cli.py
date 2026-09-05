@@ -155,6 +155,7 @@ from keel.commands.fetch import assess_products as _assess_products  # noqa: F40
 # CLI calls. `_assess_products` is re-imported because the fetch tests pin the sweep's
 # window-bounded invariant THROUGH this module's name.
 from keel.commands.fetch import run_fetch
+from keel.commands.insights import _parse_ts as _parse_attest_due  # shared --since/--until parser
 from keel.commands.insights import insights_group
 from keel.commands.mcp import mcp_cmd
 from keel.commands.monitor import run_monitor
@@ -757,6 +758,17 @@ def assets_propose(ctx: click.Context, from_file: str, as_json: bool) -> None:
 @click.option("--pays-yield", is_flag=True, default=False, help="Holding it earns a return.")
 @click.option("--source", required=True, help="Where this was established: URL, standard, ruling.")
 @click.option("--attested-by", required=True, help="Who established it.")
+@click.option(
+    "--attest-due",
+    "attest_due_raw",
+    default=None,
+    help=(
+        "Unix timestamp or YYYY-MM-DD (same shape as `keel insights journal --since`) -- when "
+        "this attestation's window closes. Optional: omitted (or on a re-attestation) records "
+        "NULL, meaning no window is recorded -- never 'expired', never 'valid forever'. keel "
+        "doctor reports a passed or approaching window; nothing vetoes on it."
+    ),
+)
 @click.pass_context
 @with_disclaimer
 def assets_attest(
@@ -767,12 +779,14 @@ def assets_attest(
     pays_yield: bool,
     source: str,
     attested_by: str,
+    attest_due_raw: str | None,
 ) -> None:
     """Record an asset's shariah classification. These are facts about the world, not defaults.
 
     Not passphrase-gated: an attestation cannot itself place an order or raise a cap, and the
     screen it feeds only ever ADMITS to a list that `guards.py` rail 1 still enforces per-trade.
     """
+    attest_due_ts = _parse_attest_due(attest_due_raw) if attest_due_raw is not None else None
     repo = _open_repo(ctx)
     repo.upsert_asset_attestation(
         asset=asset,
@@ -782,6 +796,7 @@ def assets_attest(
         source=source,
         attested_by=attested_by,
         attested_at=int(time.time()),
+        attest_due_ts=attest_due_ts,
     )
     click.echo(f"attested {asset}: sector={sector} backing={backing} pays_yield={pays_yield}")
 
@@ -801,6 +816,17 @@ def assets_attest(
     help="Where this was established: the venue's contract spec, its API docs, a filing.",
 )
 @click.option("--attested-by", required=True, help="Who established it.")
+@click.option(
+    "--attest-due",
+    "attest_due_raw",
+    default=None,
+    help=(
+        "Unix timestamp or YYYY-MM-DD (same shape as `keel insights journal --since`) -- when "
+        "this attestation's window closes. Optional: omitted (or on a re-attestation) records "
+        "NULL, meaning no window is recorded -- never 'expired', never 'valid forever'. keel "
+        "doctor reports a passed or approaching window; nothing vetoes on it."
+    ),
+)
 @click.pass_context
 @with_disclaimer
 def assets_attest_instrument(
@@ -810,6 +836,7 @@ def assets_attest_instrument(
     wrapper: str,
     source: str,
     attested_by: str,
+    attest_due_raw: str | None,
 ) -> None:
     """Record what CONTRACT a venue listing is. A claim about the PRODUCT, not the asset.
 
@@ -833,6 +860,7 @@ def assets_attest_instrument(
     `guards.py` rail 1 still enforces per-trade.
     """
     product = product.upper()  # matches the uppercase ids `_screen_product` looks up by
+    attest_due_ts = _parse_attest_due(attest_due_raw) if attest_due_raw is not None else None
     repo = _open_repo(ctx)
     repo.upsert_instrument_attestation(
         venue=venue,
@@ -841,6 +869,7 @@ def assets_attest_instrument(
         source=source,
         attested_by=attested_by,
         attested_at=int(time.time()),
+        attest_due_ts=attest_due_ts,
     )
     click.echo(f"attested {product} on {venue}: wrapper={wrapper}")
 

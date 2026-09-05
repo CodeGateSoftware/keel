@@ -29,7 +29,7 @@ from __future__ import annotations
 
 import json
 import re
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from decimal import ROUND_HALF_UP, Decimal
@@ -187,6 +187,121 @@ def attestation_findings(
                 )
             )
     return findings
+
+
+#: How long before an asset/instrument attestation window closes doctor calls it "approaching"
+#: rather than silent -- the same 7-day horizon `DOCTOR_WINDOW_SEC` already asks an operator to
+#: reason about elsewhere in this module, rather than inventing a second one. Unlike rail 22's
+#: `ATTESTATION_TTL_SEC // 6`, there is no fixed TTL to be proportional to here -- the window is
+#: whatever the operator typed at `--attest-due` -- so a flat horizon is the honest choice.
+ATTEST_WINDOW_APPROACHING_SEC = DOCTOR_WINDOW_SEC
+
+
+def _attestation_window_findings(
+    rows: Iterable[dict[str, Any]],
+    *,
+    now_ts: int,
+    name: str,
+    label: str,
+    describe: Callable[[dict[str, Any]], str],
+    fix: str,
+) -> list[Finding]:
+    """Shared core for `asset_attestation_window_findings` and
+    `instrument_attestation_window_findings` -- same NULL convention, same passed/approaching
+    split, differing only in what identifies a row (`describe`) and where the finding sends an
+    operator (`fix`).
+
+    **REPORTING ONLY.** `screen_asset` never reads `attest_due_ts` and an expired window does
+    not veto an entry -- that would change which trades happen, a decision #718 deliberately
+    leaves to a human (see `keel/compliance/screen.py`). So every non-OK status here is WARN,
+    never FAIL: nothing is actually blocked, and a FAIL would tell an operator the opposite.
+
+    NULL is not judged, the same convention `cash_posture_findings` states for its own nullable
+    due date -- except there the column is REQUIRED once attested (NULL is itself a FAIL) and
+    here it is optional: a row with no window is simply excluded from both the passed and the
+    approaching group, never reported as either.
+    """
+    due_rows = [
+        (row, int(row["attest_due_ts"])) for row in rows if row["attest_due_ts"] is not None
+    ]
+    passed = [(row, due) for row, due in due_rows if due <= now_ts]
+    approaching = [
+        (row, due)
+        for row, due in due_rows
+        if due > now_ts and due - now_ts <= ATTEST_WINDOW_APPROACHING_SEC
+    ]
+    if not passed and not approaching:
+        headline = f"no {label} attestation window overdue or approaching"
+        return [Finding(name, OK, headline, "-", "-")]
+
+    findings: list[Finding] = []
+    if passed:
+        described = ", ".join(
+            f"{describe(row)} ({_days(now_ts - due)} day(s) ago)" for row, due in passed
+        )
+        findings.append(
+            Finding(
+                name,
+                WARN,
+                f"{len(passed)} {label} attestation window(s) passed",
+                f"{described} -- reporting only, keel assets screen does not veto on this",
+                fix,
+            )
+        )
+    if approaching:
+        described = ", ".join(
+            f"{describe(row)} ({_days(due - now_ts)} day(s) left)" for row, due in approaching
+        )
+        findings.append(
+            Finding(
+                name,
+                WARN,
+                f"{len(approaching)} {label} attestation window(s) approaching",
+                described,
+                fix,
+            )
+        )
+    return findings
+
+
+def asset_attestation_window_findings(
+    attestations: Iterable[dict[str, Any]], *, now_ts: int
+) -> list[Finding]:
+    """Has any RECORDED `asset_attestations.attest_due_ts` (#718) passed or is approaching?
+
+    Takes `Repository.get_asset_attestations()` rows directly, the same shape `keel assets
+    list` already reads. Reporting only -- see `_attestation_window_findings`'s docstring for
+    the hard boundary this deliberately stops short of.
+    """
+    return _attestation_window_findings(
+        attestations,
+        now_ts=now_ts,
+        name="attest.asset_window",
+        label="asset",
+        describe=lambda row: str(row["asset"]),
+        fix=(
+            "keel assets attest --asset <asset> ... --attest-due <date>  "
+            "(re-attest with a fresh window)"
+        ),
+    )
+
+
+def instrument_attestation_window_findings(
+    attestations: Iterable[dict[str, Any]], *, now_ts: int
+) -> list[Finding]:
+    """Instrument-side twin of `asset_attestation_window_findings` -- same NULL convention,
+    same reporting-only boundary, over `Repository.get_instrument_attestations()` rows."""
+    return _attestation_window_findings(
+        attestations,
+        now_ts=now_ts,
+        name="attest.instrument_window",
+        label="instrument",
+        describe=lambda row: f"{row['venue']}:{row['product_id']}",
+        fix=(
+            "keel assets attest-instrument --product <product> ... --attest-due <date>  "
+            "(re-attest with a fresh window)"
+        ),
+    )
 
 
 def _utc_date(ts: int) -> str:
@@ -1367,6 +1482,13 @@ def gather_findings(repo: Any, config: Any, log_lines: Iterable[str], now_ts: in
         subscription=subscription,
         withdrawals_attested_at=int(repo.get_state("withdrawals_attested_at", default=0) or 0),
         now_ts=now_ts,
+    )
+    # #718: a RECORDED window (`--attest-due`) that nothing reads back is a column nobody
+    # benefits from. Reporting only -- see `_attestation_window_findings`'s docstring for why
+    # this never fails the run.
+    findings += asset_attestation_window_findings(repo.get_asset_attestations(), now_ts=now_ts)
+    findings += instrument_attestation_window_findings(
+        repo.get_instrument_attestations(), now_ts=now_ts
     )
     findings += trade_scope_findings(repo.get_venue_trade_scope(venue), venue)
     # #691. Venue-keyed the same way, and reported BEFORE it bites: rail 22 vetoes silently on

@@ -539,6 +539,75 @@ def test_profile_readable_reports_damage_that_get_profile_hides(repo):
     assert repo.get_profile().autonomous is False  # still fails closed, still no exception
 
 
+# -- asset attestations --------------------------------------------------
+
+
+def test_upsert_asset_attestation_round_trips_without_a_window(repo):
+    """No `attest_due_ts` supplied -- the honest NULL, not an inferred default (#718)."""
+    repo.upsert_asset_attestation(
+        asset="BTC",
+        sector="store of value",
+        backing="native",
+        pays_yield=False,
+        source="https://x.invalid",
+        attested_by="tester",
+        attested_at=1_800_000_000,
+    )
+    assert repo.get_asset_attestation("BTC") == {
+        "asset": "BTC",
+        "sector": "store of value",
+        "backing": "native",
+        "pays_yield": 0,
+        "source": "https://x.invalid",
+        "attested_by": "tester",
+        "attested_at": 1_800_000_000,
+        "attest_due_ts": None,
+    }
+
+
+def test_upsert_asset_attestation_round_trips_a_window(repo):
+    repo.upsert_asset_attestation(
+        asset="BTC",
+        sector="store of value",
+        backing="native",
+        pays_yield=False,
+        source="https://x.invalid",
+        attested_by="tester",
+        attested_at=1_800_000_000,
+        attest_due_ts=1_900_000_000,
+    )
+    assert repo.get_asset_attestation("BTC")["attest_due_ts"] == 1_900_000_000
+
+
+def test_reattesting_an_asset_without_a_window_clears_a_previously_recorded_one(repo):
+    """The ON CONFLICT trap: omitting `attest_due_ts` from `DO UPDATE SET` would let a
+    RE-attestation silently carry the previous window forward -- a compliance window that
+    never expires, which is worse than none (#718)."""
+    repo.upsert_asset_attestation(
+        asset="BTC",
+        sector="store of value",
+        backing="native",
+        pays_yield=False,
+        source="s1",
+        attested_by="alice",
+        attested_at=1_000,
+        attest_due_ts=2_000,
+    )
+    assert repo.get_asset_attestation("BTC")["attest_due_ts"] == 2_000
+
+    repo.upsert_asset_attestation(
+        asset="BTC",
+        sector="store of value",
+        backing="native",
+        pays_yield=False,
+        source="s2",
+        attested_by="bob",
+        attested_at=3_000,
+        # no attest_due_ts this time
+    )
+    assert repo.get_asset_attestation("BTC")["attest_due_ts"] is None
+
+
 # -- instrument attestations --------------------------------------------------
 
 
@@ -558,9 +627,38 @@ def test_upsert_instrument_attestation_round_trips_through_get(repo):
         "source": "https://x.invalid",
         "attested_by": "tester",
         "attested_at": 1_800_000_000,
-        # v20 (#721): NULL for every row -- schema only, nothing writes this column yet.
+        # No `attest_due_ts` supplied -- the honest NULL, not an inferred default (#718).
         "attest_due_ts": None,
     }
+
+
+def test_upsert_instrument_attestation_round_trips_a_window(repo):
+    repo.upsert_instrument_attestation(
+        venue="coinbase",
+        product_id="BTC-USD",
+        wrapper="spot",
+        source="https://x.invalid",
+        attested_by="tester",
+        attested_at=1_800_000_000,
+        attest_due_ts=1_900_000_000,
+    )
+    assert repo.get_instrument_attestation("coinbase", "BTC-USD")["attest_due_ts"] == 1_900_000_000
+
+
+def test_reattesting_an_instrument_without_a_window_clears_a_previously_recorded_one(repo):
+    """The ON CONFLICT trap, instrument side: omitting `attest_due_ts` from `DO UPDATE SET`
+    would let a RE-attestation silently carry the previous window forward (#718)."""
+    repo.upsert_instrument_attestation(
+        venue="coinbase", product_id="BTC-USD", wrapper="spot", source="s1",
+        attested_by="alice", attested_at=1_000, attest_due_ts=2_000,
+    )
+    assert repo.get_instrument_attestation("coinbase", "BTC-USD")["attest_due_ts"] == 2_000
+
+    repo.upsert_instrument_attestation(
+        venue="coinbase", product_id="BTC-USD", wrapper="perpetual", source="s2",
+        attested_by="bob", attested_at=3_000,
+    )
+    assert repo.get_instrument_attestation("coinbase", "BTC-USD")["attest_due_ts"] is None
 
 
 def test_upsert_instrument_attestation_on_conflict_replaces_rather_than_duplicates(repo):

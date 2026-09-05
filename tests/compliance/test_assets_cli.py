@@ -179,6 +179,62 @@ def test_attestations_round_trip_through_list(tmp_path, valid_config_path):
     assert "ayn" in result.output
 
 
+# -- attestation window (#718) --------------------------------------------------
+
+
+def test_attest_records_the_supplied_attest_due_as_epoch_seconds(tmp_path, valid_config_path):
+    db_path = tmp_path / "t.db"
+    repo = _repo_at(db_path)
+    runner = CliRunner()
+
+    result = _attest(
+        runner, db_path, valid_config_path, "PAXG",
+        **{"--backing": "ayn", "--attest-due": "2027-01-31"},
+    )
+    assert result.exit_code == 0, result.output
+
+    row = repo.get_asset_attestation("PAXG")
+    assert row is not None
+    assert row["attest_due_ts"] == 1_801_353_600  # 2027-01-31T00:00:00Z
+
+
+def test_attest_without_attest_due_records_null(tmp_path, valid_config_path):
+    db_path = tmp_path / "t.db"
+    repo = _repo_at(db_path)
+    runner = CliRunner()
+
+    result = _attest(runner, db_path, valid_config_path, "PAXG", **{"--backing": "ayn"})
+    assert result.exit_code == 0, result.output
+
+    assert repo.get_asset_attestation("PAXG")["attest_due_ts"] is None
+
+
+def test_attest_instrument_records_the_supplied_attest_due(tmp_path, valid_config_path):
+    db_path = tmp_path / "t.db"
+    repo = _repo_at(db_path)
+    runner = CliRunner()
+
+    result = _attest_instrument(
+        runner, db_path, valid_config_path, "BTC-USD", **{"--attest-due": "2027-01-31"}
+    )
+    assert result.exit_code == 0, result.output
+
+    row = repo.get_instrument_attestation("coinbase", "BTC-USD")
+    assert row is not None
+    assert row["attest_due_ts"] == 1_801_353_600
+
+
+def test_attest_instrument_without_attest_due_records_null(tmp_path, valid_config_path):
+    db_path = tmp_path / "t.db"
+    repo = _repo_at(db_path)
+    runner = CliRunner()
+
+    result = _attest_instrument(runner, db_path, valid_config_path, "BTC-USD")
+    assert result.exit_code == 0, result.output
+
+    assert repo.get_instrument_attestation("coinbase", "BTC-USD")["attest_due_ts"] is None
+
+
 # -- documented allowlist-screen exceptions (waivers) --------------------------
 #
 # `assets exempt` records a DOCUMENTED, per-asset per-criterion waiver; `assets screen` surfaces
