@@ -525,6 +525,8 @@ def test_upsert_instrument_attestation_round_trips_through_get(repo):
         "source": "https://x.invalid",
         "attested_by": "tester",
         "attested_at": 1_800_000_000,
+        # v20 (#721): NULL for every row -- schema only, nothing writes this column yet.
+        "attest_due_ts": None,
     }
 
 

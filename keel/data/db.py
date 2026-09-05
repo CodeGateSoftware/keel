@@ -20,7 +20,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
-SCHEMA_VERSION = 19
+SCHEMA_VERSION = 20
 
 # Creation order matters for readability (and for backends that validate FK targets eagerly);
 # SQLite itself only checks FK targets at DML time, but we still declare referenced tables first.
@@ -86,6 +86,19 @@ _SCHEMA_STATEMENTS: tuple[str, ...] = (
         -- linkage direction that exists.
         submit_best_bid TEXT,
         submit_best_ask TEXT,
+        -- How the price on THIS order was arrived at (v20, #715) -- e.g. "mid", "last_trade",
+        -- "limit_input", whatever label the caller that priced it used. Schema only: nothing in
+        -- this release writes it or reads it back. NULL on every row written before v20, and
+        -- forever on a row nobody ever labelled -- "not recorded", never a guessed provenance
+        -- invented after the fact from `limit_price` or `submit_best_bid`/`submit_best_ask`.
+        quote_provenance TEXT,
+        -- The id the adapter actually SENT the venue for this order (v20, #715), as distinct
+        -- from `id` (this table's own PK) and from a broker-returned `raw_response`/
+        -- `confirmation` id that only exists after acceptance. `resolve_client_order_id`
+        -- (`keel_broker_api.port`) already mints one per placement attempt; this column is
+        -- schema only -- nothing here persists that value yet. NULL on every row written before
+        -- v20, and on every row whose adapter call this database never captured.
+        client_order_id TEXT,
         raw_response TEXT,
         confirmation TEXT,
         rule_id INTEGER,
@@ -335,7 +348,13 @@ _SCHEMA_STATEMENTS: tuple[str, ...] = (
         pays_yield   INTEGER NOT NULL,
         source       TEXT NOT NULL,
         attested_by  TEXT NOT NULL,
-        attested_at  INTEGER NOT NULL
+        attested_at  INTEGER NOT NULL,
+        -- When this attestation's window closes (v20, #718), the same nullable shape as
+        -- `venue_cash_postures.attest_due_ts` -- unlike `broker_subscriptions.attest_due_ts`,
+        -- which is required because every insert there sets one. Schema only: nothing yet
+        -- writes or reads this column, so it is NULL for every row, existing or new, until a
+        -- later change wires an actual expiry policy through it.
+        attest_due_ts INTEGER
     )
     """,
     """
@@ -346,6 +365,9 @@ _SCHEMA_STATEMENTS: tuple[str, ...] = (
         source       TEXT NOT NULL,
         attested_by  TEXT NOT NULL,
         attested_at  INTEGER NOT NULL,
+        -- Same column, same meaning, same "schema only, always NULL for now" caveat as
+        -- `asset_attestations.attest_due_ts` above (v20, #718).
+        attest_due_ts INTEGER,
         PRIMARY KEY (venue, product_id)
     )
     """,
@@ -393,6 +415,52 @@ _SCHEMA_STATEMENTS: tuple[str, ...] = (
     )
     """,
     "CREATE INDEX IF NOT EXISTS idx_equity_points_mode_ts ON equity_points(mode, ts)",
+    # One row per (cycle, currency) -- the per-currency settled/available/total pair a cycle
+    # observed (v20, #719). Per CURRENCY and not one scalar pair, because folding several
+    # currencies into one figure would add them 1:1, which is the no-FX bound
+    # `agent._mark_to_market_parts` already states it will not cross.
+    #
+    # Schema only in this release: nothing writes these rows yet, and
+    # `commands/balances.py` still reports the split as unrecorded.
+    """
+    CREATE TABLE IF NOT EXISTS cycle_balances (
+        id          INTEGER PRIMARY KEY AUTOINCREMENT,
+        ts          INTEGER NOT NULL,
+        mode        TEXT NOT NULL,
+        currency    TEXT NOT NULL,
+        -- Decimal as TEXT, the same convention as every money column in this schema (`orders.
+        -- qty`, `equity_points.equity`). NULL means NOT OBSERVED, never zero: a cycle that could
+        -- read the total but not the available-to-trade split (or vice versa) must be able to
+        -- leave the unread side NULL rather than have a writer invent a number for it.
+        available   TEXT,
+        total       TEXT
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_cycle_balances_mode_currency_ts "
+    "ON cycle_balances(mode, currency, ts)",
+    """
+    CREATE TABLE IF NOT EXISTS audit_events (
+        seq_id        INTEGER PRIMARY KEY AUTOINCREMENT,
+        -- Epoch seconds, INTEGER -- deliberately NOT `ts TEXT` as issue #721's comment specifies.
+        -- Every other timestamp in this schema is INTEGER (see `positions.opened_at`,
+        -- `asset_attestations.attested_at`, and the comment on `equity_points.ts` above, which
+        -- spells out why: TEXT orders an epoch LEXICALLY, so a `ts >= ?` range read -- exactly
+        -- how an audit trail gets queried -- would silently return the wrong rows once the
+        -- second-digit count changes, e.g. "9999999999" sorting before "10000000000". That is
+        -- the one bug `equity_points.ts` exists to document and this table would walk straight
+        -- into by following the issue text literally. INTEGER matches this schema's own
+        -- established convention over the issue's literal wording.
+        ts            INTEGER NOT NULL,
+        event_type    TEXT NOT NULL,
+        entity_id     TEXT NOT NULL,
+        payload_json  TEXT NOT NULL,
+        -- Hash-chain fields: each row commits to the previous row's `row_hash`, so the chain
+        -- (not any single row) is what a reader verifies. Schema only here -- no writer computes
+        -- either hash yet; that is a later change's job.
+        prev_hash     TEXT NOT NULL,
+        row_hash      TEXT NOT NULL
+    )
+    """,
 )
 
 
@@ -857,6 +925,60 @@ def _migrate_v19_equity_points(conn: sqlite3.Connection) -> None:
     """
 
 
+def _migrate_v20_provenance_and_attest_windows(conn: sqlite3.Connection) -> None:
+    """v20 adds four columns and two tables (#721): `orders.quote_provenance`,
+    `orders.client_order_id`, `asset_attestations.attest_due_ts`,
+    `instrument_attestations.attest_due_ts`, plus `cycle_balances` and `audit_events`.
+
+    SCHEMA ONLY. Nothing in this release writes any of the four new columns, and nothing reads
+    them back -- this migration exists to make the columns and tables available, not to change
+    what any existing writer or rail does. See the DDL comments beside each column in
+    `_SCHEMA_STATEMENTS` for what each one is for and why `audit_events.ts` is INTEGER rather
+    than the `TEXT` #721's own comment specifies.
+
+    `cycle_balances` and `audit_events` are brand new, so their creation is a genuine no-op here
+    -- the `_migrate_v9_screen_exceptions`/`_migrate_v19_equity_points` pattern: `migrate()` runs
+    every `_SCHEMA_STATEMENTS` statement (all `IF NOT EXISTS`) before the version loop below, so
+    a database already stamped below v20 picks both tables up from that pass alone.
+
+    The four columns are a different story, because `orders`, `asset_attestations` and
+    `instrument_attestations` all PREDATE this migration: a database arriving from anywhere
+    between v1 and v19 already has these three tables from an EARLIER `CREATE TABLE IF NOT
+    EXISTS`, which never adds a column to a table that already exists -- the v8 lesson
+    (`profile.autonomous_until`), repeated at v11, v12, v13, v15 and v16 for exactly this reason.
+    So each column needs a real `ALTER TABLE`, guarded the v16 way: a `PRAGMA table_info` check
+    INDEPENDENTLY per column, because a database arriving fresh (or from v12 straight through)
+    gets all three tables from THIS release's `_SCHEMA_STATEMENTS`, which already carries all
+    four columns -- a bare `ALTER TABLE` there would raise sqlite's own "duplicate column name"
+    and break every upgrade landing on this release. Guarding each column on its own, rather than
+    inferring one from another, also means a database hand-patched with only some of the four
+    can still pick up the rest instead of getting stuck.
+
+    **NO BACKFILL, deliberately, for all four.** The honest value for every row written before
+    v20 is NULL -- "not recorded" -- exactly the convention `filled_quantity` (v11) and
+    `submit_best_bid`/`submit_best_ask` (v16) already established for this same `orders` table.
+    Nothing in this database can tell you what priced a 2026-07 order, what id the adapter sent
+    for it, or when an attestation window closes for an attestation nobody dated with one.
+    Inventing values for any of them would be worse than the honest NULL this migration leaves
+    behind.
+    """
+    order_columns = {row["name"] for row in conn.execute("PRAGMA table_info(orders)")}
+    if "quote_provenance" not in order_columns:
+        conn.execute("ALTER TABLE orders ADD COLUMN quote_provenance TEXT")
+    if "client_order_id" not in order_columns:
+        conn.execute("ALTER TABLE orders ADD COLUMN client_order_id TEXT")
+
+    asset_columns = {row["name"] for row in conn.execute("PRAGMA table_info(asset_attestations)")}
+    if "attest_due_ts" not in asset_columns:
+        conn.execute("ALTER TABLE asset_attestations ADD COLUMN attest_due_ts INTEGER")
+
+    instrument_columns = {
+        row["name"] for row in conn.execute("PRAGMA table_info(instrument_attestations)")
+    }
+    if "attest_due_ts" not in instrument_columns:
+        conn.execute("ALTER TABLE instrument_attestations ADD COLUMN attest_due_ts INTEGER")
+
+
 _MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
     2: _migrate_v2_broker_subscriptions,
     3: _migrate_v3_trade_outcomes,
@@ -876,6 +998,7 @@ _MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
     17: _migrate_v17_candle_series_feed,
     18: _migrate_v18_venue_cash_postures,
     19: _migrate_v19_equity_points,
+    20: _migrate_v20_provenance_and_attest_windows,
 }
 
 
