@@ -16,6 +16,15 @@
 > to, never revised (#247). It states what those same measurements produce on today's engine, over
 > a population widened from three shipped rule families to five.
 
+> **Cost note, and why this record carries a different one from its neighbours.** Every other
+> document in this directory is priced at the flat 5bp floor and points at
+> [the per-product restatement](2026-09-01-per-product-slippage-restatement.md) for the correction.
+> This one reports **both** regimes side by side. Its **flat columns are a bridge, not a result** —
+> they exist so §2 can compare like-for-like against the numbers 08-13 printed, and they are priced
+> at a floor that restatement measured **0 of 24 assets reach**. Every **verdict** on this page is
+> stated at per-product pricing and is unaffected by the correction; where a flat figure is quoted
+> as though it were a finding — ZEC crossing the maker rate in §2.1 — §2.2 exists to remove it.
+
 ---
 
 ## The verdict, first
