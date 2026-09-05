@@ -1493,6 +1493,9 @@ function gauntletSection(gauntlet) {
         { label: "when (UTC)", numeric: false },
         { label: "trial", numeric: false },
         { label: "rule", numeric: false },
+        // A PBO is only defined WITHIN a session -- `build_matrix` requires synchronous
+        // columns -- so the session is context, not decoration.
+        { label: "session", numeric: false },
         { label: "ran", numeric: false },
         { label: "PBO", numeric: true },
         { label: "train expectancy", numeric: true },
@@ -1505,6 +1508,7 @@ function gauntletSection(gauntlet) {
         row.at,
         plain(row.trial_id) || "—",
         plain(row.rule) || "—",
+        plain(row.session) || "—",
         row.ran,
         row.pbo,
         row.train_expectancy,

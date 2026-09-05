@@ -2206,7 +2206,6 @@ def _gauntlet_row_payload(row: GauntletRow) -> dict[str, Any]:
         "trial_id": row.trial_id,
         "session": row.session,
         "rule": row.rule,
-        "decision": row.decision,
         "ran": flag(
             row.available,
             on="the gauntlet ran on this trial",
@@ -2228,8 +2227,11 @@ def _gauntlet_row_payload(row: GauntletRow) -> dict[str, Any]:
             # of things that went wrong rather than as evidence of a discipline being applied.
             off_state=NEUTRAL,
         ),
-        "train_expectancy": money(row.train_expectancy, signed=True),
-        "held_out_expectancy": money(row.held_out_expectancy, signed=True),
+        # `places=4`, matching every other expectancy in this file. The default 2 showed the
+        # ledger's -1.337906... as -$1.34 here and -$1.3379 on /insights -- two front-ends
+        # saying the same figure two different ways, the drift this layer exists to stop.
+        "train_expectancy": money(row.train_expectancy, places=4, signed=True),
+        "held_out_expectancy": money(row.held_out_expectancy, places=4, signed=True),
         # A bare string, and ABSENT where none was recorded rather than `0` -- zero is a VALID
         # seed, and an unreproducible run must not read as a reproducible one.
         "seed": count(row.seed),

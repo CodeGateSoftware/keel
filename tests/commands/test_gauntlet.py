@@ -95,7 +95,10 @@ def test_a_trial_the_gauntlet_could_not_run_on_is_not_a_trial_it_never_saw(
 
     assert row.available is False
     assert row.pbo is None
-    assert row.recorded is True, "the row IS a gauntlet record; it records a refusal"
+    # Its PRESENCE is what records the attempt -- a refusal is a gauntlet record, and the row
+    # existing at all is the report saying so. A `recorded` property that said the same thing was
+    # removed as dead: nothing emitted it, so no payload reader could ever have read it.
+    assert row.trial_id == "t-1"
 
 
 def test_a_trial_with_no_gauntlet_fields_is_not_a_row_here(tmp_path: Path) -> None:
@@ -223,3 +226,115 @@ def test_a_missing_ledger_reports_no_rows_and_says_so(tmp_path: Path) -> None:
     assert report.ledger_present is False
     assert report.rows == ()
     assert report.trials_total == 0
+
+
+# -- absent is not a verdict ----------------------------------------------------------------------
+#
+# The hole an independent review found, and it is the rule this whole view is built on.
+# `seed`, `bars` and `pbo` were all given the `| None` treatment; `gate_passed` and
+# `available` were left as bare `bool`, so a row that recorded no verdict rendered "did not
+# pass the promotion gate" -- absent data as a negative judgement about somebody's rule.
+
+
+def test_a_row_with_no_gate_verdict_does_not_report_a_failed_gate(tmp_path: Path) -> None:
+    """`bool(None)` is `False`, and `False` here is a VERDICT: "did not pass the promotion gate".
+    A run that recorded a PBO but no gate outcome has not failed anything -- it has not been
+    judged, and the page must say so."""
+    path = _ledger(tmp_path, _trial(trial_id="t-1", summary={"pbo_available": 1, "pbo": "0.7"}))
+
+    (row,) = gather_gauntlet(path, now_ts=GAUNTLET_NOW_TS).rows
+
+    assert row.gate_passed is None, "no verdict recorded is not a failed verdict"
+
+
+def test_a_null_availability_is_not_a_definite_refusal(tmp_path: Path) -> None:
+    """`pbo_available: null` is a real historical artifact of this ledger --
+    `ledger._decode_summary` documents null summary values and passes them through. Reading it as
+    `0` asserts a specific mechanical cause ("no usable series, or too thin for CSCV") for a row
+    that recorded nothing at all."""
+    path = _ledger(tmp_path, _trial(trial_id="t-1", summary={"pbo_available": None}))
+
+    (row,) = gather_gauntlet(path, now_ts=GAUNTLET_NOW_TS).rows
+
+    assert row.available is None
+
+
+def test_a_recorded_refusal_is_still_a_definite_false(tmp_path: Path) -> None:
+    """The other side of it: `pbo_available: 0` IS a recorded refusal and must stay one. Making
+    everything optional would lose the distinction the view exists to draw."""
+    path = _ledger(tmp_path, _refused("t-1"))
+
+    (row,) = gather_gauntlet(path, now_ts=GAUNTLET_NOW_TS).rows
+
+    assert row.available is False
+    assert row.gate_passed is False
+
+
+def test_the_gate_count_counts_only_recorded_passes(tmp_path: Path) -> None:
+    """`None` is not a pass. A three-state field summed with `if row.gate_passed` already does the
+    right thing, and this pins it so a later `is not False` does not quietly count unjudged rows."""
+    path = _ledger(
+        tmp_path,
+        _ran("t-1", gate_passed=1),
+        _trial(trial_id="t-2", summary={"pbo_available": 1}),
+    )
+
+    assert gather_gauntlet(path, now_ts=GAUNTLET_NOW_TS).gate_passed_count == 1
+
+
+# -- a malformed row must not 500 the page ---------------------------------------------------------
+
+
+def test_a_boolean_where_a_figure_belongs_degrades_to_absent(tmp_path: Path) -> None:
+    """`bool` is an `int` subclass, so `ledger._decode_summary` passes `true` through untouched and
+    `Decimal(str(True))` raises `InvalidOperation`. A read-only page must not 500 over one row
+    written by something else."""
+    path = _ledger(tmp_path, _trial(trial_id="t-1", summary={"pbo_available": 1, "pbo": True}))
+
+    (row,) = gather_gauntlet(path, now_ts=GAUNTLET_NOW_TS).rows
+
+    assert row.pbo is None
+
+
+def test_a_non_finite_figure_degrades_to_absent(tmp_path: Path) -> None:
+    """`int(Decimal("Infinity"))` raises `OverflowError`, which is neither `TypeError` nor
+    `ValueError` -- the guard that claimed to catch malformed rows did not catch the one the
+    reachable values actually produce."""
+    path = _ledger(
+        tmp_path,
+        _trial(trial_id="t-1", summary={"pbo_available": 1, "seed": "Infinity", "bars": "NaN"}),
+    )
+
+    (row,) = gather_gauntlet(path, now_ts=GAUNTLET_NOW_TS).rows
+
+    assert row.seed is None
+    assert row.bars is None
+
+
+def test_a_boolean_seed_is_absent_and_never_one(tmp_path: Path) -> None:
+    """`int(True)` is `1`. Without an explicit bool branch a malformed `seed: true` would be
+    recorded as seed 1 -- a plausible, wrong value that makes an unreproducible run look
+    reproducible, which is worse than the crash the same value causes in the Decimal path."""
+    path = _ledger(
+        tmp_path,
+        _trial(trial_id="t-1", summary={"pbo_available": 1, "seed": True, "bars": False}),
+    )
+
+    (row,) = gather_gauntlet(path, now_ts=GAUNTLET_NOW_TS).rows
+
+    assert row.seed is None
+    assert row.bars is None
+
+
+def test_a_boolean_gate_verdict_is_not_read_as_a_verdict(tmp_path: Path) -> None:
+    """Same root cause on the flags. The writer stores 0/1; a JSON `true` is off-convention, and
+    reading it as "passed the promotion gate" would invent a verdict out of a malformed row."""
+    path = _ledger(
+        tmp_path,
+        _trial(trial_id="t-1", summary={"pbo_available": True, "gate_passed": True}),
+    )
+
+    (row,) = gather_gauntlet(path, now_ts=GAUNTLET_NOW_TS).rows
+
+    assert row.gate_passed is None
+    assert row.available is None

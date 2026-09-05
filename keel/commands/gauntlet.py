@@ -54,8 +54,12 @@ AVAILABILITY_KEY = "pbo_available"
 class GauntletRow:
     """One trial's recorded gauntlet outcome.
 
-    Every field is `None` where the ledger recorded nothing, never zero. `seed=0` is a VALID
-    seed, and an older row that recorded a PBO without one must not read as reproducible.
+    **Every field is `None` where the ledger recorded nothing.** Not zero, and -- the part a first
+    cut of this class got wrong -- not `False` either. `seed=0` is a VALID seed, so a row that
+    recorded a PBO without one must not read as reproducible; and `gate_passed=False` is a
+    VERDICT ("did not pass the promotion gate"), so a row that recorded no gate outcome must not
+    read as having failed one. Absent data rendered as a negative judgement about somebody's rule
+    is the precise failure this view exists to refuse, and `bool(None)` is how it gets in.
     """
 
     trial_id: str
@@ -65,14 +69,21 @@ class GauntletRow:
     decision: str
 
     #: Whether the gauntlet could actually run -- the ledger's `pbo_available`, as a bool.
-    available: bool
+    #: Whether the gauntlet could actually run -- the ledger's `pbo_available`.
+    #:
+    #: THREE-VALUED. `True` ran, `False` is a RECORDED refusal (every column series-missing, or
+    #: the grid too thin for CSCV), `None` is `pbo_available: null` -- which `ledger._decode_
+    #: summary` documents as a real historical artifact of this file. Reading null as `False`
+    #: would assert that specific mechanical cause for a row that recorded nothing.
+    available: bool | None
 
     #: `None` when it could not run. Stored in the ledger as a STRING, so it decodes to an exact
     #: `Decimal` and crosses the wire under Rule 1 without ever having been a float.
     pbo: Decimal | None
 
-    #: Whether the promotion gate passed. Every row in the ledger today says no.
-    gate_passed: bool
+    #: Whether the promotion gate passed, or `None` where no verdict was recorded. Every row in
+    #: the ledger today that HAS a verdict says no.
+    gate_passed: bool | None
 
     #: The pair, together, because the pair is the finding: either figure alone says nothing
     #: about overfitting, and the GAP between them is the measurement.
@@ -86,15 +97,6 @@ class GauntletRow:
     #: Bars the run covered. Carried for the same reason `SlippageRow.bars` is: a result over
     #: 17,520 bars and one over 200 are not the same evidence.
     bars: int | None
-
-    @property
-    def recorded(self) -> bool:
-        """Always true for a row that exists here -- a refusal IS a record.
-
-        Held as a property rather than left implicit so a reader of the payload does not have to
-        infer "this trial went through the gauntlet" from the row's mere presence.
-        """
-        return True
 
 
 @dataclass(frozen=True)
@@ -138,30 +140,69 @@ class GauntletReport:
 
 
 def _decimal_or_none(summary: dict[str, Any], key: str) -> Decimal | None:
-    """A summary figure as `Decimal`, or `None` when the row did not record it.
+    """A summary figure as `Decimal`, or `None` for anything that is not one.
 
-    `read_trials` has already decoded these -- a string becomes `Decimal`, an `int` stays an
-    `int`, `None` passes through. The `int` branch is why this cannot just annotate the type:
-    a summary value the writer happened to store as a whole number arrives as `int` and would
-    reach a money-shaped field as one.
+    `read_trials` has already decoded these: a string becomes `Decimal`, an `int` stays an `int`,
+    `None` passes through. The `int` branch is why this cannot just annotate the type -- a value
+    the writer stored as a whole number arrives as `int` and would reach a money field as one.
+
+    **The `except` is the fix, and it is not optional.** `bool` is an `int` subclass, so
+    `_decode_summary` passes `true` through untouched and `Decimal(str(True))` is
+    `Decimal("True")` -- an `InvalidOperation` that reached the request handler uncaught and 500'd
+    the page. `InvalidOperation` is an `ArithmeticError`, so the clause below catches it along
+    with every other malformed figure.
+
+    An explicit `isinstance(value, bool)` branch was written here first and removed: it produced
+    the same answer as the `except` for every input, so no mutation could distinguish them, and a
+    guard nothing can prove is a guard nobody should trust. `_int_or_none` keeps its bool branch
+    because there it CHANGES the answer -- `int(True)` is `1`, a silently wrong seed rather than
+    an exception.
     """
     value = summary.get(key)
     if value is None:
         return None
     if isinstance(value, Decimal):
         return value
-    return Decimal(str(value))
+    try:
+        return Decimal(str(value))
+    except (ArithmeticError, TypeError, ValueError):
+        return None
 
 
 def _int_or_none(summary: dict[str, Any], key: str) -> int | None:
+    """A summary figure as `int`, or `None` for anything that is not one.
+
+    `ArithmeticError` is in the catch and `ValueError` alone was not enough: the values that
+    reach here have already been through `_decode_summary`, so a non-numeric string died there
+    and what actually arrives is a `Decimal` -- and `int(Decimal("Infinity"))` raises
+    `OverflowError`, which is an `ArithmeticError` and neither a `TypeError` nor a `ValueError`.
+    The guard was catching exceptions the reachable values do not raise while missing the one
+    they do.
+    """
     value = summary.get(key)
-    if value is None:
+    # `bool` FIRST, and here it is load-bearing rather than defensive: `bool` is an `int`
+    # subclass and `int(True)` is `1`, so a `seed: true` in a malformed row would be recorded as
+    # seed 1 -- a plausible, wrong, reproducible-looking value. Absent is the honest answer.
+    if value is None or isinstance(value, bool):
         return None
     try:
         return int(value)
-    except (TypeError, ValueError):
+    except (ArithmeticError, TypeError, ValueError):
         # A read-only page must not 500 over one malformed row written by something else.
         return None
+
+
+def _flag_or_none(summary: dict[str, Any], key: str) -> bool | None:
+    """A recorded 0/1 as a bool, or `None` where nothing was recorded.
+
+    The whole point of this function is that it does NOT go through `bool()`: `bool(None)` is
+    `False`, and `False` on either of this module's two flags is a positive claim -- "the
+    gauntlet could not run", "the gate did not pass". Absent is a third answer.
+    """
+    recorded = _int_or_none(summary, key)
+    if recorded is None:
+        return None
+    return bool(recorded)
 
 
 def gather_gauntlet(path: Path | str, *, now_ts: int) -> GauntletReport:
@@ -178,11 +219,12 @@ def gather_gauntlet(path: Path | str, *, now_ts: int) -> GauntletReport:
             session=trial.session,
             rule=trial.rule,
             decision=trial.decision,
-            # `bool(int)`: the ledger stores 0/1. A row where the key is present but unreadable
-            # falls to False, which is the fail-closed direction -- "we could not run it".
-            available=bool(_int_or_none(trial.summary, AVAILABILITY_KEY)),
+            # NOT `bool(...)`: `bool(None)` is `False`, and `False` here says "the gauntlet
+            # could not run", which is a claim about the machinery rather than an absence of
+            # one. `pbo_available: null` is a real artifact of this ledger and reads as None.
+            available=_flag_or_none(trial.summary, AVAILABILITY_KEY),
             pbo=_decimal_or_none(trial.summary, "pbo"),
-            gate_passed=bool(_int_or_none(trial.summary, "gate_passed")),
+            gate_passed=_flag_or_none(trial.summary, "gate_passed"),
             train_expectancy=_decimal_or_none(trial.summary, "train_expectancy"),
             held_out_expectancy=_decimal_or_none(trial.summary, "held_out_expectancy"),
             seed=_int_or_none(trial.summary, "seed"),

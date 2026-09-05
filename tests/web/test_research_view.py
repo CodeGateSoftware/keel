@@ -782,6 +782,18 @@ def test_the_not_run_count_crosses_so_six_rows_are_not_read_as_the_whole_record(
     assert document["not_run_count"]["value"] == "2"
 
 
+def test_the_expectancies_carry_the_same_precision_as_every_other_one(tmp_path: Path) -> None:
+    """`places=4`, matching `payload.py`'s other expectancy sites. At the default 2 the ledger's
+    real `-1.337906...` reads `-$1.34` here and `-$1.3379` on /insights -- the two front-ends
+    disagreeing about one number, which is what this layer exists to prevent."""
+    from tests.commands.test_gauntlet import _ran
+
+    document = _gauntlet(tmp_path, _ran("t-1", train_expectancy="-1.337906173823760233469"))
+    row = document["rows"][0]
+
+    assert row["train_expectancy"]["display"].endswith("1.3379")
+
+
 def test_a_missing_seed_is_absent_and_never_zero(tmp_path: Path) -> None:
     """Zero is a VALID seed. A row that recorded a PBO without one must not reach the page
     looking reproducible."""
@@ -835,6 +847,16 @@ def test_the_gauntlet_section_computes_nothing_and_declares_no_sort_key() -> Non
 
 
 def _section_body(name: str) -> str:
+    """One helper function's body, bounded at the next function of ANY kind.
+
+    `export function` was the bound at first and it was too wide: `slippageSection` is not
+    exported, so the window for `gauntletSection` ran through all of it and the assertions
+    were quietly covering two sections. Not wrong yet -- it would have failed for the wrong
+    reason, which is the same trap `_view_keys` records having fallen into.
+    """
     after = _code("render.js").split(f"function {name}")[1]
-    end = after.find("export function ")
+    end = after.find("\nfunction ")
+    exported = after.find("\nexport function ")
+    if exported != -1 and (end == -1 or exported < end):
+        end = exported
     return after if end == -1 else after[:end]

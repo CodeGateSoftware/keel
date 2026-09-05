@@ -447,9 +447,9 @@ function mount(route, readings) {
   // endpoint declares no sortable column, and a research record that can be ordered
   // best-first is a leaderboard.
   if (route.name === "research") {
-    // The second endpoint is SECONDARY, like the journal on `/insights`: a slippage read that
-    // fails leaves the trials table standing with a stated gap in it rather than taking the
-    // whole research record down.
+    // Both extra endpoints are SECONDARY, like the journal on `/insights`: a gauntlet or
+    // slippage read that fails leaves the trials table standing with a stated gap in it
+    // rather than taking the whole research record down.
     const gauntlet = readings[1];
     const slippage = readings[2];
     return researchView(
