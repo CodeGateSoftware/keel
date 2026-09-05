@@ -220,9 +220,23 @@ def _attestation_window_findings(
     due date -- except there the column is REQUIRED once attested (NULL is itself a FAIL) and
     here it is optional: a row with no window is simply excluded from both the passed and the
     approaching group, never reported as either.
+
+    `due <= now_ts` for the passed group, matching `cash_posture_findings` below and
+    `BrokerSubscription.effective_status`: a window closing exactly NOW is closed. With `<` a row
+    landing on the second falls into neither group, and if it is the only dated row the check
+    returns a clean "nothing overdue or approaching" -- a false all-clear, which is the one
+    answer a compliance check must never give by accident.
     """
+    # `row.get`, NOT `row[...]`: `keel mcp`'s `_open_readonly_repo` deliberately does not migrate,
+    # so this seam is reached with v19-shaped rows on a database an operator has not upgraded --
+    # and a `KeyError` here took down the WHOLE `gather_findings` call, not just this check. This
+    # is the first reader of a v20-only column in the shared gather path, so the exposure is new.
+    # A column that is not there yet is the same "not recorded" a NULL is.
     due_rows = [
-        (row, int(row["attest_due_ts"])) for row in rows if row["attest_due_ts"] is not None
+        (row, int(due))
+        for row in rows
+        if (due := (row.get("attest_due_ts") if hasattr(row, "get") else row["attest_due_ts"]))
+        is not None
     ]
     passed = [(row, due) for row, due in due_rows if due <= now_ts]
     approaching = [

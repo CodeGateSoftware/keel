@@ -203,6 +203,10 @@ def test_attest_without_attest_due_records_null(tmp_path, valid_config_path):
     repo = _repo_at(db_path)
     runner = CliRunner()
 
+    db_path = tmp_path / "t.db"
+    repo = _repo_at(db_path)
+    runner = CliRunner()
+
     result = _attest(runner, db_path, valid_config_path, "PAXG", **{"--backing": "ayn"})
     assert result.exit_code == 0, result.output
 
@@ -1893,3 +1897,58 @@ def test_probe_liquidity_flags_a_candidate_whose_24h_snapshot_beats_its_median(
     sol_line = next(ln for ln in result.output.splitlines() if "SOL-USD" in ln)
     assert "LOW" in bico_line, bico_line
     assert "LOW" not in sol_line, sol_line
+
+
+def test_a_compact_date_is_refused_rather_than_read_as_a_1970_timestamp(
+    tmp_path, valid_config_path
+) -> None:
+    """`--attest-due 20270131` is the obvious shorthand for a command whose other accepted form
+    is `YYYY-MM-DD`. `_parse_ts` tries `int()` first, so it was accepted as a unix timestamp and
+    recorded a window closing in August 1970 -- an attestation already expired on the day it was
+    made, at exit 0 with no output saying so.
+
+    This is the first operator-supplied expiry in the codebase (subscriptions, scopes and cash
+    postures all compute `now + TTL`), so it is the first one that could be typed wrong.
+    """
+    db_path = tmp_path / "t.db"
+    repo = _repo_at(db_path)
+    runner = CliRunner()
+
+    result = _attest(
+        runner, db_path, valid_config_path, "PAXG",
+        **{"--backing": "ayn", "--attest-due": "20270131"},
+    )
+
+    assert result.exit_code != 0
+    assert "2027-01-31" in result.output, "the refusal must show the form that works"
+    assert repo.get_asset_attestation("PAXG") is None
+
+
+def test_the_recorded_window_is_echoed_back(tmp_path, valid_config_path) -> None:
+    """`commands/posture.py` and `commands/brokers.py` both echo `expires=<utc date>` for exactly
+    this reason: a window the operator cannot see is a window they cannot notice is wrong."""
+    db_path = tmp_path / "t.db"
+    _repo_at(db_path)
+    runner = CliRunner()
+
+    result = _attest(
+        runner, db_path, valid_config_path, "PAXG",
+        **{"--backing": "ayn", "--attest-due": "2027-01-31"},
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "expires=2027-01-31" in result.output
+
+
+def test_an_attestation_without_a_window_echoes_a_dash(tmp_path, valid_config_path) -> None:
+    """Not `expires=None` and not a silently absent field -- the same `-` the sibling commands
+    print, so "no window recorded" is visible rather than inferred from what is missing."""
+    db_path = tmp_path / "t.db"
+    _repo_at(db_path)
+    runner = CliRunner()
+
+    result = _attest(runner, db_path, valid_config_path, "PAXG", **{"--backing": "ayn"})
+
+    assert result.exit_code == 0, result.output
+    assert "expires=-" in result.output
+

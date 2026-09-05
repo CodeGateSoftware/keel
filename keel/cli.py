@@ -92,6 +92,7 @@ import json
 import os
 import sys
 import time
+from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any
@@ -155,7 +156,7 @@ from keel.commands.fetch import assess_products as _assess_products  # noqa: F40
 # CLI calls. `_assess_products` is re-imported because the fetch tests pin the sweep's
 # window-bounded invariant THROUGH this module's name.
 from keel.commands.fetch import run_fetch
-from keel.commands.insights import _parse_ts as _parse_attest_due  # shared --since/--until parser
+from keel.commands.insights import _parse_ts as _parse_since_until
 from keel.commands.insights import insights_group
 from keel.commands.mcp import mcp_cmd
 from keel.commands.monitor import run_monitor
@@ -216,6 +217,39 @@ from keel.data.db import connect, migrate
 from keel.install import install_plan_cmd
 from keel.research import ledger as trials_ledger
 from keel.version import build_info, check_install
+
+#: `--attest-due`, parsed. Wraps `insights._parse_ts` (the `--since`/`--until` convention) with
+#: one refusal and one echo, because this is the FIRST operator-supplied expiry in the codebase --
+#: subscriptions, scopes and cash postures all compute `now + TTL`, so none of them could be typed
+#: wrong. This one can.
+#:
+#: `_parse_ts` tries `int()` first, so `--attest-due 20270131` -- the obvious shorthand for a
+#: command whose other accepted form is `YYYY-MM-DD` -- was accepted as a unix timestamp and
+#: silently recorded a window that closed in August 1970. Exit 0, no output, an attestation
+#: already expired on the day it was made.
+_COMPACT_DATE_LEN = 8
+
+
+def _parse_attest_due(raw: str) -> int:
+    """`--attest-due`'s value as epoch seconds, refusing the shorthand that means the wrong year."""
+    text = raw.strip()
+    if text.isdigit() and len(text) == _COMPACT_DATE_LEN and text.startswith(("19", "20")):
+        raise click.BadParameter(
+            f"{raw!r} looks like a compact date. A bare number is read as a UNIX TIMESTAMP, so "
+            f"this would record a window closing in {_utc_day(int(text))}, not in "
+            f"{text[:4]}. Write it as {text[:4]}-{text[4:6]}-{text[6:]}."
+        )
+    return _parse_since_until(text)
+
+
+def _utc_day(ts: int | None) -> str:
+    """An epoch as a UTC date, or `-`. Echoed back after every attestation, the way
+    `commands/posture.py` and `commands/brokers.py` already echo `expires=` -- a window the
+    operator cannot see is a window they cannot notice is wrong."""
+    if ts is None:
+        return "-"
+    return datetime.fromtimestamp(ts, tz=UTC).strftime("%Y-%m-%d")
+
 
 # -- root group ---------------------------------------------------------------------------------
 
@@ -798,7 +832,10 @@ def assets_attest(
         attested_at=int(time.time()),
         attest_due_ts=attest_due_ts,
     )
-    click.echo(f"attested {asset}: sector={sector} backing={backing} pays_yield={pays_yield}")
+    click.echo(
+        f"attested {asset}: sector={sector} backing={backing} pays_yield={pays_yield} "
+        f"expires={_utc_day(attest_due_ts)}"
+    )
 
 
 @assets_group.command("attest-instrument")

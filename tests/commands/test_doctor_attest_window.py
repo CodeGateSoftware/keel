@@ -53,6 +53,7 @@ def _instrument(
 # -- asset attestations ----------------------------------------------------------------------
 
 
+
 def test_no_attestations_is_ok():
     (finding,) = asset_attestation_window_findings([], now_ts=NOW)
     assert finding.status == OK
@@ -156,3 +157,33 @@ def test_an_instrument_window_far_in_the_future_is_ok():
         [_instrument(attest_due_ts=NOW + 365 * DAY)], now_ts=NOW
     )
     assert all(f.status == OK for f in findings)
+
+
+def test_a_window_closing_exactly_now_is_already_passed() -> None:
+    """`due <= now_ts`, not `<`. A row landing exactly on the second would otherwise fall into
+    neither the passed nor the approaching group -- and if it were the only dated row the check
+    would answer a clean "nothing overdue or approaching". A false all-clear is the one answer a
+    compliance check must never give by accident.
+
+    Survived mutation before this test existed: flipping `<=` to `<` left the whole suite green.
+    """
+    (finding,) = asset_attestation_window_findings([_asset(attest_due_ts=NOW)], now_ts=NOW)
+
+    assert finding.status != OK, "a window closing exactly now is closed, not still open"
+
+
+def test_a_row_from_a_database_that_predates_the_column_is_not_an_error() -> None:
+    """`keel mcp`'s `_open_readonly_repo` deliberately does NOT migrate, so this seam is reached
+    with v19-shaped rows on a database nobody has upgraded. `row["attest_due_ts"]` raised
+    `KeyError` there and took down the WHOLE `gather_findings` call, not just this check -- a
+    reporting feature breaking a diagnostic tool on the deployments least able to spare it.
+
+    A column that does not exist yet is the same "not recorded" a NULL is.
+    """
+    row = _asset()
+    del row["attest_due_ts"]  # a v19-shaped row: the column does not exist yet
+
+    (finding,) = asset_attestation_window_findings([row], now_ts=NOW)
+
+    assert finding.status == OK
+
