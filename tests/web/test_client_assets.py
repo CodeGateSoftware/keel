@@ -1870,3 +1870,134 @@ def test_every_mapped_collection_is_either_checked_or_named() -> None:
     # has outlived its subject, and would quietly excuse a future collection of the same name.
     stale = set(_ROW_ENDPOINTS_UNCOVERED) - mapped
     assert not stale, f"exemptions for collections nothing maps: {sorted(stale)}"
+
+
+# -- the session chip and the mode banner (#704) -------------------------------------------------
+#
+# The refusal this issue is built around is a NEGATIVE: no way to go live sits on either surface.
+# A negative is exactly what rots silently, so it is pinned structurally -- against the parsed
+# function bodies and the parsed markup, not against a substring that a rename would slip past.
+
+
+def _comments_stripped(source: str) -> str:
+    """`source` with comments removed and STRING LITERALS KEPT.
+
+    Deliberately not `_code_only`, and the difference is the whole test below. `_code_only` also
+    collapses every string, which is right for the scans looking for arithmetic and wrong here:
+    the thing being forbidden is `el("button", ...)`, and `button` is a string literal. Scanning
+    the stripped form for it finds nothing, always -- a test that passes against the very mutation
+    it exists to catch. (Confirmed: adding a "Go live" button to `paperBanner` survived the first
+    version of this test.)
+
+    Comments still go, because a docstring is not what a function does -- `paperBanner`'s explains
+    at length what it refuses to build, using the exact words this scan looks for.
+    """
+    out: list[str] = []
+    i, n = 0, len(source)
+    while i < n:
+        if source.startswith("//", i):
+            while i < n and source[i] != "\n":
+                i += 1
+            continue
+        if source.startswith("/*", i):
+            end = source.find("*/", i + 2)
+            i = n if end == -1 else end + 2
+            continue
+        # Strings are stepped THROUGH rather than skipped, so a `//` inside one is not mistaken
+        # for a comment and does not eat the rest of the line.
+        if source[i] in "'\"":
+            quote = source[i]
+            out.append(source[i])
+            i += 1
+            while i < n:
+                if source[i] == "\\":
+                    out.append(source[i : i + 2])
+                    i += 2
+                    continue
+                out.append(source[i])
+                if source[i] == quote:
+                    i += 1
+                    break
+                i += 1
+            continue
+        out.append(source[i])
+        i += 1
+    return "".join(out)
+
+
+def _function_body(source: str, name: str) -> str:
+    """One exported function's body, comments stripped and string literals kept."""
+    code = _comments_stripped(source)
+    start = code.index("export function " + name + "(")
+    rest = code[start + 1 :]
+    end = rest.find("\nexport function ")
+    return rest if end == -1 else rest[:end]
+
+
+def test_the_clickable_scan_can_actually_see_a_string_literal() -> None:
+    """The scan's own smoke test, because the first version of it could not.
+
+    A source-text check that strips the very tokens it searches for passes against every input,
+    including the mutation it was written to catch. This asserts the lexer keeps what the test
+    below depends on before that test is allowed to mean anything.
+    """
+    kept = _comments_stripped('const go = el("button", undefined, "Go live"); // el("form")')
+    assert '"button"' in kept
+    assert "form" not in kept, "comments must still be stripped"
+
+
+def test_neither_the_chip_nor_the_banner_builds_anything_clickable() -> None:
+    """Display and navigation only, by construction rather than by intent.
+
+    A retail console makes the chip a dropdown and hangs an "Open Live Account" button off the
+    paper banner. Switching profile or mode in keel is a config-file edit plus a typed terminal
+    ceremony, and going live is a runbook -- this console may explain both and may not offer
+    either. So neither function may create an interactive node or bind a handler.
+    """
+    source = _source("render.js")
+    for name in ("sessionChip", "paperBanner"):
+        body = _function_body(source, name)
+        for forbidden in ("button", "addEventListener", "onclick", '"a"', "href", "form", "input"):
+            assert forbidden not in body, f"{name} builds something interactive: {forbidden}"
+
+
+def test_the_banner_sentence_is_placed_and_never_written_here() -> None:
+    """Rule 2. Choosing between two sentences on the basis of what a config says is a judgement,
+    and judgements are made in Python -- so the words must arrive on the payload. A renderer that
+    composed the sentence could drift from the one the tests assert verbatim."""
+    body = _function_body(_source("render.js"), "paperBanner")
+    assert "config.banner" in body
+    assert "PAPER" not in body, "the banner's words belong to payload._session_banner"
+
+
+def test_the_chip_and_the_banner_live_outside_the_view_so_they_survive_navigation() -> None:
+    """"Present on all views" is a property of WHERE they are, not of every view remembering to
+    draw them. `#view` is replaced wholesale on each navigation; these sit outside it."""
+    html = _INDEX.read_text(encoding="utf-8")
+    view_at = html.index('id="view"')
+    for element in ('id="session-chip"', 'id="mode-banner"'):
+        assert element in html, f"{element} is missing from the shell"
+        assert html.index(element) < view_at, f"{element} is inside #view and would be repainted"
+
+
+def test_the_banner_element_ships_empty_and_carries_no_children() -> None:
+    """Empty in the markup, like `#build` and `#mode-badge`: an unreadable config costs the
+    banner rather than showing a guessed one. And nothing is smuggled in as static markup -- the
+    node's whole content comes from the payload or it has none."""
+    html = _markup_only(_INDEX.read_text(encoding="utf-8"))
+    assert '<p id="mode-banner" class="modebanner"></p>' in html
+
+
+def test_every_id_main_js_demands_exists_in_the_shell() -> None:
+    """`must()` throws on a missing id, which is the right behaviour and a terrible way to find
+    out: the two files ship together, so a missing id is a bug in the commit that made it."""
+    import re
+
+    html = _INDEX.read_text(encoding="utf-8")
+    # The RAW source, not `_code_only`: the ids being looked for ARE string literals, which is
+    # exactly what that lexer strips. Over-matching an id mentioned in a comment would fail this
+    # test rather than pass it silently, so the raw scan errs in the safe direction.
+    demanded = set(re.findall(r'must\("([a-z0-9-]+)"\)', _source("main.js")))
+    assert demanded, "the scan found no must() calls -- it would pass against any shell"
+    for element_id in sorted(demanded):
+        assert f'id="{element_id}"' in html, f"main.js demands #{element_id}; index.html has none"

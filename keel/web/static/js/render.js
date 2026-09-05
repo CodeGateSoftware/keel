@@ -2977,6 +2977,79 @@ export function modeBadge(node, config) {
 }
 
 /**
+ * The session chip's two halves, from `/api/config` (#704).
+ *
+ * **The spine, without what usually rides on it.** Making paper-vs-live visible on every page
+ * rather than buried in settings is the one organizing idea worth taking from a retail broker
+ * console. What their version attaches -- an "Open Live Account" button on the paper banner --
+ * is a growth funnel wrapped around real money, and is refused here and in `paperBanner` below.
+ *
+ * **Display and navigation only. It never mutates.** Switching profile or mode is a config-file
+ * edit plus a typed terminal ceremony with a runbook; there is no control here, no route behind
+ * one, and no capability added. The chip surrounds the existing `modeBadge` node rather than
+ * replacing it, so the badge keeps owning the mode word and its db/config tooltip -- three facts
+ * reading `profile · mode · equity state`, each written by the one function that knows it.
+ *
+ * The two halves are filled separately because they are separately absent: a profile is always
+ * knowable (it is the database's filename), while the equity state can be genuinely unrecorded
+ * on a deployment that has never flipped modes. `equity_state` is a `Field` carrying that
+ * distinction as a state, so `field()` places the unknown reading without this function deciding
+ * anything about it.
+ *
+ * @param {HTMLElement} profileNode
+ * @param {HTMLElement} equityNode
+ * @param {any} config  `/api/config`'s `data`, or `null`.
+ */
+export function sessionChip(profileNode, equityNode, config) {
+  const profile = config && typeof config.profile === "string" ? config.profile : "";
+  if (profile) {
+    profileNode.replaceChildren(document.createTextNode(profile));
+  } else {
+    // Empty rather than a placeholder, and `keel.css` hides it while empty -- the same rule the
+    // mode badge follows. A deployment with no name is not a deployment called "unknown".
+    profileNode.replaceChildren();
+  }
+  if (config && config.equity_state) {
+    equityNode.replaceChildren(field(config.equity_state));
+  } else {
+    equityNode.replaceChildren();
+  }
+}
+
+/**
+ * The persistent mode banner (#704).
+ *
+ * **Zero buttons, zero links, forever.** In paper it states that no real money is involved; in
+ * confirm it restates the mode/equity-state pairing the operator is about to verify against the
+ * venue's own UI. It never offers a way to go live, because going live is a ceremony with a
+ * runbook that this console may explain and must never funnel toward.
+ *
+ * The SENTENCE comes from the payload (`payload._session_banner`) and is placed here unread:
+ * choosing between two sentences on the basis of what a config says is a judgement, and Rule 2
+ * keeps judgements in Python. This function decides only the emphasis, from the same
+ * `MODE_CLASS` table the badge uses -- so the banner and the badge cannot disagree about which
+ * mode is the quiet one.
+ *
+ * An empty banner means the config could not be read, and the node empties: an absent answer is
+ * not `paper`, and a banner is a claim about whether real money is involved, which has no safe
+ * default.
+ *
+ * @param {HTMLElement} node
+ * @param {any} config  `/api/config`'s `data`, or `null`.
+ */
+export function paperBanner(node, config) {
+  const text = config && typeof config.banner === "string" ? config.banner : "";
+  const mode = config && typeof config.mode === "string" ? config.mode : "";
+  if (!text) {
+    node.className = "modebanner";
+    node.replaceChildren();
+    return;
+  }
+  node.className = "modebanner ".concat(MODE_CLASS[mode] || "");
+  node.replaceChildren(document.createTextNode(text));
+}
+
+/**
  * The footer's build line, from `/api/config`.
  *
  * `reproducible` is the one judged field on that payload, and `payload.config_payload` calls it

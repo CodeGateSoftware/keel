@@ -164,7 +164,27 @@
     should cost the badge rather than guess a mode.
   -->
 <span class="right">
-    <span id="mode-badge" class="pill mode"></span>
+    <!--
+      THE SESSION CHIP (#704): profile · mode · equity state, on every view.
+
+      Three facts that together answer "which deployment is this browser looking at, and which
+      account drove the numbers on it". The mode badge above keeps its own node and its own
+      tooltip; this markup only puts a name in front of it and an equity state after it, so each
+      fact stays owned by the one function that knows it.
+
+      DISPLAY AND NAVIGATION ONLY. There is no control in here and no route behind one:
+      switching profile or mode is a config-file edit plus a typed terminal ceremony, and the
+      runbook documents it. A retail console would make this a dropdown; that dropdown is the
+      thing being refused, not the thing being copied.
+
+      Both halves empty in the markup and hidden while empty (`:empty` in `keel.css`), like
+      `#mode-badge` and `#build`: a deployment with no readable name is not one called "unknown".
+    -->
+    <span id="session-chip" class="session">
+      <span id="session-profile" class="sessionpart"></span>
+      <span id="mode-badge" class="pill mode"></span>
+      <span id="session-equity" class="sessionpart"></span>
+    </span>
   
     <!--
       THE THEME TOGGLE (#597): two states, and the stylesheet is the state machine.
@@ -203,6 +223,27 @@
     </button>
   </span>
 </header>
+
+<!--
+  THE MODE BANNER (#704): a calm, permanent statement of what this session is.
+
+  Outside `#view`, so it survives every navigation rather than being repainted per screen -- the
+  point of a persistent banner is that it is never the thing that scrolled away.
+
+  ZERO BUTTONS, ZERO LINKS, and that is the whole design decision. A retail console puts an
+  "Open Live Account" button on its paper banner: radical clarity used as a growth funnel wrapped
+  around real money. Going live in keel is a config edit plus a typed terminal ceremony with a
+  runbook, and this surface may explain that and must never funnel toward it. A test sweeps every
+  mode and equity-state pairing for the vocabulary of a funnel, so the refusal cannot be undone
+  quietly.
+
+  The SENTENCE is written by `payload._session_banner` and placed here unread. Empty in the
+  markup and hidden while empty: an unreadable config costs the banner, because a banner is a
+  claim about whether real money is involved and there is no safe default for that claim.
+
+  No `aria-live`: it changes once, at boot, and this page keeps exactly one live region.
+-->
+<p id="mode-banner" class="modebanner"></p>
 
 <main id="view" tabindex="-1">
 
