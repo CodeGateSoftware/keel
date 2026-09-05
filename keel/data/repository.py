@@ -1174,21 +1174,40 @@ class Repository:
         source: str,
         attested_by: str,
         attested_at: int,
+        attest_due_ts: int | None = None,
     ) -> None:
+        """`attest_due_ts` (v20, #718) is when THIS attestation's window closes -- NULL when
+        the caller supplies none, never inferred. It MUST appear in `DO UPDATE SET` alongside
+        every other column: a re-attestation is a fresh claim, and the caller re-attesting
+        without a window means exactly that -- no window -- not "keep whatever was there
+        before". Omitting it there would let a stale window silently outlive the claim it was
+        recorded for, which is worse than no window at all.
+        """
         self._conn.execute(
             """
             INSERT INTO asset_attestations
-                (asset, sector, backing, pays_yield, source, attested_by, attested_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+                (asset, sector, backing, pays_yield, source, attested_by, attested_at,
+                 attest_due_ts)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(asset) DO UPDATE SET
                 sector = excluded.sector,
                 backing = excluded.backing,
                 pays_yield = excluded.pays_yield,
                 source = excluded.source,
                 attested_by = excluded.attested_by,
-                attested_at = excluded.attested_at
+                attested_at = excluded.attested_at,
+                attest_due_ts = excluded.attest_due_ts
             """,
-            (asset, sector, backing, int(pays_yield), source, attested_by, attested_at),
+            (
+                asset,
+                sector,
+                backing,
+                int(pays_yield),
+                source,
+                attested_by,
+                attested_at,
+                attest_due_ts,
+            ),
         )
         self._conn.commit()
 
@@ -1217,19 +1236,25 @@ class Repository:
         source: str,
         attested_by: str,
         attested_at: int,
+        attest_due_ts: int | None = None,
     ) -> None:
+        """`attest_due_ts` (v20, #718): same column, same meaning, same ON-CONFLICT trap as
+        `upsert_asset_attestation` above -- it must be in `DO UPDATE SET` so a re-attestation
+        without a window CLEARS a previously recorded one rather than carrying it forward.
+        """
         self._conn.execute(
             """
             INSERT INTO instrument_attestations
-                (venue, product_id, wrapper, source, attested_by, attested_at)
-            VALUES (?, ?, ?, ?, ?, ?)
+                (venue, product_id, wrapper, source, attested_by, attested_at, attest_due_ts)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(venue, product_id) DO UPDATE SET
                 wrapper = excluded.wrapper,
                 source = excluded.source,
                 attested_by = excluded.attested_by,
-                attested_at = excluded.attested_at
+                attested_at = excluded.attested_at,
+                attest_due_ts = excluded.attest_due_ts
             """,
-            (venue, product_id, wrapper, source, attested_by, attested_at),
+            (venue, product_id, wrapper, source, attested_by, attested_at, attest_due_ts),
         )
         self._conn.commit()
 
