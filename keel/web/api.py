@@ -120,7 +120,20 @@ def deployment_state(cfg: ServeConfig) -> Any:
 
 
 def close_repo(repo: Any) -> None:
-    conn = getattr(repo, "conn", None)
+    """Close the connection `open_repo` opened. Every reader in this package runs this in a
+    `finally`, and until #704 none of them closed anything.
+
+    It reached for `repo.conn`. `Repository.__init__` stores `self._conn` and exposes no `conn`,
+    so the `getattr` returned `None`, the guard fell through, and the function was a no-op --
+    every page load left an unclosed sqlite3 connection, reclaimed only by CPython's refcounting
+    when the local went out of scope. Harmless in practice on CPython and wrong in the way that
+    matters here: the `finally` READ as the cleanup, so nothing looked missing.
+
+    `_conn` first, `conn` second, so this keeps working against anything duck-typed as a
+    repository (the MCP tools hand around objects that are not `Repository`), and both are
+    checked rather than one being inferred from the other.
+    """
+    conn = getattr(repo, "_conn", None) or getattr(repo, "conn", None)
     if conn is not None:
         try:
             conn.close()
@@ -164,14 +177,20 @@ def _status_report(cfg: ServeConfig, now_ts: int) -> Any:
         close_repo(repo)
 
 
-def read_config(cfg: ServeConfig, _query: Query, _state: Any, _now_ts: int) -> dict[str, Any]:
-    """The running build, and the deployment that build is serving (#597).
+def read_config(cfg: ServeConfig, _query: Query, _state: Any, now_ts: int) -> dict[str, Any]:
+    """The running build, and the deployment that build is serving (#597, #704).
 
-    Still reads NO database -- it answers on a machine with nothing set up, which is why its
-    route is `needs_database=False`. The deployment half arrives as this process's own
-    arguments (`cfg.db_path`, `cfg.config_path`) plus one read of the config FILE, which opens
-    no database and forks no subprocess, unlike the `inspect` probe the envelope has already run
-    for `engine` by the time this returns.
+    **It answers on a machine with nothing set up, which is why its route is
+    `needs_database=False` -- and #704 added one OPTIONAL database read without changing that.**
+    The chip needs `equity_state_mode`, which lives in `agent_state`, and this is the only
+    endpoint every view reads. `_equity_state_mode` therefore checks the file exists before
+    connecting (`sqlite3.connect` CREATES what it cannot find) and degrades to unknown on any
+    failure, so a first run still boots the shell -- it just boots it without the equity half of
+    the chip, which is the honest thing for a deployment that has never run.
+
+    The rest of the deployment half arrives as this process's own arguments (`cfg.db_path`,
+    `cfg.config_path`) plus one read of the config FILE, which forks no subprocess, unlike the
+    `inspect` probe the envelope has already run for `engine` by the time this returns.
 
     **`_mode` degrades rather than raising, and the whole shell depends on that.** The client
     boots from this one endpoint -- worker registration, docs links, the footer build line and
@@ -183,9 +202,73 @@ def read_config(cfg: ServeConfig, _query: Query, _state: Any, _now_ts: int) -> d
         cfg.build_info,
         describe=cfg.build,
         mode=_auto_trade_mode(cfg.config_path),
+        profile=_profile_name(cfg.db_path),
+        **_session_state(cfg.db_path, now_ts),
         db_path=cfg.db_path,
         config_path=cfg.config_path,
     )
+
+
+def _profile_name(db_path: str) -> str:
+    """The deployment profile's name: the database file's stem (#704).
+
+    ADR 0002 settles what a profile IS -- "the database is already one-per-profile", which is
+    also why `equity_points` has a `mode` column and no `profile` one. So there is nothing
+    STORED to read: the profile is the file, and this names the file.
+
+    The stem and not a prettier word, because anything prettier would be inferred. `keel.db` and
+    `keel-live.db` are the operator's own names for their deployments; a mapping from those to
+    "paper"/"live" would be this console guessing which is which from a filename, on the one
+    surface built to stop paper and live being confused. The full paths stay in the mode badge's
+    tooltip, so the short name is checkable rather than trusted.
+    """
+    return Path(db_path).stem if db_path else ""
+
+
+def _session_state(db_path: str, now_ts: int) -> dict[str, Any]:
+    """`equity_state_mode` and `autonomous` -- the two deployment facts the chip and banner need.
+
+    **Both from ONE connection.** They are read together because they are shown together, and two
+    opens on the boot path of every page would be two chances to leak and two answers that could
+    describe different instants.
+
+    `autonomous` is `Profile.is_autonomous(now_ts)`, which honours the expiry the operator set --
+    so a lapsed `keel autonomy on --until` stops being claimed by the banner at the moment it
+    stops applying, rather than at the next restart. `get_profile` FAILS CLOSED (an absent row, a
+    damaged database -> not autonomous), which is the direction that makes the banner's mistake,
+    if it makes one, the one that over-promises supervision rather than under-promising it.
+
+    **This is the one database read on an endpoint whose route is `needs_database=False`, and the
+    exemption is load-bearing.** The client boots from this endpoint alone, so a database that is
+    missing (a first run) or unreadable must cost the chip its halves, never the page its boot.
+    Every failure is one answer here for the same reason `_auto_trade_mode` treats a missing file,
+    malformed YAML and a refused value alike: naming the narrow ones would leave this reader
+    deciding which failure is which, and the caller's response is the same.
+
+    **Existence is checked before connecting, and that is not a micro-optimisation.**
+    `sqlite3.connect` CREATES the file it cannot find, so connecting unconditionally would have a
+    read-only view bring a deployment into existence merely by being polled -- and every page
+    would then report a healthy empty install rather than offering to set one up.
+    `server.ensure_schema` carries the same guard and the same reasoning, found the same way.
+
+    No migration, like every other read in this package: a view must not take a schema write lock
+    on a database the agent may be mid-cycle on.
+    """
+    unknown = {"equity_state_mode": "", "autonomous": False}
+    if not db_path or not Path(db_path).exists():
+        return unknown
+    repo = None
+    try:
+        repo = open_repo(db_path)
+        return {
+            "equity_state_mode": str(repo.get_state("equity_state_mode") or ""),
+            "autonomous": bool(repo.get_profile().is_autonomous(now_ts)),
+        }
+    except Exception:  # a database that cannot answer is one that has not answered
+        return unknown
+    finally:
+        if repo is not None:
+            close_repo(repo)
 
 
 def _auto_trade_mode(config_path: str) -> str:

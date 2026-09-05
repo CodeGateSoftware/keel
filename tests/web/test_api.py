@@ -1105,3 +1105,162 @@ def _is_format_call(node: ast.AST) -> bool:
         and isinstance(node.func, ast.Name)
         and node.func.id == "format"
     )
+
+
+def _serve_config(db_path: str, config_path: str):
+    """A `ServeConfig` with only the two fields `read_config` reads from the deployment."""
+    from keel.web.server import ServeConfig
+
+    return ServeConfig(
+        host="127.0.0.1", port=0, token="t", db_path=db_path, config_path=config_path
+    )
+
+
+# -- the session chip's database read (#704) -----------------------------------------------------
+#
+# `/api/config` is `needs_database=False` because the client boots from it alone. #704 gave it one
+# optional read; these pin that the exemption survived.
+
+
+def test_config_answers_with_no_database_at_all(tmp_path: Path) -> None:
+    """A first run. The shell must still boot -- without the equity half of the chip, which is the
+    honest answer for a deployment that has never run."""
+    from keel.web.api import read_config
+
+    missing = tmp_path / "nothing" / "keel.db"
+    cfg = _serve_config(str(missing), str(tmp_path / "nope.yaml"))
+    body = read_config(cfg, {}, None, 0)
+
+    assert body["profile"] == "keel"
+    assert body["equity_state"]["value"] == ""
+    assert body["banner"] == ""
+
+
+def test_reading_the_config_never_brings_a_database_into_existence(tmp_path: Path) -> None:
+    """`sqlite3.connect` CREATES the file it cannot find, so an unguarded read would have a
+    read-only view conjure a deployment merely by being polled every 15 seconds -- and every page
+    would then report a healthy empty install rather than offering to set one up.
+    `server.ensure_schema` carries the same guard, found the same way."""
+    from keel.web.api import read_config
+
+    missing = tmp_path / "keel.db"
+    cfg = _serve_config(str(missing), str(tmp_path / "nope.yaml"))
+    read_config(cfg, {}, None, 0)
+
+    assert not missing.exists(), "polling /api/config created the deployment database"
+
+
+def test_config_reports_the_recorded_equity_state(tmp_path: Path) -> None:
+    from keel.data.db import connect, migrate
+    from keel.data.repository import Repository
+    from keel.web.api import read_config
+
+    db_path = tmp_path / "keel-live.db"
+    conn = connect(str(db_path))
+    migrate(conn)
+    Repository(conn).set_state("equity_state_mode", "live")
+    conn.close()
+
+    cfg = _serve_config(str(db_path), str(tmp_path / "nope.yaml"))
+    body = read_config(cfg, {}, None, 0)
+
+    assert body["profile"] == "keel-live"
+    assert body["equity_state"]["value"] == "live"
+
+
+def test_an_unreadable_database_costs_the_chip_not_the_boot(tmp_path: Path) -> None:
+    """Every failure is one answer here -- unknown -- for the same reason `_auto_trade_mode`
+    treats a missing file, malformed YAML and a refused value alike."""
+    from keel.web.api import read_config
+
+    db_path = tmp_path / "keel.db"
+    db_path.write_bytes(b"this is not a database, not even close")
+    cfg = _serve_config(str(db_path), str(tmp_path / "nope.yaml"))
+
+    body = read_config(cfg, {}, None, 0)
+    assert body["equity_state"]["value"] == ""
+    # `autonomous` is an INPUT to `config_payload`, not a key on the wire: the banner is the one
+    # surface that states it, and a second rendering of the same fact is a second thing to drift.
+    assert "autonomous" not in body
+    # The boot survives: the keys the shell needs before it can paint anything are all present.
+    # The first version of this line was `body["build"] == "" or isinstance(body["build"], str)`,
+    # which is true of every string and so asserted only that a str is a str.
+    for key in ("version", "build", "mode", "profile", "banner", "db_path", "config_path"):
+        assert key in body, f"an unreadable database cost /api/config its {key}"
+
+
+def test_the_banner_reads_autonomy_from_the_deployment_not_from_the_config_alone(
+    tmp_path: Path,
+) -> None:
+    """End to end through `read_config`, because the payload tests exercise `_session_banner`
+    directly and would not notice the endpoint never asking.
+
+    `keel autonomy on` is a profile row, not a config value: `agent._effective_mode` returns
+    `"autonomous"` only when the config is `confirm` AND the profile says so, and under that
+    pairing orders place unattended. A banner that read the config alone would permanently promise
+    supervision that had been switched off.
+    """
+    import time
+
+    from keel.data.db import connect, migrate
+    from keel.data.repository import Repository
+    from keel.web.api import read_config
+
+    db_path = tmp_path / "keel-live.db"
+    conn = connect(str(db_path))
+    migrate(conn)
+    repo = Repository(conn)
+    repo.set_state("equity_state_mode", "live")
+    repo.set_autonomous(True, now_ts=0)
+    conn.close()
+
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(VALID_CONFIG_YAML + "\nauto_trade:\n  mode: confirm\n")
+    cfg = _serve_config(str(db_path), str(config_path))
+
+    body = read_config(cfg, {}, None, int(time.time()))
+    assert "AUTONOMOUS" in body["banner"], body["banner"]
+    assert "waits for your approval" not in body["banner"]
+
+
+def test_a_lapsed_autonomy_window_stops_being_claimed_by_the_banner(tmp_path: Path) -> None:
+    """`Profile.is_autonomous` honours the expiry the operator set, and the banner is read at
+    request time -- so an `--until` that has passed reverts the sentence on the next page load
+    rather than at the next restart."""
+    from keel.data.db import connect, migrate
+    from keel.data.repository import Repository
+    from keel.web.api import read_config
+
+    db_path = tmp_path / "keel-live.db"
+    conn = connect(str(db_path))
+    migrate(conn)
+    Repository(conn).set_autonomous(True, now_ts=0, expires_ts=1_000)
+    conn.close()
+
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(VALID_CONFIG_YAML + "\nauto_trade:\n  mode: confirm\n")
+    cfg = _serve_config(str(db_path), str(config_path))
+
+    assert "AUTONOMOUS" in read_config(cfg, {}, None, 999)["banner"]
+    assert "AUTONOMOUS" not in read_config(cfg, {}, None, 1_000)["banner"]
+
+
+def test_close_repo_actually_closes_the_connection(tmp_path: Path) -> None:
+    """It reached for `repo.conn`; `Repository` stores `_conn` and exposes no `conn`, so the
+    `getattr` returned `None` and the function was a no-op -- every reader in this package ran it
+    in a `finally` that closed nothing, and the `finally` READ as the cleanup so nothing looked
+    missing."""
+    import sqlite3
+
+    from keel.data.db import connect, migrate
+    from keel.data.repository import Repository
+    from keel.web.api import close_repo
+
+    db_path = tmp_path / "keel.db"
+    conn = connect(str(db_path))
+    migrate(conn)
+    repo = Repository(conn)
+
+    close_repo(repo)
+    with pytest.raises(sqlite3.ProgrammingError):
+        conn.execute("SELECT 1")

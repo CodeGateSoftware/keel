@@ -1646,3 +1646,179 @@ def test_a_verified_chain_over_recorded_events_is_the_only_green() -> None:
     broken = payload.timeline_payload(_timeline_report(chain_errors=("row 3: broken",)))
     assert broken["chain"]["state"] == "bad"
     assert broken["chain_errors"] == ["row 3: broken"]
+
+
+# -- session identity (#704) --------------------------------------------------------------------
+#
+# Alpaca's one genuinely good organizing idea: paper-vs-live is visible on every page rather than
+# buried in settings. Take the spine, refuse what rides on it -- their paper banner carries an
+# "Open Live Account" CTA, which is a growth funnel wrapped around real money.
+
+
+def _config(**overrides: object) -> dict[str, object]:
+    fields: dict[str, object] = {
+        "describe": "",
+        "mode": "paper",
+        "profile": "keel",
+        "equity_state_mode": "paper",
+        "autonomous": False,
+        "db_path": "/x/keel.db",
+        "config_path": "/x/config.yaml",
+    }
+    fields.update(overrides)
+    return payload.config_payload(None, **fields)  # type: ignore[arg-type]
+
+
+def test_the_chip_carries_the_profile_and_both_modes() -> None:
+    """The three facts that answer "which deployment is this browser looking at", on the one
+    endpoint every view reads."""
+    body = _config()
+    assert body["profile"] == "keel"
+    assert body["mode"] == "paper"
+    assert body["equity_state"]["value"] == "paper"
+
+
+def test_an_unrecorded_equity_state_is_unknown_not_paper() -> None:
+    """`equity_state_mode` is set on the first mode flip, so a deployment that has never run has
+    none. Rendering that as `paper` would be the console inventing the safer of the two answers
+    about which account drove the drawdown scalars."""
+    body = _config(equity_state_mode="")
+    assert body["equity_state"] == {
+        "value": "",
+        "display": "not recorded",
+        "state": "unknown",
+    }, "an em-dash here drops the half the banner asks the operator to verify"
+
+
+def test_paper_mode_gets_the_exact_banner_sentence() -> None:
+    """Fixed wording, asserted verbatim. This is the sentence that stands between an operator and
+    mistaking a simulation for their account."""
+    assert _config(mode="paper")["banner"] == "PAPER — no real money is involved"
+
+
+def test_confirm_mode_states_the_pairing_it_is_about_to_be_verified_against() -> None:
+    """Not a warning -- the configuration the operator is about to check against the venue's own
+    UI. Both halves, because the mode and the equity state are separately settable and a mismatch
+    between them is exactly what this banner exists to make visible."""
+    banner = _config(mode="confirm", equity_state_mode="live")["banner"]
+    assert "CONFIRM" in banner
+    assert "live" in banner
+
+
+def test_a_confirm_banner_says_so_when_the_equity_state_is_unrecorded() -> None:
+    """The pairing has two halves and one of them can be missing. Printing the mode alone would
+    quietly drop the half the operator is being asked to verify."""
+    banner = _config(mode="confirm", equity_state_mode="")["banner"]
+    assert "CONFIRM" in banner
+    assert "not recorded" in banner
+
+
+def test_an_unreadable_config_gets_no_banner_at_all() -> None:
+    """The same refusal `modeBadge` already makes: an absent answer is not `paper`, and guessing
+    a mode on a trading console is the one thing this surface must never do."""
+    assert _config(mode="")["banner"] == ""
+
+
+def test_an_autonomous_session_never_claims_orders_wait_for_you() -> None:
+    """The finding that made this banner dangerous rather than merely incomplete.
+
+    `keel autonomy on` is a supported, deliberate configuration, and under it orders place
+    unattended. A permanent full-bleed statement saying they wait for the operator's approval is
+    a false safety assurance about real money -- on the surface built to stop exactly that
+    confusion, and worse than the growth funnel this issue refuses.
+    """
+    banner = _config(mode="confirm", equity_state_mode="live", autonomous=True)["banner"]
+    assert "AUTONOMOUS" in banner
+    assert "waits for your approval" not in banner
+    assert "without asking" in banner
+
+
+def test_the_banner_and_the_engine_agree_about_who_is_asked() -> None:
+    """Two statements of ONE rule, pinned together rather than hoped about.
+
+    `agent._effective_mode` is the authority for EXECUTION -- `"autonomous"` only when the config
+    is `confirm` and the profile says so. This banner states the same pairing for DISPLAY. They
+    live in different modules for good reasons (Rule 2 keeps the sentence in the payload), which
+    is exactly the shape that drifts, so the sweep covers every reachable combination.
+    """
+    from keel.web.payload import _session_banner
+
+    for mode in ("paper", "confirm"):
+        for autonomous in (False, True):
+            # `_effective_mode`'s rule, restated as the predicate rather than re-derived: an
+            # autonomous cycle happens only when BOTH switches are thrown.
+            engine_asks = not (mode == "confirm" and autonomous)
+            banner = _session_banner(mode, "live", autonomous)
+            if mode == "paper":
+                continue  # paper reaches no executor mode at all; its banner says so instead
+            claims_you_are_asked = "waits for your approval" in banner
+            assert claims_you_are_asked == engine_asks, (
+                f"mode={mode} autonomous={autonomous}: banner says "
+                f"{'asked' if claims_you_are_asked else 'not asked'}, engine says "
+                f"{'asked' if engine_asks else 'not asked'}"
+            )
+
+
+def test_the_engines_own_rule_still_matches_the_predicate_this_pins_against() -> None:
+    """The sweep above restates `_effective_mode`'s rule as a predicate, so it is only worth
+    anything while that restatement is true. Driven through the REAL function."""
+    from keel.agent import _effective_mode
+
+    class _Cfg:
+        class auto_trade:  # noqa: N801 - mirrors the config object's attribute shape
+            mode = "confirm"
+
+    class _Profile:
+        def __init__(self, autonomous: bool) -> None:
+            self._autonomous = autonomous
+
+        def is_autonomous(self, _now: int) -> bool:
+            return self._autonomous
+
+    class _Repo:
+        def __init__(self, autonomous: bool) -> None:
+            self._autonomous = autonomous
+
+        def get_profile(self) -> _Profile:
+            return _Profile(self._autonomous)
+
+    assert _effective_mode(_Cfg(), _Repo(True), 0) == "autonomous"  # type: ignore[arg-type]
+    assert _effective_mode(_Cfg(), _Repo(False), 0) == "confirm"  # type: ignore[arg-type]
+
+
+def test_the_complete_set_of_banner_sentences_is_pinned() -> None:
+    """EXHAUSTIVE, and deliberately not a blocklist of funnel words.
+
+    The first version of this refusal listed forbidden phrases -- "open live", "go live",
+    "upgrade" -- and claimed a later edit could not add a call to action quietly. It could:
+    "Start real trading", "Enable live trading", "Switch to your real account" and four other
+    realistic sentences all passed it. A blocklist can only refuse the wordings someone thought
+    of.
+
+    `_session_banner` is a pure function of three values with a small finite domain, so the honest
+    pin is the whole output set. Any new sentence -- a call to action among them -- fails this
+    test and has to be added here deliberately, in a diff a reviewer reads.
+    """
+    from keel.web.payload import _session_banner
+
+    produced = {
+        _session_banner(mode, state, autonomous)
+        for mode in ("paper", "confirm", "live", "")
+        for state in ("paper", "live", "")
+        for autonomous in (False, True)
+    }
+    assert produced == {
+        "",
+        "PAPER — no real money is involved",
+        "CONFIRM — every order is previewed and waits for your approval; equity state paper",
+        "CONFIRM — every order is previewed and waits for your approval; equity state live",
+        "CONFIRM — every order is previewed and waits for your approval; equity state not recorded",
+        "CONFIRM · AUTONOMOUS — orders place without asking you; equity state paper",
+        "CONFIRM · AUTONOMOUS — orders place without asking you; equity state live",
+        "CONFIRM · AUTONOMOUS — orders place without asking you; equity state not recorded",
+        # `live` is not a config mode today (`_VALID_AUTO_TRADE_MODES` is paper/confirm) and is
+        # carried the way `MODE_CLASS` carries it: forward-compatibly, ungraded, still rendering.
+        "LIVE — every order is previewed and waits for your approval; equity state paper",
+        "LIVE — every order is previewed and waits for your approval; equity state live",
+        "LIVE — every order is previewed and waits for your approval; equity state not recorded",
+    }

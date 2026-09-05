@@ -2570,11 +2570,82 @@ def order_rows(
 # -- config (#534) -------------------------------------------------------------------------------
 
 
+#: The banner's exact words per `auto_trade.mode` (#704).
+#:
+#: PAPER is fixed wording, and it is the sentence that stands between an operator and mistaking a
+#: simulation for their account -- so it is asserted verbatim by a test rather than left to a
+#: renderer's phrasing. CONFIRM is not a warning: it restates the configuration the operator is
+#: about to verify against the venue's own UI, which is why it names the equity state too.
+#:
+#: **Nothing here ever offers a way to go live.** Alpaca's paper banner carries an "Open Live
+#: Account" button -- radical clarity used as a growth funnel wrapped around real money. Going
+#: live in keel is a config edit plus a typed terminal ceremony with a runbook; this surface may
+#: EXPLAIN that and must never funnel toward it. Pinned by a test that sweeps every mode and
+#: equity-state pairing for the vocabulary of a funnel.
+_BANNER_PAPER = "PAPER — no real money is involved"
+
+#: What the chip says where `equity_state_mode` has never been written -- a deployment that has
+#: not yet flipped modes. NOT `paper`: that would be the console inventing the safer of the two
+#: answers about which account drove the shared drawdown scalars.
+_EQUITY_STATE_UNRECORDED = "not recorded"
+
+
+def _session_banner(mode: str, equity_state_mode: str, autonomous: bool) -> str:
+    """The banner sentence for one session, or `""` for a config that could not be read.
+
+    Chosen HERE and not in the renderer (Rule 2): picking between sentences on the basis of what a
+    deployment says is a judgement, and judgements are made in Python. The renderer places this
+    string and decides nothing.
+
+    ── AUTONOMY IS THE HALF THIS BANNER SHIPPED WITHOUT, AND IT INVERTED THE CLAIM ──────────────
+
+    The first cut said "CONFIRM — every order is previewed and waits for your approval" whenever
+    the config mode was `confirm`. That is FALSE on a deployment running `keel autonomy on`, which
+    is a supported and deliberate configuration: `agent._effective_mode` returns `"autonomous"`
+    when the config is `confirm` AND `Profile.is_autonomous(now)`, and an autonomous cycle places
+    without asking anyone. So the one persistent, full-bleed statement on every page was
+    promising supervision that had been switched off -- a false safety assurance about real money,
+    on the surface built to stop exactly that kind of confusion, and worse than the growth funnel
+    this issue exists to refuse.
+
+    Autonomy and the config mode are two independent switches, and `_effective_mode`'s docstring
+    says why they are deliberately not one enum. This function states the same pairing for
+    display; `agent._effective_mode` remains the authority for execution, and
+    `test_the_banner_and_the_engine_agree_about_who_is_asked` sweeps both over the same inputs so
+    the two statements of one rule cannot drift apart.
+
+    An unknown mode gets NO banner, the same refusal `modeBadge` already makes for the badge
+    itself: an absent answer is not `paper`, and a banner is a claim about whether real money is
+    involved with no safe default.
+    """
+    if mode == "paper":
+        return _BANNER_PAPER
+    if not mode:
+        return ""
+    # Both halves of the pairing, always. Mode and equity state are separately settable, and a
+    # MISMATCH between them -- `confirm` against paper equity, or the reverse -- is precisely what
+    # an operator is being asked to check against the venue UI. Printing the mode alone would drop
+    # the half that makes the check possible.
+    state = equity_state_mode or _EQUITY_STATE_UNRECORDED
+    if autonomous and mode == "confirm":
+        return (
+            f"{mode.upper()} · AUTONOMOUS — orders place without asking you; "
+            f"equity state {state}"
+        )
+    return (
+        f"{mode.upper()} — every order is previewed and waits for your approval; "
+        f"equity state {state}"
+    )
+
+
 def config_payload(
     build: Any,
     *,
     describe: str = "",
     mode: str = "",
+    profile: str = "",
+    equity_state_mode: str = "",
+    autonomous: bool = False,
     db_path: str = "",
     config_path: str = "",
 ) -> dict[str, Any]:
@@ -2621,6 +2692,25 @@ def config_payload(
         # paths that answer "where am I" for a process serving one --db/--config pair. See the
         # module note above for why these are bare strings and why mode is read-only.
         "mode": mode,
+        # The session chip (#704). `profile` is a bare string like `mode` -- it NAMES the
+        # database, which ADR 0002 says is the profile ("the database is already one-per-profile"),
+        # and there is nothing to grade about a name.
+        "profile": profile,
+        # A `label` and not bare, because unlike `mode` this one has an UNKNOWN reading that
+        # matters: `equity_state_mode` is written on the first mode flip, so a deployment that has
+        # never run has none, and "which account drove the drawdown scalars" being unanswered is a
+        # different fact from either answer. Rule 3 keeps that distinction here rather than letting
+        # a client infer it from an empty string.
+        # `""` and not `None` for the absent case, deliberately. `label(None)` is `absent()`,
+        # whose display is the em-dash -- right in a table cell, wrong here: a chip reading
+        # "keel · confirm · —" drops the very half the banner asks the operator to verify. The
+        # empty `value` still says absent to anything reading the field programmatically.
+        "equity_state": label(
+            equity_state_mode,
+            display=equity_state_mode or _EQUITY_STATE_UNRECORDED,
+            state=NEUTRAL if equity_state_mode else UNKNOWN,
+        ),
+        "banner": _session_banner(mode, equity_state_mode, autonomous),
         "db_path": db_path,
         "config_path": config_path,
         # keel's central honesty signal, and the one judgement this payload carries: `False` means

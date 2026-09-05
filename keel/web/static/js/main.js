@@ -44,6 +44,8 @@ import {
   gatesView,
   insightsView,
   modeBadge,
+  paperBanner,
+  sessionChip,
   ordersView,
   balancesView,
   timelineView,
@@ -147,6 +149,13 @@ const docsNode = /** @type {HTMLAnchorElement} */ (must("docs-link"));
 const updateNode = must("update");
 /** The header's mode badge (#597). Filled once, from the boot config read. */
 const modeNode = must("mode-badge");
+/** The session chip's profile half (#704) -- the database's own name, filled from the boot read. */
+const sessionProfileNode = must("session-profile");
+/** The session chip's equity-state half (#704). Genuinely absent on a deployment that has never
+ * flipped modes, which is why it is a `Field` and not a bare word. */
+const sessionEquityNode = must("session-equity");
+/** The persistent mode banner (#704). No buttons live in here, by design and by test. */
+const modeBannerNode = must("mode-banner");
 /** The header's theme toggle (#597). Clicked, it flips and stores the choice `theme.js` restores. */
 const themeNode = /** @type {HTMLButtonElement} */ (must("theme-toggle"));
 
@@ -1519,6 +1528,11 @@ void read("config").then((reading) => {
   docsNode.href = indexUrl();
   buildLine(buildNode, config);
   modeBadge(modeNode, config);
+  // #704, hydrated from the SAME boot read for the same reason the badge is: the deployment this
+  // process serves cannot change without a restart, and filling the chip here is what puts it on
+  // every view rather than only where a status report happens to load.
+  sessionChip(sessionProfileNode, sessionEquityNode, config);
+  paperBanner(modeBannerNode, config);
   registerWorker(config);
   show(booted, false);
 });
