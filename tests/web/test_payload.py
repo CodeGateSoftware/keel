@@ -1646,3 +1646,84 @@ def test_a_verified_chain_over_recorded_events_is_the_only_green() -> None:
     broken = payload.timeline_payload(_timeline_report(chain_errors=("row 3: broken",)))
     assert broken["chain"]["state"] == "bad"
     assert broken["chain_errors"] == ["row 3: broken"]
+
+
+# -- session identity (#704) --------------------------------------------------------------------
+#
+# Alpaca's one genuinely good organizing idea: paper-vs-live is visible on every page rather than
+# buried in settings. Take the spine, refuse what rides on it -- their paper banner carries an
+# "Open Live Account" CTA, which is a growth funnel wrapped around real money.
+
+
+def _config(**overrides: object) -> dict[str, object]:
+    fields: dict[str, object] = {
+        "describe": "",
+        "mode": "paper",
+        "profile": "keel",
+        "equity_state_mode": "paper",
+        "db_path": "/x/keel.db",
+        "config_path": "/x/config.yaml",
+    }
+    fields.update(overrides)
+    return payload.config_payload(None, **fields)  # type: ignore[arg-type]
+
+
+def test_the_chip_carries_the_profile_and_both_modes() -> None:
+    """The three facts that answer "which deployment is this browser looking at", on the one
+    endpoint every view reads."""
+    body = _config()
+    assert body["profile"] == "keel"
+    assert body["mode"] == "paper"
+    assert body["equity_state"]["value"] == "paper"
+
+
+def test_an_unrecorded_equity_state_is_unknown_not_paper() -> None:
+    """`equity_state_mode` is set on the first mode flip, so a deployment that has never run has
+    none. Rendering that as `paper` would be the console inventing the safer of the two answers
+    about which account drove the drawdown scalars."""
+    body = _config(equity_state_mode="")
+    assert body["equity_state"] == {
+        "value": "",
+        "display": "not recorded",
+        "state": "unknown",
+    }, "an em-dash here drops the half the banner asks the operator to verify"
+
+
+def test_paper_mode_gets_the_exact_banner_sentence() -> None:
+    """Fixed wording, asserted verbatim. This is the sentence that stands between an operator and
+    mistaking a simulation for their account."""
+    assert _config(mode="paper")["banner"] == "PAPER — no real money is involved"
+
+
+def test_confirm_mode_states_the_pairing_it_is_about_to_be_verified_against() -> None:
+    """Not a warning -- the configuration the operator is about to check against the venue's own
+    UI. Both halves, because the mode and the equity state are separately settable and a mismatch
+    between them is exactly what this banner exists to make visible."""
+    banner = _config(mode="confirm", equity_state_mode="live")["banner"]
+    assert "CONFIRM" in banner
+    assert "live" in banner
+
+
+def test_a_confirm_banner_says_so_when_the_equity_state_is_unrecorded() -> None:
+    """The pairing has two halves and one of them can be missing. Printing the mode alone would
+    quietly drop the half the operator is being asked to verify."""
+    banner = _config(mode="confirm", equity_state_mode="")["banner"]
+    assert "CONFIRM" in banner
+    assert "not recorded" in banner
+
+
+def test_an_unreadable_config_gets_no_banner_at_all() -> None:
+    """The same refusal `modeBadge` already makes: an absent answer is not `paper`, and guessing
+    a mode on a trading console is the one thing this surface must never do."""
+    assert _config(mode="")["banner"] == ""
+
+
+def test_no_banner_anywhere_offers_a_way_to_go_live() -> None:
+    """The refusal this issue is built around. Alpaca's banner funnels; this one explains.
+    Asserted over every mode this payload can produce, so a later edit cannot add one quietly."""
+    forbidden = ("open live", "go live", "upgrade", "contact sales", "http", "click", "sign up")
+    for mode in ("paper", "confirm", "live", ""):
+        for state in ("paper", "live", ""):
+            banner = str(_config(mode=mode, equity_state_mode=state)["banner"]).lower()
+            for phrase in forbidden:
+                assert phrase not in banner, f"{mode}/{state} banner funnels: {banner!r}"

@@ -165,13 +165,19 @@ def _status_report(cfg: ServeConfig, now_ts: int) -> Any:
 
 
 def read_config(cfg: ServeConfig, _query: Query, _state: Any, _now_ts: int) -> dict[str, Any]:
-    """The running build, and the deployment that build is serving (#597).
+    """The running build, and the deployment that build is serving (#597, #704).
 
-    Still reads NO database -- it answers on a machine with nothing set up, which is why its
-    route is `needs_database=False`. The deployment half arrives as this process's own
-    arguments (`cfg.db_path`, `cfg.config_path`) plus one read of the config FILE, which opens
-    no database and forks no subprocess, unlike the `inspect` probe the envelope has already run
-    for `engine` by the time this returns.
+    **It answers on a machine with nothing set up, which is why its route is
+    `needs_database=False` -- and #704 added one OPTIONAL database read without changing that.**
+    The chip needs `equity_state_mode`, which lives in `agent_state`, and this is the only
+    endpoint every view reads. `_equity_state_mode` therefore checks the file exists before
+    connecting (`sqlite3.connect` CREATES what it cannot find) and degrades to unknown on any
+    failure, so a first run still boots the shell -- it just boots it without the equity half of
+    the chip, which is the honest thing for a deployment that has never run.
+
+    The rest of the deployment half arrives as this process's own arguments (`cfg.db_path`,
+    `cfg.config_path`) plus one read of the config FILE, which forks no subprocess, unlike the
+    `inspect` probe the envelope has already run for `engine` by the time this returns.
 
     **`_mode` degrades rather than raising, and the whole shell depends on that.** The client
     boots from this one endpoint -- worker registration, docs links, the footer build line and
@@ -183,9 +189,64 @@ def read_config(cfg: ServeConfig, _query: Query, _state: Any, _now_ts: int) -> d
         cfg.build_info,
         describe=cfg.build,
         mode=_auto_trade_mode(cfg.config_path),
+        profile=_profile_name(cfg.db_path),
+        equity_state_mode=_equity_state_mode(cfg.db_path),
         db_path=cfg.db_path,
         config_path=cfg.config_path,
     )
+
+
+def _profile_name(db_path: str) -> str:
+    """The deployment profile's name: the database file's stem (#704).
+
+    ADR 0002 settles what a profile IS -- "the database is already one-per-profile", which is
+    also why `equity_points` has a `mode` column and no `profile` one. So there is nothing
+    STORED to read: the profile is the file, and this names the file.
+
+    The stem and not a prettier word, because anything prettier would be inferred. `keel.db` and
+    `keel-live.db` are the operator's own names for their deployments; a mapping from those to
+    "paper"/"live" would be this console guessing which is which from a filename, on the one
+    surface built to stop paper and live being confused. The full paths stay in the mode badge's
+    tooltip, so the short name is checkable rather than trusted.
+    """
+    from pathlib import Path
+
+    return Path(db_path).stem if db_path else ""
+
+
+def _equity_state_mode(db_path: str) -> str:
+    """`agent_state.equity_state_mode` -- which account last drove the shared drawdown scalars.
+
+    **This is the one database read on an endpoint whose route is `needs_database=False`, and the
+    exemption is load-bearing.** The client boots from this endpoint alone, so a database that is
+    missing (a first run) or unreadable must cost the chip its equity half, never the page its
+    boot. Every failure is one answer here -- unknown -- for the same reason `_auto_trade_mode`
+    treats a missing file, malformed YAML and a refused value alike: naming the narrow ones would
+    leave this reader deciding which failure is which, and the caller's response is the same.
+
+    **Existence is checked before connecting, and that is not a micro-optimisation.**
+    `sqlite3.connect` CREATES the file it cannot find, so connecting unconditionally would have a
+    read-only view bring a deployment into existence merely by being polled -- and every page
+    would then report a healthy empty install rather than offering to set one up.
+    `server.ensure_schema` carries the same guard and the same reasoning, found the same way.
+
+    No migration, like every other read in this package: a view must not take a schema write lock
+    on a database the agent may be mid-cycle on. So a pre-migration database answers from
+    whatever `agent_state` it has, or answers unknown.
+    """
+    from pathlib import Path
+
+    if not db_path or not Path(db_path).exists():
+        return ""
+    repo = None
+    try:
+        repo = open_repo(db_path)
+        return str(repo.get_state("equity_state_mode") or "")
+    except Exception:  # a database that cannot answer is one that has not answered
+        return ""
+    finally:
+        if repo is not None:
+            close_repo(repo)
 
 
 def _auto_trade_mode(config_path: str) -> str:

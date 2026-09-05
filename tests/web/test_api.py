@@ -1105,3 +1105,78 @@ def _is_format_call(node: ast.AST) -> bool:
         and isinstance(node.func, ast.Name)
         and node.func.id == "format"
     )
+
+
+def _serve_config(db_path: str, config_path: str):
+    """A `ServeConfig` with only the two fields `read_config` reads from the deployment."""
+    from keel.web.server import ServeConfig
+
+    return ServeConfig(
+        host="127.0.0.1", port=0, token="t", db_path=db_path, config_path=config_path
+    )
+
+
+# -- the session chip's database read (#704) -----------------------------------------------------
+#
+# `/api/config` is `needs_database=False` because the client boots from it alone. #704 gave it one
+# optional read; these pin that the exemption survived.
+
+
+def test_config_answers_with_no_database_at_all(tmp_path: Path) -> None:
+    """A first run. The shell must still boot -- without the equity half of the chip, which is the
+    honest answer for a deployment that has never run."""
+    from keel.web.api import read_config
+
+    missing = tmp_path / "nothing" / "keel.db"
+    cfg = _serve_config(str(missing), str(tmp_path / "nope.yaml"))
+    body = read_config(cfg, {}, None, 0)
+
+    assert body["profile"] == "keel"
+    assert body["equity_state"]["value"] == ""
+    assert body["banner"] == ""
+
+
+def test_reading_the_config_never_brings_a_database_into_existence(tmp_path: Path) -> None:
+    """`sqlite3.connect` CREATES the file it cannot find, so an unguarded read would have a
+    read-only view conjure a deployment merely by being polled every 15 seconds -- and every page
+    would then report a healthy empty install rather than offering to set one up.
+    `server.ensure_schema` carries the same guard, found the same way."""
+    from keel.web.api import read_config
+
+    missing = tmp_path / "keel.db"
+    cfg = _serve_config(str(missing), str(tmp_path / "nope.yaml"))
+    read_config(cfg, {}, None, 0)
+
+    assert not missing.exists(), "polling /api/config created the deployment database"
+
+
+def test_config_reports_the_recorded_equity_state(tmp_path: Path) -> None:
+    from keel.data.db import connect, migrate
+    from keel.data.repository import Repository
+    from keel.web.api import read_config
+
+    db_path = tmp_path / "keel-live.db"
+    conn = connect(str(db_path))
+    migrate(conn)
+    Repository(conn).set_state("equity_state_mode", "live")
+    conn.close()
+
+    cfg = _serve_config(str(db_path), str(tmp_path / "nope.yaml"))
+    body = read_config(cfg, {}, None, 0)
+
+    assert body["profile"] == "keel-live"
+    assert body["equity_state"]["value"] == "live"
+
+
+def test_an_unreadable_database_costs_the_chip_not_the_boot(tmp_path: Path) -> None:
+    """Every failure is one answer here -- unknown -- for the same reason `_auto_trade_mode`
+    treats a missing file, malformed YAML and a refused value alike."""
+    from keel.web.api import read_config
+
+    db_path = tmp_path / "keel.db"
+    db_path.write_bytes(b"this is not a database, not even close")
+    cfg = _serve_config(str(db_path), str(tmp_path / "nope.yaml"))
+
+    body = read_config(cfg, {}, None, 0)
+    assert body["equity_state"]["value"] == ""
+    assert body["build"] == "" or isinstance(body["build"], str)

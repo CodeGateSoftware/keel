@@ -256,6 +256,52 @@ header .mode-paper { color: var(--muted); }
 header .mode-confirm,
 header .mode-live { color: var(--accent); border-color: var(--accent); }
 
+/* THE SESSION CHIP (#704): profile · mode · equity state, as one group.
+ *
+ * A group and not three loose items, because the three are one answer: "which deployment is this
+ * browser looking at, and which account drove the numbers on it". `inline-flex` so the badge in
+ * the middle keeps its own pill shape while the two text halves sit level with it.
+ *
+ * Both halves are muted. The mode badge carries the emphasis for all three -- it is the fact that
+ * decides whether orders can be placed -- and giving a profile name the same weight would make
+ * the header compete with itself. */
+header .session {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+  align-self: center;
+}
+header .sessionpart {
+  color: var(--muted);
+  font-size: 0.85em;
+}
+/* Hidden while empty, the same pairing the badge above uses and for the same reason: a lone
+ * separator beside a name that never arrived is a stray mark. */
+header .sessionpart:empty { display: none; }
+
+/* THE MODE BANNER (#704).
+ *
+ * Full-bleed and calm. It is a statement, not an alert: no `--bad`, no `--warn`, no icon, and
+ * nothing inside it that can be clicked. `MODE_CLASS` supplies the same emphasis the badge uses,
+ * so the banner and the badge cannot disagree about which mode is the quiet one -- paper reads
+ * muted on a muted ground, confirm carries the accent.
+ *
+ * Hidden while empty: an unreadable config costs the banner, because a banner is a claim about
+ * whether real money is involved and there is no safe default for that claim. */
+.modebanner {
+  margin: 0;
+  padding: 0.45rem 1rem;
+  border-bottom: 1px solid var(--line);
+  background: var(--surface);
+  font-size: 0.85rem;
+  letter-spacing: 0.01em;
+  text-align: center;
+}
+.modebanner:empty { display: none; }
+.modebanner.mode-paper { color: var(--muted); }
+.modebanner.mode-confirm,
+.modebanner.mode-live { color: var(--accent); }
+
 /* The toggle. It deliberately does NOT inherit the filled `button` rule: that one is for an
  * action that changes something on the server, and a filled teal disc beside the nav would be
  * the loudest thing in the header. `--control-line` for the border, not `--line`, for the
