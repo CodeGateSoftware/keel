@@ -16,7 +16,7 @@ import sqlite3
 from decimal import Decimal
 
 import pytest
-from keel_core.hashchain import ZERO_HASH
+from keel_core.hashchain import ZERO_HASH, chain_hash
 
 from keel.data import audit, db
 from keel.data.repository import Repository
@@ -75,7 +75,7 @@ def test_each_event_commits_to_its_predecessor(conn: sqlite3.Connection) -> None
     first = _append(conn, ts=100, event_type="order_placed", entity_id="1", payload={"a": 1})
     second = _append(conn, ts=101, event_type="order_updated", entity_id="1", payload={"a": 2})
     assert second.prev_hash == first.row_hash
-    assert audit.verify_events(audit.read_events(conn)) == []
+    assert audit.chain_state(conn).errors == ()
 
 
 def test_the_chain_spans_event_types_not_one_chain_per_table(conn: sqlite3.Connection) -> None:
@@ -87,7 +87,7 @@ def test_the_chain_spans_event_types_not_one_chain_per_table(conn: sqlite3.Conne
     )
     events = audit.read_events(conn)
     assert second.prev_hash == events[0].row_hash
-    assert audit.verify_events(events) == []
+    assert audit.chain_state(conn).errors == ()
 
 
 def test_editing_a_payload_in_place_breaks_that_row_and_no_other(conn: sqlite3.Connection) -> None:
@@ -102,7 +102,7 @@ def test_editing_a_payload_in_place_breaks_that_row_and_no_other(conn: sqlite3.C
     conn.execute("UPDATE audit_events SET payload_json = ? WHERE seq_id = 2", ('{"a":99}',))
     conn.commit()
 
-    errors = audit.verify_events(audit.read_events(conn))
+    errors = audit.chain_state(conn).errors
     assert len(errors) == 1
     assert "row 2" in errors[0]
     assert "row_hash" in errors[0]
@@ -121,7 +121,7 @@ def test_deleting_a_row_breaks_every_row_after_it(conn: sqlite3.Connection) -> N
     conn.execute("DELETE FROM audit_events WHERE seq_id = 2")
     conn.commit()
 
-    errors = audit.verify_events(audit.read_events(conn))
+    errors = audit.chain_state(conn).errors
     assert len(errors) == 1, errors
     assert "row 2" in errors[0]
     assert "does not chain" in errors[0]
@@ -142,7 +142,7 @@ def test_events_are_read_in_chain_order_not_timestamp_order(conn: sqlite3.Connec
     events = audit.read_events(conn)
     assert [event.seq_id for event in events] == [1, 2, 3]
     assert events[2].prev_hash == events[1].row_hash
-    assert audit.verify_events(events) == []
+    assert audit.chain_state(conn).errors == ()
 
 
 def test_a_decimal_in_the_payload_survives_the_round_trip(conn: sqlite3.Connection) -> None:
@@ -158,7 +158,7 @@ def test_a_decimal_in_the_payload_survives_the_round_trip(conn: sqlite3.Connecti
     stored = audit.read_events(conn)[0]
     assert stored.payload["qty"] == "0.10"
     assert stored.row_hash == event.row_hash
-    assert audit.verify_events([stored]) == []
+    assert audit.chain_state(conn).errors == ()
 
 
 # -- the vocabulary and the guards ------------------------------------------------------------
@@ -219,7 +219,7 @@ def test_insert_order_records_a_chained_placement_event(conn: sqlite3.Connection
     assert [event.event_type for event in events] == ["order_placed"]
     assert events[0].entity_id == str(order_id)
     assert events[0].payload["product_id"] == "BTC-USD"
-    assert audit.verify_events(events) == []
+    assert audit.chain_state(conn).errors == ()
 
 
 def test_update_order_records_what_changed_not_the_whole_row(conn: sqlite3.Connection) -> None:
@@ -232,7 +232,7 @@ def test_update_order_records_what_changed_not_the_whole_row(conn: sqlite3.Conne
     events = audit.read_events(conn)
     assert [event.event_type for event in events] == ["order_placed", "order_updated"]
     assert events[1].payload == {"status": "filled", "actual_fill": "42.5"}
-    assert audit.verify_events(events) == []
+    assert audit.chain_state(conn).errors == ()
 
 
 def test_an_update_with_no_fields_records_nothing(conn: sqlite3.Connection) -> None:
@@ -250,7 +250,7 @@ def test_upsert_transaction_records_a_flow_event(conn: sqlite3.Connection) -> No
     events = audit.read_events(conn)
     assert [event.event_type for event in events] == ["transaction_recorded"]
     assert events[0].entity_id == "cb-1"
-    assert audit.verify_events(events) == []
+    assert audit.chain_state(conn).errors == ()
 
 
 def test_re_importing_a_transaction_appends_rather_than_rewrites(conn: sqlite3.Connection) -> None:
@@ -265,7 +265,7 @@ def test_re_importing_a_transaction_appends_rather_than_rewrites(conn: sqlite3.C
     events = audit.read_events(conn)
     assert len(events) == 2
     assert events[0].row_hash != events[1].row_hash
-    assert audit.verify_events(events) == []
+    assert audit.chain_state(conn).errors == ()
 
 
 def test_both_attestation_upserts_record_a_human_claim(conn: sqlite3.Connection) -> None:
@@ -282,7 +282,7 @@ def test_both_attestation_upserts_record_a_human_claim(conn: sqlite3.Connection)
     assert [event.event_type for event in events] == ["asset_attested", "instrument_attested"]
     assert events[0].entity_id == "BTC"
     assert events[1].entity_id == "coinbase:BTC-USD"
-    assert audit.verify_events(events) == []
+    assert audit.chain_state(conn).errors == ()
 
 
 def test_the_store_row_and_its_event_land_together_or_not_at_all(
@@ -324,7 +324,7 @@ def test_rows_written_before_the_bump_leave_no_event_and_that_is_not_a_break(
     events = audit.read_events(conn)
     assert len(events) == 1
     assert events[0].entity_id == "2"
-    assert audit.verify_events(events) == []
+    assert audit.chain_state(conn).errors == ()
 
 
 def test_latest_hashes_reports_the_newest_event_per_entity(conn: sqlite3.Connection) -> None:
@@ -334,9 +334,9 @@ def test_latest_hashes_reports_the_newest_event_per_entity(conn: sqlite3.Connect
     order_id = repo.insert_order(_order(product_id="BTC-USD"))
     repo.update_order(order_id, status="filled")
 
-    latest = audit.latest_hashes(conn)
+    latest = audit.chain_state(conn).hashes
     events = audit.read_events(conn)
-    assert latest[("orders", str(order_id))] == events[1].row_hash
+    assert latest[("orders", str(order_id))].row_hash == events[1].row_hash
 
 
 def test_latest_hashes_is_keyed_by_store_so_two_stores_cannot_collide(
@@ -348,8 +348,8 @@ def test_latest_hashes_is_keyed_by_store_so_two_stores_cannot_collide(
     repo.insert_order(_order(product_id="BTC-USD"))
     repo.upsert_transaction(_transaction(coinbase_id="1"))
 
-    latest = audit.latest_hashes(conn)
-    assert latest[("orders", "1")] != latest[("transactions", "1")]
+    latest = audit.chain_state(conn).hashes
+    assert latest[("orders", "1")].row_hash != latest[("transactions", "1")].row_hash
 
 
 # -- readers that never migrate ----------------------------------------------------------------
@@ -406,3 +406,168 @@ def test_appending_to_a_missing_table_still_fails_loudly() -> None:
     with pytest.raises(sqlite3.OperationalError):
         repo.insert_order(_order())
     assert connection.execute("SELECT COUNT(*) FROM orders").fetchone()[0] == 0
+
+
+# -- a swallowed write must not decide whether an order is durable ------------------------------
+
+
+def test_a_swallowed_diagnostic_failure_does_not_strand_the_next_order(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The bug the first cut of `write_transaction` shipped, end to end.
+
+    `sqlite3`'s legacy mode leaves the implicit transaction OPEN after a DML that raised, so a
+    swallowed write leaves the connection dirty. `write_transaction` read that as "an outer
+    caller owns the commit", took a join branch nothing in this codebase ever legitimately
+    reaches, and returned from `insert_order` without committing -- while `broker.place_order`
+    went on to send the order to the venue.
+
+    Asserted against ANOTHER CONNECTION, because the writing connection can see its own
+    uncommitted rows: "durable" means visible outside this transaction, not merely inserted.
+    """
+    path = tmp_path / "keel.db"
+    connection = db.connect(path)
+    db.migrate(connection)
+    repo = Repository(connection)
+
+    # A failed diagnostic write, swallowed exactly as `execution/equity.py` swallows it.
+    try:
+        connection.execute(
+            "INSERT INTO cycle_balances (ts, mode, currency) VALUES (?, ?, ?)", (1, "live", None)
+        )
+    except sqlite3.IntegrityError:
+        pass
+    assert connection.in_transaction, "the premise: a swallowed write leaves the connection dirty"
+
+    order_id = repo.insert_order(_order())
+
+    reader = db.connect(path)
+    reader.execute("PRAGMA busy_timeout = 100")
+    assert reader.execute("SELECT COUNT(*) FROM orders").fetchone()[0] == 1, (
+        f"order {order_id} was returned to the executor but is not durable; "
+        "`broker.place_order` runs next"
+    )
+    assert reader.execute("SELECT COUNT(*) FROM audit_events").fetchone()[0] == 1
+
+
+def test_the_repository_rolls_a_swallowed_write_back_rather_than_leaving_it_open() -> None:
+    """The fix at the source. `execution/equity.py` calls this after swallowing, so the dirty
+    connection never reaches the next writer at all -- `write_transaction`'s unconditional commit
+    is the second belt, not the only one."""
+    connection = db.connect(":memory:")
+    db.migrate(connection)
+    repo = Repository(connection)
+    try:
+        connection.execute(
+            "INSERT INTO cycle_balances (ts, mode, currency) VALUES (?, ?, ?)", (1, "live", None)
+        )
+    except sqlite3.IntegrityError:
+        pass
+
+    repo.rollback()
+    assert not connection.in_transaction
+
+
+def test_a_blank_coinbase_id_files_its_event_under_its_own_row(conn: sqlite3.Connection) -> None:
+    """`""` is falsey to Python and perfectly indexable to sqlite, so unlike NULL it CAN take the
+    `DO UPDATE` branch -- at which point `cursor.lastrowid` is the last real insert's id, not the
+    updated row's. The first cut filed the re-upsert's event under a different row's identifier:
+    the timeline then showed one row the hash of a superseded event, marked `chained`, and a
+    phantom key existed that no row resolved to."""
+    repo = Repository(conn)
+    repo.upsert_transaction(_transaction(coinbase_id="", asset="USD"))
+    repo.upsert_transaction(_transaction(coinbase_id="X1", asset="EUR"))
+    repo.upsert_transaction(_transaction(coinbase_id="", asset="GBP"))
+
+    blank_row_id = str(
+        conn.execute("SELECT id FROM transactions WHERE coinbase_id = ''").fetchone()["id"]
+    )
+    events = audit.read_events(conn)
+    assert [event.entity_id for event in events] == [blank_row_id, "X1", blank_row_id]
+
+    # And the latest hash for that row is its LATEST event, with no phantom key beside it.
+    hashes = audit.chain_state(conn).hashes
+    assert hashes[("transactions", blank_row_id)].row_hash == events[2].row_hash
+    assert set(hashes) == {("transactions", blank_row_id), ("transactions", "X1")}
+
+
+def test_a_null_coinbase_id_still_files_under_the_row_id(conn: sqlite3.Connection) -> None:
+    """The case the `lastrowid` version got right, kept right by the lookup that replaced it."""
+    repo = Repository(conn)
+    repo.upsert_transaction(_transaction(coinbase_id=None))
+    row_id = str(conn.execute("SELECT id FROM transactions").fetchone()["id"])
+    assert [event.entity_id for event in audit.read_events(conn)] == [row_id]
+
+
+def test_an_epoch_timestamp_is_recorded_not_replaced_with_now(conn: sqlite3.Connection) -> None:
+    """`int(value or time.time())` treats `0` as absent. The event's `ts` is HASHED, so the chain
+    would then attest to a timestamp the row does not hold."""
+    repo = Repository(conn)
+    repo.insert_order(_order(created_at=0))
+    assert [event.ts for event in audit.read_events(conn)] == [0]
+
+
+def test_a_genuinely_absent_timestamp_still_falls_back_to_now(
+    conn: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The fallback is for `None`, and only for `None`."""
+    monkeypatch.setattr("keel.data.repository.time.time", lambda: 4_242.0)
+    repo = Repository(conn)
+    repo.insert_order(_order(created_at=None))
+    assert [event.ts for event in audit.read_events(conn)] == [4_242]
+
+
+def test_a_payload_commits_as_the_bytes_the_column_holds(conn: sqlite3.Connection) -> None:
+    """The hash is over the STORED string, not over a re-encoding of what a reader parsed back.
+    Editing the column by one character must therefore break the row, with no shape of payload
+    able to survive the round trip differently from how it was hashed."""
+    event = _append(
+        conn,
+        ts=100,
+        event_type="order_placed",
+        entity_id="1",
+        payload={"qty": Decimal("1.10"), "note": "a", "nested": {"b": [Decimal("2.0")]}},
+    )
+    stored = conn.execute("SELECT payload_json FROM audit_events").fetchone()["payload_json"]
+    assert stored == '{"nested":{"b":["2.0"]},"note":"a","qty":"1.10"}'
+    assert event.row_hash == chain_hash(
+        {
+            "ts": 100,
+            "event_type": "order_placed",
+            "entity_id": "1",
+            "payload": stored,
+            "prev_hash": ZERO_HASH,
+        }
+    )
+
+    conn.execute("UPDATE audit_events SET payload_json = ? WHERE seq_id = 1", (stored + " ",))
+    conn.commit()
+    assert audit.chain_state(conn).errors
+
+
+def test_an_events_entity_id_is_what_the_timeline_prints_as_the_rows_reference(
+    conn: sqlite3.Connection,
+) -> None:
+    """THE invariant, rather than either side's implementation of it.
+
+    `commands/timeline.py` looks a row's hash up by `(source, reference)`. If the writer files an
+    event under any other identifier, the lookup misses and the row silently reads `not chained`
+    -- or, worse, hits a DIFFERENT row's event. Asserted across all three `coinbase_id` shapes,
+    because that is where the two sides can disagree.
+    """
+    from keel.commands import timeline
+
+    repo = Repository(conn)
+    repo.upsert_transaction(_transaction(coinbase_id="cb-1", asset="USD"))
+    repo.upsert_transaction(_transaction(coinbase_id=None, asset="EUR"))
+    repo.upsert_transaction(_transaction(coinbase_id="", asset="GBP"))
+
+    report = timeline.gather_timeline(repo, now_ts=1_000)
+    flows = [row for row in report.rows if row.source == "transactions"]
+    assert len(flows) == 3
+    for row in flows:
+        assert row.chain_status == "chained", f"{row.reference} lost its event"
+
+    printed = {row.reference for row in flows}
+    recorded = {event.entity_id for event in audit.read_events(conn)}
+    assert printed == recorded

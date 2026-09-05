@@ -517,10 +517,10 @@ def test_the_hash_shown_is_the_hash_recorded_for_that_row(db_conn) -> None:
     repo = _chained_repo(db_conn)
     report = timeline.gather_timeline(repo, now_ts=2_000)
 
-    recorded = audit.latest_hashes(db_conn)
+    recorded = audit.chain_state(db_conn).hashes
     for row in report.rows:
         if row.chain_status == "chained":
-            assert row.row_hash == recorded[(row.source, row.reference)]
+            assert row.row_hash == recorded[(row.source, row.reference)].row_hash
 
 
 def test_a_row_written_before_the_chain_shipped_reads_as_not_chained(db_conn) -> None:
@@ -607,8 +607,12 @@ def test_the_export_carries_the_chain_status_beside_the_hash(db_conn) -> None:
     rows = list(csv.reader(io.StringIO(text)))
 
     assert rows[0][-2:] == ["row_hash", "chain_status"]
+    # Every row, and the exact pairing -- `in (the three words)` would pass on any of them and so
+    # would survive the status being hard-coded to one value.
+    assert len(rows) == 4
     for row in rows[1:]:
-        assert row[-1] in ("chained", "not chained", "chain broken")
+        assert row[-1] == "chained"
+        assert len(row[-2]) == 64
 
 
 def test_a_broken_chain_is_stated_above_the_header_not_only_per_row(db_conn) -> None:

@@ -437,3 +437,53 @@ def test_a_failing_balance_write_does_not_take_the_cycle_down() -> None:
 
     assert repo.get_equity_points(mode="live", limit=1), "the equity point still landed"
 
+
+
+def test_a_swallowed_balance_write_leaves_the_connection_clean(tmp_path) -> None:
+    """#721. `record_cycle_balance` is `execute` then `commit`, so a failing `execute` leaves
+    sqlite3's implicit transaction OPEN -- and this function swallows that failure by design, so
+    a diagnostic write cannot abort a cycle.
+
+    Swallowing without rolling back handed the next writer on this connection a dirty transaction
+    it did not open. `Repository.insert_order` inherits exactly that connection later in the same
+    cycle, and the measured consequence was an order that reached the venue with no durable row
+    behind it. The swallow is still a swallow; it just no longer leaks.
+    """
+    import sqlite3
+
+    from keel.data.db import connect, migrate
+    from keel.data.repository import Repository
+    from keel.execution import equity as equity_mod
+
+    conn = connect(str(tmp_path / "keel.db"))
+    migrate(conn)
+    repo = Repository(conn)
+    repo.set_state("equity_state_mode", "live")
+
+    real = repo.record_cycle_balance
+
+    def _fail(reading):  # type: ignore[no-untyped-def]
+        # Fail the way a real write fails: through sqlite, leaving the transaction open.
+        conn.execute(
+            "INSERT INTO cycle_balances (ts, mode, currency) VALUES (?, ?, ?)", (1, "live", None)
+        )
+        raise AssertionError("unreachable -- the INSERT above raises")
+
+    repo.record_cycle_balance = _fail  # type: ignore[method-assign]
+    try:
+        equity_mod.update_drawdown(
+            repo,
+            equity=Decimal("100"),
+            now_ts=1_000,
+            cash=Decimal("100"),
+            balances=[("USD", Decimal("100"), Decimal("100"))],
+        )
+    finally:
+        repo.record_cycle_balance = real  # type: ignore[method-assign]
+
+    assert not conn.in_transaction, "a swallowed write left the connection mid-transaction"
+    # And the reading the rail needs is still durable, read from another connection.
+    other = connect(str(tmp_path / "keel.db"))
+    other.execute("PRAGMA busy_timeout = 100")
+    assert other.execute("SELECT COUNT(*) FROM equity_points").fetchone()[0] == 1
+    assert isinstance(conn, sqlite3.Connection)

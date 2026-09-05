@@ -310,6 +310,18 @@ def _append_equity_point(
                 )
             )
         except Exception:
+            # ROLLED BACK, not merely logged. `record_cycle_balance` is `execute` then `commit`,
+            # so a failing `execute` leaves sqlite3's implicit transaction OPEN -- and swallowing
+            # the exception hands the next writer on this connection a dirty transaction it did
+            # not open. `Repository.insert_order` inherits exactly that connection a few
+            # milliseconds later, inside the same cycle. Leaving it dirty made a swallowed
+            # observability failure decide whether the ORDER ROW was durable, which is the same
+            # rule this `try` exists to enforce, violated from the other end.
+            #
+            # Safe to roll back here because the only uncommitted work is this failed INSERT:
+            # `record_equity_point` above committed its own row, and each `record_cycle_balance`
+            # commits per currency.
+            repo.rollback()
             log_exception(logger, "equity.cycle_balance_write_failed")
 
 

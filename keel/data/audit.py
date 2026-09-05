@@ -53,14 +53,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Any
 
-from keel_core.hashchain import (
-    ZERO_HASH,
-    ChainLink,
-    chain_hash,
-    encode_value,
-    find_breaks,
-    verify_links,
-)
+from keel_core.hashchain import ZERO_HASH, ChainLink, canonical_json, chain_hash, find_breaks
 
 #: Every kind of statement this chain carries, and the store each one is about.
 #:
@@ -108,18 +101,33 @@ def write_transaction(conn: sqlite3.Connection) -> Iterator[None]:
     because each row verifies against the row it believes precedes it. `IMMEDIATE` takes the
     write lock up front, which is what makes "read the head, then append" atomic.
 
-    Nested calls JOIN the caller's transaction rather than opening a second one: sqlite raises
-    "cannot start a transaction within a transaction", and more importantly a nested commit would
-    publish the outer writer's half-finished work. The outermost block owns the commit.
+    **The commit is unconditional, and the first cut of this got it wrong in a way that reached
+    the venue.** It read `if conn.in_transaction: yield; return` -- "somebody outside opened a
+    transaction, so they own the commit". Nothing in this codebase nests these, so that branch
+    was never reached by the nesting it was written for. What it WAS reached by is the accident:
+    `sqlite3` runs in legacy implicit-transaction mode, so `in_transaction` is also True after any
+    DML that has not been committed -- INCLUDING one that raised and was swallowed.
+    `execution/equity.py` swallows a failed `record_cycle_balance` by design (a diagnostic write
+    must never abort a cycle), and that left the connection mid-transaction. The next
+    `insert_order` then took the join branch, returned a real `order_id`, and never committed --
+    so `broker.place_order` sent an order to the venue with no durable row behind it, which is
+    precisely the row `execution.reconcile` exists to find. Measured end to end: `orders visible
+    to another connection: 0`.
+
+    So this always commits on a clean exit, which is exactly what the unconditional
+    `self._conn.commit()` in each writer did before this module existed. Skipping the `BEGIN` on
+    an already-open transaction is only about sqlite refusing to nest one; it never means
+    skipping the commit. (The lock invariant survives that path: legacy mode opens a transaction
+    implicitly only on DML, so a connection that is already `in_transaction` has already taken
+    the write lock, and the head read is serialised either way. `equity.py` now rolls its
+    swallowed write back, so the path should not arise at all -- this is the second belt.)
 
     Rolls back on ANY exception, `BaseException` included: a `KeyboardInterrupt` between the
     store row and its event would otherwise leave the row committed and the chain silent about
     it, which is the one lie this store must not tell about itself.
     """
-    if conn.in_transaction:
-        yield
-        return
-    conn.execute("BEGIN IMMEDIATE")
+    if not conn.in_transaction:
+        conn.execute("BEGIN IMMEDIATE")
     try:
         yield
     except BaseException:
@@ -157,29 +165,22 @@ def append_event(
 
     head = conn.execute("SELECT row_hash FROM audit_events ORDER BY seq_id DESC LIMIT 1").fetchone()
     prev_hash = ZERO_HASH if head is None else str(head["row_hash"])
-    # Encoded BEFORE hashing and stored in the encoded form, so what is hashed is byte-for-byte
-    # what a reader gets back. Encoding at read time instead would put a conversion between the
-    # stored row and the hash, and every such conversion is somewhere the two can drift.
-    encoded: dict[str, Any] = encode_value(dict(payload))
-    body = {
-        "ts": ts,
-        "event_type": event_type,
-        "entity_id": entity_id,
-        "payload": encoded,
-        "prev_hash": prev_hash,
-    }
-    row_hash = chain_hash(body)
+    # The payload is canonicalised ONCE and commits AS THAT STRING -- the exact bytes the column
+    # holds, not a re-serialisation of what a reader parsed back out of it.
+    #
+    # Two things follow, and the first is the reason. A hash taken over a parsed-then-re-encoded
+    # object puts a decode/encode round trip between the stored row and its hash, and every such
+    # conversion is somewhere the two can drift: a payload shape that does not survive the round
+    # trip byte-for-byte (a non-string key, a tuple, anything `json` normalises) would store one
+    # thing and attest to another. Hashing the bytes removes the question rather than answering it
+    # shape by shape. The second is that verification then never PARSES: measured over 20,000
+    # events, `chain_state` went from 277 ms to 134 ms, on the read a 15-second console poll makes.
+    payload_json = canonical_json(payload)
+    row_hash = chain_hash(_hash_body(ts, event_type, entity_id, payload_json, prev_hash))
     cursor = conn.execute(
         "INSERT INTO audit_events (ts, event_type, entity_id, payload_json, prev_hash, row_hash) "
         "VALUES (?, ?, ?, ?, ?, ?)",
-        (
-            ts,
-            event_type,
-            entity_id,
-            json.dumps(encoded, sort_keys=True, separators=(",", ":")),
-            prev_hash,
-            row_hash,
-        ),
+        (ts, event_type, entity_id, payload_json, prev_hash, row_hash),
     )
     assert cursor.lastrowid is not None
     return AuditEvent(
@@ -187,7 +188,7 @@ def append_event(
         ts=ts,
         event_type=event_type,
         entity_id=entity_id,
-        payload=encoded,
+        payload=json.loads(payload_json),
         prev_hash=prev_hash,
         row_hash=row_hash,
     )
@@ -213,8 +214,15 @@ def read_events(conn: sqlite3.Connection) -> list[AuditEvent]:
     ]
 
 
-def _event_payload(event: AuditEvent) -> dict[str, Any]:
-    """Everything the row commits to -- the row minus `row_hash` itself.
+def _hash_body(
+    ts: int, event_type: str, entity_id: str, payload_json: str, prev_hash: str
+) -> dict[str, Any]:
+    """Everything a row commits to -- the row minus `row_hash` itself.
+
+    `payload_json` is the STORED STRING, not a parsed object: see `append_event` for why the
+    bytes rather than a re-encoding of them. Taken as five scalars rather than as an `AuditEvent`
+    so the writer and the verifier compute the identical body from the identical inputs, with no
+    parse on the verification path.
 
     `seq_id` is deliberately NOT hashed. It is sqlite's own AUTOINCREMENT counter, assigned after
     the hash would have to be computed, and position in the chain is already committed to via
@@ -222,36 +230,12 @@ def _event_payload(event: AuditEvent) -> dict[str, Any]:
     values a writer actually chose.
     """
     return {
-        "ts": event.ts,
-        "event_type": event.event_type,
-        "entity_id": event.entity_id,
-        "payload": event.payload,
-        "prev_hash": event.prev_hash,
+        "ts": ts,
+        "event_type": event_type,
+        "entity_id": entity_id,
+        "payload": payload_json,
+        "prev_hash": prev_hash,
     }
-
-
-def verify_events(events: list[AuditEvent]) -> list[str]:
-    """Every break in the chain, as human-readable lines. Empty means intact.
-
-    Reports rather than raises, so `keel doctor` and the timeline export can both STATE chain
-    status instead of asserting it. **An empty list of events returns no errors, and that is not
-    the same as "verified"** -- nothing was checked. Only the caller knows whether that means a
-    deployment predating #721 or a deployment that has done nothing yet.
-    """
-    return verify_links(
-        ChainLink(
-            label=str(event.seq_id),
-            prev_hash=event.prev_hash,
-            row_hash=event.row_hash,
-            recomputed_hash=chain_hash(_event_payload(event)),
-        )
-        for event in events
-    )
-
-
-def latest_hashes(conn: sqlite3.Connection) -> dict[tuple[str, str], str]:
-    """`(store, entity_id) -> the row_hash of the LATEST event about it`. See `chain_state`."""
-    return {key: seen.row_hash for key, seen in _latest(read_events(conn)).items()}
 
 
 @dataclass(frozen=True)
@@ -303,7 +287,7 @@ class ChainState:
         return not self.errors and self.event_count > 0
 
 
-def _latest(events: list[AuditEvent]) -> dict[tuple[str, str], EntityHash]:
+def _latest(rows: list[sqlite3.Row]) -> dict[tuple[str, str], EntityHash]:
     """`(store, entity_id) -> the LATEST event about it`.
 
     The latest rather than the first because it is the most recent chained statement about that
@@ -315,15 +299,17 @@ def _latest(events: list[AuditEvent]) -> dict[tuple[str, str], EntityHash]:
     rows, and a single-keyed map would hand one row's hash to the other.
     """
     latest: dict[tuple[str, str], EntityHash] = {}
-    for event in events:
-        store = EVENT_STORES.get(event.event_type)
+    for row in rows:
+        store = EVENT_STORES.get(str(row["event_type"]))
         if store is None:
             # An event type this build does not know -- a row written by a NEWER keel against the
             # same database. Skipped rather than guessed at: it still chains (the chain does not
             # care what the type means), and inventing a store for it would file it against a
             # table it may have nothing to do with.
             continue
-        latest[(store, event.entity_id)] = EntityHash(row_hash=event.row_hash, seq_id=event.seq_id)
+        latest[(store, str(row["entity_id"]))] = EntityHash(
+            row_hash=str(row["row_hash"]), seq_id=int(row["seq_id"])
+        )
     return latest
 
 
@@ -337,9 +323,24 @@ def _table_present(conn: sqlite3.Connection) -> bool:
 def chain_state(conn: sqlite3.Connection) -> ChainState:
     """One read of `audit_events`, verified, indexed by the identifiers a report prints.
 
-    What `commands/timeline.py` calls. The `hashes` map is keyed by `(store, entity_id)` to match
-    that module's own `source`/`reference` pair, so the hash shown against a row is looked up by
-    the identifier printed beside it rather than by one a reader has to reconstruct.
+    What `commands/timeline.py` and `commands/doctor.py` call, and the only production path into
+    this module. The `hashes` map is keyed by `(store, entity_id)` to match `timeline.py`'s own
+    `source`/`reference` pair, so the hash shown against a row is looked up by the identifier
+    printed beside it rather than by one a reader has to reconstruct.
+
+    **The whole chain, every time, and that is not an oversight.** A chain proves a SEQUENCE, so
+    a verdict over a suffix is a verdict that has not looked at the rows most likely to have been
+    quietly edited, and a cached prefix verdict assumes precisely the thing being checked. The
+    cost is real and is stated rather than hidden, in the manner `DEFAULT_TIMELINE_LIMIT` and
+    `export_rows` already use next door: measured on a 2026 laptop, 20,000 events verify in about
+    135 ms, and the console polls `/api/timeline` every 15 seconds. Event volume is dominated by
+    `upsert_transaction` -- one event per imported CSV line -- so a long Coinbase history is what
+    puts a deployment into that band.
+
+    If it ever stops fitting, the change is to BOUND WHAT IS CLAIMED and say so on the page -- a
+    verdict over the last N events, labelled as one. Never to cache the verdict, which would put
+    a green badge over rows nothing read: the exact failure the rest of this module is built to
+    refuse.
     """
     if not _table_present(conn):
         # Checked rather than caught. A pre-v20 database is a legitimate deployment state, and a
@@ -349,23 +350,37 @@ def chain_state(conn: sqlite3.Connection) -> ChainState:
         return ChainState(
             table_present=False, event_count=0, errors=(), first_broken_seq=None, hashes={}
         )
-    events = read_events(conn)
+    # Raw rows, deliberately not `read_events`: verification needs the stored `payload_json`
+    # STRING, and parsing 20,000 payloads to re-encode them would double the cost of the check
+    # for a value nothing on this path uses.
+    rows = conn.execute(
+        "SELECT seq_id, ts, event_type, entity_id, payload_json, prev_hash, row_hash "
+        "FROM audit_events ORDER BY seq_id"
+    ).fetchall()
     breaks = find_breaks(
         ChainLink(
-            label=str(event.seq_id),
-            prev_hash=event.prev_hash,
-            row_hash=event.row_hash,
-            recomputed_hash=chain_hash(_event_payload(event)),
+            label=str(row["seq_id"]),
+            prev_hash=str(row["prev_hash"]),
+            row_hash=str(row["row_hash"]),
+            recomputed_hash=chain_hash(
+                _hash_body(
+                    int(row["ts"]),
+                    str(row["event_type"]),
+                    str(row["entity_id"]),
+                    str(row["payload_json"]),
+                    str(row["prev_hash"]),
+                )
+            ),
         )
-        for event in events
+        for row in rows
     )
-    # `index` is 1-based POSITION IN THE WALK, and `events` is read in `seq_id` order, so this is
+    # `index` is 1-based POSITION IN THE WALK, and the rows are read in `seq_id` order, so this is
     # the event the first break lands on. Looked up rather than parsed out of the message text.
-    first_broken_seq = events[breaks[0].index - 1].seq_id if breaks else None
+    first_broken_seq = int(rows[breaks[0].index - 1]["seq_id"]) if breaks else None
     return ChainState(
         table_present=True,
-        event_count=len(events),
+        event_count=len(rows),
         errors=tuple(found.message for found in breaks),
         first_broken_seq=first_broken_seq,
-        hashes=_latest(events),
+        hashes=_latest(rows),
     )

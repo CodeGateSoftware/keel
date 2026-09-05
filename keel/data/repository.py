@@ -206,6 +206,20 @@ def _json_object_hook(d: dict[str, Any]) -> Any:
     return d
 
 
+def _event_ts(value: Any) -> int:
+    """The timestamp an audit event carries, falling back to now ONLY when there is none (#721).
+
+    `int(value or time.time())` was wrong in a small, silent way: `or` treats `0` as absent, so a
+    row legitimately stamped at the epoch would get an event stamped `now` -- and the event's `ts`
+    is hashed, so the chain would then attest to a timestamp the row does not hold. Every real
+    call site supplies a non-zero value today (checked: all five `update_order` callers pass
+    `updated_at=now_ts`, both `insert_order` callers pass `created_at`, and `transactions.ts` is
+    NOT NULL), so this is a guard against a future caller rather than a live bug -- which is
+    exactly when a silent fallback is worth making explicit.
+    """
+    return int(time.time()) if value is None else int(value)
+
+
 class Repository:
     """Typed wrapper around a migrated `sqlite3.Connection` for the keel schema."""
 
@@ -213,6 +227,17 @@ class Repository:
         self._conn = conn
 
     # -- the audit chain ------------------------------------------------
+
+    def rollback(self) -> None:
+        """Discard whatever this connection has open but uncommitted.
+
+        For a caller that SWALLOWS a write failure. Every writer here is `execute` then `commit`,
+        so a failing `execute` leaves sqlite3's implicit transaction open; a caller that catches
+        the exception and carries on -- `execution/equity.py` does, so a diagnostic write cannot
+        abort a cycle -- would otherwise hand the next writer on this connection a dirty
+        transaction it did not open and does not know about.
+        """
+        self._conn.rollback()
 
     def audit_chain(self) -> ChainState:
         """The `audit_events` chain: its hashes, its condition, and where it stops being evidence.
@@ -240,7 +265,7 @@ class Repository:
             f"{c} = excluded.{c}" for c in _TRANSACTION_COLUMNS if c != "coinbase_id"
         )
         with write_transaction(self._conn):
-            cursor = self._conn.execute(
+            self._conn.execute(
                 f"""
                 INSERT INTO transactions ({columns_sql})
                 VALUES ({placeholders_sql})
@@ -248,23 +273,44 @@ class Repository:
                 """,
                 values,
             )
-            # `coinbase_id or id`, which is EXACTLY the rule `commands/timeline.py::
-            # _transaction_rows` uses for the `reference` it prints -- so the export looks the
-            # hash up by the identifier shown beside it. `coinbase_id` is nullable, and sqlite
-            # treats NULLs as distinct in a UNIQUE index, so a row without one can never take the
-            # DO UPDATE branch: `lastrowid` is a real insert's id in the only case that reads it.
-            coinbase_id = values.get("coinbase_id")
             # An APPEND even when the book row was updated in place (#721). Two events for one
             # `coinbase_id` is the record that the line was re-imported with different content --
             # which, for a store whose provenance is `imported-ledger` and whose rows nothing
             # verified on the way in, is exactly what an auditor needs visible.
             append_event(
                 self._conn,
-                ts=int(values.get("ts") or time.time()),
+                ts=_event_ts(values.get("ts")),
                 event_type="transaction_recorded",
-                entity_id=str(coinbase_id) if coinbase_id else str(cursor.lastrowid),
+                entity_id=self._transaction_reference(values),
                 payload=dict(values),
             )
+
+    def _transaction_reference(self, values: dict[str, Any]) -> str:
+        """`coinbase_id or id` -- EXACTLY the rule `commands/timeline.py::_transaction_rows` uses
+        for the `reference` it prints, so the export looks a row's hash up by the identifier shown
+        beside it.
+
+        The falsey branch READS THE ID BACK rather than taking `cursor.lastrowid`. The first cut
+        used `lastrowid` on the reasoning that `coinbase_id` is nullable and sqlite treats NULLs
+        as distinct in a UNIQUE index, so a row without one can never take the `DO UPDATE` branch
+        -- true of NULL, and false of the EMPTY STRING, which is falsey to Python and perfectly
+        indexable to sqlite. A re-upsert of a blank id therefore UPDATED an existing row while
+        `lastrowid` still held the id of the last real INSERT, filing the event under a different
+        row's identifier: the timeline then showed one row the hash of a superseded event, marked
+        `chained`, and a phantom key existed that no row resolved to. Not reachable through
+        `csv_import` today (`_row_to_tx` raises on a blank ID), and gated only by that one caller.
+
+        A lookup answers NULL and blank alike instead of reasoning about which value reaches which
+        branch. The non-empty fast path stays because a CSV import runs this per line and a
+        `coinbase_id` that is present needs no query to be known.
+        """
+        coinbase_id = values.get("coinbase_id")
+        if coinbase_id:
+            return str(coinbase_id)
+        row = self._conn.execute(
+            "SELECT id FROM transactions WHERE coinbase_id IS ?", (coinbase_id,)
+        ).fetchone()
+        return "" if row is None else str(row["id"])
 
     def get_transactions(self, asset: str | None = None) -> list[dict[str, Any]]:
         if asset is None:
@@ -450,7 +496,7 @@ class Repository:
             order_id = cursor.lastrowid
             append_event(
                 self._conn,
-                ts=int(values.get("created_at") or time.time()),
+                ts=_event_ts(values.get("created_at")),
                 event_type="order_placed",
                 entity_id=str(order_id),
                 # The row AS STORED, id included -- the whole statement being made, so a later
@@ -475,7 +521,7 @@ class Repository:
             self._conn.execute(f"UPDATE orders SET {set_sql} WHERE id = :order_id", params)
             append_event(
                 self._conn,
-                ts=int(fields.get("updated_at") or time.time()),
+                ts=_event_ts(fields.get("updated_at")),
                 event_type="order_updated",
                 entity_id=str(order_id),
                 # WHAT CHANGED, not the whole mutated row. An event is a statement about this
