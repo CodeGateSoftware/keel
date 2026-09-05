@@ -49,7 +49,7 @@ def test_fresh_database_is_stamped_at_the_current_version() -> None:
     conn = db.connect(":memory:")
     db.migrate(conn)
     version = conn.execute("SELECT version FROM schema_version").fetchone()["version"]
-    assert version == db.SCHEMA_VERSION == 19
+    assert version == db.SCHEMA_VERSION == 20
 
 
 def test_fresh_database_gets_no_subscription_row() -> None:
@@ -612,7 +612,7 @@ def test_v14_migration_bumps_the_stored_version() -> None:
     conn = _v12_database()
     db.migrate(conn)
     stamped = conn.execute("SELECT version FROM schema_version").fetchone()["version"]
-    assert stamped == db.SCHEMA_VERSION == 19
+    assert stamped == db.SCHEMA_VERSION == 20
 
 
 def test_v14_migration_step_is_not_blocked_by_another_venues_existing_row() -> None:
@@ -773,7 +773,7 @@ def test_v15_migration_bumps_the_stored_version() -> None:
     conn = _v12_database()
     db.migrate(conn)
     stamped = conn.execute("SELECT version FROM schema_version").fetchone()["version"]
-    assert stamped == db.SCHEMA_VERSION == 19
+    assert stamped == db.SCHEMA_VERSION == 20
 
 
 def test_v15_the_12_to_15_chain_creates_the_table_with_the_column_already_present() -> None:
@@ -875,7 +875,7 @@ def test_an_existing_orders_table_gains_the_submit_book_by_ALTER() -> None:
     assert row["submit_best_bid"] is None
     assert row["submit_best_ask"] is None
     stamped = conn.execute("SELECT version FROM schema_version").fetchone()["version"]
-    assert stamped == db.SCHEMA_VERSION == 19
+    assert stamped == db.SCHEMA_VERSION == 20
 
 
 def test_v16_is_idempotent_per_column() -> None:
@@ -915,3 +915,327 @@ def test_v16_on_a_pre_v15_chain_does_not_duplicate_the_column() -> None:
     cols = [r["name"] for r in conn.execute("PRAGMA table_info(orders)")]
     assert cols.count("submit_best_bid") == 1
     assert cols.count("submit_best_ask") == 1
+
+
+# ---------------------------------------------------------------------------------------------
+# v20: orders.quote_provenance / orders.client_order_id, attest_due_ts on both attestation
+# tables, and the new cycle_balances / audit_events tables (#721).
+# ---------------------------------------------------------------------------------------------
+
+
+def _v19_orders_table(conn: sqlite3.Connection) -> None:
+    """The `orders` table exactly as v19 shipped it: `filled_quantity` (v11) and
+    `submit_best_bid`/`submit_best_ask` (v16) present, but no `quote_provenance` or
+    `client_order_id`.
+
+    Written out longhand rather than derived from `_SCHEMA_STATEMENTS`, for the reason
+    `_v15_orders_table` already gives: a fixture that reads today's DDL would gain the new
+    columns the moment the schema does, and then prove nothing about upgrading a database that
+    predates them.
+    """
+    conn.execute(
+        """
+        CREATE TABLE orders (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            mode TEXT NOT NULL,
+            product_id TEXT NOT NULL,
+            side TEXT NOT NULL,
+            order_type TEXT,
+            qty TEXT NOT NULL,
+            limit_price TEXT,
+            status TEXT NOT NULL DEFAULT 'pending',
+            fee TEXT,
+            expected_fill TEXT,
+            actual_fill TEXT,
+            filled_quantity TEXT,
+            submit_best_bid TEXT,
+            submit_best_ask TEXT,
+            raw_response TEXT,
+            confirmation TEXT,
+            rule_id INTEGER,
+            created_at INTEGER,
+            updated_at INTEGER
+        )
+        """
+    )
+
+
+def _v19_asset_attestations_table(conn: sqlite3.Connection) -> None:
+    """`asset_attestations` exactly as it has shipped since v6 -- no `attest_due_ts`."""
+    conn.execute(
+        """
+        CREATE TABLE asset_attestations (
+            asset        TEXT PRIMARY KEY,
+            sector       TEXT NOT NULL,
+            backing      TEXT NOT NULL,
+            pays_yield   INTEGER NOT NULL,
+            source       TEXT NOT NULL,
+            attested_by  TEXT NOT NULL,
+            attested_at  INTEGER NOT NULL
+        )
+        """
+    )
+
+
+def _v19_instrument_attestations_table(conn: sqlite3.Connection) -> None:
+    """`instrument_attestations` exactly as it has shipped since v10 -- no `attest_due_ts`."""
+    conn.execute(
+        """
+        CREATE TABLE instrument_attestations (
+            venue        TEXT NOT NULL,
+            product_id   TEXT NOT NULL,
+            wrapper      TEXT NOT NULL,
+            source       TEXT NOT NULL,
+            attested_by  TEXT NOT NULL,
+            attested_at  INTEGER NOT NULL,
+            PRIMARY KEY (venue, product_id)
+        )
+        """
+    )
+
+
+def _v19_database() -> sqlite3.Connection:
+    """A database stamped at v19, with `orders`/`asset_attestations`/`instrument_attestations`
+    exactly as v19 shipped them -- none of the four v20 columns present."""
+    conn = db.connect(":memory:")
+    conn.execute("CREATE TABLE IF NOT EXISTS schema_version (version INTEGER NOT NULL)")
+    conn.execute("INSERT INTO schema_version (version) VALUES (19)")
+    _v19_orders_table(conn)
+    _v19_asset_attestations_table(conn)
+    _v19_instrument_attestations_table(conn)
+    conn.commit()
+    return conn
+
+
+def test_migration_to_v20_adds_the_columns_and_the_new_tables() -> None:
+    """A fresh database gets `orders.quote_provenance`, `orders.client_order_id`, an
+    `attest_due_ts` window on both attestation tables, and the two new tables."""
+    conn = db.connect(":memory:")
+    db.migrate(conn)
+
+    order_cols = {r["name"] for r in conn.execute("PRAGMA table_info(orders)")}
+    assert {"quote_provenance", "client_order_id"} <= order_cols
+
+    asset_cols = {r["name"] for r in conn.execute("PRAGMA table_info(asset_attestations)")}
+    assert "attest_due_ts" in asset_cols
+
+    instrument_cols = {
+        r["name"] for r in conn.execute("PRAGMA table_info(instrument_attestations)")
+    }
+    assert "attest_due_ts" in instrument_cols
+
+    table_names = {
+        r["name"] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")
+    }
+    assert {"cycle_balances", "audit_events"} <= table_names
+
+    index_names = {
+        r["name"] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='index'")
+    }
+    assert "idx_cycle_balances_mode_currency_ts" in index_names
+
+    stamped = conn.execute("SELECT version FROM schema_version").fetchone()["version"]
+    assert stamped == db.SCHEMA_VERSION == 20
+
+
+def test_v19_database_gains_v20_columns_as_NULL_no_backfill() -> None:
+    """NO BACKFILL: a real pre-existing `orders` row and real attestation rows must read back
+    NULL on every v20 column -- inventing a value for a row written before the column existed
+    would be worse than an honest NULL."""
+    conn = _v19_database()
+    conn.execute(
+        """
+        INSERT INTO orders (mode, product_id, side, qty, status, created_at, updated_at)
+        VALUES ('live', 'BTC-USD', 'BUY', '0.01', 'filled', 1, 1)
+        """
+    )
+    conn.execute(
+        """
+        INSERT INTO asset_attestations (
+            asset, sector, backing, pays_yield, source, attested_by, attested_at
+        ) VALUES ('BTC', 'currency', 'none', 0, 'manual', 'operator', 1)
+        """
+    )
+    conn.execute(
+        """
+        INSERT INTO instrument_attestations (
+            venue, product_id, wrapper, source, attested_by, attested_at
+        ) VALUES ('coinbase', 'BTC-USD', 'spot', 'manual', 'operator', 1)
+        """
+    )
+    conn.commit()
+
+    db.migrate(conn)
+
+    order_row = conn.execute(
+        "SELECT quote_provenance, client_order_id FROM orders"
+    ).fetchone()
+    assert order_row["quote_provenance"] is None
+    assert order_row["client_order_id"] is None
+
+    asset_row = conn.execute(
+        "SELECT attest_due_ts FROM asset_attestations WHERE asset = 'BTC'"
+    ).fetchone()
+    assert asset_row["attest_due_ts"] is None
+
+    instrument_row = conn.execute(
+        "SELECT attest_due_ts FROM instrument_attestations WHERE venue = 'coinbase'"
+    ).fetchone()
+    assert instrument_row["attest_due_ts"] is None
+
+    stamped = conn.execute("SELECT version FROM schema_version").fetchone()["version"]
+    assert stamped == db.SCHEMA_VERSION == 20
+
+
+def test_v20_is_idempotent_per_column() -> None:
+    """Each of the four ALTERs is guarded independently: re-running adds nothing, and a database
+    hand-patched with only SOME of the four columns must still gain the rest rather than
+    sticking -- the same shape `test_v16_is_idempotent_per_column` established."""
+    conn = _v19_database()
+    db._migrate_v20_provenance_and_attest_windows(conn)
+    conn.commit()
+    db._migrate_v20_provenance_and_attest_windows(conn)
+    conn.commit()
+
+    order_cols = [r["name"] for r in conn.execute("PRAGMA table_info(orders)")]
+    assert order_cols.count("quote_provenance") == 1
+    assert order_cols.count("client_order_id") == 1
+    asset_cols = [r["name"] for r in conn.execute("PRAGMA table_info(asset_attestations)")]
+    assert asset_cols.count("attest_due_ts") == 1
+    instrument_cols = [
+        r["name"] for r in conn.execute("PRAGMA table_info(instrument_attestations)")
+    ]
+    assert instrument_cols.count("attest_due_ts") == 1
+
+    # A database hand-patched with only ONE of the four columns must still gain the rest.
+    half = _v19_database()
+    half.execute("ALTER TABLE orders ADD COLUMN quote_provenance TEXT")
+    half.execute("ALTER TABLE asset_attestations ADD COLUMN attest_due_ts INTEGER")
+    half.commit()
+    db._migrate_v20_provenance_and_attest_windows(half)
+    half.commit()
+
+    order_cols = [r["name"] for r in half.execute("PRAGMA table_info(orders)")]
+    assert order_cols.count("quote_provenance") == 1
+    assert order_cols.count("client_order_id") == 1
+    asset_cols = [r["name"] for r in half.execute("PRAGMA table_info(asset_attestations)")]
+    assert asset_cols.count("attest_due_ts") == 1
+    instrument_cols = [
+        r["name"] for r in half.execute("PRAGMA table_info(instrument_attestations)")
+    ]
+    assert instrument_cols.count("attest_due_ts") == 1
+
+
+def test_v20_on_a_pre_v11_chain_does_not_duplicate_columns() -> None:
+    """The hazard the PRAGMA guards exist for: a database arriving from v10 gets `orders`,
+    `asset_attestations` and `instrument_attestations` fresh from `_SCHEMA_STATEMENTS` -- which
+    runs BEFORE any numbered step and already carries all four v20 columns -- so a bare
+    `ALTER TABLE` here would raise sqlite's own "duplicate column name" and break every upgrade
+    landing on this release."""
+    conn = db.connect(":memory:")
+    conn.execute("CREATE TABLE IF NOT EXISTS schema_version (version INTEGER NOT NULL)")
+    conn.execute("INSERT INTO schema_version (version) VALUES (10)")
+    conn.commit()
+
+    db.migrate(conn)  # must not raise
+
+    order_cols = [r["name"] for r in conn.execute("PRAGMA table_info(orders)")]
+    assert order_cols.count("quote_provenance") == 1
+    assert order_cols.count("client_order_id") == 1
+    asset_cols = [r["name"] for r in conn.execute("PRAGMA table_info(asset_attestations)")]
+    assert asset_cols.count("attest_due_ts") == 1
+    instrument_cols = [
+        r["name"] for r in conn.execute("PRAGMA table_info(instrument_attestations)")
+    ]
+    assert instrument_cols.count("attest_due_ts") == 1
+
+    table_names = {
+        r["name"] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")
+    }
+    assert {"cycle_balances", "audit_events"} <= table_names
+
+    stamped = conn.execute("SELECT version FROM schema_version").fetchone()["version"]
+    assert stamped == db.SCHEMA_VERSION == 20
+
+
+def test_cycle_balances_accepts_null_and_round_trips_a_decimal_string() -> None:
+    """`available`/`total` are Decimal-as-TEXT, the same convention as every money column in
+    this schema (`orders.qty`, `equity_points.equity`). NULL means NOT OBSERVED, never zero: a
+    cycle that could read the total but not the available-to-trade split (or vice versa) must be
+    able to leave the unread side NULL rather than have a writer invent a number for it."""
+    conn = db.connect(":memory:")
+    db.migrate(conn)
+
+    conn.execute(
+        "INSERT INTO cycle_balances (ts, mode, currency, available, total) VALUES (?, ?, ?, ?, ?)",
+        (1_700_000_000, "paper", "USD", str(Decimal("123.456789")), None),
+    )
+    conn.commit()
+
+    row = conn.execute(
+        "SELECT available, total FROM cycle_balances WHERE currency = 'USD'"
+    ).fetchone()
+    assert row["available"] == "123.456789"
+    assert Decimal(row["available"]) == Decimal("123.456789")
+    assert row["total"] is None
+
+
+def _columns(conn: sqlite3.Connection, table: str) -> dict[str, tuple[str, int]]:
+    """`{name: (declared_type, notnull)}` for `table`."""
+    return {
+        row["name"]: (str(row["type"]).upper(), int(row["notnull"]))
+        for row in conn.execute(f"PRAGMA table_info({table})")
+    }
+
+
+def test_audit_events_stores_its_timestamp_as_an_integer() -> None:
+    """The one deliberate deviation in v20, and the only change in it that nothing tested.
+
+    #721's comment specifies `ts TEXT`. It is INTEGER here because every other timestamp in this
+    schema is, and because TEXT orders an epoch LEXICALLY: with a TEXT column, `ORDER BY ts` puts
+    '10000000000' BEFORE '9999999999' -- the reverse of the numeric truth -- so a `ts >= ?` range
+    read over an audit trail silently returns the wrong rows once the digit count changes.
+
+    Without this test the deviation was free to be reverted: flipping the column back to TEXT
+    passed the entire suite. A deviation from a written decision that nothing pins is a deviation
+    the next reader will undo in good faith.
+    """
+    conn = db.connect(":memory:")
+    db.migrate(conn)
+
+    assert _columns(conn, "audit_events")["ts"][0] == "INTEGER"
+
+
+def test_the_audit_chain_columns_exist_and_are_all_required() -> None:
+    """A hash chain with a nullable link is not a chain. Every field is NOT NULL because the
+    table is append-only from v20 forward -- there are no pre-existing rows to be honest about,
+    which is exactly why it can afford constraints the ALTERed columns cannot."""
+    conn = db.connect(":memory:")
+    db.migrate(conn)
+    columns = _columns(conn, "audit_events")
+
+    for name in ("ts", "event_type", "entity_id", "payload_json", "prev_hash", "row_hash"):
+        assert name in columns, f"audit_events is missing {name}"
+        assert columns[name][1] == 1, f"audit_events.{name} must be NOT NULL"
+
+
+def test_the_audit_trail_can_be_read_by_time_range_without_a_table_scan() -> None:
+    """The comment names `ts >= ?` as how this table gets queried, and `cycle_balances` two
+    statements earlier gets its index. An index the schema is missing is a migration later."""
+    conn = db.connect(":memory:")
+    db.migrate(conn)
+
+    indexes = {row["name"] for row in conn.execute("PRAGMA index_list(audit_events)")}
+
+    assert any("ts" in name for name in indexes), f"no ts index on audit_events: {indexes}"
+
+
+def test_the_recorded_balance_columns_are_text_and_nullable() -> None:
+    """Money as TEXT, never REAL -- and nullable, because a cycle that read the total but not the
+    available split must leave the unread side NULL rather than have a writer invent a figure."""
+    conn = db.connect(":memory:")
+    db.migrate(conn)
+    columns = _columns(conn, "cycle_balances")
+
+    for name in ("available", "total"):
+        assert columns[name] == ("TEXT", 0), f"cycle_balances.{name} is {columns[name]}"
