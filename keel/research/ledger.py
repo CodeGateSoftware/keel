@@ -13,7 +13,6 @@ after it -- tamper-EVIDENT, not tamper-proof (spec §4.3).
 
 from __future__ import annotations
 
-import hashlib
 import json
 import time
 from collections.abc import Iterable, Mapping, Sequence
@@ -21,6 +20,18 @@ from dataclasses import dataclass, field, replace
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
+
+# The canonical form and the chain walk are SHARED with `keel/data/audit.py` (#721) rather
+# than defined here. `canonical_json` and `ZERO_HASH` keep their names in this module's
+# namespace because `tests/research/test_ledger.py` and every downstream reader reach for
+# `ledger.canonical_json` -- the definition moved, the vocabulary did not.
+from keel_core.hashchain import (
+    ZERO_HASH,
+    ChainLink,
+    canonical_json,
+    chain_hash,
+    verify_links,
+)
 
 PROVENANCE = frozenset({"a_priori", "fitted"})
 #: `monte_carlo` (#441) is a resampling DIAGNOSTIC row -- same vocabulary discipline as the
@@ -44,7 +55,6 @@ DECISIONS = frozenset({"selected", "rejected", "diagnostic_only"})
 #: A CSCV column is a diagnostic, not a decision (spec §4.4) -- it does not count toward N.
 DIAGNOSTIC_ONLY = "diagnostic_only"
 
-ZERO_HASH = "0" * 64
 
 DEFAULT_LEDGER_PATH = Path("docs/experiments/trials-ledger.jsonl")
 
@@ -67,17 +77,6 @@ class TrialRecord:
     row_hash: str = ""
 
 
-def _encode(value: Any) -> Any:
-    """Decimal -> str so JSON round-trips exactly; recurse through containers."""
-    if isinstance(value, Decimal):
-        return str(value)
-    if isinstance(value, Mapping):
-        return {k: _encode(v) for k, v in value.items()}
-    if isinstance(value, (list, tuple)):
-        return [_encode(v) for v in value]
-    return value
-
-
 def _decode_series(raw: Any) -> list[Decimal]:
     return [Decimal(v) for v in (raw or [])]
 
@@ -96,15 +95,6 @@ def _decode_summary(raw: Any) -> dict[str, Any]:
         else:
             out[key] = Decimal(value)
     return out
-
-
-def canonical_json(payload: Mapping[str, Any]) -> str:
-    """Deterministic serialisation: sorted keys, no incidental whitespace.
-
-    The hash is only reproducible if this is byte-stable, so both the separators and the key
-    ordering are pinned here rather than left to `json.dumps` defaults.
-    """
-    return json.dumps(_encode(dict(payload)), sort_keys=True, separators=(",", ":"))
 
 
 def _row_payload(record: TrialRecord) -> dict[str, Any]:
@@ -127,7 +117,15 @@ def _row_payload(record: TrialRecord) -> dict[str, Any]:
 
 
 def compute_row_hash(record: TrialRecord) -> str:
-    return hashlib.sha256(canonical_json(_row_payload(record)).encode("utf-8")).hexdigest()
+    """This row's hash, over `_row_payload` -- i.e. the row minus `row_hash` itself.
+
+    The arithmetic moved to `keel_core.hashchain.chain_hash` in #721 so `audit_events` could
+    share it. WHAT is hashed stayed here, because only this module knows which of a trial's
+    fields are part of the record. The 93 rows in the git-tracked ledger were hashed before that
+    move and still verify byte-for-byte -- pinned by
+    `test_the_tracked_ledger_still_verifies_after_the_canonicaliser_moved`.
+    """
+    return chain_hash(_row_payload(record))
 
 
 def _validate(record: TrialRecord) -> None:
@@ -257,18 +255,15 @@ def verify_records(records: Iterable[TrialRecord]) -> list[str]:
     it is held for the web view, and it is the difference between an honest badge and a green
     light over a file nothing read.
     """
-    errors: list[str] = []
-    expected_prev = ZERO_HASH
-    for index, record in enumerate(records, start=1):
-        if record.prev_hash != expected_prev:
-            errors.append(
-                f"row {index} ({record.trial_id}): prev_hash {record.prev_hash[:12]}... "
-                f"does not chain to {expected_prev[:12]}..."
-            )
-        elif compute_row_hash(record) != record.row_hash:
-            errors.append(f"row {index} ({record.trial_id}): content does not match row_hash")
-        expected_prev = record.row_hash
-    return errors
+    return verify_links(
+        ChainLink(
+            label=record.trial_id,
+            prev_hash=record.prev_hash,
+            row_hash=record.row_hash,
+            recomputed_hash=compute_row_hash(record),
+        )
+        for record in records
+    )
 
 
 def trial_counts(trials: Iterable[TrialRecord]) -> tuple[int, int]:

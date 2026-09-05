@@ -246,3 +246,13 @@ def test_the_export_carries_every_row_in_scope_not_the_pages_worth(tmp_path: Pat
     assert len(data_rows) == total, (
         f"the export must carry the whole scope; got {len(data_rows)} of {total}"
     )
+
+
+def test_the_export_names_the_chain_status_beside_the_hash(running: Any) -> None:  # noqa: F811
+    """#721. The hash column stopped being a placeholder; a hash with no verdict beside it is a
+    number a reader takes on trust, and the reading taken on trust is the flattering one."""
+    _status, _headers, body = _csv(running)
+
+    header = next(csv.reader(io.StringIO(body)))
+
+    assert header[-2:] == ["row_hash", "chain_status"]

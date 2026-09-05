@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 from decimal import Decimal
+from pathlib import Path
 
 import pytest
 
@@ -205,3 +206,26 @@ def test_verify_records_of_nothing_is_no_errors_and_not_a_verification(tmp_path)
     held for the web view. Pinned here so the emptiness stays the caller's problem to name rather
     than becoming a silent green light."""
     assert ledger.verify_records([]) == []
+
+
+def test_the_tracked_ledger_still_verifies_after_the_canonicaliser_moved() -> None:
+    """The 93 rows in `docs/experiments/trials-ledger.jsonl` were hashed by the canonicaliser
+    that used to live in this module. #721 moved it to `keel_core.hashchain` so `audit_events`
+    could share one definition of canonical JSON rather than grow a second one.
+
+    A move like that is exactly where a chain dies quietly: nothing raises, no test fails, and
+    the ledger simply stops verifying the next time anyone asks -- by which point there is no way
+    to tell an honest refactor from an edit. So this reads the REAL, git-tracked file (not a
+    fixture, not a temp path -- `conftest`'s autouse redirect is deliberately bypassed by using
+    the literal path) and asserts every one of its rows still reproduces its recorded hash.
+
+    It is the only test in this suite that asserts against hashes computed by a previous version
+    of the code, and that is the point: it is the byte-identity proof.
+    """
+    tracked = Path(__file__).resolve().parents[2] / "docs/experiments/trials-ledger.jsonl"
+    assert tracked.exists(), f"the tracked ledger is missing: {tracked}"
+    records = ledger.read_trials(tracked)
+    # Guards the assertion below against passing over an empty read: `verify_chain` returns no
+    # errors for zero rows, which is not the same as "verified" (see `verify_records`).
+    assert len(records) > 1, "the tracked ledger must hold a chain, not a single row"
+    assert ledger.verify_chain(tracked) == []

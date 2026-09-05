@@ -300,6 +300,72 @@ def asset_attestation_window_findings(
     )
 
 
+def audit_chain_findings(state: Any) -> list[Finding]:
+    """Does the append-only audit chain still verify? (#721)
+
+    THREE readings, and the middle one is the whole reason this is not a boolean:
+
+    * **no `audit_events` table** -- a database this build has not migrated. Both the web server
+      and `keel mcp` open a repo WITHOUT migrating (a view must not take a schema write lock), so
+      an un-upgraded database reaching a reader is ordinary, not an error.
+    * **a table with no events** -- nothing has been written since the chain shipped. Reported as
+      OK, and the headline says UNVERIFIED rather than verified: an empty chain has no breaks
+      because it has nothing in it to break, and calling that "verified" is a positive claim over
+      zero rows.
+    * **a break** -- FAIL. This is the one check in this module where a failure means the RECORD
+      has been altered rather than a rail being out of position, so it names the row and offers no
+      `fix`: there is no command that repairs a broken chain, and offering one would imply the
+      break can be papered over. What an operator does here is investigate.
+
+    `state` is a `keel.data.audit.ChainState`, typed `Any` for the same reason every other
+    gatherer's input here is: the MCP tool and the click command hand this module rows and records
+    from a repo it does not import.
+    """
+    if not getattr(state, "table_present", False):
+        return [
+            Finding(
+                "audit.chain",
+                OK,
+                "audit chain not on this database",
+                "schema predates the append-only audit chain; nothing is recorded to verify",
+                "keel migrate",
+            )
+        ]
+    errors = tuple(getattr(state, "errors", ()) or ())
+    count = int(getattr(state, "event_count", 0) or 0)
+    if errors:
+        return [
+            Finding(
+                "audit.chain",
+                FAIL,
+                "audit chain does NOT verify",
+                f"{len(errors)} break(s) over {count} event(s); first: {errors[0]}",
+                # No fix. Nothing repairs a broken chain, and a command here would read as though
+                # something could -- which is the opposite of what a break means.
+                "-",
+            )
+        ]
+    if count == 0:
+        return [
+            Finding(
+                "audit.chain",
+                OK,
+                "audit chain empty — unverified",
+                "no events recorded yet; nothing has been checked",
+                "-",
+            )
+        ]
+    return [
+        Finding(
+            "audit.chain",
+            OK,
+            "audit chain verifies",
+            f"{count} event(s), every one still hashing to the next",
+            "-",
+        )
+    ]
+
+
 def instrument_attestation_window_findings(
     attestations: Iterable[dict[str, Any]], *, now_ts: int
 ) -> list[Finding]:
@@ -1504,6 +1570,10 @@ def gather_findings(repo: Any, config: Any, log_lines: Iterable[str], now_ts: in
     findings += instrument_attestation_window_findings(
         repo.get_instrument_attestations(), now_ts=now_ts
     )
+    # #721. Deliberately AFTER the attestation checks and before the venue rails: a chain break
+    # is a statement about the record those checks were read from, and an operator scanning the
+    # output should meet it in the same block as the rest of the record's condition.
+    findings += audit_chain_findings(repo.audit_chain())
     findings += trade_scope_findings(repo.get_venue_trade_scope(venue), venue)
     # #691. Venue-keyed the same way, and reported BEFORE it bites: rail 22 vetoes silently on
     # a lapse, and the live profile runs unattended.

@@ -1203,8 +1203,15 @@ export function timelineView(data, sort, onSort, onKind) {
   link.setAttribute("href", target.pathname.concat(target.search));
   link.setAttribute("download", "");
   actions.append(link);
-  actions.append(" — every row with its provenance; hashes are not recorded yet.");
+  actions.append(" — every row with its provenance, its hash and whether the chain verifies it.");
   fragment.append(actions);
+
+  // The chain's verdict over the whole record, above the rows it applies to. A per-row status
+  // answers "is this row evidence"; this answers "has this record been altered", which is the
+  // question an operator opening an audit page is actually asking.
+  const chain = el("p", "note");
+  chain.append(field(data.chain));
+  fragment.append(chain);
 
   fragment.append(heading("h-timeline", "What happened"));
   fragment.append(
@@ -1222,6 +1229,10 @@ export function timelineView(data, sort, onSort, onKind) {
         { label: "product", numeric: false, key: "product_id" },
         { label: "amount", numeric: true },
         { label: "what", numeric: false },
+        // Both columns, never one. A hash with nothing saying whether it verifies is a number a
+        // reader takes on trust, and the reading taken on trust is the flattering one.
+        { label: "row hash", numeric: false },
+        { label: "tamper-evidence", numeric: false },
       ],
       (data.rows || []).map(/** @param {any} row */ (row) => [
         row.at,
@@ -1232,6 +1243,8 @@ export function timelineView(data, sort, onSort, onKind) {
         plain(row.product_id) || "—",
         row.amount,
         plain(row.summary) || "—",
+        row.row_hash,
+        row.chain_status,
       ]),
       "Nothing recorded in this window.",
       { sort: sort, onSort: onSort },

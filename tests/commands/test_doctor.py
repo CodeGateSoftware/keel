@@ -598,6 +598,7 @@ def test_gather_findings_covers_every_check_over_a_seeded_db(tmp_path, valid_con
         "attest.withdrawals",
         "attest.asset_window",
         "attest.instrument_window",
+        "audit.chain",
         "scope.trade",
         "attest.cash_posture",
         "rail.kill_switch",
@@ -1065,3 +1066,64 @@ def test_a_folder_keel_cannot_read_measures_as_empty(tmp_path) -> None:
 
     assert footprint.total_files == 0
     assert read_backup_footprint(tmp_path / "missing").total_files == 0
+
+
+# -- the audit chain (#721) ---------------------------------------------------------------------
+
+
+def _chain(**overrides: object):
+    from keel.data.audit import ChainState
+
+    fields: dict[str, object] = {
+        "table_present": True,
+        "event_count": 3,
+        "errors": (),
+        "first_broken_seq": None,
+        "hashes": {},
+    }
+    fields.update(overrides)
+    return ChainState(**fields)  # type: ignore[arg-type]
+
+
+def test_a_verifying_chain_is_ok_and_says_how_much_it_checked() -> None:
+    from keel.commands.doctor import audit_chain_findings
+
+    (finding,) = audit_chain_findings(_chain())
+    assert finding.name == "audit.chain"
+    assert finding.status == "ok"
+    assert "3" in finding.detail
+
+
+def test_an_empty_chain_is_ok_but_never_called_verified() -> None:
+    """Nothing was checked. A doctor line reading "audit chain verifies" over zero events is the
+    green badge over an unread file that this codebase keeps having to take back out."""
+    from keel.commands.doctor import audit_chain_findings
+
+    (finding,) = audit_chain_findings(_chain(event_count=0))
+    assert finding.status == "ok"
+    assert "verifies" not in finding.headline
+    assert "unverified" in finding.headline
+
+
+def test_a_break_fails_and_offers_no_fix() -> None:
+    """The one check here whose failure means the RECORD was altered rather than a rail being out
+    of position. Nothing repairs a broken chain, and a `fix` command would imply something does."""
+    from keel.commands.doctor import audit_chain_findings
+
+    (finding,) = audit_chain_findings(
+        _chain(errors=("row 2 (2): content does not match row_hash",), first_broken_seq=2)
+    )
+    assert finding.status == "fail"
+    assert finding.fix == "-"
+    assert "row 2" in finding.detail
+
+
+def test_a_database_without_the_table_is_reported_not_crashed_on() -> None:
+    """`keel mcp`'s `_open_readonly_repo` and the web server both open a repo WITHOUT migrating.
+    A reader that raised here would take the whole of `gather_findings` down on an un-upgraded
+    deployment -- which is exactly what #718's first cut did."""
+    from keel.commands.doctor import audit_chain_findings
+
+    (finding,) = audit_chain_findings(_chain(table_present=False))
+    assert finding.status == "ok"
+    assert finding.fix == "keel migrate"

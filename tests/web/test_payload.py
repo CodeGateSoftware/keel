@@ -31,7 +31,7 @@ produce it.
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
@@ -1543,3 +1543,106 @@ def test_an_empty_series_says_so_rather_than_describing_an_empty_chart() -> None
     assert empty["segments"] == []
     assert empty["point_count"]["value"] == "0"
     assert "no" in empty["reading"]["display"].lower()
+
+
+# -- the audit chain on the wire (#721) ---------------------------------------------------------
+
+
+def _timeline_report(**overrides: object):
+    from keel.commands.timeline import TimelineReport, TimelineRow
+
+    row = TimelineRow(
+        ts=1_000,
+        kind="trade",
+        provenance="venue-reported",
+        source="orders",
+        reference="1",
+        summary="filled buy BTC-USD (live)",
+        product_id="BTC-USD",
+        amount=None,
+        amount_kind="",
+        row_hash="a" * 64,
+        chain_status="chained",
+    )
+    fields: dict[str, object] = {
+        "now_ts": 2_000,
+        "scope": "all",
+        "scope_start_ts": None,
+        "kind": "",
+        "limit": None,
+        "scoped_count": 1,
+        "filtered_count": 1,
+        "rows": (row,),
+        "kinds_present": ("trade",),
+        "chain_recorded": True,
+        "chain_errors": (),
+    }
+    fields.update(overrides)
+    return TimelineReport(**fields)  # type: ignore[arg-type]
+
+
+def test_a_chained_row_is_green_and_shortened() -> None:
+    """The hash is truncated for a cell -- the full value lives in the CSV, which is what anyone
+    actually verifying one would be working from."""
+    body = payload.timeline_payload(_timeline_report())
+    cell = body["rows"][0]["row_hash"]
+
+    assert cell["state"] == "good"
+    assert cell["value"] == "a" * 64
+    assert cell["display"].endswith("…")
+    assert len(cell["display"]) < 64
+
+
+def test_not_recorded_is_shown_whole_because_it_is_a_sentence() -> None:
+    """Truncating "NOT RECORDED" to twelve characters and an ellipsis would make it LOOK like a
+    short hash in a column of long ones -- the absence of evidence dressed as some."""
+    from keel.commands.timeline import HASH_NOT_RECORDED
+
+    report = _timeline_report()
+    row = replace(report.rows[0], row_hash=HASH_NOT_RECORDED, chain_status="not chained")
+    body = payload.timeline_payload(replace(report, rows=(row,)))
+
+    cell = body["rows"][0]["row_hash"]
+    assert cell["display"] == HASH_NOT_RECORDED
+    assert cell["state"] == "unknown"
+
+
+def test_a_row_past_a_break_is_bad_even_though_it_has_a_hash() -> None:
+    """The state must come from the CHAIN, not from whether a hash is present. A client inferring
+    the verdict from a 64-character string would call an unverified row evidence."""
+    report = _timeline_report(chain_errors=("row 1 (1): content does not match row_hash",))
+    row = replace(report.rows[0], chain_status="chain broken")
+    body = payload.timeline_payload(replace(report, rows=(row,)))
+
+    assert body["rows"][0]["row_hash"]["state"] == "bad"
+    assert body["rows"][0]["chain_status"]["state"] == "bad"
+
+
+def test_every_chain_status_carries_a_sentence_not_only_the_term() -> None:
+    """The same rule `_PROVENANCE_NOTES` follows: on an audit surface the term of art is not the
+    thing a reader can act on."""
+    from keel.commands.timeline import CHAIN_STATUSES
+
+    report = _timeline_report()
+    for status in CHAIN_STATUSES:
+        row = replace(report.rows[0], chain_status=status)
+        cell = payload.timeline_payload(replace(report, rows=(row,)))["rows"][0]["chain_status"]
+        assert cell["value"] == status
+        assert cell["display"] != status, f"{status} has no sentence beside it"
+
+
+def test_an_empty_chain_is_never_green() -> None:
+    """No events means nothing was checked -- not that everything verified. The exact trap
+    `_chain_payload` documents for the research ledger, on the trading side."""
+    body = payload.timeline_payload(_timeline_report(chain_recorded=False))
+    assert body["chain"]["state"] == "unknown"
+    assert body["chain"]["value"] == "unverified"
+
+
+def test_a_verified_chain_over_recorded_events_is_the_only_green() -> None:
+    intact = payload.timeline_payload(_timeline_report())
+    assert intact["chain"]["state"] == "good"
+
+    broken = payload.timeline_payload(_timeline_report(chain_errors=("row 3: broken",)))
+    assert broken["chain"]["state"] == "bad"
+    assert broken["chain_errors"] == ["row 3: broken"]
