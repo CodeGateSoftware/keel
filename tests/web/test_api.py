@@ -1264,3 +1264,30 @@ def test_close_repo_actually_closes_the_connection(tmp_path: Path) -> None:
     close_repo(repo)
     with pytest.raises(sqlite3.ProgrammingError):
         conn.execute("SELECT 1")
+
+
+def test_the_trade_limit_does_not_truncate_the_operators_journal(tmp_path: Path) -> None:
+    """#705. `?limit=` is the closed-trade table's page control, and the two records share a route
+    only by arrangement. Passing it through meant narrowing to one trade silently hid 300 of an
+    operator's 301 notes -- one record's page control truncating a different record."""
+    from keel.data.db import connect, migrate
+    from keel.data.repository import Repository
+    from keel.web.api import read_journal
+
+    db_path = tmp_path / "keel.db"
+    conn = connect(str(db_path))
+    migrate(conn)
+    repo = Repository(conn)
+    for index in range(5):
+        repo.append_journal_entry(ts=1_000 + index, chart_note=f"note {index}")
+    conn.close()
+
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(VALID_CONFIG_YAML)
+    cfg = _serve_config(str(db_path), str(config_path))
+
+    body = read_journal(cfg, {"limit": ["1"]}, None, 2_000)
+    notes = body["notes"]
+    assert notes["shown_count"]["value"] == "5", "the trades' limit reached the journal"
+    assert notes["total_count"]["value"] == "5"
+    assert notes["window"]["value"] == "all"

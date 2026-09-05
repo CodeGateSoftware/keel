@@ -226,6 +226,159 @@ class Repository:
     def __init__(self, conn: sqlite3.Connection) -> None:
         self._conn = conn
 
+    # -- the discretionary journal (#705) ---------------------------------
+    #
+    # The operator's own account of their own conduct: what they felt, whether they followed
+    # their rules, what it cost. Declared in the schema since the beginning with no method and no
+    # caller -- dead schema, which is worse than none, because a reader assumes a declared table
+    # is a used one.
+    #
+    # UNLIKE EVERY OTHER STORE HERE, none of this can be checked. An order is what a venue
+    # reported, a transaction is a line from a venue's own export, an asset attestation is a claim
+    # a prospectus could contradict. A self-assessment has no external referent at all, and the
+    # whole value of keeping it depends on it staying visibly separate from the things that do --
+    # which is why `commands/timeline.py` gives it its own provenance word rather than filing it
+    # under `human-attested` beside the attestations.
+    #
+    # APPEND-ONLY, and there is no update method by design. A journal you can go back and edit is
+    # a journal that records what you wish you had thought.
+
+    def append_journal_entry(
+        self,
+        *,
+        ts: int,
+        emotion_score: str | None = None,
+        rules_followed: bool | None = None,
+        errors_made: str | None = None,
+        dollar_impact: Decimal | None = None,
+        chart_note: str | None = None,
+        screenshot_ref: str | None = None,
+    ) -> int:
+        """Append one entry and return its `id`.
+
+        Every field but `ts` defaults to `None`, and `None` means DID NOT SAY -- never a zero, an
+        empty string or a `False`. An operator who wants to record one sentence about one day must
+        not have to invent an emotion score to do it, and `rules_followed=False` is a positive
+        confession that nobody should be able to make by omission.
+
+        The entry and its audit-chain row land in one transaction (#721), the same discipline
+        every other writer here follows.
+        """
+        with write_transaction(self._conn):
+            cursor = self._conn.execute(
+                """
+                INSERT INTO journal
+                    (ts, emotion_score, rules_followed, errors_made, dollar_impact, chart_note,
+                     screenshot_ref)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    ts,
+                    emotion_score,
+                    None if rules_followed is None else int(rules_followed),
+                    errors_made,
+                    _dec_to_text(dollar_impact),
+                    chart_note,
+                    screenshot_ref,
+                ),
+            )
+            assert cursor.lastrowid is not None
+            entry_id = cursor.lastrowid
+            # The row id, because `journal` has no natural key -- no `coinbase_id`, no asset, no
+            # venue pair -- and it is what `commands/timeline.py` prints as the row's reference.
+            append_event(
+                self._conn,
+                ts=ts,
+                event_type="journal_recorded",
+                entity_id=str(entry_id),
+                payload={
+                    "id": entry_id,
+                    "ts": ts,
+                    "emotion_score": emotion_score,
+                    "rules_followed": rules_followed,
+                    "errors_made": errors_made,
+                    "dollar_impact": dollar_impact,
+                    "chart_note": chart_note,
+                    "screenshot_ref": screenshot_ref,
+                },
+            )
+        return entry_id
+
+    def get_journal_entries(
+        self,
+        *,
+        since_ts: int | None = None,
+        until_ts: int | None = None,
+        limit: int | None = None,
+    ) -> list[dict[str, Any]]:
+        """Entries in the window, OLDEST FIRST -- a journal reads forwards.
+
+        The window is half-open (`since_ts <= ts < until_ts`), matching `get_candles` and
+        `commands/orders.py::scope_start_ts`, so two adjacent windows cover a range without
+        double-counting the seam.
+
+        `limit` keeps the NEWEST entries and still returns them oldest-first: a capped read of a
+        journal wants the recent end, and the cap must change how many entries a caller sees
+        rather than which way they read. `id` breaks a timestamp tie, so two notes written in one
+        second keep a stable order across reads.
+        """
+        where, params = self._journal_where(since_ts, until_ts)
+        if limit is None:
+            query = f"SELECT * FROM journal{where} ORDER BY ts, id"
+        else:
+            # The SUBQUERY, not a DESC read reversed in Python -- the identical shape
+            # `get_equity_points` and `get_cycle_balances` use, and `get_equity_points`' docstring
+            # is where the reasoning lives: the ordering is the caller's contract rather than an
+            # artefact of how the rows were selected, so a bounded read and an unbounded one
+            # differ only in how much they return. `id` breaks the tie in BOTH directions, so the
+            # newest-N and the oldest-first re-order agree about which of two same-second entries
+            # is the newer.
+            query = (
+                f"SELECT * FROM (SELECT * FROM journal{where} "
+                "ORDER BY ts DESC, id DESC LIMIT ?) ORDER BY ts, id"
+            )
+            params = [*params, limit]
+        rows = self._conn.execute(query, params).fetchall()
+        return [self._journal_row_to_dict(row) for row in rows]
+
+    def count_journal_entries(
+        self, *, since_ts: int | None = None, until_ts: int | None = None
+    ) -> int:
+        """How many entries the window holds, BEFORE any `limit` truncated it.
+
+        The sibling `count_equity_points` exists for the same reason and its docstring states the
+        rule: a caller that bounds a read is showing a WINDOW of the record and must say so. The
+        console showed a capped journal with nothing on the page distinguishing it from a complete
+        one, which is the failure that rule exists to prevent.
+        """
+        where, params = self._journal_where(since_ts, until_ts)
+        row = self._conn.execute(f"SELECT COUNT(*) AS n FROM journal{where}", params).fetchone()
+        return int(row["n"])
+
+    @staticmethod
+    def _journal_where(since_ts: int | None, until_ts: int | None) -> tuple[str, list[Any]]:
+        """The half-open window, shared by the read and the count so the two cannot disagree
+        about which entries are in it."""
+        clauses: list[str] = []
+        params: list[Any] = []
+        if since_ts is not None:
+            clauses.append("ts >= ?")
+            params.append(since_ts)
+        if until_ts is not None:
+            clauses.append("ts < ?")
+            params.append(until_ts)
+        return ((" WHERE " + " AND ".join(clauses)) if clauses else "", params)
+
+    def _journal_row_to_dict(self, row: sqlite3.Row) -> dict[str, Any]:
+        entry = dict(row)
+        entry["dollar_impact"] = _text_to_dec(entry.get("dollar_impact"))
+        raw = entry.get("rules_followed")
+        # THREE-VALUED. `bool(None)` is `False`, and `False` on this column is the operator
+        # saying they broke their rules -- a confession nobody should make by leaving a prompt
+        # blank.
+        entry["rules_followed"] = None if raw is None else bool(raw)
+        return entry
+
     # -- the audit chain ------------------------------------------------
 
     def rollback(self) -> None:

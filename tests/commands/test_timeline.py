@@ -626,3 +626,119 @@ def test_a_broken_chain_is_stated_above_the_header_not_only_per_row(db_conn) -> 
     text = timeline.to_csv(timeline.export_rows(repo, now_ts=2_000))
     assert text.splitlines()[0].startswith("# NOTE")
     assert "chain" in text.splitlines()[0]
+
+
+# -- the journal in the feed (#705) --------------------------------------------------------------
+
+
+def _journal(repo: Repository, **overrides: Any) -> int:
+    row: dict[str, Any] = {"ts": NOW_TS - 100, "chart_note": "range top, thin book"}
+    row.update(overrides)
+    return repo.append_journal_entry(**row)
+
+
+def test_a_journal_entry_reaches_the_feed_under_the_attestation_chip(repo: Repository) -> None:
+    """It IS an attestation -- something a person put their name to -- and the chip groups it with
+    the others. What keeps it from being READ as one is the provenance column, not the chip."""
+    _journal(repo)
+    report = gather_timeline(repo, now_ts=NOW_TS, scope="all")
+
+    (row,) = [r for r in report.rows if r.source == "journal"]
+    assert row.kind == "attestation"
+    assert "attestation" in report.kinds_present
+
+
+def test_a_journal_entry_is_self_reported_and_never_human_attested(repo: Repository) -> None:
+    """Two different kinds of claim. An asset attestation says PAXG is backed by allocated gold,
+    which a prospectus could contradict; "I broke my rule" has no external referent at all. Filing
+    the second under the word this feed uses for checkable human claims would put the one
+    unverifiable record in the database under a heading implying otherwise."""
+    _journal(repo)
+    _attestation(repo)
+    report = gather_timeline(repo, now_ts=NOW_TS, scope="all")
+
+    by_source = {r.source: r.provenance for r in report.rows}
+    assert by_source["journal"] == "self-reported"
+    assert by_source["asset_attestations"] == "human-attested"
+
+
+def test_the_self_reported_impact_is_labelled_as_self_reported(repo: Repository) -> None:
+    """A self-reported dollar figure and a venue-reported fee in one column, with nothing saying
+    which is which, is a column that will be summed."""
+    _journal(repo, dollar_impact=Decimal("-42.50"))
+    report = gather_timeline(repo, now_ts=NOW_TS, scope="all")
+
+    (row,) = [r for r in report.rows if r.source == "journal"]
+    assert row.amount == Decimal("-42.50")
+    assert "self-reported" in row.amount_kind
+
+
+def test_a_broken_rule_is_said_and_a_skipped_question_is_not(repo: Repository) -> None:
+    """`rules_followed` is three-valued and `bool(None)` is `False`. Printing the confession over
+    the silence would put words in the operator's mouth on the one row where that matters most."""
+    _journal(repo, ts=NOW_TS - 300, rules_followed=False, chart_note="rushed it")
+    _journal(repo, ts=NOW_TS - 200, rules_followed=None, chart_note="quiet day")
+    _journal(repo, ts=NOW_TS - 100, rules_followed=True, chart_note="by the book")
+
+    summaries = {
+        r.reference: r.summary for r in gather_timeline(repo, now_ts=NOW_TS).rows
+        if r.source == "journal"
+    }
+    broke = [s for s in summaries.values() if "BROKE RULES" in s]
+    assert len(broke) == 1
+    assert "rushed it" in broke[0]
+
+
+def test_an_empty_entry_still_says_something(repo: Repository) -> None:
+    """An operator can record a day with nothing written on it. A blank summary would make the
+    feed's densest human content its least legible."""
+    _journal(repo, chart_note=None)
+    (row,) = [r for r in gather_timeline(repo, now_ts=NOW_TS).rows if r.source == "journal"]
+    assert row.summary.strip()
+
+
+def test_a_journal_entry_carries_its_chain_hash_like_every_other_record(repo: Repository) -> None:
+    """It rides the audit export beside orders and fills, so it is chained beside them too."""
+    _journal(repo)
+    (row,) = [r for r in gather_timeline(repo, now_ts=NOW_TS).rows if r.source == "journal"]
+    assert row.chain_status == "chained"
+    assert len(row.row_hash) == 64
+
+
+def test_the_journal_respects_the_scope_window(repo: Repository) -> None:
+    _journal(repo, ts=NOW_TS - 100)
+    _journal(repo, ts=NOW_TS - (40 * 86_400))
+    assert len([r for r in gather_timeline(repo, now_ts=NOW_TS, scope="7d").rows
+                if r.source == "journal"]) == 1
+    assert len([r for r in gather_timeline(repo, now_ts=NOW_TS, scope="all").rows
+                if r.source == "journal"]) == 2
+
+
+def test_the_export_row_carries_every_sentence_the_operator_wrote(repo: Repository) -> None:
+    """This row is the journal's WHOLE representation in the CSV -- there is no other column any
+    of it could reappear in. The first cut used `elif`, so an entry carrying both an error and a
+    chart note exported only the error, and `screenshot_ref` reached the file nowhere at all."""
+    _journal(
+        repo,
+        errors_made="entered early",
+        chart_note="range top",
+        screenshot_ref="~/shot.png",
+        emotion_score="2",
+    )
+    text = timeline.to_csv(timeline.export_rows(repo, now_ts=NOW_TS))
+    (line,) = [row for row in text.splitlines() if "journal" in row]
+
+    for written in ("entered early", "range top", "~/shot.png", "emotion 2"):
+        assert written in line, f"{written!r} is in no column and in no summary"
+
+
+def test_a_hostile_journal_note_cannot_execute_in_a_spreadsheet(repo: Repository) -> None:
+    """Journal text is operator-typed free text and it lands in a cell of a file an auditor
+    opens. `csv_safe` applies to every cell, and the summary's `.strip()` means a note beginning
+    with a tab or a newline still reaches it starting with the trigger."""
+    _journal(repo, errors_made="=cmd|' /C calc'!A0", chart_note=None)
+    text = timeline.to_csv(timeline.export_rows(repo, now_ts=NOW_TS))
+    (line,) = [row for row in text.splitlines() if "cmd" in row]
+
+    assert "'=cmd" in line
+    assert ",=cmd" not in line and not line.startswith("=cmd")

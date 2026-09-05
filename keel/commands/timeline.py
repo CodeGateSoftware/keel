@@ -1,8 +1,9 @@
 """One chronology over everything keel has done -- issue #703.
 
-Four stores record activity and none of them knew about the others: the engine's JSONL log
-(cycles), the `orders` table (fills), the `transactions` ledger (cash flows), and the attestation
-tables (what a human swore to). This module merges them into one timeline WITHOUT letting them
+Five stores record activity and none of them knew about the others: the engine's JSONL log
+(cycles), the `orders` table (fills), the `transactions` ledger (cash flows), the attestation
+tables (what a human swore to about the world), and the discretionary `journal` (#705 -- what the
+operator says about THEMSELVES). This module merges them into one timeline WITHOUT letting them
 blur, which is the whole difficulty: a venue-reported fill, a line imported from a venue's CSV,
 and a sentence a human typed are three different kinds of evidence, and a feed that presented
 them identically would be worse than four separate tables.
@@ -58,11 +59,18 @@ TIMELINE_KINDS: tuple[str, ...] = ("trade", "flow", "attestation", "system")
 #: - `imported-ledger` -- a `transactions` row, read out of a venue's own CSV export.
 #: - `human-attested` -- someone typed it and signed their name to it.
 #: - `engine-log` -- the agent's own structured log of what it did.
+#: - `self-reported` -- the operator's account of their OWN conduct (#705). A sixth word rather
+#:   than a reuse of `human-attested`, because the two are different kinds of claim: an asset
+#:   attestation says PAXG is backed by allocated gold, which a prospectus could contradict, while
+#:   "I felt rushed and broke my rule" has no external referent and cannot be checked by anyone,
+#:   ever. Filing a self-assessment under the word this feed uses for checkable human claims would
+#:   put the one unverifiable record in the database under a heading that implies otherwise.
 PROVENANCES: tuple[str, ...] = (
     "venue-reported",
     "simulated",
     "imported-ledger",
     "human-attested",
+    "self-reported",
     "engine-log",
 )
 
@@ -405,6 +413,69 @@ def _attestation_rows(
     return rows
 
 
+def _journal_rows(
+    repo: Repository, since_ts: int | None, chain: _Chain
+) -> list[TimelineRow]:
+    """`journal` -> attestation rows (#705).
+
+    Under the ATTESTATION chip, because that is the kind of thing this is -- something a person
+    put their name to -- and with `self-reported` provenance, because it is the one kind of
+    attestation nothing outside the operator's head produced. The chip groups it with the asset
+    and instrument attestations; the provenance column is what keeps it from being read as one.
+
+    The summary carries EVERY sentence the operator wrote, in a fixed order, because this row is
+    the journal's whole representation in the CSV -- there is no other column any of it could
+    reappear in. An entry whose only content is an emotion score still says something, and a row
+    reading only "journal entry" would make the feed's densest human content its least legible.
+    """
+    rows: list[TimelineRow] = []
+    for raw in repo.get_journal_entries(since_ts=since_ts):
+        entry_id = str(raw.get("id") or "")
+        rows.append(
+            TimelineRow(
+                ts=int(raw["ts"]),
+                kind="attestation",
+                provenance="self-reported",
+                source="journal",
+                reference=entry_id,
+                summary=_journal_summary(raw),
+                product_id="",
+                # The figure is what the operator SAYS the day cost them, and `amount_kind` names
+                # it as such: a self-reported impact and a venue-reported fee in one column, with
+                # nothing saying which is which, is a column that will be summed.
+                amount=raw.get("dollar_impact"),
+                amount_kind="self-reported impact" if raw.get("dollar_impact") is not None else "",
+                **chain.of("journal", entry_id),
+            )
+        )
+    return rows
+
+
+def _journal_summary(raw: dict[str, Any]) -> str:
+    """One line from an entry, leading with whatever the operator wrote.
+
+    `rules_followed` is THREE-valued and only one of the three is worth a chip: `False` is the
+    operator saying they broke their own rules, which is the single most consequential thing this
+    table can hold, and `None` is a question they skipped. `bool(None)` would print the confession
+    over the silence.
+    """
+    parts: list[str] = []
+    if raw.get("rules_followed") is False:
+        parts.append("BROKE RULES")
+    # EVERY sentence the operator wrote, not the first one found. The first cut used `elif`, so an
+    # entry carrying both an error and a chart note exported only the error -- and this row is the
+    # journal's whole representation in a file an operator hands to an auditor. There is no other
+    # column it could reappear in.
+    for field in ("errors_made", "chart_note", "screenshot_ref"):
+        written = str(raw.get(field) or "").strip()
+        if written:
+            parts.append(written)
+    emotion = str(raw.get("emotion_score") or "").strip()
+    if emotion:
+        parts.append(f"emotion {emotion}")
+    return " — ".join(parts) if parts else "journal entry (nothing written)"
+
+
 def _cycle_rows(cycles: Iterable[Any], since_ts: int | None) -> list[TimelineRow]:
     """`ActivityCycle`s -> system rows.
 
@@ -490,6 +561,7 @@ def gather_timeline(
     scoped.extend(_order_rows(repo, since, chained))
     scoped.extend(_transaction_rows(repo, since, chained))
     scoped.extend(_attestation_rows(repo, since, chained))
+    scoped.extend(_journal_rows(repo, since, chained))
     # No chain argument, and never one: `_cycle_rows` reads the engine's own log FILE, which is
     # not a chained store. A cycle row carrying a hash would be this module attesting to something
     # it merely read.

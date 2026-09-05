@@ -710,14 +710,34 @@ def read_journal(cfg: ServeConfig, query: Query, _state: Any, now_ts: int) -> di
     redrawn in `pnl` order would be a cumulative total of a sequence that never happened.
     """
     from keel.commands.insights import build_equity_curve, build_journal_report
+    from keel.commands.journal import DEFAULT_NOTES_LIMIT, gather_journal
 
     limit = _journal_limit(query)
     repo = open_repo(cfg.db_path)
     try:
         report = build_journal_report(repo, _status_report(cfg, now_ts), now_ts, limit=limit)
+        # #705's DISCRETIONARY journal, on this route rather than one of its own. Two things
+        # called a journal, and this is the page where the distinction has to be visible: the
+        # table above is closed trades as a venue reported them, and these are sentences the
+        # operator wrote about themselves. Putting them on separate pages would let a reader meet
+        # one without ever learning the other exists.
+        #
+        # It is NOT this route's `collection`, so `?sort=` reorders the trades and leaves these
+        # alone -- and that is a refusal, not an omission. A journal reads forwards; sorted by
+        # dollar impact it becomes a ranking of your own worst days, which is the shape this
+        # codebase refuses everywhere else it appears.
+        #
+        # ITS OWN CAP, not the trades' `?limit=`. The first cut passed `limit` through, so
+        # narrowing to one closed trade silently hid 300 of an operator's 301 notes -- one
+        # record's page control truncating a different record, by the coincidence of their
+        # sharing a route. `total_count` rides the payload either way, so the page can say what
+        # it is not showing.
+        notes = gather_journal(repo, now_ts=now_ts, limit=DEFAULT_NOTES_LIMIT)
     finally:
         close_repo(repo)
-    return payload.journal_payload(report, curve=build_equity_curve(report.entries))
+    return payload.journal_payload(
+        report, curve=build_equity_curve(report.entries), notes=notes
+    )
 
 
 def read_rules(cfg: ServeConfig, _query: Query, _state: Any, _now_ts: int) -> dict[str, Any]:

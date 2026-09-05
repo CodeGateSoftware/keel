@@ -1760,6 +1760,10 @@ _ROW_ENDPOINTS: tuple[tuple[str, str, str, str, str], ...] = (
     ("rulesView", "data", "rules", "/api/rules", "rules"),
     ("researchView", "slippage", "rows", "/api/research/slippage", "none"),
     ("researchView", "gauntlet", "rows", "/api/research/gauntlet", "gauntlet"),
+    # #705's discretionary journal, registered WITH the code that reads it. It hangs off
+    # `/api/journal`'s `notes`, and the seeder writes one entry through the repository because the
+    # CLI writer refuses to run without a terminal.
+    ("insightsView", "notes", "notes.entries", "/api/journal", "journal"),
 )
 
 #: Mapped collections this test does NOT cover, each with the reason. Named rather than omitted:
@@ -1833,6 +1837,27 @@ def _seed_for(kind: str, db_path: str) -> None:
         _seed_orders(db_path, (("BTC-USD", "buy", "50000"),))
     elif kind == "rules":
         _seed_rules(db_path, ("breakout",))
+    elif kind == "journal":
+        # Through the REPOSITORY, not the CLI: `keel journal add` refuses to run without a
+        # terminal (#705), which is the property that makes the record an attestation and is
+        # exactly what a test harness cannot supply.
+        from decimal import Decimal
+
+        from keel.data.db import connect, migrate
+        from keel.data.repository import Repository
+
+        conn = connect(db_path)
+        migrate(conn)
+        Repository(conn).append_journal_entry(
+            ts=1_756_000_000,
+            emotion_score="3",
+            rules_followed=False,
+            errors_made="entered before the close confirmed",
+            dollar_impact=Decimal("-42.50"),
+            chart_note="range top",
+            screenshot_ref="~/shot.png",
+        )
+        conn.close()
 
 
 @pytest.mark.parametrize(("view", "root", "collection", "endpoint", "seed"), _ROW_ENDPOINTS)
@@ -1855,11 +1880,23 @@ def test_every_row_key_a_view_reads_is_a_key_its_endpoint_sends(
     assert status == 200, endpoint
     document = json.loads(body)
     assert document["engine"]["value"] == "running", document
-    rows = document["data"][collection]
+    # A DOTTED PATH, because a collection is not always a top-level key: #705's discretionary
+    # journal rides `/api/journal` at `data.notes.entries`, beside the closed trades it must not
+    # be blended into. Walking the path keeps that arrangement checkable rather than forcing a
+    # route of its own for the sake of this test.
+    rows = document["data"]
+    for part in collection.split("."):
+        assert isinstance(rows, dict), (
+            f"{endpoint}: {part} is not an object on the way to {collection}"
+        )
+        assert part in rows, f"{endpoint} does not send {collection}"
+        rows = rows[part]
 
     # A collection with no rows proves nothing, so an empty one is the failure rather than a pass.
     assert rows, f"{endpoint} sent no {collection} to check {view}'s row reads against"
-    reads = _row_reads(view).get((root, collection), set())
+    # The SCAN is keyed by the last segment -- `render.js` maps `notes.entries`, so `_row_reads`
+    # sees the receiver `notes` and the collection `entries`.
+    reads = _row_reads(view).get((root, collection.rsplit(".", 1)[-1]), set())
     assert reads, f"the scan found no row keys in {view} -- it would pass against any payload"
 
     for row in rows:
@@ -1874,7 +1911,13 @@ def test_every_mapped_collection_is_either_checked_or_named() -> None:
     added later inherits the exact hole #725 fell into. With it, a new `.map()` over a payload
     collection fails the build until it is either checked or written down with a reason.
     """
-    checked = {(view, root, collection) for view, root, collection, _e, _s in _ROW_ENDPOINTS}
+    # The last segment of the path, because that is what `_row_reads` sees: `render.js` maps
+    # `notes.entries`, so the scan reports the receiver `notes` and the collection `entries`,
+    # while the table above carries the payload path `notes.entries` for the walk.
+    checked = {
+        (view, root, collection.rsplit(".", 1)[-1])
+        for view, root, collection, _e, _s in _ROW_ENDPOINTS
+    }
     views = {view for view, _root, _endpoint in _VIEW_ENDPOINTS} | {"statusView", "gatesView"}
 
     mapped = {
@@ -1946,12 +1989,24 @@ def _comments_stripped(source: str) -> str:
 
 
 def _function_body(source: str, name: str) -> str:
-    """One exported function's body, comments stripped and string literals kept."""
+    """One top-level function's body, comments stripped and string literals kept.
+
+    Exported OR module-private: `notesSection` (#705) is private, and a helper that only knew how
+    to find exports raised `ValueError` on it -- which at least fails loudly, unlike the shape
+    where a scan silently finds nothing. Bounded at the next top-level function of either kind, so
+    the next function's body cannot be read as this one's.
+    """
     code = _comments_stripped(source)
-    start = code.index("export function " + name + "(")
+    for prefix in ("export function ", "function "):
+        marker = prefix + name + "("
+        if marker in code:
+            start = code.index(marker)
+            break
+    else:
+        raise AssertionError(f"render.js declares no top-level function {name}")
     rest = code[start + 1 :]
-    end = rest.find("\nexport function ")
-    return rest if end == -1 else rest[:end]
+    ends = [at for at in (rest.find("\nexport function "), rest.find("\nfunction ")) if at != -1]
+    return rest if not ends else rest[: min(ends)]
 
 
 def test_the_clickable_scan_can_actually_see_a_string_literal() -> None:
@@ -2082,3 +2137,41 @@ def test_the_chip_separators_the_comments_describe_actually_ship() -> None:
     css = (_STATIC / "css" / "keel.css").read_text(encoding="utf-8")
     for selector in ("#session-profile:not(:empty)::after", "#session-equity:not(:empty)::before"):
         assert selector in css, f"no separator rule for {selector}"
+
+
+# -- the discretionary journal's own section (#705) -----------------------------------------------
+#
+# Every other pin on `notesSection` asks what it WOULD draw. None asked whether anything draws it,
+# or whether the marker survives -- so deleting the call, or the `SELF-REPORTED` pill, left the
+# whole 6,000-test suite green while the console lost the section and the acceptance criterion the
+# issue names. The parity scan cannot catch either: an uncalled function still reads the keys it
+# reads.
+
+
+def test_the_insights_view_actually_renders_the_journal_section() -> None:
+    body = _function_body(_source("render.js"), "insightsView")
+    assert "notesSection(" in body, "insightsView never draws the discretionary journal"
+
+
+def test_the_journal_section_shows_the_self_reported_marker() -> None:
+    """The issue's acceptance criterion, on the surface it names. The marker is what keeps a
+    self-assessment from being read as a venue fact, and it is one deleted line away from gone."""
+    body = _function_body(_source("render.js"), "notesSection")
+    assert "notes.marker" in body
+
+
+def test_the_journal_section_says_how_much_of_the_journal_it_is_showing() -> None:
+    """A capped list with nothing beside it reads as a complete one. The payload composes the
+    sentence; this asserts the client places it."""
+    body = _function_body(_source("render.js"), "notesSection")
+    assert "notes.window" in body
+
+
+def test_the_journal_section_offers_no_sort_control() -> None:
+    """Not an omission. A journal reads forwards, and sorted by dollar impact it becomes a ranking
+    of the operator's own worst days -- the Strathern rail where the thing ranked is a person.
+    `table()` draws a sort control only when handed a `sort`/`onSort` pair, so the refusal is the
+    absence of that argument."""
+    body = _function_body(_source("render.js"), "notesSection")
+    assert "onSort" not in body
+    assert "sort:" not in body

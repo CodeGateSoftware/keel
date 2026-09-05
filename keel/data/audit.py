@@ -70,6 +70,12 @@ EVENT_STORES: Mapping[str, str] = {
     "transaction_recorded": "transactions",
     "asset_attested": "asset_attestations",
     "instrument_attested": "instrument_attestations",
+    # #705. The journal is chained for the same reason the two attestation tables are -- it is
+    # something a human swore to, and it rides the same audit export. It is also the ONLY store
+    # here whose subject is the operator rather than the world, which is a difference the
+    # timeline's `provenance` column carries, not this one: the chain's job is that a row cannot
+    # be altered quietly, and that is the same job whatever the row claims.
+    "journal_recorded": "journal",
 }
 
 

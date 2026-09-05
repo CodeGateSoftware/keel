@@ -134,6 +134,11 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
         JournalReport,
         RuleTrackRecord,
     )
+
+    # #705's journal is a DIFFERENT record from `insights.JournalReport` above -- closed trades
+    # there, the operator's own account of themselves here -- and the alias says so at the import
+    # rather than leaving two `JournalReport`s in one namespace to be told apart by context.
+    from keel.commands.journal import JournalReport as DiscretionaryJournal
     from keel.commands.orders import OrderRow, OrdersReport
     from keel.commands.positions import PositionRow, PositionsReport
     from keel.commands.research_record import RuleExploration, TrialRow, TrialsReport
@@ -1189,7 +1194,9 @@ def equity_series_payload(series: EquitySeries) -> dict[str, Any]:
     }
 
 
-def journal_payload(report: JournalReport, *, curve: EquityCurve) -> dict[str, Any]:
+def journal_payload(
+    report: JournalReport, *, curve: EquityCurve, notes: DiscretionaryJournal
+) -> dict[str, Any]:
     """`build_journal_report`'s `JournalReport`, as JSON.
 
     `curve` is passed in rather than built here, and the direction is the point: `keel/web/api.py`
@@ -1243,7 +1250,121 @@ def journal_payload(report: JournalReport, *, curve: EquityCurve) -> dict[str, A
         "filters": {str(key): stringify(value) for key, value in sorted(report.filters.items())},
         "entries": entries,
         "curve": equity_curve_payload(curve),
+        # #705's DISCRETIONARY journal, beside the closed trades rather than on a page of its own:
+        # two things called a journal, and this is where a reader has to be able to tell them
+        # apart. A REQUIRED keyword like `curve`, for the same reason -- a default would let every
+        # existing caller keep working while quietly serving the page without it.
+        "notes": _discretionary_journal_payload(notes),
     }
+
+
+def _discretionary_journal_payload(notes: DiscretionaryJournal) -> dict[str, Any]:
+    """The operator's own account of their own conduct (#705).
+
+    **Every figure here is a claim by the person reading it.** `dollar_impact` is what the
+    operator SAYS the day cost them -- not a fill, not a fee, nothing a venue reported -- so it
+    carries `WARN` and a marker rather than sitting in a money column looking like the ones above
+    it. That is the same judgement `_PROVENANCE_STATES` makes for `self-reported` in the timeline,
+    and for the same reason: a row that reads like evidence and is not is the one thing an honest
+    surface must not produce.
+
+    `rules_followed` is a THREE-valued flag. `False` is the operator confessing they broke their
+    own rules -- the most consequential thing this table can hold -- and `None` is a question they
+    skipped, so `flag()`'s two-state rendering would print the confession over the silence.
+
+    No sortable column, here or on the route. A journal reads forwards, and sorted by dollar
+    impact it becomes a ranking of the operator's own worst days: the Strathern rail, in the one
+    place where the thing being ranked is a person.
+    """
+    # The marker word is READ from the command module rather than restated here, so the CLI and
+    # the console cannot come to use two different words for the one record neither can verify.
+    from keel.commands.journal import SELF_REPORTED
+
+    return {
+        "marker": SELF_REPORTED,
+        "recorded": flag(
+            notes.any_recorded,
+            on="recorded",
+            off="no journal entries yet — `keel journal add` writes one, and only a person can",
+            on_state=NEUTRAL,
+            off_state=UNKNOWN,
+        ),
+        # BOTH counts, and a sentence that already says which is which. A journal is capped on
+        # this page, and a short list with nothing beside it reads as a complete one -- the
+        # failure `Repository.get_equity_points`' docstring names ("a caller that bounds a read is
+        # showing a WINDOW of the record and must say so"). The sentence is composed here rather
+        # than by the client, because choosing between "3 entries" and "50 of 301 (newest)" is a
+        # judgement (Rule 2) and the client may not count (Rule 6e).
+        "shown_count": count(notes.entry_count),
+        "total_count": count(notes.total_count),
+        "window": label(
+            "page" if notes.truncated else "all",
+            display=_notes_window_display(notes),
+            state=WARN if notes.truncated else NEUTRAL,
+        ),
+        "entries": [
+            {
+                "at": moment(entry.ts),
+                "reference": str(entry.id),
+                "emotion": label(
+                    entry.emotion_score,
+                    display=entry.emotion_score or None,
+                    state=NEUTRAL,
+                ),
+                # `""` and not `None` for the skipped question. `label(None)` is `absent()`,
+                # whose display is the em-dash -- fine in a numeric column and ambiguous here,
+                # where the neighbouring values read "followed their rules" and "BROKE their own
+                # rules": a dash between those two invites the reader to supply the missing one.
+                # The empty `value` still says absent to anything reading the field
+                # programmatically, and the display says which absence it is.
+                "rules_followed": label(
+                    ""
+                    if entry.rules_followed is None
+                    else ("yes" if entry.rules_followed else "no"),
+                    display=_rules_followed_display(entry.rules_followed),
+                    state=_rules_followed_state(entry.rules_followed),
+                ),
+                "errors_made": entry.errors_made or "",
+                # WARN, and named as self-reported in `amount_kind`'s spirit: this figure is the
+                # operator's estimate of their own damage, and a money column that did not say so
+                # would invite it to be added to the venue-reported ones above.
+                "dollar_impact": money(entry.dollar_impact, state=WARN),
+                "chart_note": entry.chart_note or "",
+                "screenshot_ref": entry.screenshot_ref or "",
+            }
+            for entry in notes.entries
+        ],
+    }
+
+
+def _notes_window_display(notes: DiscretionaryJournal) -> str:
+    """What the page says about how much of the journal it is showing.
+
+    `WARN` on a truncated window rather than `NEUTRAL`, because the reader is looking at an
+    incomplete record of their own conduct and the whole point of the sentence is that they
+    notice.
+    """
+    if not notes.any_recorded:
+        return "nothing recorded"
+    if notes.truncated:
+        return f"showing the {notes.entry_count} most recent of {notes.total_count}"
+    return f"showing all {notes.entry_count}"
+
+
+def _rules_followed_display(value: bool | None) -> str:
+    """Three readings for three values, spelled out. "not said" is not "no"."""
+    if value is None:
+        return "not said"
+    return "followed their rules" if value else "BROKE their own rules"
+
+
+def _rules_followed_state(value: bool | None) -> str:
+    """`UNKNOWN` for the skipped question, `WARN` for the confession, `NEUTRAL` for the ordinary
+    day. Never `GOOD`: "I followed my rules" is a self-assessment, and grading it green would have
+    the console endorsing a claim nothing verified."""
+    if value is None:
+        return UNKNOWN
+    return NEUTRAL if value else WARN
 
 
 # -- activity ------------------------------------------------------------------------------------
@@ -1780,6 +1901,11 @@ _PROVENANCE_STATES: Mapping[str, str] = {
     "simulated": WARN,
     "imported-ledger": NEUTRAL,
     "human-attested": NEUTRAL,
+    # WARN, like `simulated`, and for the parallel reason: both mark a row that reads like
+    # evidence and is not. `simulated` warns that no venue was involved; this warns that nothing
+    # outside the operator's own head was. Not `BAD` -- a self-assessment is worth keeping, and
+    # grading the operator's honesty is not this column's job.
+    "self-reported": WARN,
     "engine-log": NEUTRAL,
 }
 
@@ -1791,6 +1917,7 @@ _PROVENANCE_NOTES: Mapping[str, str] = {
     "simulated": "the paper trader wrote this -- no venue was involved",
     "imported-ledger": "imported from a venue CSV; nothing verified it on the way in",
     "human-attested": "a person typed this and signed their name to it",
+    "self-reported": "the operator's own account of their own conduct — nothing verified it",
     "engine-log": "the agent's own log of what it did",
 }
 
