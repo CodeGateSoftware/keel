@@ -13,13 +13,25 @@ came out of, decided here, once.
 
 **Read-only, no broker, no network.** Same posture as every other service in this package.
 
-**Nothing here is tamper-evident, and the export says so.** #703 asked the CSV to carry each
-row's hash. None of these four stores hashes its rows: `orders`, `transactions`,
-`asset_attestations` and `instrument_attestations` have no hash column between them, and the only
-hash-chained store in this codebase is the research trials ledger (`keel/research/ledger.py`),
-which records experiments rather than trading activity and does not belong in this feed. So the
-hash column is emitted as NOT RECORDED rather than left blank -- blank invites the reader to
-assume the check passed -- and hashing these tables is filed as engine work.
+**Tamper-evidence, and its three honest readings (#721).** #703 asked the CSV to carry each row's
+hash, and shipped with the column reading NOT RECORDED on every row because no store hashed
+anything. `keel/data/audit.py` now chains an append-only event per write to `orders`,
+`transactions` and both attestation tables, so this feed reads real hashes -- and has to keep
+three readings apart:
+
+- `chained` -- an event exists for this row and the chain vouches for it.
+- `not chained` -- no event was ever written. Rows predating #721, and every engine-log row, which
+  comes from a FILE rather than a chained store. An honest gap; deliberately NOT a break, so a
+  deployment upgrading into the chain does not open its timeline to a page of red.
+- `chain broken` -- an event exists and falls at or after the first break. The hash is shown and
+  is NOT evidence: a chain proves a sequence, so past a break the sequence is unproven. Showing
+  these as `chained` would present unverified values as evidence, which is the one thing the
+  column exists to prevent.
+
+The research trials ledger (`keel/research/ledger.py`) is still not in this feed: it records
+experiments rather than trading activity, and borrowing its hashes to decorate a trading audit
+trail would be provenance laundering. The two stores share `keel_core.hashchain` -- one definition
+of canonical JSON, so one row can only ever have one hash -- and nothing else.
 """
 
 from __future__ import annotations
@@ -32,6 +44,7 @@ from decimal import Decimal
 from typing import Any
 
 from keel.commands.orders import normalise_scope, scope_start_ts
+from keel.data.audit import ChainState
 from keel.data.repository import Repository
 
 #: The type chips, and the only words `kind` ever takes.
@@ -53,9 +66,18 @@ PROVENANCES: tuple[str, ...] = (
     "engine-log",
 )
 
-#: What the hash column says until the engine records one. NOT blank: an empty cell in a column
+#: What the hash column says where no event was recorded. NOT blank: an empty cell in a column
 #: headed `row_hash` reads as "nothing to report", and the honest reading is "nobody checked".
 HASH_NOT_RECORDED = "NOT RECORDED"
+
+#: What the chain says about one row, as a closed vocabulary (#721). The full reasoning is in the
+#: module docstring; the short version is that a hash and a verdict are two different facts, and a
+#: hash printed without one is a number an auditor cannot use.
+CHAIN_STATUSES: tuple[str, ...] = ("chained", "not chained", "chain broken")
+
+CHAINED = "chained"
+NOT_CHAINED = "not chained"
+CHAIN_BROKEN = "chain broken"
 
 #: The characters a spreadsheet treats as the start of a formula. OWASP's list.
 #:
@@ -126,8 +148,14 @@ class TimelineRow:
     #: one thing.
     amount: Decimal | None
     amount_kind: str
-    #: The row's own tamper-evidence, when its store records one. None of the four does today.
+    #: The row's own tamper-evidence: the `row_hash` of the latest `audit_events` statement about
+    #: it, or `HASH_NOT_RECORDED` where none was written.
     row_hash: str = HASH_NOT_RECORDED
+    #: One of `CHAIN_STATUSES`. Carried BESIDE the hash rather than inferred from it, because
+    #: "a hash is present" and "the chain vouches for it" are different facts and the second is
+    #: the one an auditor is actually asking about. A client that inferred the verdict from the
+    #: presence of a 64-character string would call a broken row verified.
+    chain_status: str = NOT_CHAINED
 
 
 @dataclass(frozen=True)
@@ -157,6 +185,15 @@ class TimelineReport:
     #: bar that reordered itself as history arrived would move under the reader.
     kinds_present: tuple[str, ...]
 
+    #: Whether the `audit_events` chain holds ANY events (#721). Distinct from `chain_errors`
+    #: being empty: a verification over zero rows reports nothing and has verified nothing, and a
+    #: green badge over a table nothing wrote is the failure this codebase keeps re-learning. A
+    #: deployment that predates the chain and one that has done nothing since are both False here.
+    chain_recorded: bool = False
+    #: Every break the chain walk found, verbatim from `keel_core.hashchain`. Reported rather
+    #: than raised, so both renderers can STATE the chain's condition instead of asserting it.
+    chain_errors: tuple[str, ...] = ()
+
     #: `read_log_window`'s own word for how the engine log read went: `ok`, `missing`, `empty`,
     #: `oversized`, `unreadable`. Carried rather than acted on, so the page and the CSV can SAY
     #: the log did not reach this report.
@@ -173,6 +210,18 @@ class TimelineReport:
         """How many rows this report carries. Derived rather than stored, and held here because
         `keel/web/payload.py` may not call `len()` (Rule 6e)."""
         return len(self.rows)
+
+    @property
+    def chain_intact(self) -> bool:
+        """Whether the chain found nothing wrong.
+
+        TRUE over an empty chain, and that is the deliberate reading: nothing was checked, so
+        nothing is broken, and a deployment upgrading into #721 must not open its timeline to a
+        page of red. `chain_recorded` is the companion that says whether anything was checked at
+        all, and the two are read together -- exactly the pairing
+        `payload.py::_chain_payload` holds for the research ledger's badge.
+        """
+        return not self.chain_errors
 
     @property
     def log_gap(self) -> bool:
@@ -201,7 +250,36 @@ class TimelineReport:
 DEFAULT_TIMELINE_LIMIT = 200
 MAX_TIMELINE_LIMIT = 2000
 
-def _order_rows(repo: Repository, since_ts: int | None) -> list[TimelineRow]:
+class _Chain:
+    """The chain state, as the two fields a `TimelineRow` carries.
+
+    A thin adapter and not a second source of truth: `keel/data/audit.py` decides what the chain
+    says, and this decides only how to SAY it on a row. Held as a class so the four row builders
+    ask one object the same question rather than each reproducing the three-way reading.
+    """
+
+    def __init__(self, state: ChainState) -> None:
+        self._state = state
+
+    def of(self, store: str, reference: str) -> dict[str, str]:
+        """`row_hash` and `chain_status` for one row, as kwargs.
+
+        A row with no event is `not chained` -- an honest gap, deliberately not a break. A row
+        whose event falls AT OR AFTER the first break is `chain broken`: its hash is still shown,
+        because hiding it would destroy the very value an auditor would use to establish what the
+        row said, but the status refuses to call it evidence. A chain proves a SEQUENCE, so past
+        a break the sequence is unproven -- which is why this compares `seq_id` against the break
+        rather than re-verifying the single row, whose own hash may well still match.
+        """
+        seen = self._state.hashes.get((store, reference))
+        if seen is None:
+            return {"row_hash": HASH_NOT_RECORDED, "chain_status": NOT_CHAINED}
+        broken_from = self._state.first_broken_seq
+        status = CHAINED if broken_from is None or seen.seq_id < broken_from else CHAIN_BROKEN
+        return {"row_hash": seen.row_hash, "chain_status": status}
+
+
+def _order_rows(repo: Repository, since_ts: int | None, chain: _Chain) -> list[TimelineRow]:
     """`orders` -> trade rows.
 
     A PAPER order is `simulated`, not `venue-reported`. The paper trader wrote that row with no
@@ -224,6 +302,7 @@ def _order_rows(repo: Repository, since_ts: int | None) -> list[TimelineRow]:
                 provenance="simulated" if mode == "paper" else "venue-reported",
                 source="orders",
                 reference=str(raw.get("id") or ""),
+                **chain.of("orders", str(raw.get("id") or "")),
                 summary=f"{status} {side} {product} ({mode})".strip(),
                 product_id=product,
                 amount=raw.get("actual_fill"),
@@ -233,7 +312,9 @@ def _order_rows(repo: Repository, since_ts: int | None) -> list[TimelineRow]:
     return rows
 
 
-def _transaction_rows(repo: Repository, since_ts: int | None) -> list[TimelineRow]:
+def _transaction_rows(
+    repo: Repository, since_ts: int | None, chain: _Chain
+) -> list[TimelineRow]:
     """`transactions` -> flow rows.
 
     `imported-ledger`, never `venue-reported`: these lines came out of a CSV the operator
@@ -255,6 +336,7 @@ def _transaction_rows(repo: Repository, since_ts: int | None) -> list[TimelineRo
                 provenance="imported-ledger",
                 source="transactions",
                 reference=str(raw.get("coinbase_id") or raw.get("id") or ""),
+                **chain.of("transactions", str(raw.get("coinbase_id") or raw.get("id") or "")),
                 summary=f"{kind_word} {asset}".strip() + (f" -- {note}" if note else ""),
                 product_id="",
                 amount=raw.get("total"),
@@ -264,7 +346,9 @@ def _transaction_rows(repo: Repository, since_ts: int | None) -> list[TimelineRo
     return rows
 
 
-def _attestation_rows(repo: Repository, since_ts: int | None) -> list[TimelineRow]:
+def _attestation_rows(
+    repo: Repository, since_ts: int | None, chain: _Chain
+) -> list[TimelineRow]:
     """The attestation tables -> attestation rows.
 
     `human-attested`: someone typed this and signed their name to it, which is a different kind
@@ -284,6 +368,7 @@ def _attestation_rows(repo: Repository, since_ts: int | None) -> list[TimelineRo
                 provenance="human-attested",
                 source="asset_attestations",
                 reference=asset,
+                **chain.of("asset_attestations", asset),
                 summary=(
                     f"{asset} attested by {raw.get('attested_by') or 'unnamed'} "
                     f"(source: {raw.get('source') or 'unstated'})"
@@ -306,6 +391,7 @@ def _attestation_rows(repo: Repository, since_ts: int | None) -> list[TimelineRo
                 provenance="human-attested",
                 source="instrument_attestations",
                 reference=f"{venue}:{product}",
+                **chain.of("instrument_attestations", f"{venue}:{product}"),
                 summary=(
                     f"{product} on {venue} attested by "
                     f"{raw.get('attested_by') or 'unnamed'} "
@@ -393,10 +479,20 @@ def gather_timeline(
     resolved_limit = None if limit is None else max(1, min(int(limit), MAX_TIMELINE_LIMIT))
     since = scope_start_ts(resolved_scope, now_ts)
 
+    # ONE read of `audit_events`, shared by all three store readers (#721). Not one lookup per
+    # row: the hash printed beside a row and the verdict printed above it would then describe
+    # different reads of the table, and an event appended between them would have the verdict
+    # cover a row this report never showed.
+    chain = repo.audit_chain()
+    chained = _Chain(chain)
+
     scoped: list[TimelineRow] = []
-    scoped.extend(_order_rows(repo, since))
-    scoped.extend(_transaction_rows(repo, since))
-    scoped.extend(_attestation_rows(repo, since))
+    scoped.extend(_order_rows(repo, since, chained))
+    scoped.extend(_transaction_rows(repo, since, chained))
+    scoped.extend(_attestation_rows(repo, since, chained))
+    # No chain argument, and never one: `_cycle_rows` reads the engine's own log FILE, which is
+    # not a chained store. A cycle row carrying a hash would be this module attesting to something
+    # it merely read.
     scoped.extend(_cycle_rows(cycles, since))
 
     # Newest first, HERE -- so neither renderer sorts, and they cannot disagree about what "the
@@ -417,6 +513,8 @@ def gather_timeline(
         rows=tuple(filtered if resolved_limit is None else filtered[:resolved_limit]),
         log_status=log_status,
         kinds_present=tuple(kind for kind in TIMELINE_KINDS if kind in present),
+        chain_recorded=chain.event_count > 0,
+        chain_errors=chain.errors,
     )
 
 
@@ -463,13 +561,28 @@ def to_csv(report: TimelineReport) -> str:
 
     **Provenance is a column, not a footnote.** The point of this file is that a reader can tell
     a venue-reported fill from a line someone imported from a spreadsheet -- so `provenance` and
-    `source` sit beside every figure, and `row_hash` says NOT RECORDED rather than being blank.
+    `source` sit beside every figure, `row_hash` carries the chain's own hash where one was
+    recorded and says NOT RECORDED rather than being blank where none was, and `chain_status`
+    says whether that hash is evidence. All three in the same file, on every row.
 
     `amount_kind` rides beside `amount` for the same reason: a fill price and a cash-flow total
     in one column, with nothing saying which is which, is a column that will be summed.
     """
     buffer = io.StringIO()
     writer = csv.writer(buffer)
+    if not report.chain_intact:
+        # Stated ABOVE the header, for the same reason the log note below is: an auditor holding
+        # this file cannot ask the page anything, and a finding that changes how the whole file
+        # should be read must travel with the file. Per-row `chain_status` says WHICH rows; this
+        # says the record has been altered, which is the sentence that matters first.
+        writer.writerow(
+            [
+                csv_safe(
+                    f"# NOTE: the audit chain does not verify ({report.chain_errors[0]}); "
+                    "every row marked `chain broken` below is shown but is NOT evidence"
+                )
+            ]
+        )
     if report.log_gap:
         # Stated IN THE FILE, above the header, because this file leaves the application. An
         # auditor holding a CSV cannot ask the page whether a source was missing from it, and
@@ -494,6 +607,10 @@ def to_csv(report: TimelineReport) -> str:
             "amount_kind",
             "summary",
             "row_hash",
+            # Beside the hash, never instead of it. A 64-character string with nothing saying
+            # whether it verifies is a number an auditor cannot use, and the reading a reader
+            # defaults to is the flattering one.
+            "chain_status",
         ]
     )
     for row in report.rows:
@@ -509,6 +626,7 @@ def to_csv(report: TimelineReport) -> str:
                 csv_safe(row.amount_kind),
                 csv_safe(row.summary),
                 csv_safe(row.row_hash),
+                csv_safe(row.chain_status),
             ]
         )
     return buffer.getvalue()

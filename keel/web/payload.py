@@ -1795,6 +1795,36 @@ _PROVENANCE_NOTES: Mapping[str, str] = {
 }
 
 
+#: What the chain says about one row, as a state a client can style (#721). `chained` is the only
+#: green: `not chained` is an honest gap that nobody checked, and `chain broken` is the row whose
+#: hash is shown and is NOT evidence. Nothing here infers a state from whether a hash is present.
+_TIMELINE_CHAIN_STATES: Mapping[str, str] = {
+    "chained": GOOD,
+    "not chained": UNKNOWN,
+    "chain broken": BAD,
+}
+
+#: What each status MEANS, spelled out beside the word, for the same reason `_PROVENANCE_NOTES`
+#: above exists: on an audit surface the term of art is not the thing a reader can act on.
+_TIMELINE_CHAIN_NOTES: Mapping[str, str] = {
+    "chained": "recorded in the audit chain, and the chain verifies",
+    "not chained": "written before the audit chain, or from a source that has none — unchecked",
+    "chain broken": "the chain does not verify from here on; this hash is not evidence",
+}
+
+
+def _timeline_hash_display(row: TimelineRow) -> str | None:
+    """A row hash, shortened for a table cell -- or the NOT-RECORDED words, unshortened.
+
+    `HASH_NOT_RECORDED` is a SENTENCE, not a hash, and truncating it to twelve characters and an
+    ellipsis would turn "NOT RECORDED" into something that looks like a short hash in a column of
+    long ones. The status carries the distinction, and the display must not fight it.
+    """
+    if row.chain_status == "not chained":
+        return row.row_hash
+    return _hash_display(row.row_hash)
+
+
 def _timeline_row_payload(row: TimelineRow) -> dict[str, Any]:
     """One event, placed.
 
@@ -1822,9 +1852,57 @@ def _timeline_row_payload(row: TimelineRow) -> dict[str, Any]:
         "amount_kind": row.amount_kind,
         "summary": row.summary,
         # A `label`, so the "we did not check" reading carries a state a client can style rather
-        # than a bare string it might render as though it were a hash.
-        "row_hash": label(row.row_hash, state=UNKNOWN),
+        # than a bare string it might render as though it were a hash. Shortened for a table cell
+        # -- the full value is in the CSV export, which is the artefact anyone actually verifying
+        # a hash would be working from.
+        "row_hash": label(
+            row.row_hash,
+            display=_timeline_hash_display(row),
+            state=_TIMELINE_CHAIN_STATES.get(row.chain_status, UNKNOWN),
+        ),
+        # BESIDE the hash, never derived from it. "A hash is present" and "the chain vouches for
+        # it" are different facts, and a client inferring the second from the first would call a
+        # row inside a broken region verified. Rule 3: the judgement is made here.
+        "chain_status": label(
+            row.chain_status,
+            display=_TIMELINE_CHAIN_NOTES.get(row.chain_status, row.chain_status),
+            state=_TIMELINE_CHAIN_STATES.get(row.chain_status, UNKNOWN),
+        ),
     }
+
+
+def _timeline_chain_payload(report: TimelineReport) -> Field:
+    """The audit chain's verdict, as THREE states -- the trading-side twin of `_chain_payload`.
+
+    Three rather than that function's four because this store cannot be ABSENT: `audit_events` is
+    a table in the same database the report was read from, so "no file" has no analogue here. The
+    other three are the same distinctions and are the same trap:
+
+    * **no events** -- a deployment that predates #721, or one that has written nothing since.
+      Not a verification: an empty chain reports no breaks because there is nothing in it to
+      break, and calling that "verified" is a positive claim about zero rows.
+    * **events, no errors** -- the one case that is green.
+    * **a break** -- the record has been altered, and every row from there on is unproven.
+
+    GOOD requires BOTH: no errors, over events that actually exist.
+    """
+    if not report.chain_recorded:
+        return label(
+            "unverified",
+            display="no audit chain recorded yet — nothing here was checked",
+            state=UNKNOWN,
+        )
+    if report.chain_intact:
+        return label(
+            "intact",
+            display="audit chain verified — every recorded event still hashes to the next",
+            state=GOOD,
+        )
+    return label(
+        "broken",
+        display="the audit chain does not verify — the rows below say from where",
+        state=BAD,
+    )
 
 
 def timeline_payload(report: TimelineReport) -> dict[str, Any]:
@@ -1845,6 +1923,11 @@ def timeline_payload(report: TimelineReport) -> dict[str, Any]:
         "scoped_count": count(report.scoped_count),
         "filtered_count": count(report.filtered_count),
         "shown_count": count(report.shown_count),
+        # The verdict over the WHOLE chain, beside the per-row statuses -- the same pairing
+        # `_chain_payload` holds for the research ledger, and for the same reason: an empty chain
+        # has no breaks and has verified nothing, so "no errors" is never on its own a green light.
+        "chain": _timeline_chain_payload(report),
+        "chain_errors": [str(error) for error in report.chain_errors],
         "rows": [_timeline_row_payload(row) for row in report.rows],
     }
 

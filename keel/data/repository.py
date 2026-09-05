@@ -18,6 +18,7 @@ from keel_core.cash_posture import CashPostureState, VenueCashPosture
 from keel_core.subscription import BrokerSubscription, SubscriptionStatus
 from keel_core.trade_scope import TradeScopeState, VenueTradeScope
 
+from keel.data.audit import ChainState, append_event, chain_state, write_transaction
 from keel.types import Candle, CycleBalance, EquityReading, Granularity, Profile
 
 _TRANSACTION_COLUMNS = (
@@ -211,6 +212,17 @@ class Repository:
     def __init__(self, conn: sqlite3.Connection) -> None:
         self._conn = conn
 
+    # -- the audit chain ------------------------------------------------
+
+    def audit_chain(self) -> ChainState:
+        """The `audit_events` chain: its hashes, its condition, and where it stops being evidence.
+
+        Exposed here rather than letting a reader reach for the connection, because "which rows
+        does this chain vouch for" is a question about the record and the repository is what owns
+        the record. `commands/timeline.py` is the caller.
+        """
+        return chain_state(self._conn)
+
     # -- transactions ---------------------------------------------------
 
     def upsert_transaction(self, tx: dict[str, Any]) -> None:
@@ -227,15 +239,32 @@ class Repository:
         update_sql = ", ".join(
             f"{c} = excluded.{c}" for c in _TRANSACTION_COLUMNS if c != "coinbase_id"
         )
-        self._conn.execute(
-            f"""
-            INSERT INTO transactions ({columns_sql})
-            VALUES ({placeholders_sql})
-            ON CONFLICT(coinbase_id) DO UPDATE SET {update_sql}
-            """,
-            values,
-        )
-        self._conn.commit()
+        with write_transaction(self._conn):
+            cursor = self._conn.execute(
+                f"""
+                INSERT INTO transactions ({columns_sql})
+                VALUES ({placeholders_sql})
+                ON CONFLICT(coinbase_id) DO UPDATE SET {update_sql}
+                """,
+                values,
+            )
+            # `coinbase_id or id`, which is EXACTLY the rule `commands/timeline.py::
+            # _transaction_rows` uses for the `reference` it prints -- so the export looks the
+            # hash up by the identifier shown beside it. `coinbase_id` is nullable, and sqlite
+            # treats NULLs as distinct in a UNIQUE index, so a row without one can never take the
+            # DO UPDATE branch: `lastrowid` is a real insert's id in the only case that reads it.
+            coinbase_id = values.get("coinbase_id")
+            # An APPEND even when the book row was updated in place (#721). Two events for one
+            # `coinbase_id` is the record that the line was re-imported with different content --
+            # which, for a store whose provenance is `imported-ledger` and whose rows nothing
+            # verified on the way in, is exactly what an auditor needs visible.
+            append_event(
+                self._conn,
+                ts=int(values.get("ts") or time.time()),
+                event_type="transaction_recorded",
+                entity_id=str(coinbase_id) if coinbase_id else str(cursor.lastrowid),
+                payload=dict(values),
+            )
 
     def get_transactions(self, asset: str | None = None) -> list[dict[str, Any]]:
         if asset is None:
@@ -405,12 +434,31 @@ class Repository:
 
         columns_sql = ", ".join(_ORDER_COLUMNS)
         placeholders_sql = ", ".join(f":{c}" for c in _ORDER_COLUMNS)
-        cursor = self._conn.execute(
-            f"INSERT INTO orders ({columns_sql}) VALUES ({placeholders_sql})", values
-        )
-        self._conn.commit()
-        assert cursor.lastrowid is not None
-        return cursor.lastrowid
+        # The row and its audit event in ONE transaction (#721). Both land or neither: an order
+        # row with no event reads forever after as "written before the chain shipped" -- an
+        # honest-looking gap that would in fact be a failed chain write, which is the one lie
+        # this record must not tell about itself.
+        #
+        # This runs BEFORE `broker.place_order` (see `executor.execute`), so a failure here fails
+        # CLOSED: no row, no event, no order at the venue. That ordering is why the audit write
+        # is allowed to be load-bearing here where a diagnostic write would not be.
+        with write_transaction(self._conn):
+            cursor = self._conn.execute(
+                f"INSERT INTO orders ({columns_sql}) VALUES ({placeholders_sql})", values
+            )
+            assert cursor.lastrowid is not None
+            order_id = cursor.lastrowid
+            append_event(
+                self._conn,
+                ts=int(values.get("created_at") or time.time()),
+                event_type="order_placed",
+                entity_id=str(order_id),
+                # The row AS STORED, id included -- the whole statement being made, so a later
+                # reader can reproduce the hash from the row without knowing which columns this
+                # build happened to populate.
+                payload={"id": order_id, **values},
+            )
+        return order_id
 
     def update_order(self, order_id: int, **fields: Any) -> None:
         """Partially update the order row `order_id` with `fields`."""
@@ -423,8 +471,19 @@ class Repository:
         set_sql = ", ".join(f"{k} = :{k}" for k in fields)
         params = dict(fields)
         params["order_id"] = order_id
-        self._conn.execute(f"UPDATE orders SET {set_sql} WHERE id = :order_id", params)
-        self._conn.commit()
+        with write_transaction(self._conn):
+            self._conn.execute(f"UPDATE orders SET {set_sql} WHERE id = :order_id", params)
+            append_event(
+                self._conn,
+                ts=int(fields.get("updated_at") or time.time()),
+                event_type="order_updated",
+                entity_id=str(order_id),
+                # WHAT CHANGED, not the whole mutated row. An event is a statement about this
+                # update; re-hashing the full row would make every event a snapshot, and a reader
+                # could no longer tell an update from a rewrite. The empty-`fields` early return
+                # above is what keeps a no-op from appending an event asserting nothing changed.
+                payload=dict(fields),
+            )
 
     def get_order(self, order_id: int) -> dict[str, Any] | None:
         row = self._conn.execute("SELECT * FROM orders WHERE id = ?", (order_id,)).fetchone()
@@ -1278,33 +1337,53 @@ class Repository:
         before". Omitting it there would let a stale window silently outlive the claim it was
         recorded for, which is worse than no window at all.
         """
-        self._conn.execute(
-            """
-            INSERT INTO asset_attestations
-                (asset, sector, backing, pays_yield, source, attested_by, attested_at,
-                 attest_due_ts)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(asset) DO UPDATE SET
-                sector = excluded.sector,
-                backing = excluded.backing,
-                pays_yield = excluded.pays_yield,
-                source = excluded.source,
-                attested_by = excluded.attested_by,
-                attested_at = excluded.attested_at,
-                attest_due_ts = excluded.attest_due_ts
-            """,
-            (
-                asset,
-                sector,
-                backing,
-                int(pays_yield),
-                source,
-                attested_by,
-                attested_at,
-                attest_due_ts,
-            ),
-        )
-        self._conn.commit()
+        with write_transaction(self._conn):
+            self._conn.execute(
+                """
+                INSERT INTO asset_attestations
+                    (asset, sector, backing, pays_yield, source, attested_by, attested_at,
+                     attest_due_ts)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(asset) DO UPDATE SET
+                    sector = excluded.sector,
+                    backing = excluded.backing,
+                    pays_yield = excluded.pays_yield,
+                    source = excluded.source,
+                    attested_by = excluded.attested_by,
+                    attested_at = excluded.attested_at,
+                    attest_due_ts = excluded.attest_due_ts
+                """,
+                (
+                    asset,
+                    sector,
+                    backing,
+                    int(pays_yield),
+                    source,
+                    attested_by,
+                    attested_at,
+                    attest_due_ts,
+                ),
+            )
+            # Appended, not rewritten (#721): a re-attestation is a FRESH human claim, and the
+            # claim it replaced is part of the record. `attested_at` is the timestamp the human
+            # supplied for the claim, so the event is stamped with when the claim was made rather
+            # than when the row happened to be written.
+            append_event(
+                self._conn,
+                ts=attested_at,
+                event_type="asset_attested",
+                entity_id=asset,
+                payload={
+                    "asset": asset,
+                    "sector": sector,
+                    "backing": backing,
+                    "pays_yield": bool(pays_yield),
+                    "source": source,
+                    "attested_by": attested_by,
+                    "attested_at": attested_at,
+                    "attest_due_ts": attest_due_ts,
+                },
+            )
 
     def get_asset_attestation(self, asset: str) -> dict | None:
         row = self._conn.execute(
@@ -1337,21 +1416,40 @@ class Repository:
         `upsert_asset_attestation` above -- it must be in `DO UPDATE SET` so a re-attestation
         without a window CLEARS a previously recorded one rather than carrying it forward.
         """
-        self._conn.execute(
-            """
-            INSERT INTO instrument_attestations
-                (venue, product_id, wrapper, source, attested_by, attested_at, attest_due_ts)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(venue, product_id) DO UPDATE SET
-                wrapper = excluded.wrapper,
-                source = excluded.source,
-                attested_by = excluded.attested_by,
-                attested_at = excluded.attested_at,
-                attest_due_ts = excluded.attest_due_ts
-            """,
-            (venue, product_id, wrapper, source, attested_by, attested_at, attest_due_ts),
-        )
-        self._conn.commit()
+        with write_transaction(self._conn):
+            self._conn.execute(
+                """
+                INSERT INTO instrument_attestations
+                    (venue, product_id, wrapper, source, attested_by, attested_at, attest_due_ts)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(venue, product_id) DO UPDATE SET
+                    wrapper = excluded.wrapper,
+                    source = excluded.source,
+                    attested_by = excluded.attested_by,
+                    attested_at = excluded.attested_at,
+                    attest_due_ts = excluded.attest_due_ts
+                """,
+                (venue, product_id, wrapper, source, attested_by, attested_at, attest_due_ts),
+            )
+            # `venue:product_id`, the same compound key this table is UNIQUE on and the same
+            # string `commands/timeline.py` puts in its `reference` column -- so the hash the
+            # export shows against an instrument attestation is looked up by the identifier
+            # printed beside it, not by one a reader has to reconstruct.
+            append_event(
+                self._conn,
+                ts=attested_at,
+                event_type="instrument_attested",
+                entity_id=f"{venue}:{product_id}",
+                payload={
+                    "venue": venue,
+                    "product_id": product_id,
+                    "wrapper": wrapper,
+                    "source": source,
+                    "attested_by": attested_by,
+                    "attested_at": attested_at,
+                    "attest_due_ts": attest_due_ts,
+                },
+            )
 
     def get_instrument_attestation(self, venue: str, product_id: str) -> dict | None:
         row = self._conn.execute(

@@ -14,13 +14,17 @@ from __future__ import annotations
 
 import csv
 import io
+import sqlite3
 from decimal import Decimal
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
 
+from keel.commands import timeline
 from keel.commands.timeline import PROVENANCES, TIMELINE_KINDS, gather_timeline
+from keel.data import audit
 from keel.data.db import connect, migrate
 from keel.data.repository import Repository
 
@@ -30,10 +34,17 @@ TODAY_START = 1_799_971_200  # 2027-01-15T00:00:00Z
 
 
 @pytest.fixture()
-def repo(tmp_path: Path) -> Repository:
+def db_conn(tmp_path: Path) -> sqlite3.Connection:
+    """The CONNECTION, for the tests that reach past the repository to edit `audit_events` in
+    place -- which is the only way to write the tampering the chain exists to detect."""
     conn = connect(str(tmp_path / "keel.db"))
     migrate(conn)
-    return Repository(conn)
+    return conn
+
+
+@pytest.fixture()
+def repo(db_conn: sqlite3.Connection) -> Repository:
+    return Repository(db_conn)
 
 
 def _order(repo: Repository, **overrides: Any) -> int:
@@ -200,17 +211,27 @@ def test_each_row_names_the_store_it_came_from(repo: Repository, tmp_path: Path)
 
 
 def test_no_row_claims_a_hash_it_does_not_have(repo: Repository, tmp_path: Path) -> None:
-    """#703 asked for tamper-evidence. None of these four stores hashes its rows, so every row
-    says NOT RECORDED -- never blank, which a reader takes as "nothing to report", and never a
-    hash computed here, which would be this module attesting to its own output."""
-    from keel.commands.timeline import HASH_NOT_RECORDED
+    """Never blank, which a reader takes as "nothing to report", and never a hash computed HERE,
+    which would be this module attesting to its own output.
+
+    #703 shipped this as "every row says NOT RECORDED", which was the whole truth then. #721 made
+    the three stores chain their writes, so the invariant is now the pairing rather than the
+    constant: a hash and a `chained` status travel together, and the absence of one is the
+    absence of both. A row showing a hash while claiming `not chained`, or claiming `chained`
+    with nothing to show, would be a row asserting something the chain never said.
+    """
+    from keel.commands.timeline import CHAIN_STATUSES, HASH_NOT_RECORDED
 
     _order(repo)
     _transaction(repo)
     _attestation(repo)
 
-    for row in gather_timeline(repo, now_ts=NOW_TS, scope="all").rows:
-        assert row.row_hash == HASH_NOT_RECORDED
+    rows = gather_timeline(repo, now_ts=NOW_TS, scope="all").rows
+    assert rows
+    for row in rows:
+        assert row.chain_status in CHAIN_STATUSES
+        assert (row.row_hash == HASH_NOT_RECORDED) == (row.chain_status == "not chained")
+        assert row.row_hash != ""
 
 
 # -- filtering and scoping ----------------------------------------------------------------------
@@ -432,3 +453,172 @@ def test_the_kind_collapse_is_applied_and_echoed(repo, tmp_path) -> None:
 
     assert report.kind == "", "the applied value is echoed, so the substitution is visible"
     assert report.shown_count == 2, "and nothing was filtered out"
+
+
+# -- the hash column, once the engine records one (#721) ----------------------------------------
+#
+# #703 shipped `row_hash` reading NOT RECORDED on every row because none of the four stores hashed
+# anything. `keel/data/audit.py` now does. These pin the three readings the column has to keep
+# apart: a hash the chain vouches for, an honest gap where no event was ever written, and a hash
+# that exists inside the region a break has invalidated. The third is the one that must not be
+# allowed to look like the first.
+
+
+def _chained_repo(conn) -> Repository:
+    """A repository whose writers have recorded events for everything they wrote."""
+    repo = Repository(conn)
+    repo.insert_order(
+        {
+            "mode": "live",
+            "product_id": "BTC-USD",
+            "side": "buy",
+            "qty": Decimal("1"),
+            "status": "filled",
+            "created_at": 1_000,
+        }
+    )
+    repo.upsert_transaction(
+        {
+            "coinbase_id": "cb-1",
+            "source": "coinbase",
+            "type": "deposit",
+            "asset": "USD",
+            "qty": Decimal("250"),
+            "ts": 1_100,
+        }
+    )
+    repo.upsert_asset_attestation(
+        asset="BTC",
+        sector="tech",
+        backing="none",
+        pays_yield=False,
+        source="prospectus",
+        attested_by="operator",
+        attested_at=1_200,
+    )
+    return repo
+
+
+def test_a_chained_row_carries_its_recorded_hash(db_conn) -> None:
+    """The swap #703 built the column for: a real hash where the engine recorded one."""
+    repo = _chained_repo(db_conn)
+    report = timeline.gather_timeline(repo, now_ts=2_000)
+
+    by_source = {row.source: row for row in report.rows}
+    for source in ("orders", "transactions", "asset_attestations"):
+        assert by_source[source].row_hash != timeline.HASH_NOT_RECORDED
+        assert len(by_source[source].row_hash) == 64
+        assert by_source[source].chain_status == "chained"
+
+
+def test_the_hash_shown_is_the_hash_recorded_for_that_row(db_conn) -> None:
+    """Looked up by `(source, reference)` -- the pair printed beside it. A lookup keyed on the
+    entity alone would hand an `orders.id` of "1" the hash of a `coinbase_id` of "1"."""
+    repo = _chained_repo(db_conn)
+    report = timeline.gather_timeline(repo, now_ts=2_000)
+
+    recorded = audit.latest_hashes(db_conn)
+    for row in report.rows:
+        if row.chain_status == "chained":
+            assert row.row_hash == recorded[(row.source, row.reference)]
+
+
+def test_a_row_written_before_the_chain_shipped_reads_as_not_chained(db_conn) -> None:
+    """NO BACKFILL, on the surface that shows it. An honest gap -- and crucially NOT a break: a
+    deployment upgrading into #721 must not open its timeline to a page of red."""
+    db_conn.execute(
+        "INSERT INTO orders (mode, product_id, side, qty, status, created_at) "
+        "VALUES ('live','BTC-USD','buy','1','filled',900)"
+    )
+    db_conn.commit()
+    repo = _chained_repo(db_conn)
+    report = timeline.gather_timeline(repo, now_ts=2_000)
+
+    unchained = [row for row in report.rows if row.reference == "1" and row.source == "orders"]
+    assert len(unchained) == 1
+    assert unchained[0].row_hash == timeline.HASH_NOT_RECORDED
+    assert unchained[0].chain_status == "not chained"
+    assert report.chain_intact is True
+
+
+def test_an_engine_log_row_is_never_chained_and_says_so(db_conn) -> None:
+    """The engine log is a FILE, not a chained store. A cycle row carrying a hash would be this
+    module attesting to something it only read."""
+    repo = _chained_repo(db_conn)
+    cycle = SimpleNamespace(
+        started_ts=1_500, cycle_id="c-1", products=("BTC-USD",), signals=1, entered=1, exited=0,
+        errors=0,
+    )
+    report = timeline.gather_timeline(repo, now_ts=2_000, cycles=[cycle])
+
+    system = [row for row in report.rows if row.kind == "system"]
+    assert len(system) == 1
+    assert system[0].row_hash == timeline.HASH_NOT_RECORDED
+    assert system[0].chain_status == "not chained"
+
+
+def test_a_break_marks_the_rows_the_chain_no_longer_vouches_for(db_conn) -> None:
+    """Editing one event does not merely fail that row: the chain proves a SEQUENCE, so every row
+    from the break onward is unverified. A page that showed those later hashes as `chained` would
+    be presenting unverified values as evidence -- the one thing this column exists to prevent."""
+    repo = _chained_repo(db_conn)
+    db_conn.execute("UPDATE audit_events SET payload_json = ? WHERE seq_id = 1", ('{"a":1}',))
+    db_conn.commit()
+
+    report = timeline.gather_timeline(repo, now_ts=2_000)
+    assert report.chain_intact is False
+    assert report.chain_errors
+    assert {row.chain_status for row in report.rows} == {"chain broken"}
+
+
+def test_a_break_leaves_earlier_rows_verified(db_conn) -> None:
+    """The break is located, not global. Rows chained BEFORE it are still vouched for, and
+    reporting them as broken would throw away the evidence the chain does hold."""
+    repo = _chained_repo(db_conn)
+    db_conn.execute("UPDATE audit_events SET payload_json = ? WHERE seq_id = 3", ('{"a":1}',))
+    db_conn.commit()
+
+    report = timeline.gather_timeline(repo, now_ts=2_000)
+    statuses = {row.source: row.chain_status for row in report.rows}
+    assert statuses["orders"] == "chained"
+    assert statuses["transactions"] == "chained"
+    assert statuses["asset_attestations"] == "chain broken"
+
+
+def test_an_empty_chain_is_reported_as_unchecked_not_as_verified(db_conn) -> None:
+    """`verify` over zero rows returns no errors, and that is not "verified" -- nothing was read.
+    The report must not offer a green verdict over a table nothing wrote."""
+    db_conn.execute(
+        "INSERT INTO orders (mode, product_id, side, qty, status, created_at) "
+        "VALUES ('live','BTC-USD','buy','1','filled',900)"
+    )
+    db_conn.commit()
+    report = timeline.gather_timeline(Repository(db_conn), now_ts=2_000)
+    assert report.chain_recorded is False
+    assert report.chain_intact is True
+    assert report.chain_errors == ()
+
+
+def test_the_export_carries_the_chain_status_beside_the_hash(db_conn) -> None:
+    """A hash with nothing saying whether it verifies is a number an auditor cannot use. Both
+    columns, in the same file, on every row."""
+    repo = _chained_repo(db_conn)
+    text = timeline.to_csv(timeline.export_rows(repo, now_ts=2_000))
+    rows = list(csv.reader(io.StringIO(text)))
+
+    assert rows[0][-2:] == ["row_hash", "chain_status"]
+    for row in rows[1:]:
+        assert row[-1] in ("chained", "not chained", "chain broken")
+
+
+def test_a_broken_chain_is_stated_above_the_header_not_only_per_row(db_conn) -> None:
+    """The same reasoning as the engine-log note this file already carries: an auditor holding a
+    CSV cannot ask the page anything, so a finding that changes how the whole file should be read
+    belongs in the file."""
+    repo = _chained_repo(db_conn)
+    db_conn.execute("UPDATE audit_events SET payload_json = ? WHERE seq_id = 1", ('{"a":1}',))
+    db_conn.commit()
+
+    text = timeline.to_csv(timeline.export_rows(repo, now_ts=2_000))
+    assert text.splitlines()[0].startswith("# NOTE")
+    assert "chain" in text.splitlines()[0]
