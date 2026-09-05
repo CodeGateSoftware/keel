@@ -4656,3 +4656,78 @@ class TestProvenanceCannotBlockAPlacement:
             est_quote_size = Decimal("NaN")
 
         assert provenance_of(_Nan()) == UNREADABLE
+
+
+class TestTheTwoBalanceReadersCannotDrift:
+    """`_fetch_available_quote` and `_fetch_quote_balance_pair` read the SAME venue endpoint the
+    same way, and #719 deliberately duplicated the second rather than refactor the first — because
+    the first is rail 13's input and its `None` contract decides whether an order is placed.
+
+    Duplication was the right trade. What it buys has to be paid for here: two functions that
+    answer one question can disagree, and if they do, the balance rail 13 gates on and the balance
+    a cycle RECORDS stop being the same number — a divergence nothing else in the system would
+    surface, because each looks self-consistent.
+
+    The codebase already names this failure: `screen.median_daily_quote_volume`'s docstring
+    refuses a second copy of one statistic because "a sweep that proposes an asset the screen then
+    rejects" is what drift looks like from the outside.
+    """
+
+    @staticmethod
+    def _brokers():
+        from keel_broker_api.results import Balance
+
+        class _Two:
+            def get_balances(self):
+                return [
+                    Balance(currency="USD", available=Decimal("250.10"), total=Decimal("300.00")),
+                    Balance(currency="EUR", available=Decimal("10"), total=Decimal("10")),
+                ]
+
+        class _Raising:
+            def get_balances(self):
+                raise RuntimeError("venue down")
+
+        class _Empty:
+            def get_balances(self):
+                return []
+
+        return _Two(), _Raising(), _Empty()
+
+    def test_both_report_the_same_available_for_every_case(self) -> None:
+        from keel.execution import executor
+
+        two, raising, empty = self._brokers()
+        cases = [
+            (two, "USD"), (two, "usd"), (two, "EUR"), (two, "GBP"),
+            (raising, "USD"), (empty, "USD"), (None, "USD"), (two, ""),
+        ]
+
+        for broker, currency in cases:
+            scalar = executor._fetch_available_quote(broker, currency)
+            paired, _total = executor._fetch_quote_balance_pair(broker, currency)
+            assert scalar == paired, f"drifted on {currency!r}: {scalar!r} vs {paired!r}"
+
+
+def test_a_balance_object_without_a_total_leg_does_not_raise() -> None:
+    """`broker` is `Any` at this seam and brokers are plugins. A balance carrying
+    `currency`/`available` but no `total` is perfectly answerable by `_fetch_available_quote`,
+    and raised `AttributeError` from its sibling — inside `_mark_to_market_parts`, on the live
+    cycle, BEFORE order placement. A diagnostic read must not be able to abort a cycle.
+
+    The drift pin above cannot reach this: it builds real `Balance` dataclasses, which always
+    have the attribute.
+    """
+    from keel.execution import executor
+
+    class _Partial:
+        currency = "USD"
+        available = Decimal("250.10")
+
+    class _Broker:
+        def get_balances(self):
+            return [_Partial()]
+
+    assert executor._fetch_quote_balance_pair(_Broker(), "USD") == (Decimal("250.10"), None)
+    assert executor._fetch_available_quote(_Broker(), "USD") == Decimal("250.10")
+

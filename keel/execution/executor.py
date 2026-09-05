@@ -479,6 +479,54 @@ def _fetch_available_quote(broker: Any, quote_currency: str | None) -> Decimal |
     return None
 
 
+def _fetch_quote_balance_pair(broker: Any, currency: str) -> tuple[Decimal | None, Decimal | None]:
+    """Live `(available, total)` for `currency`, from the port's `get_balances()` (#719).
+
+    A SIBLING of `_fetch_available_quote`, not a refactor of it. That function is rail 13's
+    input -- its every-failure-is-`None` contract is called out as pinned byte-identical, its
+    tests are the load-bearing guard, and duplicating its dozen lines here is cheaper than
+    risking it. This one exists because the write site that persists a cycle's OBSERVED balance
+    (`agent._mark_to_market_parts`, called from the live branch of `agent.run_once`) needs
+    `Balance.total` too -- the field `_fetch_available_quote` reads off `Balance` and discards.
+
+    `(None, None)` when the broker is `None` (paper has no venue to observe -- same reasoning as
+    `_fetch_available_quote`), on any exception fetching balances, or when `currency` has no
+    matching account: the same three fail-closed cases, because this reads the same endpoint the
+    same way. Once a `Balance` IS matched, whatever it reports for either leg passes straight
+    through, `None` included -- a venue can genuinely answer one side and not the other, and this
+    function's job is to relay that observation, never to invent a value for the side it did
+    not see.
+
+    Not reachable through a conforming adapter TODAY: `Balance.available` and
+    `Balance.total` are both non-optional at the port, so a real broker answers both legs
+    or neither. The relay is written this way for the duck-typed case (`broker` is `Any`
+    here) and for the day the port widens -- not because any shipped venue does it.
+    """
+    if not currency:
+        return (None, None)
+    if broker is None:
+        # Paper mode passes no broker. Not an error, and not logged as one -- see
+        # `_fetch_available_quote`'s identical guard.
+        return (None, None)
+    try:
+        balances = broker.get_balances()
+    except Exception:
+        log_venue_failure(logger, "executor.balance_pair_fetch_failed", quote_currency=currency)
+        return (None, None)
+
+    for balance in balances or []:
+        if balance.currency.upper() == currency.upper():
+            # `getattr` on `total`, not attribute access. `broker` is `Any` at this seam and
+            # brokers are plugins: a balance object carrying `currency`/`available` but no
+            # `total` is answerable by `_fetch_available_quote` and would raise `AttributeError`
+            # here -- and this runs inside `_mark_to_market_parts` on the live cycle, so the
+            # raise would abort the cycle BEFORE order placement. A diagnostic read must not be
+            # able to do that; the missing leg is simply not observed.
+            return (balance.available, getattr(balance, "total", None))
+
+    return (None, None)
+
+
 #: `agent_state` key prefix for a recorded divergence between keel's ledger and the venue's own
 #: holding (#667). Written whenever a SELL is clamped, read by `keel doctor` -- the drift is a
 #: fact about the ACCOUNT, so it outlives the order that discovered it and must not live only in

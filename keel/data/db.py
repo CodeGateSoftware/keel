@@ -444,8 +444,11 @@ _SCHEMA_STATEMENTS: tuple[str, ...] = (
     # series of readings, deduplicated by nobody. A reader wanting the current balance takes the
     # newest row per (mode, currency), exactly as `gather_balances` already does for equity.
     #
-    # Schema only in this release: nothing writes these rows yet, and
-    # `commands/balances.py` still reports the split as unrecorded.
+    # Written by `execution.equity._append_equity_point`'s live branch (#719), under the SAME
+    # `equity_state_mode` read as that cycle's `equity_points` row -- see that function's own
+    # docstring for why one `get_state` call has to serve both tables. `commands/balances.py`
+    # reads the newest row for `config.quote_currency` (the settlement currency; see its module
+    # docstring for why not a cross-currency sum).
     """
     CREATE TABLE IF NOT EXISTS cycle_balances (
         id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -970,9 +973,10 @@ def _migrate_v20_provenance_and_attest_windows(conn: sqlite3.Connection) -> None
     `update_order` as of that PR; `attest_due_ts`'s writer arrived in #718
     (`Repository.upsert_asset_attestation`/`upsert_instrument_attestation` gain an optional
     `attest_due_ts` kwarg, surfaced as `--attest-due` on `keel assets attest`/
-    `attest-instrument` and read only by `keel doctor`, never by the screen); `cycle_balances`
-    and `audit_events` still have none, and `commands/balances.py` and `commands/timeline.py`
-    go on reporting their fields as unrecorded until they do.
+    `attest-instrument` and read only by `keel doctor`, never by the screen); `cycle_balances`'s
+    writer arrived in #719 (`execution.equity._append_equity_point`'s live branch, read by
+    `commands/balances.py`); `audit_events` still has none, and `commands/timeline.py` goes on
+    reporting its fields as unrecorded until it does.
 
     See the DDL comments beside each column in `_SCHEMA_STATEMENTS` for what each one is for,
     and why `audit_events.ts` is INTEGER rather than the `TEXT` #721's own comment specifies.

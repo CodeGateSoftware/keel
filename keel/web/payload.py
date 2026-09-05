@@ -1686,11 +1686,11 @@ def positions_payload(report: PositionsReport) -> dict[str, Any]:
     }
 
 
-#: What the settled/unsettled split says while nothing records it (#702). A FIXED sentence, not
-#: a figure: `equity_points.cash` is `Balance.available` and only that, so the distinction is not
-#: a number this deployment has. Rendering the available figure under a "settled" label would
-#: answer the question the page exists to ask honestly.
-_SETTLED_UNRECORDED = "UNRECORDED IN CYCLE SNAPSHOT -- only the available figure is written down"
+#: What the settled/unsettled split says while no `cycle_balances` row (#719) has been recorded
+#: for this mode/currency yet (#702). A FIXED sentence, not a figure: rendering the summed
+#: `equity_points.cash` figure under a "settled" label would answer the question the page exists
+#: to ask honestly, even though a per-currency observation may simply not exist yet.
+_SETTLED_UNRECORDED = "UNRECORDED -- no cycle has read this currency's settled/total split yet"
 
 
 def _asset_balance_payload(row: AssetBalanceRow) -> dict[str, Any]:
@@ -1722,10 +1722,12 @@ def balances_payload(report: BalancesReport) -> dict[str, Any]:
     (`CashAccountRequired`, #372) -- a "buying power" figure would invite exactly the leverage the
     engine refuses to take.
 
-    `settled_cash` and `total_cash` cross as ABSENT with `settled_breakdown` saying why, rather
-    than being omitted: a client that had to notice a missing key would be inferring from payload
-    shape, and the day a cycle records the pair this becomes a value change rather than a shape
-    change.
+    `settled_cash` and `total_cash` cross as ABSENT, with `settled_breakdown` saying why, when no
+    `cycle_balances` row (#719) has been recorded yet for this mode and settlement currency --
+    and as real figures once one has, `settled_breakdown` saying so instead. Always present as
+    keys either way, never omitted: a client that had to notice a missing key would be inferring
+    from payload shape, which #719 turned from a forward-looking promise into an ordinary state
+    change on a shape that was already stable.
     """
     return {
         "as_of": iso(report.now_ts),
@@ -1740,15 +1742,21 @@ def balances_payload(report: BalancesReport) -> dict[str, Any]:
         "hwm": money(report.hwm),
         "paper_cash": money(report.paper_cash),
         "settled_cash": money(report.settled_cash),
+        # The split's own stamp. Every other recorded figure on this page carries one and
+        # this pair shipped without, which made these the only tiles exempt from the rule
+        # stated two paragraphs up. A venue outage holds the last row for as long as it
+        # lasts, so the stamp is what separates a current split from a stale one.
+        "settled_as_of": moment(report.settled_as_of),
         "total_cash": money(report.total_cash),
         "settled_breakdown": flag(
             report.settled_breakdown_recorded,
-            on="settled and unsettled recorded",
+            on="recorded by the last cycle",
             off=_SETTLED_UNRECORDED,
             on_state=NEUTRAL,
-            # UNKNOWN and not WARN: nothing is wrong, and nothing is late. The venue reports the
-            # split and no cycle writes it down, which is a gap in what keel records rather than
-            # a condition an operator can act on.
+            # UNKNOWN and not WARN: nothing is wrong, and nothing is late. Before the first live
+            # cycle after #719 shipped, no `cycle_balances` row exists yet for this mode/currency,
+            # which is a gap in what keel has recorded rather than a condition an operator can
+            # act on.
             off_state=UNKNOWN,
         ),
         "recorded": flag(

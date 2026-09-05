@@ -330,3 +330,110 @@ def test_an_unstamped_mode_writes_no_point_and_still_updates_the_rail() -> None:
     equity.update_drawdown(repo, equity=Decimal("10000"), now_ts=NOW)
     assert repo.get_equity_points() == []
     assert repo.get_state("equity_high_water_mark") == Decimal("10000")
+
+
+# -- the persisted cycle_balances series (#719) -------------------------------------------------
+
+
+def test_a_cycle_writes_one_cycle_balance_row_per_currency() -> None:
+    """The write site's whole point: two currencies observed in the same cycle become two rows,
+    `available` and `total` kept separate per currency -- never summed (that would cross the
+    no-FX bound `agent._mark_to_market_parts` already states it will not cross)."""
+    repo = _repo()
+    repo.set_state("equity_state_mode", "live")
+    equity.update_drawdown(
+        repo,
+        equity=Decimal("10000"),
+        now_ts=NOW,
+        cash=Decimal("9007"),
+        balances=[
+            ("USD", Decimal("1000"), Decimal("1000")),
+            ("USDC", Decimal("7"), Decimal("9")),
+        ],
+    )
+    rows = {b.currency: b for b in repo.get_cycle_balances()}
+    assert set(rows) == {"USD", "USDC"}
+    assert rows["USD"].available == Decimal("1000")
+    assert rows["USD"].total == Decimal("1000")
+    assert rows["USDC"].available == Decimal("7")
+    assert rows["USDC"].total == Decimal("9")
+
+
+def test_a_currency_with_no_observed_total_writes_it_as_none_not_zero() -> None:
+    """NULL means NOT OBSERVED, never zero -- the `cycle_balances` DDL comment. A venue that
+    answered `available` and not `total` must not have a zero total invented for it."""
+    repo = _repo()
+    repo.set_state("equity_state_mode", "live")
+    equity.update_drawdown(
+        repo,
+        equity=Decimal("10000"),
+        now_ts=NOW,
+        balances=[("USD", Decimal("1000"), None)],
+    )
+    row = repo.get_cycle_balances()[0]
+    assert row.available == Decimal("1000")
+    assert row.total is None
+
+
+def test_cycle_balances_carry_the_same_mode_stamp_as_the_equity_point() -> None:
+    """Written under the SAME `equity_state_mode` read -- so one cycle cannot answer "which mode"
+    two different ways."""
+    repo = _repo()
+    repo.set_state("equity_state_mode", "live")
+    equity.update_drawdown(
+        repo, equity=Decimal("10000"), now_ts=NOW, balances=[("USD", Decimal("1000"), None)]
+    )
+    point = repo.get_equity_points()[0]
+    balance = repo.get_cycle_balances()[0]
+    assert balance.mode == point.mode == "live"
+    assert balance.ts == point.ts == NOW
+
+
+def test_an_unstamped_mode_writes_no_cycle_balance_either() -> None:
+    """Mirrors the equity-point rescue directly above: an unstamped call is not a real cycle, and
+    a row labelled with a guessed mode would land in the wrong currency's curve."""
+    repo = _repo()
+    equity.update_drawdown(
+        repo, equity=Decimal("10000"), now_ts=NOW, balances=[("USD", Decimal("1000"), None)]
+    )
+    assert repo.get_cycle_balances() == []
+
+
+def test_no_balances_argument_writes_no_rows() -> None:
+    """The paper branch never passes `balances=` at all (paper has no venue to observe) --
+    proved here at the level `update_drawdown` itself can guarantee: the default writes nothing."""
+    repo = _repo()
+    repo.set_state("equity_state_mode", "paper")
+    equity.update_drawdown(repo, equity=Decimal("10000"), now_ts=NOW)
+    assert repo.get_cycle_balances() == []
+
+
+def test_a_failing_balance_write_does_not_take_the_cycle_down() -> None:
+    """`_append_equity_point` is deliberately LAST so "the rail is served before the record is
+    kept". The balance rows are kept after it, and a raise there would propagate through
+    `update_drawdown` and out of `run_once` — which has only `try/finally` — aborting the cycle
+    before any order was placed.
+
+    `executor._submit_book` states the rule for its own diagnostic column: a record must never be
+    able to decide whether an order is placed. The drawdown scalars and the equity point are
+    already on disk by this point and stay there.
+    """
+    from keel.execution import equity as equity_mod
+
+    repo = _repo()
+    repo.set_state("equity_state_mode", "live")
+
+    def _boom(*_a, **_k):
+        raise RuntimeError("disk full")
+
+    repo.record_cycle_balance = _boom  # type: ignore[method-assign]
+
+    equity_mod.update_drawdown(
+        repo,
+        equity=Decimal("1000"),
+        now_ts=NOW,
+        balances=(("USD", Decimal("100"), Decimal("120")),),
+    )
+
+    assert repo.get_equity_points(mode="live", limit=1), "the equity point still landed"
+

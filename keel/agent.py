@@ -84,7 +84,7 @@ from keel.data import freshness, market_feed
 from keel.data.repository import Repository
 from keel.execution import equity as equity_mod
 from keel.execution import executor, guards, reconcile, streak
-from keel.execution.executor import ExecutionResult, _fetch_available_quote
+from keel.execution.executor import ExecutionResult, _fetch_quote_balance_pair
 from keel.execution.guards import FEED_STALENESS_CYCLES
 from keel.strategy import engine
 from keel.strategy.exit_policy import EXIT_POLICY_OFF, next_stop, policy_for, trailing_atr
@@ -424,11 +424,20 @@ class _EquityParts:
     out of ONE pass over ONE set of balances and marks, which is the point -- reading the total
     and the split separately would let a price tick between them and file a row that does not
     reconcile.
+
+    `balances` is the per-CURRENCY detail behind `cash` (#719): one `(currency, available,
+    total)` tuple per currency in this pass's union (`quote_currency` plus every product's own
+    quote leg), straight from the same `_fetch_quote_balance_pair` calls that computed `cash` --
+    never re-derived from the summed total, which would have no way back to the per-currency
+    split. `cash` stays the NO-FX sum this function has always computed; `balances` is what lets
+    a caller persist the observation that sum was built from without inventing per-currency
+    figures from a scalar.
     """
 
     equity: Decimal
     cash: Decimal
     unrealized: Decimal
+    balances: tuple[tuple[str, Decimal | None, Decimal | None], ...] = ()
 
 
 def _mark_to_market_equity(
@@ -491,6 +500,11 @@ def _mark_to_market_parts(
 
     `unrealized` follows `equity.unrealized_on_marks`: a position valued at cost (no fresh
     price) contributes ZERO, because the equity in the same record valued it at cost too.
+
+    `_fetch_quote_balance_pair`, not `_fetch_available_quote`, does the actual per-currency read
+    (#719): same broker call, same match-by-currency, same fail-closed `None`, but it keeps
+    `Balance.total` alongside `Balance.available` instead of discarding it, so this pass has both
+    legs to hand to `balances` below without a second broker round trip.
     """
     currencies: list[str] = []
     scanned = (*products, *repo.held_products())
@@ -499,7 +513,13 @@ def _mark_to_market_parts(
         if upper and upper not in currencies:
             currencies.append(upper)
 
-    balances = [(c, _fetch_available_quote(broker, c)) for c in currencies]
+    balance_pairs = [(c, _fetch_quote_balance_pair(broker, c)) for c in currencies]
+    # NAMED, not `pair[0]`. This list is what becomes rail 11's `cash` and feeds `equity`, and it
+    # must be the AVAILABLE leg -- what the account can actually deploy -- never `total`, which
+    # includes funds already committed to resting orders. Index-swapping the tuple here was a
+    # surviving mutant: every real `Balance` fixture in the suite has `available == total`, so
+    # nothing was asserting the distinction on the one number the engine sizes positions against.
+    balances = [(currency, available) for currency, (available, _total) in balance_pairs]
     if all(balance is None for _, balance in balances):
         # Nothing readable at all -- not "zero cash", genuinely unknown.
         return None
@@ -540,7 +560,12 @@ def _mark_to_market_parts(
         # meaning ("nothing was observed") rather than leaning on the arithmetic.
         if fresh is not None and fresh > 0:
             unrealized += qty * (fresh - avg_cost)
-    return _EquityParts(equity=total, cash=quote, unrealized=unrealized)
+    return _EquityParts(
+        equity=total,
+        cash=quote,
+        unrealized=unrealized,
+        balances=tuple((c, avail, tot) for c, (avail, tot) in balance_pairs),
+    )
 
 
 def _seed_paper_account_if_needed(
@@ -1729,6 +1754,11 @@ def run_once(
                 if product_candles:
                     latest_price_by_product[product_id] = product_candles[-1].close
 
+        # The per-currency balances behind this cycle's cash (#719). `()` on the paper branch
+        # unconditionally -- paper has no venue account to observe, so there is nothing to fetch
+        # and nothing to persist; only the live branch below ever assigns something else here.
+        live_balances: tuple[tuple[str, Decimal | None, Decimal | None], ...] = ()
+
         # Paper now advances rail 11's scalars too: the synthetic account is seeded (once, from
         # real mark-to-market equity or the config fallback) and marked to market every cycle
         # exactly like a live account, via `_seed_paper_account_if_needed` + `PaperTrader.equity`.
@@ -1774,6 +1804,12 @@ def run_once(
             equity_now = None if live_parts is None else live_parts.equity
             equity_cash = None if live_parts is None else live_parts.cash
             equity_unrealized = None if live_parts is None else live_parts.unrealized
+            # The per-currency detail behind `equity_cash`, off the SAME pass -- see
+            # `_EquityParts.balances`. Left at its `()` default when the read failed entirely
+            # (`live_parts is None`), matching `equity_cash`: nothing readable is nothing to
+            # persist either.
+            if live_parts is not None:
+                live_balances = live_parts.balances
         # Task 9: paper-forward observability -- the synthetic equity + drawdown scalars this
         # cycle advanced, surfaced on `LoopResult` (rendered by
         # `keel.commands.trading.render_loop_result` + this log line) instead
@@ -1799,6 +1835,7 @@ def run_once(
                 now_ts=now_ts,
                 cash=equity_cash,
                 unrealized=equity_unrealized,
+                balances=live_balances,
             )
 
             if paper_trader is not None:
