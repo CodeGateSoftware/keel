@@ -789,7 +789,12 @@ def test_the_shell_carries_its_accessibility_affordances() -> None:
     # And ONLY one: a live region around the data would re-announce every table twice a minute.
     assert html.count("aria-live") == 1, "exactly one live region -- see index.html's note"
 
-    assert '<a class="skip" href="#view">' in html, "keyboard users need a way past the nav"
+    # The TARGET moved in #704 (`#view` -> `#session`, the wrapper that opens above the mode
+    # banner) because skipping the nav must not also skip the statement about whether real money
+    # is involved. What this line pins is that the affordance EXISTS; which element it lands on,
+    # and that the element can take focus, are pinned by
+    # `test_skipping_the_nav_does_not_skip_the_mode_banner` and its sibling below.
+    assert '<a class="skip" href="#' in html, "keyboard users need a way past the nav"
     assert '<main id="view" tabindex="-1">' in html, (
         "main must be focusable-by-script so a route change can move focus to it"
     )
@@ -921,6 +926,13 @@ def test_the_theme_choice_is_spelled_where_it_is_stored() -> None:
 _CONFIG_READERS: tuple[tuple[str, str], ...] = (
     ("buildLine", "data"),
     ("modeBadge", "config"),
+    # #704's two, registered WITH them rather than after a review found them missing. The rule
+    # this table states is "a new consumer arrives with the check that covers it", and the first
+    # cut of #704 added two consumers and left this tuple alone -- so renaming `config.profile`
+    # on the client would have passed the whole suite while the chip's profile half rendered
+    # empty forever, which is precisely the failure named below.
+    ("sessionChip", "config"),
+    ("paperBanner", "config"),
 )
 
 
@@ -1236,7 +1248,15 @@ def _view_keys(view: str, root: str) -> list[str]:
     # The negative lookahead drops METHOD calls: `data.data_freshness.map(` must contribute
     # `data_freshness`, not `data_freshness.map`. Backtracking does that -- the two-segment
     # alternative fails the lookahead on `(` and the one-segment one succeeds on `.`.
-    found = re.findall(rf"\b{root}\.([a-z_]+(?:\.[a-z_0-9]+)?)\b(?!\s*\()", source[start:end])
+    # `[a-zA-Z_]`, not `[a-z_]`. Payload keys are snake_case by convention, so the lowercase
+    # class looked sufficient -- and it silently made the scan blind to exactly the rename it
+    # exists to catch. `config.profileName` matched as `config.profile`, a key the endpoint DOES
+    # send, so renaming a client read to camelCase passed this check while the element rendered
+    # empty forever. Found by mutating #704's `sessionChip`; the class now covers any identifier
+    # JavaScript allows, and a key the payload does not send fails whatever its casing.
+    found = re.findall(
+        rf"\b{root}\.([a-zA-Z_]+(?:\.[a-zA-Z_0-9]+)?)\b(?!\s*\()", source[start:end]
+    )
     # Neither `.length` nor `.display` is a payload key: the first is a list length in JavaScript,
     # the second is half of a `Field` whose presence is already checked one level up. Two names
     # rather than a general rule, because a THIRD non-payload member appearing here should be
@@ -2001,3 +2021,64 @@ def test_every_id_main_js_demands_exists_in_the_shell() -> None:
     assert demanded, "the scan found no must() calls -- it would pass against any shell"
     for element_id in sorted(demanded):
         assert f'id="{element_id}"' in html, f"main.js demands #{element_id}; index.html has none"
+
+
+def test_the_shell_actually_calls_the_chip_and_the_banner() -> None:
+    """A renderer nothing invokes is a renderer that ships doing nothing.
+
+    Every other pin on these two functions asks what they WOULD draw. None asked whether anything
+    draws them -- so deleting both call sites in `main.js` left the whole suite green while the
+    header lost its chip and the banner never appeared. The parity scan above cannot catch that
+    either: an uncalled function still reads the keys it reads.
+    """
+    source = _comments_stripped(_source("main.js"))
+    for name in ("sessionChip", "paperBanner"):
+        assert name + "(" in source, f"main.js never calls {name}"
+
+
+def test_the_chip_and_the_banner_hydrate_from_the_boot_read() -> None:
+    """From the SAME `/api/config` read the badge and the docs links use, which is what puts them
+    on every view rather than only where a status report happens to load. A second read would be a
+    second round trip on the boot path and a second answer that could describe another instant."""
+    source = _comments_stripped(_source("main.js"))
+    boot = source[source.index('read("config")') :]
+    for name in ("modeBadge", "sessionChip", "paperBanner"):
+        assert name + "(" in boot, f"{name} is not hydrated from the boot config read"
+
+
+def test_skipping_the_nav_does_not_skip_the_mode_banner() -> None:
+    """Skip-to-content exists to skip the NAV. The banner is not nav, and it is the one persistent
+    statement about whether real money is involved -- so the link's target opens above it rather
+    than past it. It targeted `#view`, which sits below the banner."""
+    html = _INDEX.read_text(encoding="utf-8")
+    target = re.search(r'<a class="skip" href="#([a-z0-9-]+)"', html)
+    assert target is not None, "the shell has no skip link"
+    anchor = f'id="{target.group(1)}"'
+    assert anchor in html, f"the skip link points at {target.group(1)}, which the shell lacks"
+    assert html.index(anchor) < html.index('id="mode-banner"'), (
+        "skip-to-content lands below the mode banner"
+    )
+
+
+def test_the_skip_target_can_actually_take_focus() -> None:
+    """A `div` is not focusable without it, so the link would move the viewport and leave the
+    keyboard where it was. `#view` carries one for the same reason."""
+    html = _INDEX.read_text(encoding="utf-8")
+    target = re.search(r'<a class="skip" href="#([a-z0-9-]+)"', html)
+    assert target is not None
+    element = re.search(rf"<[a-z]+ id=\"{target.group(1)}\"[^>]*>", html)
+    assert element is not None
+    assert 'tabindex="-1"' in element.group(0)
+
+
+def test_the_chip_separators_the_comments_describe_actually_ship() -> None:
+    """Three comments and an issue describe `profile · mode · equity state`. The first cut shipped
+    no separator anywhere and the chip read "keel paper not recorded" -- and the CSS `:empty` rule
+    reasoned at length about "a lone separator beside a name that never arrived", a separator that
+    did not exist.
+
+    Generated on the parts, so a hidden part takes its own separator with it.
+    """
+    css = (_STATIC / "css" / "keel.css").read_text(encoding="utf-8")
+    for selector in ("#session-profile:not(:empty)::after", "#session-equity:not(:empty)::before"):
+        assert selector in css, f"no separator rule for {selector}"

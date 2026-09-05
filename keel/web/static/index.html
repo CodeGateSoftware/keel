@@ -72,7 +72,14 @@
 </head>
 <body>
 
-<a class="skip" href="#view">Skip to content</a>
+<!--
+  The skip link targets `#session`, not `#view`. `#session` opens above the mode banner (#704),
+  so a keyboard user taking skip-to-content meets the one persistent statement about whether real
+  money is involved rather than landing past it -- skipping the NAV is what this link is for, and
+  the banner is not nav. `tabindex="-1"` on the target because a `div` is not focusable
+  otherwise, the same reason `#view` carries one.
+-->
+<a class="skip" href="#session">Skip to content</a>
 
 <header>
   <!--
@@ -180,7 +187,7 @@
       Both halves empty in the markup and hidden while empty (`:empty` in `keel.css`), like
       `#mode-badge` and `#build`: a deployment with no readable name is not one called "unknown".
     -->
-    <span id="session-chip" class="session">
+    <span id="session-chip">
       <span id="session-profile" class="sessionpart"></span>
       <span id="mode-badge" class="pill mode"></span>
       <span id="session-equity" class="sessionpart"></span>
@@ -243,8 +250,16 @@
 
   No `aria-live`: it changes once, at boot, and this page keeps exactly one live region.
 -->
+<div id="session" tabindex="-1">
+
 <p id="mode-banner" class="modebanner"></p>
 
+<!--
+  `#view` is where `main.js` paints, and `#content` is what the skip link targets (see the note
+  beside it): a keyboard user taking skip-to-content lands ABOVE the mode banner rather than past
+  it, so the one persistent statement about whether real money is involved is not the thing that
+  skipping the nav skips.
+-->
 <main id="view" tabindex="-1">
 
   <noscript>
@@ -288,6 +303,8 @@
   </div>
 
 </main>
+
+</div><!-- #session -->
 
 <footer>
   <span>keel &middot; served from this machine only</span>

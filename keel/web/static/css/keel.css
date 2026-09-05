@@ -265,7 +265,7 @@ header .mode-live { color: var(--accent); border-color: var(--accent); }
  * Both halves are muted. The mode badge carries the emphasis for all three -- it is the fact that
  * decides whether orders can be placed -- and giving a profile name the same weight would make
  * the header compete with itself. */
-header .session {
+header #session-chip {
   display: inline-flex;
   align-items: center;
   gap: 0.4rem;
@@ -274,7 +274,24 @@ header .session {
 header .sessionpart {
   color: var(--muted);
   font-size: 0.85em;
+  /* A long profile name is an operator's own filename and can be any length. Bounded here so a
+   * `keel-paper-hourly-experiment.db` cannot push the theme toggle off the header. */
+  max-width: 12ch;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
+/* THE SEPARATORS. Generated rather than written into the markup, because each one belongs to the
+ * part beside it: `display: none` takes a hidden part's pseudo-element with it, so a name that
+ * never arrived cannot leave a lone middot behind. That is the pairing the `:empty` rule below
+ * exists to make -- the first cut of this file described these separators in three comments and
+ * shipped none, and the chip read "keel paper not recorded".
+ *
+ * `aria-hidden` is not available to a pseudo-element, so these are punctuation a screen reader
+ * may or may not announce -- which is why they are middots and not words: an announced "middot"
+ * is noise, an announced "or" would be a claim. */
+header #session-profile:not(:empty)::after { content: "\00B7"; margin-left: 0.4rem; }
+header #session-equity:not(:empty)::before { content: "\00B7"; margin-right: 0.4rem; }
 /* Hidden while empty, the same pairing the badge above uses and for the same reason: a lone
  * separator beside a name that never arrived is a stray mark. */
 header .sessionpart:empty { display: none; }

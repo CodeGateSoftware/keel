@@ -2590,27 +2590,48 @@ _BANNER_PAPER = "PAPER — no real money is involved"
 _EQUITY_STATE_UNRECORDED = "not recorded"
 
 
-def _session_banner(mode: str, equity_state_mode: str) -> str:
-    """The banner sentence for one mode, or `""` for a config that could not be read.
+def _session_banner(mode: str, equity_state_mode: str, autonomous: bool) -> str:
+    """The banner sentence for one session, or `""` for a config that could not be read.
 
-    Chosen HERE and not in the renderer (Rule 2): picking between two sentences on the basis of
-    what a config says is a judgement, and judgements are made in Python. The renderer places
-    this string and decides nothing.
+    Chosen HERE and not in the renderer (Rule 2): picking between sentences on the basis of what a
+    deployment says is a judgement, and judgements are made in Python. The renderer places this
+    string and decides nothing.
 
-    An unknown mode gets NO banner, which is the same refusal `modeBadge` already makes for the
-    badge itself: an absent answer is not `paper`, and guessing a mode on a trading console is
-    the one thing this surface must never do. A banner is a claim about whether real money is
-    involved, and there is no safe default for that claim.
+    ── AUTONOMY IS THE HALF THIS BANNER SHIPPED WITHOUT, AND IT INVERTED THE CLAIM ──────────────
+
+    The first cut said "CONFIRM — every order is previewed and waits for your approval" whenever
+    the config mode was `confirm`. That is FALSE on a deployment running `keel autonomy on`, which
+    is a supported and deliberate configuration: `agent._effective_mode` returns `"autonomous"`
+    when the config is `confirm` AND `Profile.is_autonomous(now)`, and an autonomous cycle places
+    without asking anyone. So the one persistent, full-bleed statement on every page was
+    promising supervision that had been switched off -- a false safety assurance about real money,
+    on the surface built to stop exactly that kind of confusion, and worse than the growth funnel
+    this issue exists to refuse.
+
+    Autonomy and the config mode are two independent switches, and `_effective_mode`'s docstring
+    says why they are deliberately not one enum. This function states the same pairing for
+    display; `agent._effective_mode` remains the authority for execution, and
+    `test_the_banner_and_the_engine_agree_about_who_is_asked` sweeps both over the same inputs so
+    the two statements of one rule cannot drift apart.
+
+    An unknown mode gets NO banner, the same refusal `modeBadge` already makes for the badge
+    itself: an absent answer is not `paper`, and a banner is a claim about whether real money is
+    involved with no safe default.
     """
     if mode == "paper":
         return _BANNER_PAPER
     if not mode:
         return ""
-    # Both halves, always. Mode and equity state are separately settable, and a MISMATCH between
-    # them -- `confirm` against paper equity, or the reverse -- is precisely what an operator is
-    # being asked to check against the venue UI. Printing the mode alone would drop the half that
-    # makes the check possible.
+    # Both halves of the pairing, always. Mode and equity state are separately settable, and a
+    # MISMATCH between them -- `confirm` against paper equity, or the reverse -- is precisely what
+    # an operator is being asked to check against the venue UI. Printing the mode alone would drop
+    # the half that makes the check possible.
     state = equity_state_mode or _EQUITY_STATE_UNRECORDED
+    if autonomous and mode == "confirm":
+        return (
+            f"{mode.upper()} · AUTONOMOUS — orders place without asking you; "
+            f"equity state {state}"
+        )
     return (
         f"{mode.upper()} — every order is previewed and waits for your approval; "
         f"equity state {state}"
@@ -2624,6 +2645,7 @@ def config_payload(
     mode: str = "",
     profile: str = "",
     equity_state_mode: str = "",
+    autonomous: bool = False,
     db_path: str = "",
     config_path: str = "",
 ) -> dict[str, Any]:
@@ -2688,7 +2710,7 @@ def config_payload(
             display=equity_state_mode or _EQUITY_STATE_UNRECORDED,
             state=NEUTRAL if equity_state_mode else UNKNOWN,
         ),
-        "banner": _session_banner(mode, equity_state_mode),
+        "banner": _session_banner(mode, equity_state_mode, autonomous),
         "db_path": db_path,
         "config_path": config_path,
         # keel's central honesty signal, and the one judgement this payload carries: `False` means
