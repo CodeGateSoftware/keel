@@ -243,6 +243,16 @@ def _journal_report(**overrides: Any) -> JournalReport:
     return JournalReport(**base)
 
 
+
+def _empty_notes():
+    """An empty discretionary journal (#705), for the callers that are testing the closed-trade
+    half. A REQUIRED keyword on `journal_payload`, like `curve`: a default would let every one of
+    these keep passing while the page quietly lost the section."""
+    from keel.commands.journal import JournalReport
+
+    return JournalReport(now_ts=0, entries=())
+
+
 def _journal_json(**overrides: Any) -> dict[str, Any]:
     """`journal_payload` over `_journal_report(**overrides)`, with the curve built from THOSE
     entries.
@@ -256,7 +266,9 @@ def _journal_json(**overrides: Any) -> dict[str, Any]:
     Nothing about `_journal_report` changed, and every test that called it directly still does.
     """
     report = _journal_report(**overrides)
-    return payload.journal_payload(report, curve=build_equity_curve(report.entries))
+    return payload.journal_payload(
+        report, curve=build_equity_curve(report.entries), notes=_empty_notes()
+    )
 
 
 def _activity_feed(**overrides: Any) -> ActivityFeed:
@@ -665,7 +677,11 @@ def _journal_case() -> tuple[str, tuple[Any, ...], dict[str, Any]]:
     """
     report = _journal_report()
     curve = build_equity_curve(report.entries)
-    return ("journal", (report, curve), payload.journal_payload(report, curve=curve))
+    return (
+        "journal",
+        (report, curve),
+        payload.journal_payload(report, curve=curve, notes=_empty_notes()),
+    )
 
 
 def test_the_serialiser_computes_nothing_every_wire_figure_came_from_the_report() -> None:
@@ -1363,7 +1379,11 @@ def test_every_payload_is_json_serialisable_without_a_custom_encoder(builder: st
         # the table below, because folding it in would mean a default somewhere -- and the whole
         # reason `curve` is required is that a default serves a journal with no chart.
         report = _journal_report()
-        json.dumps(payload.journal_payload(report, curve=build_equity_curve(report.entries)))
+        json.dumps(
+            payload.journal_payload(
+                report, curve=build_equity_curve(report.entries), notes=_empty_notes()
+            )
+        )
         return
 
     other = {
@@ -1822,3 +1842,69 @@ def test_the_complete_set_of_banner_sentences_is_pinned() -> None:
         "LIVE — every order is previewed and waits for your approval; equity state live",
         "LIVE — every order is previewed and waits for your approval; equity state not recorded",
     }
+
+
+# -- the discretionary journal (#705) ------------------------------------------------------------
+
+
+def _notes(**overrides: object):
+    from keel.commands.journal import JournalEntry, JournalReport
+
+    fields: dict[str, object] = {
+        "id": 1,
+        "ts": 1_000,
+        "emotion_score": "3",
+        "rules_followed": True,
+        "errors_made": "",
+        "dollar_impact": Decimal("-42.50"),
+        "chart_note": "",
+        "screenshot_ref": "",
+    }
+    fields.update(overrides)
+    return JournalReport(now_ts=2_000, entries=(JournalEntry(**fields),))  # type: ignore[arg-type]
+
+
+def test_a_followed_rule_is_never_graded_good() -> None:
+    """`GOOD` would be the console ENDORSING a claim nothing verified.
+
+    Every other green on this page is a fact -- a fill happened, a chain verified, an attestation
+    is in date. "I followed my rules" is the operator's opinion of the operator, and a surface
+    that reflected it back as a pass would be flattering them with their own words. Neutral is the
+    strongest thing that can honestly be said, and `WARN` on the confession is not the mirror
+    image of a `GOOD` that does not exist.
+    """
+    entry = payload._discretionary_journal_payload(_notes(rules_followed=True))["entries"][0]
+    assert entry["rules_followed"]["state"] == "neutral"
+
+    broke = payload._discretionary_journal_payload(_notes(rules_followed=False))["entries"][0]
+    assert broke["rules_followed"]["state"] == "warn"
+
+    silent = payload._discretionary_journal_payload(_notes(rules_followed=None))["entries"][0]
+    assert silent["rules_followed"]["state"] == "unknown"
+    assert silent["rules_followed"]["display"] == "not said"
+
+
+def test_no_state_on_this_section_is_ever_good() -> None:
+    """The rule above, swept rather than spot-checked: nothing an operator says about themselves
+    may come back from this codebase as a pass."""
+    for rules in (True, False, None):
+        for impact in (Decimal("10"), Decimal("-10"), None):
+            body = payload._discretionary_journal_payload(
+                _notes(rules_followed=rules, dollar_impact=impact)
+            )
+            states = [
+                value["state"]
+                for entry in body["entries"]
+                for value in entry.values()
+                if isinstance(value, dict) and "state" in value
+            ]
+            assert "good" not in states, f"rules={rules} impact={impact} graded a claim good"
+
+
+def test_a_profitable_self_reported_day_still_warns() -> None:
+    """`money()` grades a positive figure GOOD by default, which is right for a realised p&l and
+    wrong here: a self-reported gain is still a claim, and the sign of a number the operator chose
+    is not evidence about it."""
+    body = payload._discretionary_journal_payload(_notes(dollar_impact=Decimal("250")))
+    entry = body["entries"][0]
+    assert entry["dollar_impact"]["state"] == "warn"

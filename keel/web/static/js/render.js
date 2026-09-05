@@ -2538,6 +2538,68 @@ export function insightsView(insights, journal, sort, onSort, journalSort, onJou
     row.setAttribute("tabindex", "0");
   }
   fragment.append(journalTable);
+  fragment.append(notesSection(journal.notes));
+  return fragment;
+}
+
+/**
+ * The DISCRETIONARY journal (#705): what the operator wrote about themselves.
+ *
+ * **Below the closed trades, deliberately, and never blended into them.** Two records on one page
+ * both called a journal, and this is where a reader has to be able to tell them apart: the table
+ * above is what a venue reported, and nothing outside this operator's own head produced anything
+ * here. So the heading carries the marker (`SELF-REPORTED`, written by the payload so the CLI and
+ * this page cannot come to use two different words for it) and the impact column says so again on
+ * every row.
+ *
+ * **No sort control, on any column.** Not an omission -- a journal reads forwards, and sorted by
+ * dollar impact it becomes a ranking of the operator's own worst days. That is the Strathern rail
+ * in the one place where the thing being ranked is a person, and `api.py` refuses it on the route
+ * as well: these entries are not this endpoint's sortable collection.
+ *
+ * Every cell that carries a judgement arrives as a `Field` -- `rules_followed` is three-valued
+ * (`not said` is not `no`) and `dollar_impact` warns because it is a claim rather than a fill.
+ * This function places them and decides nothing.
+ *
+ * @param {any} notes  `/api/journal`'s `notes`, or `null`/undefined where that read failed.
+ * @returns {DocumentFragment}
+ */
+function notesSection(notes) {
+  const fragment = document.createDocumentFragment();
+  if (!notes) return fragment;
+
+  fragment.append(heading("h-notes", "Your own account"));
+  const sub = el("p", "sub");
+  sub.append(pill(plain(notes.marker), "warn"), " ");
+  sub.append(field(notes.recorded));
+  fragment.append(sub);
+
+  fragment.append(
+    table(
+      "h-notes",
+      [
+        { label: "when (UTC)", numeric: false },
+        { label: "emotion", numeric: false },
+        { label: "rules", numeric: false },
+        { label: "errors made", numeric: false },
+        { label: "self-reported impact", numeric: true },
+        { label: "chart note", numeric: false },
+        { label: "screenshot", numeric: false },
+      ],
+      (notes.entries || []).map(/** @param {any} entry */ (entry) => [
+        entry.at,
+        entry.emotion,
+        entry.rules_followed,
+        plain(entry.errors_made) || "—",
+        entry.dollar_impact,
+        plain(entry.chart_note) || "—",
+        plain(entry.screenshot_ref) || "—",
+      ]),
+      // From the payload, never written here: "no entries yet" and "this could not be read" are
+      // different sentences, and choosing between them is a judgement (Rule 2).
+      plain(notes.recorded.display),
+    ),
+  );
   return fragment;
 }
 

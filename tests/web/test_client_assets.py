@@ -1760,6 +1760,10 @@ _ROW_ENDPOINTS: tuple[tuple[str, str, str, str, str], ...] = (
     ("rulesView", "data", "rules", "/api/rules", "rules"),
     ("researchView", "slippage", "rows", "/api/research/slippage", "none"),
     ("researchView", "gauntlet", "rows", "/api/research/gauntlet", "gauntlet"),
+    # #705's discretionary journal, registered WITH the code that reads it. It hangs off
+    # `/api/journal`'s `notes`, and the seeder writes one entry through the repository because the
+    # CLI writer refuses to run without a terminal.
+    ("insightsView", "notes", "notes.entries", "/api/journal", "journal"),
 )
 
 #: Mapped collections this test does NOT cover, each with the reason. Named rather than omitted:
@@ -1833,6 +1837,27 @@ def _seed_for(kind: str, db_path: str) -> None:
         _seed_orders(db_path, (("BTC-USD", "buy", "50000"),))
     elif kind == "rules":
         _seed_rules(db_path, ("breakout",))
+    elif kind == "journal":
+        # Through the REPOSITORY, not the CLI: `keel journal add` refuses to run without a
+        # terminal (#705), which is the property that makes the record an attestation and is
+        # exactly what a test harness cannot supply.
+        from decimal import Decimal
+
+        from keel.data.db import connect, migrate
+        from keel.data.repository import Repository
+
+        conn = connect(db_path)
+        migrate(conn)
+        Repository(conn).append_journal_entry(
+            ts=1_756_000_000,
+            emotion_score="3",
+            rules_followed=False,
+            errors_made="entered before the close confirmed",
+            dollar_impact=Decimal("-42.50"),
+            chart_note="range top",
+            screenshot_ref="~/shot.png",
+        )
+        conn.close()
 
 
 @pytest.mark.parametrize(("view", "root", "collection", "endpoint", "seed"), _ROW_ENDPOINTS)
@@ -1855,11 +1880,23 @@ def test_every_row_key_a_view_reads_is_a_key_its_endpoint_sends(
     assert status == 200, endpoint
     document = json.loads(body)
     assert document["engine"]["value"] == "running", document
-    rows = document["data"][collection]
+    # A DOTTED PATH, because a collection is not always a top-level key: #705's discretionary
+    # journal rides `/api/journal` at `data.notes.entries`, beside the closed trades it must not
+    # be blended into. Walking the path keeps that arrangement checkable rather than forcing a
+    # route of its own for the sake of this test.
+    rows = document["data"]
+    for part in collection.split("."):
+        assert isinstance(rows, dict), (
+            f"{endpoint}: {part} is not an object on the way to {collection}"
+        )
+        assert part in rows, f"{endpoint} does not send {collection}"
+        rows = rows[part]
 
     # A collection with no rows proves nothing, so an empty one is the failure rather than a pass.
     assert rows, f"{endpoint} sent no {collection} to check {view}'s row reads against"
-    reads = _row_reads(view).get((root, collection), set())
+    # The SCAN is keyed by the last segment -- `render.js` maps `notes.entries`, so `_row_reads`
+    # sees the receiver `notes` and the collection `entries`.
+    reads = _row_reads(view).get((root, collection.rsplit(".", 1)[-1]), set())
     assert reads, f"the scan found no row keys in {view} -- it would pass against any payload"
 
     for row in rows:
@@ -1874,7 +1911,13 @@ def test_every_mapped_collection_is_either_checked_or_named() -> None:
     added later inherits the exact hole #725 fell into. With it, a new `.map()` over a payload
     collection fails the build until it is either checked or written down with a reason.
     """
-    checked = {(view, root, collection) for view, root, collection, _e, _s in _ROW_ENDPOINTS}
+    # The last segment of the path, because that is what `_row_reads` sees: `render.js` maps
+    # `notes.entries`, so the scan reports the receiver `notes` and the collection `entries`,
+    # while the table above carries the payload path `notes.entries` for the walk.
+    checked = {
+        (view, root, collection.rsplit(".", 1)[-1])
+        for view, root, collection, _e, _s in _ROW_ENDPOINTS
+    }
     views = {view for view, _root, _endpoint in _VIEW_ENDPOINTS} | {"statusView", "gatesView"}
 
     mapped = {

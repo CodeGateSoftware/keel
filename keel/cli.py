@@ -158,6 +158,7 @@ from keel.commands.fetch import assess_products as _assess_products  # noqa: F40
 from keel.commands.fetch import run_fetch
 from keel.commands.insights import _parse_ts as _parse_since_until
 from keel.commands.insights import insights_group
+from keel.commands.journal import journal_group
 from keel.commands.mcp import mcp_cmd
 from keel.commands.monitor import run_monitor
 from keel.commands.orders import orders_cmd
@@ -1498,6 +1499,18 @@ cli.add_command(install_plan_cmd)
 # A pure VIEW over `gather_status`/`StatusReport`, the repository read methods, and the
 # promotion/track-record machinery -- defined in `keel.commands.insights` and registered here.
 cli.add_command(insights_group)
+
+
+# -- journal (the discretionary journal: human-sourced, CLI-only, append-only) --------------------
+
+# #705. The `journal` table was declared in the schema from the beginning and had no repository
+# method and no caller -- dead schema. This is its only write path, and it is deliberately the
+# ONLY one: attestations are human-sourced or refused, `keel serve` has no route to it, and
+# `journal add` takes no value options so the entry cannot be scripted past the TTY gate.
+#
+# NOT `keel insights journal`, registered above, which is a filterable view of closed TRADES.
+# Two similar names over two different kinds of evidence, and both say which they are.
+cli.add_command(journal_group)
 
 
 # -- versions (the deploy check: every keel distribution, not just this one) ---------------------
