@@ -23,6 +23,37 @@ Bulk sweep output is **not** committed — it is derived data, regenerated from 
 
 Index is **newest first**, by the date each document carries in its filename.
 
+## 2026-09
+
+- [`2026-09-05-restatement-restated.md`](2026-09-05-restatement-restated.md) — The 08-13
+  restatement restated on `v0.13.3`: its verdict holds (**0 of 240** at the taker rate, priced
+  per product) and the engine turns out to be innocent — three of its printed cells reproduce
+  BIT-IDENTICALLY, and what moved the record is 565 new candles, worth +0.67 of gross profit
+  factor on one asset. Also: the break-even-inside-the-allowance row re-derived at the slippage
+  assets actually pay · drivers `2026-09-05-restatement-restated.py`,
+  `2026-09-05-restatement-restated-control.py`, artifact
+  `2026-09-05-restatement-restated.jsonl`
+- [`2026-09-03-equities-dca-benchmark.md`](2026-09-03-equities-dca-benchmark.md) — The number
+  any future equities strategy is read against: the MEDIAN TICKER at +70.62%, not the pooled
+  sleeve at +145.10%, because NVDA is 44.8% of the sleeve · driver
+  `2026-09-03-equities-dca-benchmark.py`
+- [`2026-09-02-equities-cost-fidelity.md`](2026-09-02-equities-cost-fidelity.md) — What a round
+  trip costs on a commission-free venue: ~2.2bp on Alpaca equities against ~306bp on Coinbase
+  spot, a factor of 141 — and keel's cost model is conservative by 8% on crypto and wrong by
+  7.5× on equities · driver `2026-09-02-equities-cost-fidelity.py`
+- [`2026-09-01-per-product-slippage-restatement.md`](2026-09-01-per-product-slippage-restatement.md)
+  — Every measured null re-priced per product, and the flat floor nobody reaches: 0 of 24 assets
+  at the floor, median ≈10×, a median overstatement of 0.090 — 2.7× larger than the best genuine
+  improvement any rule change produced · driver `2026-09-01-per-product-slippage-restatement.py`
+- [`2026-09-01-triple-barrier-first-measurement.md`](2026-09-01-triple-barrier-first-measurement.md)
+  — Triple-barrier exits: a real gross improvement (+0.033 at zero fee, 17 of 24 assets) worth
+  exactly nothing after friction (−0.004 at the taker rate) · driver
+  `2026-09-01-triple-barrier-first-measurement.py`
+- [`2026-09-01-cusum-event-first-measurement.md`](2026-09-01-cusum-event-first-measurement.md)
+  — CUSUM event gating, first measurement: feasible (21 of 24 clear the trade floor, contra the
+  worry filed with #341) and without a gross edge — it loses at a median before a single fee ·
+  driver `2026-09-01-cusum-event-first-measurement.py`
+
 ## 2026-08
 
 - [`2026-08-30-slippage-cap-options.md`](2026-08-30-slippage-cap-options.md) — All three of
@@ -31,6 +62,10 @@ Index is **newest first**, by the date each document carries in its filename.
   deployment's real $50 clip (a flattery, not a correction), and a $5M admission floor changes
   no number it keeps while deleting 15 products and live PAXG. Decides nothing · driver
   `2026-08-30-slippage-cap-options.py`
+- [`2026-08-27-pooled-review-preview.md`](2026-08-27-pooled-review-preview.md) — The
+  2026-09-30 pooled forward-trades review, run early and deliberately DESCRIPTIVE rather than
+  pass/fail (#427's correction of record): `n_eff`-corrected rates over three profiles · driver
+  `2026-09-30-pooled-review.py`, artifact `2026-08-27-pooled-review-preview.jsonl`
 - [`2026-08-27-external-strategy-evaluation-hazard.md`](2026-08-27-external-strategy-evaluation-hazard.md)
   — No new measurement: the fill-model hazard in externally-sourced strategies (#529) — the four
   questions to answer before porting one (fill model, cost regime, sample size, capability) and
