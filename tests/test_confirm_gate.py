@@ -22,6 +22,13 @@ from decimal import Decimal
 import click
 import pytest
 from keel_broker_api.results import Preview
+from keel_core.quote_provenance import (
+    SYNTHETIC_ESTIMATE,
+    UNPRICED,
+    UNREADABLE,
+    VENUE_QUOTED,
+    provenance_of,
+)
 from keel_core.types import Side
 
 import keel.cli as cli_module
@@ -266,6 +273,69 @@ def test_an_unreadable_preview_is_treated_as_degraded(monkeypatch, capsys, at_a_
 
     assert cli_module._interactive_confirm(None) is False
     assert cli_module.UNREADABLE_PREVIEW_MARKER in capsys.readouterr().out
+
+
+# -- #715: the recorded token and the rendered banner must correspond ---------------------------
+
+
+#: The exact sentence each token must put on screen, written out here as a LITERAL.
+#:
+#: Not `getattr(cli_module, "<NAME>_MARKER")`, which is what this test did first and which
+#: asserted the constant against itself: rewriting the token->sentence dict so an unpriced order
+#: displayed "BROKER QUOTE -- the venue priced this order itself." left all 511 tests green. That
+#: dict is this feature's headline mechanism, and nothing pinned it. A one-token typo there
+#: silently mislabels a money screen, which is the single failure this gate exists to prevent.
+_EXPECTED_SENTENCE = {
+    VENUE_QUOTED: "BROKER QUOTE -- the venue priced this order itself.",
+    SYNTHETIC_ESTIMATE: "SYNTHETIC ESTIMATE -- NOT A BROKER QUOTE.",
+    UNPRICED: "UNPRICED -- this preview carries no usable size.",
+    UNREADABLE: "PREVIEW UNREADABLE -- this gate cannot interpret what came back.",
+}
+
+
+@pytest.mark.parametrize(
+    "preview, expected_token",
+    [
+        (_preview(), VENUE_QUOTED),
+        (_preview(synthetic=True), SYNTHETIC_ESTIMATE),
+        (
+            _preview(est_base_size=Decimal("0"), est_quote_size=Decimal("0")),
+            UNPRICED,
+        ),
+        (None, UNREADABLE),
+        ({"order_total": Decimal("5.00")}, UNREADABLE),
+    ],
+)
+def test_the_recorded_token_and_the_rendered_banner_correspond(
+    monkeypatch, capsys, at_a_terminal, preview, expected_token
+):
+    """#715: `executor._order_row` records `keel_core.quote_provenance.provenance_of(preview)`
+    into `orders.quote_provenance` for the SAME preview that drives the banner a human approves
+    here. Pinned so the two can never drift apart: whatever token would be written to the
+    database for this preview, that token's marker sentence must actually be on the screen the
+    human read before approving it.
+    """
+    _answers(monkeypatch, confirm=True, prompt=cli_module.DEGRADED_PREVIEW_PHRASE)
+
+    assert provenance_of(preview) == expected_token
+
+    cli_module._interactive_confirm(preview)
+
+    out = capsys.readouterr().out
+    assert _EXPECTED_SENTENCE[expected_token] in out
+
+
+def test_every_token_has_exactly_one_sentence_and_the_module_agrees() -> None:
+    """The other half of the pin: the literals above must stay the module's own wording, and
+    every token must map somewhere. Without this, correcting a banner's text in `confirm.py`
+    would fail four tests with no hint that the fixture is the thing that went stale."""
+    from keel_core.quote_provenance import SYNTHETIC_ESTIMATE, UNPRICED, UNREADABLE, VENUE_QUOTED
+
+    assert set(_EXPECTED_SENTENCE) == {VENUE_QUOTED, SYNTHETIC_ESTIMATE, UNPRICED, UNREADABLE}
+    assert _EXPECTED_SENTENCE[VENUE_QUOTED] == cli_module.NATIVE_PREVIEW_MARKER
+    assert _EXPECTED_SENTENCE[SYNTHETIC_ESTIMATE] == cli_module.SYNTHETIC_PREVIEW_MARKER
+    assert _EXPECTED_SENTENCE[UNPRICED] == cli_module.UNPRICED_PREVIEW_MARKER
+    assert _EXPECTED_SENTENCE[UNREADABLE] == cli_module.UNREADABLE_PREVIEW_MARKER
 
 
 # -- fails closed -------------------------------------------------------------------------------

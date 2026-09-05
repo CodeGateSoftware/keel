@@ -192,11 +192,20 @@ class Preview:
 
 @dataclass(frozen=True)
 class PlaceResult:
-    """Outcome of a placement attempt."""
+    """Outcome of a placement attempt.
+
+    `client_order_id` (#715) is the id the adapter actually SENT the venue for THIS attempt --
+    what `resolve_client_order_id` (`keel_broker_api.port`) minted, not a value invented after
+    the fact. It is distinct from `broker_order_id`: that is the venue's own id, assigned only on
+    acceptance, while `client_order_id` is the caller-chosen id sent WITH the request and known
+    whether the venue accepts or refuses it. Defaults to `None` -- an adapter that does not
+    populate it records "not captured", never a guessed or empty-string value.
+    """
 
     success: bool
     broker_order_id: str | None
     reason: str | None = None
+    client_order_id: str | None = None
 
 
 @dataclass(frozen=True)

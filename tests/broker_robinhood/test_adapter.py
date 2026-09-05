@@ -719,6 +719,46 @@ def test_place_order_generates_a_fresh_client_order_id_per_call() -> None:
     uuid.UUID(second)
 
 
+def test_place_order_records_the_client_order_id_it_actually_sent() -> None:
+    """#715: `PlaceResult.client_order_id` must be the id THIS call put on the wire, in
+    `body["client_order_id"]` -- not a value derived again afterwards."""
+    transport = FakeTransport(placed=load_fixture("rh_order_open.json"))
+    adapter = RobinhoodAdapter(transport)
+    spec = MarketIOCByBase(product_id="BTC-USD", side=Side.SELL, base_size=Decimal("0.1"))
+
+    result = adapter.place_order(spec)
+
+    assert result.client_order_id == transport.calls["create_order"]["body"]["client_order_id"]
+    assert result.client_order_id is not None
+
+
+def test_a_rejected_placement_still_reports_the_client_order_id_it_sent() -> None:
+    """The id was sent on the wire even though Robinhood's happy-path 200 reported the order as
+    not-live -- see `test_place_order_reports_failure_when_the_venue_rejected_the_order`."""
+    transport = FakeTransport(placed=_placed_with_state("failed"))
+    adapter = RobinhoodAdapter(transport)
+    spec = MarketIOCByBase(product_id="BTC-USD", side=Side.SELL, base_size=Decimal("0.1"))
+
+    result = adapter.place_order(spec)
+
+    assert result.success is False
+    assert result.client_order_id == transport.calls["create_order"]["body"]["client_order_id"]
+    assert result.client_order_id is not None
+
+
+def test_a_preflight_refusal_never_reports_a_client_order_id() -> None:
+    """#410's pre-flight refusal never reaches the transport at all -- nothing was sent, so
+    nothing must be reported as sent. See `test_place_order_refuses_a_buy_below_the_quote_minimum`
+    for the refusal itself."""
+    transport = _placing_transport()
+
+    result = RobinhoodAdapter(transport).place_order(_buy(base_size=Decimal("0.00000001")))
+
+    assert result.success is False
+    assert result.client_order_id is None
+    assert "create_order" not in transport.calls
+
+
 def test_get_order_maps_fill_quantity_average_price_and_fee() -> None:
     """Reconciliation needs OBSERVED fill data, not the expected price and previewed fee the
     executor recorded at placement time -- `filled_asset_quantity`, `average_price`, and

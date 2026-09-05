@@ -24,16 +24,37 @@ from typing import Any
 
 import click
 from keel_broker_api.results import Preview
+from keel_core.quote_provenance import (
+    SYNTHETIC_ESTIMATE,
+    UNPRICED,
+    UNREADABLE,
+    VENUE_QUOTED,
+)
 
 from keel.commands import _common
 
-#: The banner a venue-priced preview carries. Exported (no underscore) because the tests assert
-#: on the exact text a human sees -- the failure this gate defends against is a *misread screen*,
-#: so the rendered string is the contract, not an implementation detail.
-NATIVE_PREVIEW_MARKER = "BROKER QUOTE -- the venue priced this order itself."
-SYNTHETIC_PREVIEW_MARKER = "SYNTHETIC ESTIMATE -- NOT A BROKER QUOTE."
-UNPRICED_PREVIEW_MARKER = "UNPRICED -- this preview carries no usable size."
-UNREADABLE_PREVIEW_MARKER = "PREVIEW UNREADABLE -- this gate cannot interpret what came back."
+#: token -> the banner sentence a human reads for it (#715). `keel.execution.executor` writes
+#: the SAME tokens into `orders.quote_provenance`, so this dict is the one place both the gate an
+#: operator sees and the value later read back from the database get their WORDING from.
+#:
+#: That is a shared vocabulary, not a shared classifier, and the distinction matters: this module
+#: still decides a preview's case itself, because a screen can carry several alarms at once (a
+#: synthetic preview that is also unpriced renders both) while the column holds one value.
+#: `provenance_of` applies a precedence to pick that one. The two are pinned against each other
+#: on the rendered SENTENCE by `test_the_recorded_token_and_the_rendered_banner_correspond`.
+#: Exported below under their historical names (no underscore) because the tests
+#: assert on the exact text a human sees -- the failure this gate defends against is a *misread
+#: screen*, so the rendered string is the contract, not an implementation detail.
+_PROVENANCE_MARKERS = {
+    VENUE_QUOTED: "BROKER QUOTE -- the venue priced this order itself.",
+    SYNTHETIC_ESTIMATE: "SYNTHETIC ESTIMATE -- NOT A BROKER QUOTE.",
+    UNPRICED: "UNPRICED -- this preview carries no usable size.",
+    UNREADABLE: "PREVIEW UNREADABLE -- this gate cannot interpret what came back.",
+}
+NATIVE_PREVIEW_MARKER = _PROVENANCE_MARKERS[VENUE_QUOTED]
+SYNTHETIC_PREVIEW_MARKER = _PROVENANCE_MARKERS[SYNTHETIC_ESTIMATE]
+UNPRICED_PREVIEW_MARKER = _PROVENANCE_MARKERS[UNPRICED]
+UNREADABLE_PREVIEW_MARKER = _PROVENANCE_MARKERS[UNREADABLE]
 #: What a human must type to place a degraded (unpriced / error-carrying / unreadable) preview.
 #: Compared case-insensitively after stripping: see `_ask_to_place`.
 DEGRADED_PREVIEW_PHRASE = "place anyway"

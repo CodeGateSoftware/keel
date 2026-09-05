@@ -279,6 +279,33 @@ def test_an_idempotency_key_pins_the_client_order_id_across_attempts() -> None:
     assert transport.calls["create_order"]["client_order_id"] != first
 
 
+def test_place_order_records_the_client_order_id_it_actually_sent() -> None:
+    """#715: `PlaceResult.client_order_id` must be the SAME id this adapter put on the wire --
+    not a fresh one minted after the fact, which `resolve_client_order_id`'s per-attempt default
+    would make trivially easy to get wrong."""
+    transport = FakeTransport(placed=load_fixture("cb_place_order_market.json"))
+    adapter = CoinbaseAdapter(transport)
+    spec = MarketIOCByQuote(product_id="BTC-USD", side=Side.BUY, quote_size=Decimal("100"))
+
+    result = adapter.place_order(spec)
+
+    assert result.client_order_id == transport.calls["create_order"]["client_order_id"]
+    assert result.client_order_id is not None
+
+
+def test_a_rejected_placement_still_reports_the_client_order_id_it_sent() -> None:
+    """The id was sent regardless of whether the venue accepted the order."""
+    transport = FakeTransport(placed=load_fixture("cb_place_order_error.json"))
+    adapter = CoinbaseAdapter(transport)
+    spec = MarketIOCByQuote(product_id="BTC-USD", side=Side.BUY, quote_size=Decimal("100"))
+
+    result = adapter.place_order(spec)
+
+    assert result.success is False
+    assert result.client_order_id == transport.calls["create_order"]["client_order_id"]
+    assert result.client_order_id is not None
+
+
 def test_limit_order_translates_through_to_the_transport() -> None:
     transport = FakeTransport(placed=load_fixture("cb_place_order_limit.json"))
     adapter = CoinbaseAdapter(transport)

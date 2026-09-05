@@ -421,6 +421,28 @@ def test_place_order_mints_an_idempotency_key_per_attempt_unless_given_one() -> 
     assert transport.calls["create_order"]["client_order_id"] == "the-same-intent"
 
 
+def test_place_order_records_the_client_order_id_it_actually_sent() -> None:
+    """#715: `PlaceResult.client_order_id` must be the id THIS call actually put on the wire."""
+    transport = FakeTransport(placed=_load_fixture("cb_place_order_market.json"))
+
+    result = CoinbaseClient(transport).place_order(_buy_spec())
+
+    assert result.client_order_id == transport.calls["create_order"]["client_order_id"]
+    assert result.client_order_id is not None
+
+
+def test_a_rejected_placement_still_reports_the_client_order_id_it_sent() -> None:
+    transport = FakeTransport(
+        placed={"success": False, "error_response": {"message": "insufficient funds"}}
+    )
+
+    result = CoinbaseClient(transport).place_order(_buy_spec())
+
+    assert result.success is False
+    assert result.client_order_id == transport.calls["create_order"]["client_order_id"]
+    assert result.client_order_id is not None
+
+
 def test_place_order_renders_a_bracket_through_the_one_renderer() -> None:
     """The kind that had two renderers until #524, and the reason the parity test existed."""
     transport = FakeTransport(placed=_load_fixture("cb_place_order_market.json"))

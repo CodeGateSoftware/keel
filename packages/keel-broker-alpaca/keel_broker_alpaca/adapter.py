@@ -649,12 +649,22 @@ class AlpacaAdapter:
         never handed back as a handle on a resting order.
         """
         self._reject_unsupported(spec)
-        body = to_order_body(spec, client_order_id=resolve_client_order_id(idempotency_key))
+        # Held in a local so every return below can report the id actually SENT (#715), not just
+        # the happy path. A rejection is exactly when an operator most needs to know what went
+        # to the venue, and `orders.client_order_id` reading NULL there would be indistinguishable
+        # from an adapter that never sent one.
+        client_order_id = resolve_client_order_id(idempotency_key)
+        body = to_order_body(spec, client_order_id=client_order_id)
         try:
             response = self._require_transport().create_order(body)
         except AlpacaAPIError as exc:
             if exc.status_code in _VENUE_REFUSAL_STATUSES:
-                return PlaceResult(success=False, broker_order_id=None, reason=exc.message)
+                return PlaceResult(
+                    success=False,
+                    broker_order_id=None,
+                    reason=exc.message,
+                    client_order_id=client_order_id,
+                )
             raise
 
         order_id = _field(response, "id")
@@ -663,6 +673,7 @@ class AlpacaAdapter:
                 success=False,
                 broker_order_id=None,
                 reason="alpaca accepted the request but returned no order id",
+                client_order_id=client_order_id,
             )
         status = str(_field(response, "status", "") or "")
         if status in _PLACEMENT_REJECTED_STATUSES:
@@ -673,8 +684,11 @@ class AlpacaAdapter:
                     f"alpaca returned order {order_id} in status {status!r}: the venue "
                     "rejected this order, so it is not resting and must not be recorded as placed"
                 ),
+                client_order_id=client_order_id,
             )
-        return PlaceResult(success=True, broker_order_id=str(order_id))
+        return PlaceResult(
+            success=True, broker_order_id=str(order_id), client_order_id=client_order_id
+        )
 
     def get_fee_summary(self) -> FeeSummary:
         """Alpaca's Trading API publishes nothing a `FeeSummary` would assert: no fee
