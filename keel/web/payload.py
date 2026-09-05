@@ -121,6 +121,7 @@ from keel.venue_readiness import VenueReadiness
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from keel.commands.activity import ActivityCycle, ActivityEvent, ActivityFeed
     from keel.commands.balances import AssetBalanceRow, BalancesReport
+    from keel.commands.gauntlet import GauntletReport, GauntletRow
     from keel.commands.insights import (
         AccountSummary,
         EquityCurve,
@@ -2178,6 +2179,90 @@ def slippage_payload(report: SlippageReport) -> dict[str, Any]:
         "capped_count": count(report.capped_count),
         "fallback_count": count(report.fallback_count),
         "rows": [_slippage_row_payload(row) for row in report.rows],
+    }
+
+
+# -- the gauntlet, as it was recorded (#708, view 3) -----------------------------------------------
+#
+# NOTHING HERE IS COMPUTED. `keel/commands/gauntlet.py` records why in full: DSR needs a `--sharpe`
+# the ledger does not store, PBO raises over the whole ledger and costs 12-14 s per session where
+# it runs, and Monte Carlo runs a backtest. #726 is the engine issue for persisting the rest.
+
+
+def _gauntlet_row_payload(row: GauntletRow) -> dict[str, Any]:
+    """One recorded gauntlet outcome, placed.
+
+    **`pbo` is a `ratio`, deliberately not a judged field.** A high PBO is not simply bad:
+    `trials pbo`'s own closing note says so -- "a high PBO with a flat, positive OOS scatter is
+    the GOOD outcome -- a broad plateau of near-identical configurations produces high PBO by
+    construction" -- and it must be read alongside the degradation slope, which the ledger does
+    not record (#726). Colouring it here would be this layer supplying a verdict the number
+    cannot carry alone, which is worse than leaving it neutral.
+
+    `gate_passed` IS judged, because it is already a verdict: the gate said yes or no.
+    """
+    return {
+        "at": moment(row.timestamp),
+        "trial_id": row.trial_id,
+        "session": row.session,
+        "rule": row.rule,
+        "decision": row.decision,
+        "ran": flag(
+            row.available,
+            on="the gauntlet ran on this trial",
+            off="attempted — could not run (no usable series, or too thin for CSCV)",
+            on_state=NEUTRAL,
+            # UNKNOWN, not WARN: a refusal is the machinery working. `cscv` REFUSES a
+            # series-missing column rather than scoring nothing, which is the behaviour that
+            # makes the rest of the record trustworthy.
+            off_state=UNKNOWN,
+        ),
+        "pbo": ratio(row.pbo, places=3),
+        "gate_passed": flag(
+            row.gate_passed,
+            on="passed the promotion gate",
+            off="did not pass the promotion gate",
+            on_state=GOOD,
+            # NEUTRAL and NOT `bad`. A candidate failing the gauntlet is the system working as
+            # designed -- it is the whole exhibit -- and a table of red rows would read as a list
+            # of things that went wrong rather than as evidence of a discipline being applied.
+            off_state=NEUTRAL,
+        ),
+        "train_expectancy": money(row.train_expectancy, signed=True),
+        "held_out_expectancy": money(row.held_out_expectancy, signed=True),
+        # A bare string, and ABSENT where none was recorded rather than `0` -- zero is a VALID
+        # seed, and an unreproducible run must not read as a reproducible one.
+        "seed": count(row.seed),
+        "bars": count(row.bars),
+    }
+
+
+def gauntlet_payload(report: GauntletReport) -> dict[str, Any]:
+    """`gather_gauntlet`'s `GauntletReport`, as JSON (#708).
+
+    **`not_run_count` is the field that keeps this honest.** Six rows shown with no denominator
+    would read as though six trials were the whole research record; 87 trials have no gauntlet
+    record at all, and saying so is what stops the scorecard implying coverage it does not have.
+
+    `recorded_count` is likewise the denominator `gate_passed_count` is out of -- a pass rate
+    over every trial in the ledger would be a rate for trials the gauntlet never looked at.
+    """
+    return {
+        "as_of": iso(report.now_ts),
+        "generated_at": moment(report.now_ts),
+        "ledger": flag(
+            report.ledger_present,
+            on="trials ledger read",
+            off="no trials ledger beside this deployment",
+            on_state=NEUTRAL,
+            off_state=UNKNOWN,
+        ),
+        "trials_total": count(report.trials_total),
+        "recorded_count": count(report.recorded_count),
+        "available_count": count(report.available_count),
+        "not_run_count": count(report.not_run_count),
+        "gate_passed_count": count(report.gate_passed_count),
+        "rows": [_gauntlet_row_payload(row) for row in report.rows],
     }
 
 

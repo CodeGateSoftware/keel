@@ -105,7 +105,7 @@ const ROUTES = [
   { name: "balances", label: "Balances", endpoints: ["balances"] },
   { name: "timeline", label: "Timeline", endpoints: ["timeline"] },
   { name: "insights", label: "Insights", endpoints: ["insights", "journal"] },
-  { name: "research", label: "Research", endpoints: ["research/trials", "research/slippage"] },
+  { name: "research", label: "Research", endpoints: ["research/trials", "research/gauntlet", "research/slippage"] },
   { name: "rules", label: "Rules", endpoints: ["rules"] },
   { name: "venues", label: "Venues", endpoints: ["venues"] },
   { name: "gates", label: "Gates", endpoints: ["gates"] },
@@ -450,8 +450,13 @@ function mount(route, readings) {
     // The second endpoint is SECONDARY, like the journal on `/insights`: a slippage read that
     // fails leaves the trials table standing with a stated gap in it rather than taking the
     // whole research record down.
-    const slippage = readings[1];
-    return researchView(data, slippage ? slippage.data : null);
+    const gauntlet = readings[1];
+    const slippage = readings[2];
+    return researchView(
+      data,
+      gauntlet ? gauntlet.data : null,
+      slippage ? slippage.data : null,
+    );
   }
   if (route.name === "rules") return rulesView(data, primary.sort, onSort);
   if (route.name === "venues") return venuesView(data, primary.sort, onSort);

@@ -360,6 +360,28 @@ def read_balances(cfg: ServeConfig, _query: Query, _state: Any, now_ts: int) -> 
     return payload.balances_payload(report)
 
 
+def read_gauntlet(cfg: ServeConfig, _query: Query, _state: Any, now_ts: int) -> dict[str, Any]:
+    """The gauntlet, as it was recorded (#708, view 3).
+
+    **This route computes NOTHING, and that refusal is the whole design.** Measured before it was
+    written: `matrix.build_matrix` raises over the ledger as a whole ("columns are not
+    synchronous"), and where it runs per session CSCV costs 11.9-14.3 s -- ~39 s of CPU for three
+    sessions, against `main.js`'s 15 s poll. DSR is worse than slow: `trials deflate` takes
+    `--sharpe` as a REQUIRED operator input because the ledger stores no observed annualised
+    Sharpe, so computing it here would mean synthesising the input. Monte Carlo runs a backtest.
+
+    So this reads the scalars a gauntlet run wrote down, and #726 is the engine issue for
+    persisting the distributions it currently prints and discards.
+
+    Same source as `/api/research/trials` and the same `needs_database=False` for the same
+    reason: the ledger is a file, and a machine with no deployment on it can still carry a
+    research record.
+    """
+    from keel.commands.gauntlet import gather_gauntlet
+
+    return payload.gauntlet_payload(gather_gauntlet(_ledger_path(cfg), now_ts=now_ts))
+
+
 def read_slippage(cfg: ServeConfig, _query: Query, _state: Any, now_ts: int) -> dict[str, Any]:
     """What a fill is assumed to cost, per product (#708, view 4).
 
@@ -855,6 +877,15 @@ API_ROUTES: dict[str, ApiRoute] = {
         # `profit_factor`, and at that point the research record is a leaderboard -- which turns
         # a record of what was TRIED into an argument for what to TRADE, the exact reversal the
         # trials ledger exists to prevent. See `keel/commands/research_record.py` on the rail.
+        collection="",
+        sortable=(),
+    ),
+    "/api/research/gauntlet": ApiRoute(
+        html_route="/research",
+        read=read_gauntlet,
+        needs_database=False,
+        # The rail again, across the whole `/research` surface. Ordering a gauntlet table by PBO
+        # would be ranking by exactly the score `cscv.py`'s own source forbids as a ranking key.
         collection="",
         sortable=(),
     ),
