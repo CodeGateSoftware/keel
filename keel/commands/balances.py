@@ -129,7 +129,24 @@ class BalancesReport:
     settled_cash: Decimal | None
     total_cash: Decimal | None
 
+    #: When the cycle that observed the split ran, or `None` when none has.
+    #:
+    #: This page's own rule, stated in the module docstring above and repeated in
+    #: `payload.balances_payload`, is that every recorded figure says WHEN -- "a tile with
+    #: no time on it is a claim about now that was made at some other now". The cash tile
+    #: has carried `cash_as_of` since #702; the settled/total pair shipped without one,
+    #: which made those two tiles the only figures on the page exempt from the rule the
+    #: page exists to enforce. A venue outage holds the last row for as long as it lasts,
+    #: so the stamp is the difference between a current split and a stale one.
+    settled_as_of: int | None
+
     #: Whether a `cycle_balances` row was recorded for this mode/currency at all -- distinct from
+    #: True only when a row exists AND at least one leg carries a figure.
+    #:
+    #: The row-exists-alone reading was wrong: `_mark_to_market_parts` writes a row for every
+    #: currency in the cycle's union, including ones the venue has no account for, so a
+    #: settlement currency with no account produced `(None, None)` -- and the page then said
+    #: "settled and unsettled recorded" over two empty tiles. Distinct from
     #: `settled_cash is None`/`total_cash is None`, which can each be absent even when this is
     #: `True` (a row that observed one leg and not the other). Mirrors `has_recorded_cash`'s own
     #: "was anything written" vs "is this particular figure known" split.
@@ -184,7 +201,11 @@ def gather_balances(repo: Repository, config: Config, *, now_ts: int) -> Balance
         paper_cash=repo.get_state("paper_cash_usdc") if mode == "paper" else None,
         settled_cash=None if balance is None else balance.available,
         total_cash=None if balance is None else balance.total,
-        settled_breakdown_recorded=balance is not None,
+        settled_as_of=None if balance is None else balance.ts,
+        # A row whose every leg is NULL records that the cycle LOOKED and found no account for
+        # this currency -- which is worth keeping, and is not a recorded split.
+        settled_breakdown_recorded=balance is not None
+        and (balance.available is not None or balance.total is not None),
         assets=_assets_from(positions.rows, positions.products),
     )
 

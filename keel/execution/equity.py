@@ -16,7 +16,7 @@ import logging
 from collections.abc import Sequence
 from decimal import Decimal
 
-from keel_core.telemetry import log_event
+from keel_core.telemetry import log_event, log_exception
 from keel_core.types import CycleBalance, EquityReading
 
 from keel.compliance.purification import build_report
@@ -289,16 +289,28 @@ def _append_equity_point(
             hwm=hwm,
         )
     )
+    # Wrapped, and LAST, for the reason this function is already ordered the way it is: the rail
+    # is served before the record is kept. `record_cycle_balance` raising would propagate through
+    # `update_drawdown` and out of `run_once`, which has only `try/finally` -- so a failure
+    # writing an observability row would abort the cycle before any order was placed. That is the
+    # same rule `executor._submit_book` states for its own diagnostic column: a record must never
+    # be able to decide whether an order is placed.
+    #
+    # Per row rather than around the loop, so one unwritable currency does not silently discard
+    # the others' readings.
     for currency, available, total in balances:
-        repo.record_cycle_balance(
-            CycleBalance(
-                ts=now_ts,
-                mode=str(mode),
-                currency=currency,
-                available=available,
-                total=total,
+        try:
+            repo.record_cycle_balance(
+                CycleBalance(
+                    ts=now_ts,
+                    mode=str(mode),
+                    currency=currency,
+                    available=available,
+                    total=total,
+                )
             )
-        )
+        except Exception:
+            log_exception(logger, "equity.cycle_balance_write_failed")
 
 
 def _warn_on_unexplained_jump(repo: Repository, *, equity: Decimal) -> None:

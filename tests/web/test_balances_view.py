@@ -279,12 +279,17 @@ def test_the_balances_view_offers_no_action_of_any_kind() -> None:
 
 
 def test_the_view_stamps_the_recorded_figures() -> None:
-    """A recorded page is honest only if it says when. Both stamps are read from the payload --
-    the cash reading's, and each asset's mark."""
+    """A recorded page is honest only if it says when. EVERY recorded figure on this page, with
+    no exceptions -- the cash reading's stamp, each asset's mark, and the settled/total split's.
+
+    The split was the exception for one release: it shipped as two tiles with no time on them,
+    on the page whose own module docstring says "a tile with no time on it is a claim about now
+    that was made at some other now". Enumerated here rather than spot-checked, so a fourth
+    recorded figure added without a stamp is a decision someone has to make deliberately."""
     body = _view_body()
 
-    assert "cash_as_of" in body
-    assert "mark_as_of" in body
+    for stamp in ("cash_as_of", "mark_as_of", "settled_as_of"):
+        assert stamp in body, f"a recorded figure with no {stamp} beside it"
 
 
 def test_the_view_names_the_settled_split_as_unrecorded() -> None:

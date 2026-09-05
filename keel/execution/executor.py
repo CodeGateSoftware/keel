@@ -494,8 +494,13 @@ def _fetch_quote_balance_pair(broker: Any, currency: str) -> tuple[Decimal | Non
     matching account: the same three fail-closed cases, because this reads the same endpoint the
     same way. Once a `Balance` IS matched, whatever it reports for either leg passes straight
     through, `None` included -- a venue can genuinely answer one side and not the other, and this
-    function's job is to relay that observation, never to invent a value for the side it did not
-    see.
+    function's job is to relay that observation, never to invent a value for the side it did
+    not see.
+
+    Not reachable through a conforming adapter TODAY: `Balance.available` and
+    `Balance.total` are both non-optional at the port, so a real broker answers both legs
+    or neither. The relay is written this way for the duck-typed case (`broker` is `Any`
+    here) and for the day the port widens -- not because any shipped venue does it.
     """
     if not currency:
         return (None, None)
@@ -511,7 +516,13 @@ def _fetch_quote_balance_pair(broker: Any, currency: str) -> tuple[Decimal | Non
 
     for balance in balances or []:
         if balance.currency.upper() == currency.upper():
-            return (balance.available, balance.total)
+            # `getattr` on `total`, not attribute access. `broker` is `Any` at this seam and
+            # brokers are plugins: a balance object carrying `currency`/`available` but no
+            # `total` is answerable by `_fetch_available_quote` and would raise `AttributeError`
+            # here -- and this runs inside `_mark_to_market_parts` on the live cycle, so the
+            # raise would abort the cycle BEFORE order placement. A diagnostic read must not be
+            # able to do that; the missing leg is simply not observed.
+            return (balance.available, getattr(balance, "total", None))
 
     return (None, None)
 

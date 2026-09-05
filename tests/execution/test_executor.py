@@ -4708,3 +4708,26 @@ class TestTheTwoBalanceReadersCannotDrift:
             paired, _total = executor._fetch_quote_balance_pair(broker, currency)
             assert scalar == paired, f"drifted on {currency!r}: {scalar!r} vs {paired!r}"
 
+
+def test_a_balance_object_without_a_total_leg_does_not_raise() -> None:
+    """`broker` is `Any` at this seam and brokers are plugins. A balance carrying
+    `currency`/`available` but no `total` is perfectly answerable by `_fetch_available_quote`,
+    and raised `AttributeError` from its sibling — inside `_mark_to_market_parts`, on the live
+    cycle, BEFORE order placement. A diagnostic read must not be able to abort a cycle.
+
+    The drift pin above cannot reach this: it builds real `Balance` dataclasses, which always
+    have the attribute.
+    """
+    from keel.execution import executor
+
+    class _Partial:
+        currency = "USD"
+        available = Decimal("250.10")
+
+    class _Broker:
+        def get_balances(self):
+            return [_Partial()]
+
+    assert executor._fetch_quote_balance_pair(_Broker(), "USD") == (Decimal("250.10"), None)
+    assert executor._fetch_available_quote(_Broker(), "USD") == Decimal("250.10")
+

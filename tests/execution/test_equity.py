@@ -406,3 +406,34 @@ def test_no_balances_argument_writes_no_rows() -> None:
     repo.set_state("equity_state_mode", "paper")
     equity.update_drawdown(repo, equity=Decimal("10000"), now_ts=NOW)
     assert repo.get_cycle_balances() == []
+
+
+def test_a_failing_balance_write_does_not_take_the_cycle_down() -> None:
+    """`_append_equity_point` is deliberately LAST so "the rail is served before the record is
+    kept". The balance rows are kept after it, and a raise there would propagate through
+    `update_drawdown` and out of `run_once` — which has only `try/finally` — aborting the cycle
+    before any order was placed.
+
+    `executor._submit_book` states the rule for its own diagnostic column: a record must never be
+    able to decide whether an order is placed. The drawdown scalars and the equity point are
+    already on disk by this point and stay there.
+    """
+    from keel.execution import equity as equity_mod
+
+    repo = _repo()
+    repo.set_state("equity_state_mode", "live")
+
+    def _boom(*_a, **_k):
+        raise RuntimeError("disk full")
+
+    repo.record_cycle_balance = _boom  # type: ignore[method-assign]
+
+    equity_mod.update_drawdown(
+        repo,
+        equity=Decimal("1000"),
+        now_ts=NOW,
+        balances=(("USD", Decimal("100"), Decimal("120")),),
+    )
+
+    assert repo.get_equity_points(mode="live", limit=1), "the equity point still landed"
+

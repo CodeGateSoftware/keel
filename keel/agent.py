@@ -514,7 +514,12 @@ def _mark_to_market_parts(
             currencies.append(upper)
 
     balance_pairs = [(c, _fetch_quote_balance_pair(broker, c)) for c in currencies]
-    balances = [(c, pair[0]) for c, pair in balance_pairs]
+    # NAMED, not `pair[0]`. This list is what becomes rail 11's `cash` and feeds `equity`, and it
+    # must be the AVAILABLE leg -- what the account can actually deploy -- never `total`, which
+    # includes funds already committed to resting orders. Index-swapping the tuple here was a
+    # surviving mutant: every real `Balance` fixture in the suite has `available == total`, so
+    # nothing was asserting the distinction on the one number the engine sizes positions against.
+    balances = [(currency, available) for currency, (available, _total) in balance_pairs]
     if all(balance is None for _, balance in balances):
         # Nothing readable at all -- not "zero cash", genuinely unknown.
         return None

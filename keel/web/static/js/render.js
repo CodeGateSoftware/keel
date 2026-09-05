@@ -1651,7 +1651,11 @@ export function balancesView(data, sort, onSort) {
   settled.append(field(data.settled_breakdown));
   fragment.append(settled);
   fragment.append(
-    gridCard([kv("settled", data.settled_cash), kv("total", data.total_cash)]),
+    gridCard([
+      kv("settled", data.settled_cash),
+      kv("total", data.total_cash),
+      kv("as of", data.settled_as_of),
+    ]),
   );
 
   if (plain(data.mode) === "paper") {

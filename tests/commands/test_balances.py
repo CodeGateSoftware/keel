@@ -509,3 +509,45 @@ def test_a_paper_deployment_never_reads_a_live_cycle_s_balances(
     assert report.total_cash is None
     assert report.settled_breakdown_recorded is False
 
+
+def test_a_currency_the_venue_has_no_account_for_is_not_a_recorded_split(
+    repo: Repository, tmp_path: Path
+) -> None:
+    """`_mark_to_market_parts` writes a row for EVERY currency in the cycle's union, including
+    ones the venue has no account for -- so the settlement currency can have a row whose every
+    leg is NULL.
+
+    Treating a row's mere existence as "recorded" put the sentence "settled and unsettled
+    recorded" over two empty tiles. The row is still worth keeping (it records that the cycle
+    looked and found nothing), but it is not a recorded split.
+    """
+    repo.set_state("equity_state_mode", "live")
+    repo.record_equity_point(_reading(NOW_TS - 60, "live", "250.10"))
+    repo.record_cycle_balance(
+        _cycle_balance(NOW_TS - 60, "live", "USD", available=None, total=None)
+    )
+
+    report = gather_balances(repo, _config(tmp_path), now_ts=NOW_TS)
+
+    assert report.settled_breakdown_recorded is False
+    assert report.settled_cash is None
+    assert report.total_cash is None
+
+
+def test_the_recorded_split_carries_the_instant_it_was_observed(
+    repo: Repository, tmp_path: Path
+) -> None:
+    """This page's rule, from its own module docstring: every recorded figure says WHEN. A venue
+    outage holds the last row for as long as it lasts, so without the stamp a split observed
+    hours ago is indistinguishable from one observed this cycle -- on the page whose entire job
+    is saying what is actually there, now."""
+    repo.set_state("equity_state_mode", "live")
+    repo.record_equity_point(_reading(NOW_TS - 60, "live", "250.10"))
+    repo.record_cycle_balance(
+        _cycle_balance(NOW_TS - 3600, "live", "USD", available="200", total="250")
+    )
+
+    report = gather_balances(repo, _config(tmp_path), now_ts=NOW_TS)
+
+    assert report.settled_as_of == NOW_TS - 3600
+

@@ -4815,3 +4815,27 @@ def test_run_once_sweeps_orphan_brackets_after_the_rebracket_pass(repo, monkeypa
     assert calls == ["open_orders", "unbracketed", "orphan_sweep"], (
         f"expected the three reconciliation passes in order, got {calls}"
     )
+
+
+
+def test_the_cycle_sizes_against_available_never_total(repo: Repository) -> None:
+    """`_mark_to_market_parts`' `cash` becomes rail 11's cash and feeds `equity`. It must be the
+    AVAILABLE leg -- what the account can actually deploy -- never `total`, which includes funds
+    already committed to resting orders.
+
+    Every other `Balance` fixture in this suite has `available == total`, so index-swapping the
+    tuple survived mutation: nothing asserted the distinction on the one number the engine sizes
+    positions against. Here they differ by a factor of ten.
+    """
+
+    class _WideSpreadBroker:
+        def get_balances(self) -> list[Balance]:
+            return [Balance(currency="USDC", available=Decimal("100"), total=Decimal("999"))]
+
+    parts = agent._mark_to_market_parts(repo, _WideSpreadBroker(), ["BTC-USD"], {}, "USDC")
+
+    assert parts is not None
+    assert parts.cash == Decimal("100"), "cash is the deployable leg, not the account total"
+    by_currency = {c: (a, t) for c, a, t in parts.balances}
+    assert by_currency["USDC"] == (Decimal("100"), Decimal("999"))
+

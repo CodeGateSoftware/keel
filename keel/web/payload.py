@@ -1742,6 +1742,11 @@ def balances_payload(report: BalancesReport) -> dict[str, Any]:
         "hwm": money(report.hwm),
         "paper_cash": money(report.paper_cash),
         "settled_cash": money(report.settled_cash),
+        # The split's own stamp. Every other recorded figure on this page carries one and
+        # this pair shipped without, which made these the only tiles exempt from the rule
+        # stated two paragraphs up. A venue outage holds the last row for as long as it
+        # lasts, so the stamp is what separates a current split from a stale one.
+        "settled_as_of": moment(report.settled_as_of),
         "total_cash": money(report.total_cash),
         "settled_breakdown": flag(
             report.settled_breakdown_recorded,
