@@ -136,6 +136,7 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
     from keel.commands.orders import OrderRow, OrdersReport
     from keel.commands.positions import PositionRow, PositionsReport
     from keel.commands.research_record import RuleExploration, TrialRow, TrialsReport
+    from keel.commands.slippage import SlippageReport, SlippageRow
     from keel.commands.status import (
         AutonomyStatus,
         MarketSessionStatus,
@@ -472,6 +473,49 @@ def percent(
         display = f"{magnitude}%"
     resolved = state if state is not None else (_sign_state(figure) if signed else NEUTRAL)
     return {"value": _plain(figure), "display": display, "state": resolved}
+
+
+def basis_points(value: Decimal | float | None, *, places: int = 1, state: str = NEUTRAL) -> Field:
+    """A figure ALREADY IN BASIS POINTS (`5` meaning 5bp), suffixed with `bp`.
+
+    `percent`'s sibling, and the same rule applies: this SUFFIXES, it never rescales. A rate held
+    as the fraction `0.0005` is converted where the report is built (`keel/commands/slippage.py`),
+    for the reason `ratio` below states about the identical temptation -- rescaling here would be
+    "the serialiser computing a figure the report never held".
+
+    It exists because the alternative was `ratio`, which emits a bare `5.0`. In a table the
+    column header can supply the unit; in a summary tile nothing can, so the floor and the cap of
+    a cost model rendered as unitless numbers on the one page whose whole subject is a cost in
+    basis points.
+    """
+    figure = _decimalise(value)
+    if figure is None:
+        return absent()
+    negative, magnitude = _is_negative(figure), _magnitude(figure, places)
+    display = f"{MINUS}{magnitude}bp" if negative else f"{magnitude}bp"
+    return {"value": _plain(figure), "display": display, "state": state}
+
+
+def multiple(value: Decimal | float | None, *, places: int = 1, state: str = NEUTRAL) -> Field:
+    """A figure that is a MULTIPLE of something named elsewhere (`2` meaning 2x), suffixed `x`.
+
+    Distinct from `ratio`, which is for a dimensionless figure that is not a multiple OF
+    anything -- an R-multiple, a profit factor. The `x` is what stops `1.1` in a cell from being
+    read as an absolute rate rather than as "1.1 times the floor".
+
+    A plain `x` rather than a multiplication sign, and NOT for the ASCII reason a first draft of
+    this docstring gave: `MINUS` is U+2212 and the line below interpolates it, so a rule about
+    non-ASCII in display strings would be a rule this function breaks and `ABSENT`, `UP` and
+    `DOWN` break beside it. The real reason is narrower -- `1.1x` is what the terminal reports
+    already write (`simulate.render_slippage_assumptions`, `sim/report.py`), and the two
+    front-ends saying the same figure two different ways is the drift this file exists to stop.
+    """
+    figure = _decimalise(value)
+    if figure is None:
+        return absent()
+    negative, magnitude = _is_negative(figure), _magnitude(figure, places)
+    display = f"{MINUS}{magnitude}x" if negative else f"{magnitude}x"
+    return {"value": _plain(figure), "display": display, "state": state}
 
 
 def ratio(
@@ -2047,6 +2091,93 @@ def trials_payload(report: TrialsReport) -> dict[str, Any]:
         "rules": [str(rule) for rule in report.rules],
         "exploration": [_exploration_payload(row) for row in report.exploration],
         "rows": [_trial_row_payload(row) for row in report.rows],
+    }
+
+
+# -- what a fill is assumed to cost (#708, view 4) -------------------------------------------------
+
+
+def _slippage_row_payload(row: SlippageRow) -> dict[str, Any]:
+    """One product's assumed per-leg cost, placed.
+
+    `slippage_bp` arrives already in basis points -- `keel/commands/slippage.py` does that
+    conversion, because `ratio`'s docstring above refuses the identical rescale here.
+
+    Both flags are `flag`s and both are WARN when set, which needs saying because it looks
+    asymmetric next to the rest of this file: neither means an error. Both mean the number shown
+    is understated in the FLATTERING direction -- a fallback row got the model's cheapest rate for
+    having no evidence, and a capped row hit the bound before its own liquidity was allowed to
+    decide. A reader skimming a cost table for the big numbers is exactly the reader those two
+    rows are hiding from.
+    """
+    return {
+        "product_id": row.product_id,
+        "slippage_bp": basis_points(row.slippage_bp),
+        "median_daily_quote_volume": money(row.median_daily_quote_volume),
+        # ABSENT on a fallback row, never `1.0x`: the rate is the floor, but a multiple in that
+        # cell would read "as cheap as the most liquid asset in the corpus" about an asset with
+        # no cached history at all.
+        "floor_multiple": multiple(row.floor_multiple),
+        "bars": count(row.bars),
+        # `fallback`, matching `SlippageRow` and `SlippageAssumption`. It was `priced_from`,
+        # whose `value` was `"true"` when the product was NOT priced from its own liquidity -- a
+        # key reading as the opposite of what it carried. Nothing rendered wrong (Rule 3 clients
+        # read `display` and `state`), but a name that inverts its value is a trap laid for
+        # whoever reads it next.
+        "fallback": flag(
+            row.fallback,
+            on="no cached liquidity — flat floor rate applied",
+            off="this product's own cached liquidity",
+            on_state=WARN,
+            off_state=NEUTRAL,
+        ),
+        "capped": flag(
+            row.capped,
+            on="at the model's thin-end cap — a lower bound on the real cost",
+            off="within the model's bounds",
+            on_state=WARN,
+            off_state=NEUTRAL,
+        ),
+    }
+
+
+def slippage_payload(report: SlippageReport) -> dict[str, Any]:
+    """`gather_slippage`'s `SlippageReport`, as JSON (#708).
+
+    **`basis` is not decoration and must not be dropped.** Every figure on this page is an
+    ASSUMPTION scaled from a liquidity proxy, because keel stores no book snapshots and no
+    realised spreads -- `slippage_for_quote_volume` says so in its first line, and #708's own
+    scope note gets it wrong by calling these figures "measured". A cost table read as a
+    measurement is a page inventing evidence, so the correction crosses as a field rather than
+    living in a comment nobody ships.
+
+    The floor, cap and anchor cross for the reason `sim/report.py` states about its own table:
+    "a number whose assumptions cannot be recovered is not evidence". Everything needed to
+    recompute any row is on the page.
+
+    Every count comes off the report (Rule 6e bans `len()` here), including `at_floor_count`,
+    whose exclusion of fallback rows is the honesty of the headline -- see the report property.
+    """
+    return {
+        "as_of": iso(report.now_ts),
+        "generated_at": moment(report.now_ts),
+        "basis": label(
+            "assumption",
+            display="an assumption, not a measurement — keel stores no spreads or book snapshots",
+            # UNKNOWN rather than WARN: nothing is wrong and nothing is late. It is a statement
+            # about what kind of number this is, and a warning triangle beside every rate would
+            # train a reader to stop reading it.
+            state=UNKNOWN,
+        ),
+        "floor_bp": basis_points(report.floor_bp),
+        "cap_bp": basis_points(report.cap_bp),
+        "anchor_quote_volume": money(report.anchor_quote_volume),
+        "product_count": count(report.product_count),
+        "priced_count": count(report.priced_count),
+        "at_floor_count": count(report.at_floor_count),
+        "capped_count": count(report.capped_count),
+        "fallback_count": count(report.fallback_count),
+        "rows": [_slippage_row_payload(row) for row in report.rows],
     }
 
 
