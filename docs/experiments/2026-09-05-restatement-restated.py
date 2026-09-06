@@ -191,6 +191,11 @@ def done_combos():
             row = json.loads(line)
         except json.JSONDecodeError:
             continue  # torn final line from a kill mid-write
+        if "error" in row:
+            # An errored combo is NOT done. Counting it would make a resume skip the cell
+            # permanently and print "done" over a short artifact -- the failure mode that
+            # silently shrinks a denominator the document then reports as "0 of N".
+            continue
         done.add((row["arm"], row["rule"], row["product"], row.get("oversold")))
     return done
 
@@ -208,7 +213,7 @@ def main():
     print(f"declared {len(declared)} combos; done {len(done)}; running {len(jobs)}", flush=True)
 
     started = time.time()
-    with open(JSONL_PATH, "a") as sink, ProcessPoolExecutor(max_workers=14) as pool:
+    with open(JSONL_PATH, "a") as sink, ProcessPoolExecutor() as pool:
         futures = {pool.submit(run_job, job): job for job in jobs}
         for index, future in enumerate(as_completed(futures), start=1):
             for row in future.result():

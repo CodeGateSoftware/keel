@@ -160,7 +160,10 @@ decimal is the strongest statement this directory can make that the number is re
 ### 3.1 The cells 08-13 printed, at the price their assets actually pay
 
 08-13 §3 listed seven gross-positive cells at the floor and observed that all seven die at the
-maker rate. Priced per product, **six of them are already dead at zero fee**:
+maker rate. Six of those seven are Arm A cells and are re-priced here; the seventh is an Arm B
+cell, which this run measured **only at the taker rate**, so it has no zero-fee figure below.
+Priced per product, **five of the six are already dead at zero fee** — the exception is XRP-USD,
+the cheapest of them to trade at 13.9bp:
 
 | rule | product | n | slippage | gross | maker | taker |
 | :-- | :-- | --: | --: | --: | --: | --: |
@@ -182,7 +185,8 @@ turtle TON-USD  n=31   taker, flat 0.774  ->  taker, per-product 0.317
 
 ### 3.2 The measured slippage, in full
 
-**0 of 24 assets reach the 5bp floor.** Median **10.5×**; thirteen above 10×, four above 20×.
+**0 of 24 assets reach the 5bp floor.** Median **10.5× (52.3bp)** — the mean of ranks 12 and
+13, BCH-USD and AAVE-USD; thirteen assets above 10×, four above 20×.
 
 | | product | per-leg | × floor | median daily quote volume |
 | :-- | :-- | --: | --: | --: |
@@ -190,7 +194,7 @@ turtle TON-USD  n=31   taker, flat 0.774  ->  taker, per-product 0.317
 | | PAXG-USD | 135.1bp | 27.0× | $0.69M |
 | | WLD-USD | 120.9bp | 24.2× | $0.86M |
 | | ZEC-USD | 107.3bp | 21.5× | $1.08M |
-| **median** | **XLM-USD / AVAX-USD** | **≈52.3bp** | **10.5×** | ≈$9M |
+| **median** | **BCH-USD / AAVE-USD** | **53.5 / 51.2bp** | **10.7× / 10.2×** | $4.37M / $4.77M |
 | | SOL-USD | 12.1bp | 2.4× | $85.21M |
 | | ETH-USD | 7.0bp | 1.4× | $253.53M |
 | cheapest | BTC-USD | 5.5bp | 1.1× | $419.73M |
@@ -297,7 +301,9 @@ second.
 1. **08-13 §6's scope claim is false.** Three families were measured; five ship. This document is
    the measurement that makes the sentence true again.
 2. **08-13 §3's "all seven die at the maker rate" was an artifact of the flat floor.** Priced per
-   product, six of the seven are dead at zero fee. So is the WLD/TON observation that follows it.
+   product, **five of the six Arm A cells among those seven are dead at zero fee** — XRP-USD is
+   the exception at 1.109, and the seventh cell is Arm B, which this run priced only at the taker
+   rate. So is the WLD/TON observation that follows it.
 3. **08-13 §3.2's 0.034 transfer gap is 0.117–0.136 when re-measured.** *Stably unprofitable*
    holds; *not overfit* is a weaker claim than the document makes.
 4. **The 08-20 note's break-even-inside-the-allowance row is superseded** by §6 above.
