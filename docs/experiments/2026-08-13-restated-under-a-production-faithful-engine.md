@@ -8,6 +8,19 @@
 > already negative. Nothing on this page has been rewritten; records are appended to, not
 > revised.
 
+> **Restated 2026-09-05.** [The restatement restated](2026-09-05-restatement-restated.md)
+> re-ran this document on `v0.13.3` over five shipped rule families instead of three. **The
+> verdict holds — 0 of 240 at the taker rate, priced per product.** Three things on this page did
+> not: §3's *"all seven die at the maker rate"* was an artifact of the flat floor (priced per
+> product, five of the six Arm A cells among those seven are dead at **zero** fee, XRP-USD
+> excepted; the seventh is an Arm B cell that run priced only at the taker rate); §3.2's 0.034
+> transfer gap re-measures at
+> 0.117–0.136; and §6's claim that every shipped signal rule has been measured stopped being true
+> when #341/#342 shipped. Also recorded there, because the honest expectation was the opposite:
+> **no engine change since moved any number on this page.** Three of §3's cells reproduce
+> bit-identically on the 08-13 corpus, and what moved the rest is 565 new candles. Nothing here
+> has been rewritten; records are appended to, not revised.
+
 **Date:** 2026-08-13
 **Amends:** `2026-08-12-shipped-defaults-intersection.md` (#252) and
 `2026-08-12-rsi-meanrev-scale-vs-selectivity.md` (#255)
