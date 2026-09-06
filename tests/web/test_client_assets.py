@@ -2175,3 +2175,64 @@ def test_the_journal_section_offers_no_sort_control() -> None:
     body = _function_body(_source("render.js"), "notesSection")
     assert "onSort" not in body
     assert "sort:" not in body
+
+
+# -- the Plans page's refusals (#706) -------------------------------------------------------------
+#
+# The acceptance criterion is "zero interactive purchase affordances", which is a NEGATIVE -- the
+# thing that rots silently. So it is asserted structurally against the parsed function bodies,
+# with string literals KEPT (the earlier lesson: a scan that strips them cannot see `el("a")`).
+
+
+def test_the_plans_view_builds_nothing_a_reader_can_click() -> None:
+    """No button, no anchor, no form, no handler.
+
+    A retail Plans page is a funnel by construction: every row exists to move a reader one row
+    down. The inversion is not a matter of gentler wording -- there must be nothing on the page
+    that could take an action, so that the page cannot become a funnel by a later edit that only
+    changes copy.
+    """
+    source = _source("render.js")
+    for name in ("plansView", "claimList", "citation"):
+        body = _function_body(source, name)
+        for forbidden in ('"button"', '"a"', '"form"', '"input"', "addEventListener", "onclick"):
+            assert forbidden not in body, f"{name} builds something interactive: {forbidden}"
+
+
+def test_the_plans_payload_sends_no_destination_to_build_one_from() -> None:
+    """The refusal is structural rather than editorial: `render.js` cannot make a link out of a
+    payload that never sends a URL. Asserted over the SERIALISED payload, so a key added anywhere
+    beneath it is caught too."""
+    from keel.commands.plans import gather_plans
+    from keel.web import payload as payload_mod
+
+    body = json.dumps(payload_mod.plans_payload(gather_plans(now_ts=0))).lower()
+    for affordance in ("http://", "https://", "mailto:", "checkout", "subscribe", "upgrade"):
+        assert affordance not in body, f"the plans payload carries {affordance}"
+
+
+def test_the_plans_view_cites_a_path_and_never_links_to_one() -> None:
+    """`keel serve` is a loopback SQLite reader with no document server behind it, so a link to a
+    document would 404 -- and a path a reader can open in their own checkout is the honest form.
+    It is also what keeps this page free of anchors entirely."""
+    body = _function_body(_source("render.js"), "citation")
+    assert '"code"' in body
+    assert "href" not in body
+
+
+def test_the_plans_view_shows_every_section_the_payload_sends() -> None:
+    """A page that quoted the constitution and dropped the refusal list would be a page choosing
+    which of the project's commitments a reader sees -- on the page whose subject is exactly
+    that."""
+    body = _function_body(_source("render.js"), "plansView")
+    for key in ("data.for_sale", "data.constitution", "data.tiers", "data.triggers",
+                "data.never_paywalled", "data.trigger_framing"):
+        assert key in body, f"plansView never renders {key}"
+
+
+def test_the_plans_table_offers_no_sort_control() -> None:
+    """A tier table ordered by price is a shopping comparison. These four rows are not four
+    choices, and `table()` draws a sort control only when handed a `sort`/`onSort` pair."""
+    body = _function_body(_source("render.js"), "plansView")
+    assert "onSort" not in body
+    assert "sort:" not in body

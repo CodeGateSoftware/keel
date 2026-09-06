@@ -149,6 +149,7 @@ CLIENT_ROUTES: tuple[str, ...] = (
     "rules",
     "venues",
     "gates",
+    "plans",
 )
 
 #: The shell every client route is served from, relative to `STATIC_ROOT`.

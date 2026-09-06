@@ -42,6 +42,7 @@ import {
   buildLine,
   engineBanner,
   gatesView,
+  plansView,
   insightsView,
   modeBadge,
   paperBanner,
@@ -111,6 +112,7 @@ const ROUTES = [
   { name: "rules", label: "Rules", endpoints: ["rules"] },
   { name: "venues", label: "Venues", endpoints: ["venues"] },
   { name: "gates", label: "Gates", endpoints: ["gates"] },
+  { name: "plans", label: "Plans", endpoints: ["plans"] },
 ];
 
 /** Where an unrecognised path lands, and what `BASE` alone means. @type {Route} */
@@ -470,6 +472,7 @@ function mount(route, readings) {
   if (route.name === "rules") return rulesView(data, primary.sort, onSort);
   if (route.name === "venues") return venuesView(data, primary.sort, onSort);
   if (route.name === "gates") return gatesView(data);
+  if (route.name === "plans") return plansView(data);
   return statusView(data);
 }
 

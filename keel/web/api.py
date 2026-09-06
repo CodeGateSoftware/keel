@@ -740,6 +740,23 @@ def read_journal(cfg: ServeConfig, query: Query, _state: Any, now_ts: int) -> di
     )
 
 
+def read_plans(_cfg: ServeConfig, _query: Query, _state: Any, now_ts: int) -> dict[str, Any]:
+    """The Plans page (#706) -- the one route whose subject is the PROJECT, not the deployment.
+
+    No repository, no config, no network. Every string it answers with is quoted from a document
+    in this repository and carries that document's path, so a reader can check the page against
+    the source and `tests/commands/test_plans.py` can check it on every build.
+
+    `needs_database=False` for the same reason `/api/config` and `/api/venues` carry it: this
+    answers identically on a machine with nothing set up, and a page explaining that keel is free
+    and runs entirely on the operator's own hardware would be a strange one to gate behind having
+    already installed it.
+    """
+    from keel.commands.plans import gather_plans
+
+    return payload.plans_payload(gather_plans(now_ts=now_ts))
+
+
 def read_rules(cfg: ServeConfig, _query: Query, _state: Any, _now_ts: int) -> dict[str, Any]:
     repo = open_repo(cfg.db_path)
     try:
@@ -1006,6 +1023,14 @@ API_ROUTES: dict[str, ApiRoute] = {
         read=read_rules,
         collection="rules",
         sortable=("id", "kind", "status", "created_at", "promoted_at", "demoted_at"),
+    ),
+    # #706. `needs_database=False`, and NO `collection`/`sortable`: there is nothing on this page
+    # to sort. A tier table ordered by price is a shopping comparison, and the whole point of the
+    # inversion is that these four rows are not four choices.
+    "/api/plans": ApiRoute(
+        html_route="/plans",
+        read=read_plans,
+        needs_database=False,
     ),
     "/api/venues": ApiRoute(
         html_route="/venues",

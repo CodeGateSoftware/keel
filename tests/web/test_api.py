@@ -69,6 +69,7 @@ API_ROUTES = (
     "/api/rules",
     "/api/venues",
     "/api/gates",
+    "/api/plans",
 )
 
 
@@ -742,7 +743,11 @@ def test_a_stopped_engine_still_answers_the_endpoints_that_describe_the_binary(
     about (200 with data, nothing required to exist first) still holds. All three still report
     `engine`, because a client showing the "keel isn't running" banner should not have to fetch a
     different endpoint to know whether to show it."""
-    for path in ("/api/config", "/api/venues", "/api/gates"):
+    # `/api/plans` (#706) joins them and is the purest case: its subject is the PROJECT rather
+    # than the deployment, so it reads no repository at all -- and a page explaining that keel is
+    # free and runs on the operator's own hardware would be a strange one to gate behind having
+    # already installed it.
+    for path in ("/api/config", "/api/venues", "/api/gates", "/api/plans"):
         status, _headers, document = _json(empty_machine, path)
 
         assert status == 200, path
@@ -850,7 +855,7 @@ def test_setup_carries_the_csrf_token_and_only_setup_does(
     _status, _headers, document = _json(empty_machine, "/api/setup")
     assert document["data"]["csrf"] == csrf_token(empty_machine.token)
 
-    for path in ("/api/config", "/api/status", "/api/venues", "/api/gates"):
+    for path in ("/api/config", "/api/status", "/api/venues", "/api/gates", "/api/plans"):
         _status, _headers, other = _json(empty_machine, path)
         assert csrf_token(empty_machine.token) not in json.dumps(other), path
 
