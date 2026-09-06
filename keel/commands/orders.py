@@ -59,6 +59,7 @@ import click
 
 from keel.commands._common import _open_repo_ro, with_disclaimer
 from keel.data.repository import Repository
+from keel.execution.executor import RESTING_STATUSES
 
 #: The scope vocabulary, spelled exactly as `keel.commands.activity.ACTIVITY_SCOPES` spells
 #: it. Two views over the same deployment answering "how far back" with different words would
@@ -805,7 +806,122 @@ def render_orders(report: OrdersReport) -> list[str]:
 # -- the command -----------------------------------------------------------------------------
 
 
-@click.command("orders")
+# -- the cancel asymmetry (#707) -------------------------------------------------------------------
+#
+# Cancelling an open ENTRY is refusing risk. The constitution makes refusing risk frictionless, so
+# it asks once and does it.
+#
+# Cancelling an open EXIT or a protective bracket is REMOVING PROTECTION -- the same class of
+# action as disabling a stop -- and it takes the typed friction every capability-increasing step in
+# this program takes. No venue draws this distinction; it falls out of keel's own rails, and the
+# whole feature is getting the classification right in the cases where a row does not announce
+# which kind it is.
+
+#: The statuses a cancel can reach, READ from the executor rather than restated.
+#:
+#: Two copies would drift the day the engine learned a third resting state, and this surface would
+#: then refuse to cancel something the engine still considers live. `partially_filled` is in the
+#: list for the reason `_clear_resting_bracket` gives: its unfilled remainder is working at the
+#: exchange exactly like a pending order's whole size.
+CANCELLABLE_STATUSES = RESTING_STATUSES
+
+#: What a cancel is, as a closed vocabulary.
+#:
+#: `protective` is separate from `exit` because they are refused for different reasons and an
+#: operator should be told which: an `exit` is liquidating inventory, a `protective` leg is the
+#: stop that stands under a live tranche.
+CANCEL_KINDS: tuple[str, ...] = ("entry", "exit", "protective", "unknown")
+
+
+@dataclass(frozen=True)
+class CancelDecision:
+    """What this order is, and therefore what it takes to cancel it.
+
+    ONE classification, read by both front-ends. The CLI turns `typed` into a phrase prompt and the
+    console turns it into a 403; if each decided for itself, the console could one-click something
+    the terminal makes you type.
+    """
+
+    order_id: int
+    kind: str
+    cancellable: bool
+    #: Whether cancelling this needs the typed phrase rather than a `y/N`. True for everything but
+    #: an entry -- including `unknown`, so a row this build cannot classify is never the easy case.
+    typed: bool
+    #: Why not, when `cancellable` is False. Always a sentence naming the order and its state: a
+    #: cancel that silently does nothing is the worst answer here, because the operator then
+    #: believes they have cancelled something still live at the venue.
+    reason: str = ""
+    #: Whether cancelling this must also clear the product's resting bracket.
+    #:
+    #: TRUE ONLY FOR A ZERO-FILLED ENTRY. `executor.execute` places the bracket as soon as the
+    #: entry is PLACED rather than once it fills, so a resting entry can already have a protective
+    #: leg -- and if nothing filled, that leg commits base inventory which was never acquired. It
+    #: is an orphan and goes with the entry (the #519 protocol).
+    #:
+    #: A PARTIALLY FILLED entry is the opposite case and the issue's rule does not cover it: the
+    #: operator holds real inventory, the bracket is what protects it, and clearing it "because we
+    #: cancelled an entry" would strip a stop from a live tranche. That is the exit-side hazard
+    #: reappearing inside an entry-side action, which is the thing this asymmetry exists to
+    #: prevent. The remainder is cancelled; the protection stays.
+    clears_bracket: bool = False
+    product_id: str = ""
+
+
+def classify_cancel(repo: Repository, order_id: int) -> CancelDecision:
+    """What cancelling `order_id` would be, and what it therefore takes.
+
+    Reads only. It decides nothing about whether the operator may proceed -- that is the caller's
+    gate -- and it never touches a broker.
+    """
+    row = repo.get_order(order_id)
+    if row is None:
+        return CancelDecision(
+            order_id=order_id,
+            kind="unknown",
+            cancellable=False,
+            typed=True,
+            reason=f"no order {order_id} in this deployment's book",
+        )
+
+    product_id = str(row.get("product_id") or "")
+    status = str(row.get("status") or "")
+    # PROTECTIVE first, and the order of these two checks is the guard. A protective leg is the
+    # real hazard rather than the word "sell": a row wearing the BUY side while a position points
+    # at it as its protection would pass a side-only rule and be cancelled one-click, stripping a
+    # stop from a live tranche.
+    protective = repo.get_position_for_bracket(order_id) is not None
+    if protective:
+        kind = "protective"
+    elif str(row.get("side") or "").lower() == "sell":
+        kind = "exit"
+    else:
+        kind = "entry"
+
+    if status not in CANCELLABLE_STATUSES:
+        return CancelDecision(
+            order_id=order_id,
+            kind=kind,
+            cancellable=False,
+            typed=kind != "entry",
+            reason=(
+                f"order {order_id} is {status}, and only a resting order can be cancelled "
+                f"({', '.join(CANCELLABLE_STATUSES)})"
+            ),
+            product_id=product_id,
+        )
+
+    return CancelDecision(
+        order_id=order_id,
+        kind=kind,
+        cancellable=True,
+        typed=kind != "entry",
+        clears_bracket=kind == "entry" and status == "pending",
+        product_id=product_id,
+    )
+
+
+@click.group("orders", invoke_without_command=True)
 @click.option(
     "--scope",
     type=click.Choice(ORDERS_SCOPES),
@@ -825,6 +941,10 @@ def render_orders(report: OrdersReport) -> list[str]:
 def orders_cmd(ctx: click.Context, scope: str, limit: int) -> None:
     """What keel actually bought and sold, and at what price -- read-only.
 
+    `keel orders` still LISTS, with no subcommand and the same options it always took (#707 turned
+    it into a group and `invoke_without_command=True` is what keeps that true). `keel orders list`
+    is the same thing under its own name, and `keel orders cancel <id>` is the write.
+
     One row per order the engine placed, newest first, straight from the `orders` table: who
     placed it (a human at the terminal, or keel on its own), what was expected versus what the
     venue gave, the fee as charged, and the venue's own order id. No broker call and no write:
@@ -834,7 +954,113 @@ def orders_cmd(ctx: click.Context, scope: str, limit: int) -> None:
     Rows from BOTH modes are shown and the mode is on the row. A deployment book holds one
     mode, so a filter here would render empty on the other books and read as "nothing traded".
     """
+    if ctx.invoked_subcommand is not None:
+        return
+    _list_orders(ctx, scope=scope, limit=limit)
+
+
+def _list_orders(ctx: click.Context, *, scope: str, limit: int) -> None:
     repo = _open_repo_ro(ctx)
     report = gather_orders(repo, now_ts=int(time.time()), scope=scope, limit=limit)
     for line in render_orders(report):
         click.echo(line)
+
+
+@orders_cmd.command("list")
+@click.option(
+    "--scope",
+    type=click.Choice(ORDERS_SCOPES),
+    default=DEFAULT_ORDERS_SCOPE,
+    show_default=True,
+    help="How far back to read: a UTC calendar window, or every order in the book.",
+)
+@click.option(
+    "--limit",
+    type=int,
+    default=DEFAULT_ORDERS_LIMIT,
+    show_default=True,
+    help=f"How many rows to show, newest first (1-{MAX_ORDERS_LIMIT}).",
+)
+@click.pass_context
+@with_disclaimer
+def orders_list(ctx: click.Context, scope: str, limit: int) -> None:
+    """The same listing `keel orders` prints, under its own name."""
+    _list_orders(ctx, scope=scope, limit=limit)
+
+
+#: What an operator types to cancel protection. Long enough that it cannot be muscle memory, and
+#: it NAMES the order, so a phrase copied from one prompt cannot answer a different one.
+CANCEL_EXIT_PHRASE = "remove protection from order {order_id}"
+
+
+@orders_cmd.command("cancel")
+@click.argument("order_id", type=int)
+@click.pass_context
+@with_disclaimer
+def orders_cancel(ctx: click.Context, order_id: int) -> None:
+    """Cancel a resting order. Entries ask once; exits and protective legs are typed.
+
+    THE ASYMMETRY. Cancelling an entry is refusing risk, and the constitution makes refusing risk
+    frictionless -- so it asks `y/N` and does it. Cancelling an exit or a protective bracket is
+    REMOVING PROTECTION, the same class of action as disabling a stop, and it takes the typed
+    friction every capability-increasing step in this program takes.
+
+    A protective leg is classified by the POSITION that points at it, not by its side label:
+    `positions.bracket_order_id` is the link, and a row wearing the entry side while a tranche
+    relies on it for protection would pass a side-only rule.
+
+    Needs a terminal either way. The venue is reached only after the confirmation, and only the
+    venue's own confirmation lets the local row be marked -- `executor._cancel_at_exchange` owns
+    that rule and this calls it rather than restating it.
+    """
+    from keel.commands._common import _build_broker, _is_interactive, _load_cfg, _open_repo
+    from keel.execution.executor import _cancel_at_exchange, _clear_resting_bracket
+
+    if not _is_interactive():
+        raise click.ClickException(
+            f"refusing to cancel order {order_id}: this needs an interactive terminal."
+        )
+
+    repo = _open_repo(ctx)
+    decision = classify_cancel(repo, order_id)
+    if not decision.cancellable:
+        # A NAMED refusal, never a silent success. An operator told "cancelled" about an order
+        # still live at the venue is worse off than one told why it could not be.
+        raise click.ClickException(decision.reason)
+
+    click.echo(f"order {order_id}: {decision.kind} on {decision.product_id}")
+    if decision.typed:
+        phrase = CANCEL_EXIT_PHRASE.format(order_id=order_id)
+        click.echo(
+            "This is protection, not risk. Cancelling it leaves the position it stands under "
+            "with nothing beneath it."
+        )
+        typed = click.prompt(f'Type "{phrase}" to confirm', default="", show_default=False)
+        if typed.strip() != phrase:
+            raise click.ClickException("aborted (phrase not typed).")
+    elif not click.confirm("Cancel this resting entry?", default=False):
+        raise click.ClickException("aborted.")
+
+    now_ts = int(time.time())
+    broker = _build_broker(_load_cfg(ctx))
+    row = repo.get_order(order_id)
+    assert row is not None  # classify_cancel already read it inside this same process
+    _cancel_at_exchange(broker, repo, row)
+    repo.update_order(order_id, status="canceled", updated_at=now_ts)
+    click.echo(f"cancelled order {order_id} at the venue.")
+
+    if decision.clears_bracket:
+        # The #519 protocol, reused rather than restated. An entry that nothing filled can still
+        # have a bracket -- `executor.execute` places it as soon as the entry is PLACED -- and
+        # that leg now commits base inventory which was never acquired.
+        if _clear_resting_bracket(broker, repo, decision.product_id, now_ts):
+            click.echo(f"cleared the resting bracket on {decision.product_id}.")
+        else:
+            # LOUD. The entry is gone and a protective leg may still be working at the venue
+            # against inventory that does not exist, which is a state an operator has to know
+            # about rather than discover from a fill.
+            raise click.ClickException(
+                f"order {order_id} was cancelled, but the resting bracket on "
+                f"{decision.product_id} could NOT be cleared -- it may still be live at the "
+                "venue over inventory that was never acquired. Check the venue directly."
+            )
