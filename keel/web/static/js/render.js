@@ -2890,24 +2890,6 @@ function venueCard(info) {
 }
 
 /**
- * Gates: `/api/gates`'s payload -- the capability inventory (#436).
- *
- * **This view is the reason a browser interface can be honest about its own limits.** The read
- * surface cannot reach one of these actions: the server implements no verb that would, and the
- * page says so beside the list of what it cannot do and who can. `gates_payload` reads a pure
- * declaration -- no config, no database, no network -- which is why this view has something to
- * show on a machine with nothing set up.
- *
- * The action count in each heading is `actions.length`, and `gates_payload`'s own docstring
- * sanctions it: "a client renders `actions.length`, which is a list length in the language that
- * owns the list, not a figure this layer invented." `Gate` holds no count, and Rule 6e bans
- * `len()` in the serialiser, so this is the one number on any of these views the server did not
- * send.
- *
- * @param {any} data
- * @returns {DocumentFragment}
- */
-/**
  * The Plans page, inverted (#706).
  *
  * A retail broker's Plans & Features page is a tier matrix with "Current plan" and "Upgrade"
@@ -3029,6 +3011,24 @@ function citation(claim) {
   return el("code", "muted", plain(claim.source));
 }
 
+/**
+ * Gates: `/api/gates`'s payload -- the capability inventory (#436).
+ *
+ * **This view is the reason a browser interface can be honest about its own limits.** The read
+ * surface cannot reach one of these actions: the server implements no verb that would, and the
+ * page says so beside the list of what it cannot do and who can. `gates_payload` reads a pure
+ * declaration -- no config, no database, no network -- which is why this view has something to
+ * show on a machine with nothing set up.
+ *
+ * The action count in each heading is `actions.length`, and `gates_payload`'s own docstring
+ * sanctions it: "a client renders `actions.length`, which is a list length in the language that
+ * owns the list, not a figure this layer invented." `Gate` holds no count, and Rule 6e bans
+ * `len()` in the serialiser, so this is the one number on any of these views the server did not
+ * send.
+ *
+ * @param {any} data
+ * @returns {DocumentFragment}
+ */
 export function gatesView(data) {
   const fragment = document.createDocumentFragment();
   fragment.append(el("h1", undefined, "Gates"));

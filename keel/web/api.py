@@ -740,7 +740,7 @@ def read_journal(cfg: ServeConfig, query: Query, _state: Any, now_ts: int) -> di
     )
 
 
-def read_plans(_cfg: ServeConfig, _query: Query, _state: Any, now_ts: int) -> dict[str, Any]:
+def read_plans(_cfg: ServeConfig, _query: Query, _state: Any, _now_ts: int) -> dict[str, Any]:
     """The Plans page (#706) -- the one route whose subject is the PROJECT, not the deployment.
 
     No repository, no config, no network. Every string it answers with is quoted from a document
@@ -754,7 +754,7 @@ def read_plans(_cfg: ServeConfig, _query: Query, _state: Any, now_ts: int) -> di
     """
     from keel.commands.plans import gather_plans
 
-    return payload.plans_payload(gather_plans(now_ts=now_ts))
+    return payload.plans_payload(gather_plans())
 
 
 def read_rules(cfg: ServeConfig, _query: Query, _state: Any, _now_ts: int) -> dict[str, Any]:

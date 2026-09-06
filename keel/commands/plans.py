@@ -152,10 +152,27 @@ TIERS: tuple[Tier, ...] = (
 TRIGGER_FRAMING = "Framed in users and demonstrated demand"
 TRIGGER_FRAMING_SOURCE = DECISION_RECORD
 
-#: The four triggers, abbreviated to their firing condition. The record's own table carries the
-#: evidence each one needs and who observes it; this page carries what would have to be true.
+#: The four triggers, quoting the record's "What fires it" cell WHOLE.
+#:
+#: The evidence column and the observer column stay in the record -- this page carries what would
+#: have to be true, not how it would be established. But the FIRING CONDITION is quoted entire,
+#: cell for cell, and a test compares it against the record's own table rather than merely finding
+#: it inside the document.
+#:
+#: The first cut cut all three short, and each cut changed what fires. Trigger 3 lost "not a
+#: feature request, a request to pay for upkeep" -- the clause separating it from an ordinary
+#: feature request. Trigger 1 lost most of its condition. Trigger 4 lost "evidenced by external
+#: contributors, not by the founder's schedule", which is what stops a tired maintainer being the
+#: evidence. A truncated trigger fires on strictly more of the world than the record's does, so
+#: the page would have been publishing an easier promise than the one that was made -- and
+#: anchoring a quote to the start of a statement catches a quote that begins late, never one that
+#: ends early.
 TRIGGERS: tuple[Trigger, ...] = (
-    Trigger(1, "keel reaches an audience shaped like Jesse's pre-2021 one"),
+    Trigger(
+        1,
+        "keel reaches an audience shaped like Jesse's pre-2021 one — public for a comparable "
+        "stretch, with adoption to show for it",
+    ),
     Trigger(
         2,
         "The headline finding reverses — a shipped rule family is measured net-positive at the "
@@ -164,34 +181,48 @@ TRIGGERS: tuple[Trigger, ...] = (
     Trigger(
         3,
         "Operators repeatedly and unprompted ask for something that costs real money to run on "
-        "their behalf",
+        "their behalf — hosted infra, a maintained third-party integration, priority support — "
+        "not a feature request, a request to pay for upkeep",
     ),
     Trigger(
         4,
         "keel's own maintenance load demonstrably exceeds what volunteer, spare-time work can "
-        "carry",
+        "carry — evidenced by external contributors, not by the founder's schedule",
     ),
 )
 
 #: What no tier will ever gate. The load-bearing half of this page, and the half a later
 #: contributor would be most tempted to soften -- so each line is quoted from a document that
 #: already committed to it rather than written fresh here.
+#:
+#: SIX CLAIMS THAT ARE ACTUALLY ABOUT GATING. The first cut carried three constitution lines
+#: verbatim from the section above, so a reader met them twice -- and two of them ("Fees are
+#: priced at what was actually paid", "Every attestation is human-sourced, or refused") are not
+#: things a tier could gate at all. A refusal list padded from the section above it reads as a
+#: longer promise than the project made, which on this page is the specific failure to avoid.
+#:
+#: The markdown emphasis and the sentence tails are stripped: `**bold**` markers render as literal
+#: asterisks through `plain()` (the client has no markdown pass and bans `innerHTML`), and the
+#: affiliate line ended mid-sentence at its closing `**`, which reads as a truncation bug on the
+#: page whose whole subject is that it can be checked. The TEST normalises the document instead --
+#: see `_readable` there -- so these stay checkable while reading as prose.
 NEVER_PAYWALLED: tuple[Claim, ...] = (
     Claim("Paper is free and unlimited, forever.", EVOLUTION_PLAN),
-    Claim("Fees are priced at what was actually paid.", EVOLUTION_PLAN),
-    Claim("Every attestation is human-sourced, or refused.", EVOLUTION_PLAN),
+    Claim("The free engine is never a demo.", EVOLUTION_PLAN),
+    Claim("No engine feature gates for paid tiers", "docs/architecture.md"),
     Claim(
         "Live order placement (`keel/execution/`) stays inside the Apache-2.0 tree in full, "
         "always.",
         DECISION_RECORD,
     ),
     Claim(
-        "**No engine feature gates for paid tiers** — the free engine is never a demo.",
-        "docs/architecture.md",
+        "Affiliate or referral links to any trading venue, broker, or exchange are never added "
+        "to keel, its documentation, or its site",
+        DECISION_RECORD,
     ),
     Claim(
-        "**Affiliate or referral links to any trading venue, broker, or exchange are never "
-        "added**",
+        "No accounts, billing relationship, license-token gate, or server-side validation gets "
+        "added to keel while this record stands.",
         DECISION_RECORD,
     ),
 )
@@ -210,6 +241,14 @@ def every_claim() -> Iterator[Claim]:
     yield from CONSTITUTION
     yield from NEVER_PAYWALLED
     for tier in TIERS:
+        # NAME, PRICE, BUYS AND PROMISE. The first cut yielded only the promise, so `buys` -- the
+        # longest string on the page and a whole table column -- was traced by nothing: a
+        # contributor could add "early access to new rule families" to a tier, render it with a
+        # citation beside it, and pass every gate. The acceptance criterion is traceability, and
+        # the largest cell in the table was outside it.
+        yield Claim(tier.name, tier.source)
+        yield Claim(tier.price, tier.source)
+        yield Claim(tier.buys, tier.source)
         yield Claim(tier.promise, tier.source)
     for trigger in TRIGGERS:
         yield Claim(trigger.text, trigger.source)
@@ -218,7 +257,12 @@ def every_claim() -> Iterator[Claim]:
 
 @dataclass(frozen=True)
 class PlansReport:
-    now_ts: int
+    #: NO TIMESTAMP, deliberately, and the sibling settles it: `gates_payload` describes capability
+    #: rather than deployment and takes no `now_ts` at all. Every other view stamps itself because
+    #: its figures were observed at a moment; nothing on this page was observed. The first cut sent
+    #: `as_of` and `generated_at` and rendered neither -- a stamp nobody shows is a stamp that will
+    #: eventually be shown, and it would date a page whose content changes only when a document
+    #: does.
     constitution: tuple[Claim, ...]
     tiers: tuple[Tier, ...]
     triggers: tuple[Trigger, ...]
@@ -235,11 +279,10 @@ class PlansReport:
         return any(tier.shipped for tier in self.tiers)
 
 
-def gather_plans(*, now_ts: int) -> PlansReport:
-    """The page. No repository, no config, no network -- it describes the project, not the
-    deployment, which is why its route answers on a machine with nothing set up."""
+def gather_plans() -> PlansReport:
+    """The page. No repository, no config, no network and no clock -- it describes the project,
+    not the deployment, which is why its route answers on a machine with nothing set up."""
     return PlansReport(
-        now_ts=now_ts,
         constitution=CONSTITUTION,
         tiers=TIERS,
         triggers=TRIGGERS,

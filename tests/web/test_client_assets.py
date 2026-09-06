@@ -732,8 +732,10 @@ def test_the_python_and_javascript_route_tables_agree() -> None:
 def test_the_route_table_parser_actually_found_something() -> None:
     """The premise for the test above: an empty parse compared to an empty tuple is green.
 
-    `CLIENT_ROUTES` has seven entries today, and the assertion is on a floor rather than on the
-    exact number so that #537 adding a view does not have to edit this test to keep it honest."""
+    The assertion is a FLOOR rather than an exact number, so adding a view does not have to edit
+    this test to keep it honest -- which is also why the docstring no longer names a count. It
+    said "seven entries today" while `CLIENT_ROUTES` held thirteen, which is the failure mode of
+    writing a number into prose beside a test that deliberately does not assert one."""
     names = _js_route_names()
     assert len(names) >= 7, f"parsed {names} out of main.js -- the parser has stopped working"
     assert "status" in names
@@ -2021,6 +2023,25 @@ def test_the_clickable_scan_can_actually_see_a_string_literal() -> None:
     assert "form" not in kept, "comments must still be stripped"
 
 
+#: What a display-only renderer may not contain. ONE list, shared by every such test, because two
+#: lists drift: #704's blocked `button` and `href` UNQUOTED and #706's blocked `"button"` quoted
+#: and dropped `href` -- so `el('button', 'cta', 'Buy Pro')` in single quotes, and a `setAttribute`
+#: of `href` on a span, both passed the newer test while failing the older one.
+#:
+#: Unquoted, so a quoting style cannot evade it. `element` and `anchor` are absent deliberately:
+#: `el(...)` is this file's own constructor and every renderer calls it.
+_INTERACTIVE_TOKENS: tuple[str, ...] = (
+    "button",
+    "addEventListener",
+    "onclick",
+    '"a"',
+    "'a'",
+    "href",
+    "form",
+    "input",
+)
+
+
 def test_neither_the_chip_nor_the_banner_builds_anything_clickable() -> None:
     """Display and navigation only, by construction rather than by intent.
 
@@ -2032,7 +2053,7 @@ def test_neither_the_chip_nor_the_banner_builds_anything_clickable() -> None:
     source = _source("render.js")
     for name in ("sessionChip", "paperBanner"):
         body = _function_body(source, name)
-        for forbidden in ("button", "addEventListener", "onclick", '"a"', "href", "form", "input"):
+        for forbidden in _INTERACTIVE_TOKENS:
             assert forbidden not in body, f"{name} builds something interactive: {forbidden}"
 
 
@@ -2184,6 +2205,38 @@ def test_the_journal_section_offers_no_sort_control() -> None:
 # with string literals KEPT (the earlier lesson: a scan that strips them cannot see `el("a")`).
 
 
+#: Text that would turn a published price into something a reader could act on.
+#:
+#: A SECOND BELT, and it is worth saying which belt is first: every string in the tier table has to
+#: appear verbatim in `docs/evolution-plan.md` (`tests/commands/test_plans.py`), so an injected
+#: call to action fails traceability before it reaches this list. That is the defence that does not
+#: depend on anyone having thought of the wording.
+#:
+#: This list exists for the strings traceability does not cover, and it carries the schemes the
+#: project ACTUALLY chose: ADR 0004 and Phase F both name self-hosted BTCPay, so `bitcoin:` and
+#: `lightning:` URIs are the single most likely real affordance here -- and the first cut of this
+#: list, built from generic e-commerce words, could not see either of them.
+_PURCHASE_AFFORDANCES: tuple[str, ...] = (
+    "http://",
+    "https://",
+    "mailto:",
+    "bitcoin:",
+    "lightning:",
+    "btcpay",
+    "lnbc",
+    "checkout",
+    "subscribe",
+    "upgrade",
+    "purchase",
+    "pay via",
+    "pay with",
+    "get started",
+    "buy ",
+    "order at",
+    "contact sales",
+)
+
+
 def test_the_plans_view_builds_nothing_a_reader_can_click() -> None:
     """No button, no anchor, no form, no handler.
 
@@ -2195,7 +2248,7 @@ def test_the_plans_view_builds_nothing_a_reader_can_click() -> None:
     source = _source("render.js")
     for name in ("plansView", "claimList", "citation"):
         body = _function_body(source, name)
-        for forbidden in ('"button"', '"a"', '"form"', '"input"', "addEventListener", "onclick"):
+        for forbidden in _INTERACTIVE_TOKENS:
             assert forbidden not in body, f"{name} builds something interactive: {forbidden}"
 
 
@@ -2206,8 +2259,8 @@ def test_the_plans_payload_sends_no_destination_to_build_one_from() -> None:
     from keel.commands.plans import gather_plans
     from keel.web import payload as payload_mod
 
-    body = json.dumps(payload_mod.plans_payload(gather_plans(now_ts=0))).lower()
-    for affordance in ("http://", "https://", "mailto:", "checkout", "subscribe", "upgrade"):
+    body = json.dumps(payload_mod.plans_payload(gather_plans())).lower()
+    for affordance in _PURCHASE_AFFORDANCES:
         assert affordance not in body, f"the plans payload carries {affordance}"
 
 
@@ -2224,10 +2277,17 @@ def test_the_plans_view_shows_every_section_the_payload_sends() -> None:
     """A page that quoted the constitution and dropped the refusal list would be a page choosing
     which of the project's commitments a reader sees -- on the page whose subject is exactly
     that."""
+    from keel.commands.plans import gather_plans
+    from keel.web import payload as payload_mod
+
+    # DERIVED from the payload, not a list of literals: a section added to the wire and never
+    # rendered would have passed a hardcoded list forever.
+    sections = set(payload_mod.plans_payload(gather_plans()))
+    assert sections, "the scan found no sections -- it would pass against any view"
+
     body = _function_body(_source("render.js"), "plansView")
-    for key in ("data.for_sale", "data.constitution", "data.tiers", "data.triggers",
-                "data.never_paywalled", "data.trigger_framing"):
-        assert key in body, f"plansView never renders {key}"
+    for key in sorted(sections):
+        assert "data." + key in body, f"/api/plans sends {key}; plansView never renders it"
 
 
 def test_the_plans_table_offers_no_sort_control() -> None:

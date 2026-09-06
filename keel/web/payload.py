@@ -1392,14 +1392,17 @@ def _claim_payload(claim: Claim) -> dict[str, Any]:
 def _tier_payload(tier: Tier) -> dict[str, Any]:
     """One row of the Phase F table, and whether it exists.
 
-    `status` is a `label` and the two readings are NOT good and bad. The free tier is what the
+    `status` is a `label` and the readings are NOT good and bad. The free tier is what the
     reader is already running (`GOOD` -- it is the one thing on this page that is true today), and
     every other row is `UNKNOWN`: not warned about, not promised, simply not a thing yet. `WARN`
     would read as a caution about a product, and there is no product to caution anyone about.
 
     `shipped` and `available_now` are separate fields on the report and collapse to one word here,
     because a client rendering two booleans would be deciding what their combination means, which
-    is a judgement (Rule 2).
+    is a judgement (Rule 2). The state comes off the SAME word, not off `available_now` -- the
+    first cut read `GOOD if tier.available_now else UNKNOWN`, so the day a Pro tier shipped, the
+    one row that had become real would have worn the same "not a thing yet" badge as the three
+    that had not.
     """
     return {
         "name": tier.name,
@@ -1410,7 +1413,7 @@ def _tier_payload(tier: Tier) -> dict[str, Any]:
         "status": label(
             _tier_status(tier),
             display=_TIER_STATUS_NOTES[_tier_status(tier)],
-            state=GOOD if tier.available_now else UNKNOWN,
+            state=_TIER_STATES[_tier_status(tier)],
         ),
     }
 
@@ -1421,7 +1424,21 @@ def _tier_payload(tier: Tier) -> dict[str, Any]:
 _TIER_STATUS_NOTES: Mapping[str, str] = {
     "running": "this is what you are running now, and it is the whole engine",
     "planned": "does not exist — a published intention, gated on a trigger that has not fired",
-    "shipped": "shipped",
+    # The one status a future PR will actually set, and the first cut left its display collapsed to
+    # the word itself -- so the cell would have read "shipped / shipped" on the only row where a
+    # reader most needs a sentence.
+    "shipped": "this exists and can be bought — see the decision record that superseded ADR 0004",
+}
+
+
+#: The state each status word carries. `running` and `shipped` are both things that EXIST; the
+#: difference between them is price, not reality, and a page that graded the shipped one as unknown
+#: would be contradicting its own table. `planned` is UNKNOWN and never WARN: there is no product
+#: to caution anyone about.
+_TIER_STATES: Mapping[str, str] = {
+    "running": GOOD,
+    "shipped": GOOD,
+    "planned": UNKNOWN,
 }
 
 
@@ -1462,8 +1479,10 @@ def plans_payload(report: PlansReport) -> dict[str, Any]:
     )
 
     return {
-        "as_of": iso(report.now_ts),
-        "generated_at": moment(report.now_ts),
+        # NO `as_of`/`generated_at`, matching `gates_payload` next door, which also describes
+        # capability rather than deployment and also sends none. Nothing on this page was
+        # OBSERVED at a moment -- it changes when a document changes -- and a stamp nobody renders
+        # is a stamp that eventually gets rendered, dating a page that has no date.
         "for_sale": flag(
             report.anything_for_sale,
             on="a tier has shipped — this page is out of date",
