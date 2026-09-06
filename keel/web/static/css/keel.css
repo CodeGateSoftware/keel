@@ -256,6 +256,51 @@ header .mode-paper { color: var(--muted); }
 header .mode-confirm,
 header .mode-live { color: var(--accent); border-color: var(--accent); }
 
+/* THE CANCEL-HELP MODAL (#707).
+ *
+ * A `<dialog>`, so focus trapping, Escape and the backdrop are the browser's rather than
+ * hand-built: a modal that traps focus badly is worse than none on a page an operator reaches with
+ * a keyboard.
+ *
+ * `.linklike` is a button that does not look like a filled action, because none of these buttons
+ * DOES anything to the deployment -- one opens instructions, one copies text, one closes. The
+ * filled `button` rule is reserved for a control that changes something on the server, and there
+ * is no such control anywhere in this console. */
+.cancelhelp {
+  max-width: 34rem;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--card);
+  color: var(--fg);
+  padding: 1.25rem;
+}
+.cancelhelp::backdrop { background: rgba(0, 0, 0, 0.45); }
+.cancelhelp h2 { margin: 0 0 0.5rem; font-size: 1rem; }
+/* The command itself: selectable, wrapping, and monospaced, so an operator who cannot use the
+ * clipboard button can still read and select it. The copy button is a convenience, never the only
+ * way to get the command. */
+.invocation {
+  margin: 0.75rem 0;
+  padding: 0.6rem 0.75rem;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  background: var(--bg);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.85rem;
+  white-space: pre-wrap;
+  word-break: break-word;
+  user-select: all;
+}
+.linklike {
+  background: none;
+  border: none;
+  padding: 0;
+  color: var(--accent);
+  font: inherit;
+  text-decoration: underline;
+  cursor: pointer;
+}
+
 /* THE PLANS PAGE's claim list (#706).
  *
  * A quoted sentence with its citation beside it, not beneath it: a citation a reader has to go
@@ -331,7 +376,12 @@ header .sessionpart:empty { display: none; }
   margin: 0;
   padding: 0.45rem 1rem;
   border-bottom: 1px solid var(--line);
-  background: var(--surface);
+  /* `--card`, not `--surface`. #704 shipped `var(--surface)`, which this stylesheet does not
+     define -- the site's name for the token is `--surface` and keel.css's is `--card`, and an
+     undefined custom property falls back to transparent, so the banner has been painting no
+     background at all. Found while adding the modal below, which reached for the same wrong
+     name. */
+  background: var(--card);
   font-size: 0.85rem;
   letter-spacing: 0.01em;
   text-align: center;

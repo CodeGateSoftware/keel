@@ -49,16 +49,21 @@ from __future__ import annotations
 
 import datetime
 import json
+import logging
 import time
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from decimal import Decimal, InvalidOperation
 from typing import Any
 
 import click
+from keel_core.telemetry import log_exception
 
 from keel.commands._common import _open_repo_ro, with_disclaimer
 from keel.data.repository import Repository
+from keel.execution.executor import RESTING_STATUSES
+
+logger = logging.getLogger(__name__)
 
 #: The scope vocabulary, spelled exactly as `keel.commands.activity.ACTIVITY_SCOPES` spells
 #: it. Two views over the same deployment answering "how far back" with different words would
@@ -310,6 +315,18 @@ class OrderRow:
     rule_id: int | None
     created_at: int | None
     updated_at: int | None
+    #: What cancelling this order would be, and what it would take (#707).
+    #:
+    #: On the ROW rather than looked up by a front-end, because both front-ends need it and the
+    #: classification is the feature: the console renders a modal from it and the CLI gates on it,
+    #: and a console that classified for itself could describe an order as a frictionless entry
+    #: while the terminal demanded the typed phrase for it.
+    #:
+    #: Defaulted and LAST, so every existing `OrderRow(...)` construction in this module and its
+    #: tests is untouched -- a dataclass cannot carry a default ahead of a required field.
+    cancel: CancelDecision = field(
+        default_factory=lambda: CancelDecision(0, "unknown", False, True)
+    )
 
 
 @dataclass(frozen=True)
@@ -473,7 +490,13 @@ def _adverse(side: str, difference: Decimal | None) -> bool | None:
     return None
 
 
-def _row_from_dict(row: dict[str, Any], rule_names: Mapping[int, str] | None = None) -> OrderRow:
+def _row_from_dict(
+    row: dict[str, Any],
+    rule_names: Mapping[int, str] | None = None,
+    *,
+    repo: Repository | None = None,
+    bracket_ids: frozenset[int] | None = None,
+) -> OrderRow:
     """One repository dict, projected. Every judgement this report makes about a row is made
     here, once, so neither renderer has to make it twice.
 
@@ -521,8 +544,14 @@ def _row_from_dict(row: dict[str, Any], rule_names: Mapping[int, str] | None = N
     else:
         book_detail = LIVE_NO_BOOK_DETAIL
 
+    order_id = int(row["id"])
     return OrderRow(
-        id=int(row["id"]),
+        id=order_id,
+        cancel=(
+            CancelDecision(order_id, "unknown", False, True)
+            if repo is None
+            else classify_cancel(repo, order_id, row=row, bracket_ids=bracket_ids)
+        ),
         mode=mode,
         product_id=str(row.get("product_id") or ""),
         side=side,
@@ -634,7 +663,14 @@ def gather_orders(
     # Newest first, HERE. `get_orders` orders by `id` ascending; reversing in each renderer
     # would be the same decision made twice and the second copy is the one that drifts.
     filtered.reverse()
-    shown = tuple(_row_from_dict(row, rule_names) for row in filtered[:resolved_limit])
+    # ONE query for every protective link on the page, not one per row (#707). `classify_cancel`
+    # takes the set when it has one and falls back to the single lookup when it does not, so this
+    # is the same rule applied efficiently rather than a second one.
+    bracket_ids = repo.open_bracket_order_ids()
+    shown = tuple(
+        _row_from_dict(row, rule_names, repo=repo, bracket_ids=bracket_ids)
+        for row in filtered[:resolved_limit]
+    )
 
     # Ordered widest cause first: a book with nothing in it is not a scope problem, and a scope
     # that excluded everything is not the tab's doing. Reporting the narrowest true cause would
@@ -805,7 +841,205 @@ def render_orders(report: OrdersReport) -> list[str]:
 # -- the command -----------------------------------------------------------------------------
 
 
-@click.command("orders")
+# -- the cancel asymmetry (#707) -------------------------------------------------------------------
+#
+# Cancelling an open ENTRY is refusing risk. The constitution makes refusing risk frictionless, so
+# it asks once and does it.
+#
+# Cancelling an open EXIT or a protective bracket is REMOVING PROTECTION -- the same class of
+# action as disabling a stop -- and it takes the typed friction every capability-increasing step in
+# this program takes. No venue draws this distinction; it falls out of keel's own rails, and the
+# whole feature is getting the classification right in the cases where a row does not announce
+# which kind it is.
+
+#: The statuses a cancel can reach, READ from the executor rather than restated.
+#:
+#: Two copies would drift the day the engine learned a third resting state, and this surface would
+#: then refuse to cancel something the engine still considers live. `partially_filled` is in the
+#: list for the reason `_clear_resting_bracket` gives: its unfilled remainder is working at the
+#: exchange exactly like a pending order's whole size.
+CANCELLABLE_STATUSES = RESTING_STATUSES
+
+#: What a cancel is, as a closed vocabulary.
+#:
+#: `protective` is separate from `exit` because they are refused for different reasons and an
+#: operator should be told which: an `exit` is liquidating inventory, a `protective` leg is the
+#: stop that stands under a live tranche.
+CANCEL_KINDS: tuple[str, ...] = ("entry", "exit", "protective", "unknown")
+
+#: The command that cancels one order. Composed in Python and placed by the client, so the console
+#: cannot come to print a command that does not exist.
+CANCEL_INVOCATION = "keel orders cancel {order_id}"
+
+
+#: The badge every order page carries, and the sentence behind it (#707).
+#:
+#: Not an apology for a missing feature. `keel serve` holds no venue credential and no broker
+#: handle, and that is the property that keeps the worst case of a bug in the HTTP layer at "reads
+#: a local SQLite file" rather than "exfiltrates live trading keys". Unlocking the keychain and
+#: signing a request to a venue happens during a terminal invocation the operator started, never
+#: from an ambient loopback daemon.
+WEB_READ_ONLY_BADGE = "read-only"
+WEB_READ_ONLY_NOTE = (
+    "The web console is read-only for security: it holds no venue credentials. "
+    "State-changing actions run through the CLI."
+)
+
+#: What each kind of cancel MEANS, for the modal that hands over the command. The word is a term of
+#: art; the sentence is what an operator decides on.
+#: Checked at import: a kind with no headline or no note would render an empty modal, and a table
+#: that has drifted from the vocabulary is exactly the thing nobody notices until a reader sees the
+#: gap. This is what `CANCEL_KINDS` is FOR -- declared and never read, it was decoration.
+CANCEL_HEADLINES: Mapping[str, str] = {
+    "entry": "Entry order #{order_id} — resting",
+    "exit": "⚠️ Exit order #{order_id} — live liquidation",
+    "protective": "⚠️ Protective bracket #{order_id} — live protection",
+    "unknown": "⚠️ Order #{order_id} — unclassified",
+}
+
+CANCEL_NOTES: Mapping[str, str] = {
+    "entry": "Cancelling a resting entry refuses risk. Nothing is protecting anything here.",
+    "exit": (
+        "This order liquidates inventory you hold. Cancelling it leaves the position open with "
+        "no exit working."
+    ),
+    "protective": (
+        "This is live downside protection — a position relies on it for its stop. Cancelling it "
+        "leaves that position with nothing beneath it, and the terminal will ask you to type a "
+        "phrase before it does."
+    ),
+    "unknown": "keel could not classify this order, so it is treated as protection.",
+}
+
+
+
+# The vocabulary and its tables, checked here rather than hoped about. `CANCEL_KINDS` existed and
+# nothing read it; now a kind added to the set without a headline or a note fails at import.
+assert set(CANCEL_HEADLINES) == set(CANCEL_KINDS), "CANCEL_HEADLINES does not cover CANCEL_KINDS"
+assert set(CANCEL_NOTES) == set(CANCEL_KINDS), "CANCEL_NOTES does not cover CANCEL_KINDS"
+
+@dataclass(frozen=True)
+class CancelDecision:
+    """What this order is, and therefore what it takes to cancel it.
+
+    ONE classification, read by both front-ends. The CLI turns `typed` into a phrase prompt and the
+    console turns it into a 403; if each decided for itself, the console could one-click something
+    the terminal makes you type.
+    """
+
+    order_id: int
+    kind: str
+    cancellable: bool
+    #: Whether cancelling this needs the typed phrase rather than a `y/N`. True for everything but
+    #: an entry -- including `unknown`, so a row this build cannot classify is never the easy case.
+    typed: bool
+    #: Why not, when `cancellable` is False. Always a sentence naming the order and its state: a
+    #: cancel that silently does nothing is the worst answer here, because the operator then
+    #: believes they have cancelled something still live at the venue.
+    reason: str = ""
+    #: Whether cancelling this must also clear the product's resting bracket.
+    #:
+    #: TRUE ONLY FOR A ZERO-FILLED ENTRY. `executor.execute` places the bracket as soon as the
+    #: entry is PLACED rather than once it fills, so a resting entry can already have a protective
+    #: leg -- and if nothing filled, that leg commits base inventory which was never acquired. It
+    #: is an orphan and goes with the entry (the #519 protocol).
+    #:
+    #: A PARTIALLY FILLED entry is the opposite case and the issue's rule does not cover it: the
+    #: operator holds real inventory, the bracket is what protects it, and clearing it "because we
+    #: cancelled an entry" would strip a stop from a live tranche. That is the exit-side hazard
+    #: reappearing inside an entry-side action, which is the thing this asymmetry exists to
+    #: prevent. The remainder is cancelled; the protection stays.
+    clears_bracket: bool = False
+    product_id: str = ""
+    #: The exact terminal command, composed HERE (Rule 2) so the console places it rather than
+    #: building it. `""` when the order cannot be cancelled: handing an operator a command that
+    #: would be refused is worse than handing them nothing -- they run it, it fails, and they
+    #: learn the console does not know what it is looking at.
+    invocation: str = ""
+    #: The modal's heading, composed HERE because it is a judgement about what the reader is
+    #: looking at -- "Entry order #42" and "Protective bracket #43 — live protection" are two
+    #: different warnings, and choosing between them is Rule 2's territory. It also keeps the
+    #: client from having to read `Field.value` to find the id, which `render.js` may not do.
+    headline: str = ""
+
+
+def classify_cancel(
+    repo: Repository,
+    order_id: int,
+    *,
+    row: dict[str, Any] | None = None,
+    bracket_ids: frozenset[int] | None = None,
+) -> CancelDecision:
+    """What cancelling `order_id` would be, and what it therefore takes.
+
+    Reads only. It decides nothing about whether the operator may proceed -- that is the caller's
+    gate -- and it never touches a broker, which is why the web console can call it: `keel serve`
+    holds no venue credential and no broker handle, and #707 settled that it never will.
+
+    ONE function for both front-ends. The CLI turns `typed` into a phrase prompt; the console
+    turns it into a modal that hands over `invocation`. If each classified for itself, the console
+    could describe an order as a frictionless entry while the terminal demanded the phrase for it.
+
+    `row` and `bracket_ids` are the BATCH form, for a caller classifying a whole page: the row is
+    already in hand and `repo.open_bracket_order_ids()` answers every protective link in one query
+    rather than one per order. Same rule either way -- the lookups below are what this function
+    falls back to when a caller has neither, not a second implementation.
+    """
+    if row is None:
+        row = repo.get_order(order_id)
+    if row is None:
+        return CancelDecision(
+            order_id=order_id,
+            kind="unknown",
+            cancellable=False,
+            typed=True,
+            reason=f"no order {order_id} in this deployment's book",
+        )
+
+    product_id = str(row.get("product_id") or "")
+    status = str(row.get("status") or "")
+    # PROTECTIVE first, and the order of these two checks is the guard. A protective leg is the
+    # real hazard rather than the word "sell": a row wearing the BUY side while a position points
+    # at it as its protection would pass a side-only rule and be cancelled one-click, stripping a
+    # stop from a live tranche.
+    protective = (
+        order_id in bracket_ids
+        if bracket_ids is not None
+        else repo.get_position_for_bracket(order_id) is not None
+    )
+    if protective:
+        kind = "protective"
+    elif str(row.get("side") or "").lower() == "sell":
+        kind = "exit"
+    else:
+        kind = "entry"
+
+    if status not in CANCELLABLE_STATUSES:
+        return CancelDecision(
+            order_id=order_id,
+            kind=kind,
+            cancellable=False,
+            typed=kind != "entry",
+            reason=(
+                f"order {order_id} is {status}, and only a resting order can be cancelled "
+                f"({', '.join(CANCELLABLE_STATUSES)})"
+            ),
+            product_id=product_id,
+        )
+
+    return CancelDecision(
+        order_id=order_id,
+        kind=kind,
+        cancellable=True,
+        typed=kind != "entry",
+        clears_bracket=kind == "entry" and status == "pending",
+        product_id=product_id,
+        invocation=CANCEL_INVOCATION.format(order_id=order_id),
+        headline=CANCEL_HEADLINES[kind].format(order_id=order_id),
+    )
+
+
+@click.group("orders", invoke_without_command=True)
 @click.option(
     "--scope",
     type=click.Choice(ORDERS_SCOPES),
@@ -823,7 +1057,13 @@ def render_orders(report: OrdersReport) -> list[str]:
 @click.pass_context
 @with_disclaimer
 def orders_cmd(ctx: click.Context, scope: str, limit: int) -> None:
-    """What keel actually bought and sold, and at what price -- read-only.
+    """What keel actually bought and sold, and at what price.
+
+    THE LISTING is read-only; `cancel` below is not, and it is the only write in this group.
+
+    `keel orders` still LISTS, with no subcommand and the same options it always took (#707 turned
+    it into a group and `invoke_without_command=True` is what keeps that true). `keel orders list`
+    is the same thing under its own name, and `keel orders cancel <id>` is the write.
 
     One row per order the engine placed, newest first, straight from the `orders` table: who
     placed it (a human at the terminal, or keel on its own), what was expected versus what the
@@ -834,7 +1074,213 @@ def orders_cmd(ctx: click.Context, scope: str, limit: int) -> None:
     Rows from BOTH modes are shown and the mode is on the row. A deployment book holds one
     mode, so a filter here would render empty on the other books and read as "nothing traded".
     """
+    if ctx.invoked_subcommand is not None:
+        return
+    _list_orders(ctx, scope=scope, limit=limit)
+
+
+def _list_orders(ctx: click.Context, *, scope: str, limit: int) -> None:
     repo = _open_repo_ro(ctx)
     report = gather_orders(repo, now_ts=int(time.time()), scope=scope, limit=limit)
     for line in render_orders(report):
         click.echo(line)
+
+
+@orders_cmd.command("list")
+@click.option(
+    "--scope",
+    type=click.Choice(ORDERS_SCOPES),
+    default=DEFAULT_ORDERS_SCOPE,
+    show_default=True,
+    help="How far back to read: a UTC calendar window, or every order in the book.",
+)
+@click.option(
+    "--limit",
+    type=int,
+    default=DEFAULT_ORDERS_LIMIT,
+    show_default=True,
+    help=f"How many rows to show, newest first (1-{MAX_ORDERS_LIMIT}).",
+)
+@click.pass_context
+def orders_list(ctx: click.Context, scope: str, limit: int) -> None:
+    """The same listing `keel orders` prints, under its own name.
+
+    NO `@with_disclaimer`: click runs the group callback first, and it carries one. Both would
+    print it twice -- and on `--help`, print it above the usage text.
+    """
+    _list_orders(ctx, scope=scope, limit=limit)
+
+
+#: What an operator types to cancel protection. Long enough that it cannot be muscle memory, and
+#: it NAMES the order, so a phrase copied from one prompt cannot answer a different one.
+CANCEL_EXIT_PHRASE = "remove protection from order {order_id}"
+
+
+@orders_cmd.command("cancel")
+@click.argument("order_id", type=int)
+@click.pass_context
+def orders_cancel(ctx: click.Context, order_id: int) -> None:
+    """Cancel a resting order. Entries ask once; exits and protective legs are typed.
+
+    THE ASYMMETRY. Cancelling an entry is refusing risk, and the constitution makes refusing risk
+    frictionless -- so it asks `y/N` and does it. Cancelling an exit or a protective bracket is
+    REMOVING PROTECTION, the same class of action as disabling a stop, and it takes the typed
+    friction every capability-increasing step in this program takes.
+
+    A protective leg is classified by the POSITION that points at it, not by its side label:
+    `positions.bracket_order_id` is the link, and a row wearing the entry side while a tranche
+    relies on it for protection would pass a side-only rule.
+
+    Needs a terminal either way. The venue is reached only after the confirmation, and only the
+    venue's own confirmation lets the local row be marked -- `executor._cancel_at_exchange` owns
+    that rule and this calls it rather than restating it.
+    """
+    from keel.commands._common import _build_broker, _is_interactive, _load_cfg, _open_repo
+    from keel.execution.executor import CancelPending, CancelUnavailable, _cancel_at_exchange
+
+    if not _is_interactive():
+        raise click.ClickException(
+            f"refusing to cancel order {order_id}: this needs an interactive terminal."
+        )
+
+    repo = _open_repo(ctx)
+    decision = classify_cancel(repo, order_id)
+    if not decision.cancellable:
+        # A NAMED refusal, never a silent success. An operator told "cancelled" about an order
+        # still live at the venue is worse off than one told why it could not be.
+        raise click.ClickException(decision.reason)
+
+    click.echo(f"order {order_id}: {decision.kind} on {decision.product_id}")
+    if decision.typed:
+        phrase = CANCEL_EXIT_PHRASE.format(order_id=order_id)
+        click.echo(
+            "This is protection, not risk. Cancelling it leaves the position it stands under "
+            "with nothing beneath it."
+        )
+        typed = click.prompt(f'Type "{phrase}" to confirm', default="", show_default=False)
+        if typed.strip() != phrase:
+            raise click.ClickException("aborted (phrase not typed).")
+    elif not click.confirm("Cancel this resting entry?", default=False):
+        raise click.ClickException("aborted.")
+
+    now_ts = int(time.time())
+    broker = _build_broker(_load_cfg(ctx))
+
+    # RE-READ AND RE-CLASSIFY after the prompt. A typed phrase is 34 characters, and a resting
+    # order can fill while it is being typed -- at which point `clears_bracket`, decided before the
+    # prompt, would run an orphan sweep against inventory that now exists. Everything downstream
+    # reads `fresh`, and a status change is a refusal rather than a proceed: the operator answered
+    # a question about a different order than the one in front of them now.
+    row = repo.get_order(order_id)
+    if row is None:
+        raise click.ClickException(f"order {order_id} vanished from the book while you answered.")
+    fresh = classify_cancel(repo, order_id, row=row)
+    if not fresh.cancellable:
+        raise click.ClickException(
+            f"not cancelling: {fresh.reason}. That changed while you were answering."
+        )
+
+    try:
+        _cancel_at_exchange(broker, repo, row)
+    except (CancelUnavailable, CancelPending) as exc:
+        # A CLI failure, not a traceback. This is the LIKELY outcome of the window above -- the
+        # order filled while the operator typed -- and "the exchange refused" is a sentence they
+        # can act on where a `RuntimeError` is not. Nothing local was written: `_cancel_at_exchange`
+        # marks no state on failure, which is its own first rule.
+        raise click.ClickException(f"the venue did not cancel order {order_id}: {exc}") from exc
+
+    # The fill BEFORE the terminal status, because `canceled` is terminal and `execution.reconcile`
+    # states the rule this would otherwise break: "A CANCELLED/EXPIRED order can still have SOLD
+    # something -- Coinbase reports `filled_size > 0` for an order that partly filled before being
+    # cancelled." `_polled_rows` only revisits RESTING statuses, so a fill dropped here is dropped
+    # for good -- and `CANCELLABLE_STATUSES` deliberately includes `partially_filled`, which is
+    # exactly the row that carries one.
+    _record_fill_before_cancel(broker, repo, row, now_ts)
+    repo.update_order(order_id, status="canceled", updated_at=now_ts)
+    click.echo(f"cancelled order {order_id} at the venue.")
+
+    if fresh.clears_bracket:
+        cleared, stranded = _clear_orphaned_brackets(broker, repo, fresh.product_id, now_ts)
+        for cleared_id in cleared:
+            click.echo(f"cleared orphaned bracket {cleared_id} on {fresh.product_id}.")
+        if stranded:
+            # LOUD. The entry is gone and a protective leg may still be working at the venue over
+            # inventory that was never acquired, which is a state an operator has to know about
+            # rather than discover from a fill.
+            raise click.ClickException(
+                f"order {order_id} was cancelled, but orphaned bracket(s) "
+                f"{', '.join(str(one) for one in stranded)} on {fresh.product_id} could NOT be "
+                "cleared -- they may still be live at the venue over inventory that was never "
+                "acquired. Check the venue directly."
+            )
+
+
+def _record_fill_before_cancel(
+    broker: Any, repo: Repository, row: dict[str, Any], now_ts: int
+) -> None:
+    """Book whatever the order filled before it is marked terminal.
+
+    Reuses `execution.reconcile`'s own recorder rather than restating it: that module owns the
+    rule that a cancelled order can still have filled, and owns what booking a fill means.
+
+    WRAPPED, because this is the one step here that must not be able to strip the cancel it
+    follows. The venue has already confirmed; failing to read back a fill is a reporting gap the
+    next reconcile pass can close, while raising would leave the order live locally and cancelled
+    at the exchange -- the disagreement this whole command exists to avoid.
+    """
+    from keel.execution import reconcile as reconcile_mod
+
+    recorder = getattr(reconcile_mod, "_try_record_fill", None)
+    if recorder is None:  # pragma: no cover - the seam is present in every shipped build
+        return
+    try:
+        recorder(broker, repo, row, now_ts)
+    except Exception:
+        log_exception(logger, "orders.cancel_fill_readback_failed", order_id=row.get("id"))
+
+
+def _clear_orphaned_brackets(
+    broker: Any, repo: Repository, product_id: str, now_ts: int
+) -> tuple[list[int], list[int]]:
+    """Cancel the resting SELLs on `product_id` that NO OPEN TRANCHE relies on.
+
+    `(cleared, stranded)`.
+
+    **Deliberately NOT `executor._clear_resting_bracket`, and the difference nearly shipped as a
+    one-`y` path to a naked position.** That function is product-wide: it cancels every resting
+    SELL for the product, which is right where the executor calls it because the caller is about to
+    place a REPLACEMENT sell over the same inventory. Here nothing replaces anything -- the entry
+    is going away -- so cancelling every resting sell strips the stop from any other open tranche
+    on that product, on the one path built to be frictionless. Cancelling that bracket directly
+    demands the typed phrase; reaching it sideways through an entry must not be a shortcut past
+    that.
+
+    So the filter is `open_bracket_order_ids()`, the same set `classify_cancel` calls `protective`.
+    What is left is a resting sell nothing depends on -- an order committing base inventory that no
+    open position accounts for, which is what "orphan" means here.
+
+    Failures are COLLECTED rather than raised, so one uncancellable orphan does not hide the others
+    from the operator, and the caller reports them all at once.
+    """
+    from keel.execution.executor import CancelPending, CancelUnavailable, _cancel_at_exchange
+
+    protected = repo.open_bracket_order_ids()
+    rows: list[dict[str, Any]] = []
+    for status in CANCELLABLE_STATUSES:
+        rows.extend(repo.get_orders(mode="live", product_id=product_id, status=status))
+
+    cleared: list[int] = []
+    stranded: list[int] = []
+    for row in sorted(rows, key=lambda one: int(one["id"])):
+        order_id = int(row["id"])
+        if str(row.get("side") or "").lower() != "sell" or order_id in protected:
+            continue
+        try:
+            _cancel_at_exchange(broker, repo, row)
+        except (CancelUnavailable, CancelPending):
+            log_exception(logger, "orders.orphan_bracket_cancel_failed", order_id=order_id)
+            stranded.append(order_id)
+            continue
+        repo.update_order(order_id, status="canceled", updated_at=now_ts)
+        cleared.append(order_id)
+    return cleared, stranded

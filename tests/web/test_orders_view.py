@@ -702,3 +702,135 @@ def test_the_status_tab_reaches_the_query_string_not_a_client_side_filter() -> N
     the fifty rows that arrived and label the result "every canceled order"."""
     code = _code("main.js")
     assert ".status = status" in code, "the tab must set the endpoint's status param"
+
+
+# -- the cancel asymmetry, console side (#707) ---------------------------------------------------
+#
+# THE DECISION THIS PINS: `keel serve` holds no venue credential and no broker handle, and #707
+# settled that it never will. Cancelling reaches a venue, so the console classifies (a read) and
+# hands over the exact terminal command. The refusals below are the boundary itself, so they are
+# asserted structurally rather than trusted.
+
+
+def test_there_is_no_cancel_route_at_all() -> None:
+    """Not a guarded route -- NO route. A guard is a thing that can be got wrong; an absent
+    endpoint cannot be. The console's only POST remains `keel.commands.setup.ACTIONS`."""
+    from keel.web.api import API_ROUTES
+
+    assert not [path for path in API_ROUTES if "cancel" in path]
+
+
+def test_the_web_package_cannot_reach_a_broker_or_a_credential() -> None:
+    """No web module NAMES the broker or credential seams. The narrow half of the property."""
+    import pathlib
+
+    web = pathlib.Path(__file__).resolve().parents[2] / "keel" / "web"
+    for path in sorted(web.glob("*.py")):
+        text = path.read_text(encoding="utf-8")
+        for forbidden in ("_build_broker", "cancel_order", "_cancel_at_exchange", "load_secret"):
+            assert forbidden not in text, f"{path.name} reaches for {forbidden}"
+
+
+def test_serving_the_orders_page_imports_no_credential_code(tmp_path) -> None:
+    """The property the whole decision rests on, asserted where it actually lives.
+
+    The source scan above would pass either way, and this PR is the demonstration: it put a
+    broker-building, venue-cancelling function (`orders_cancel`) into `keel.commands.orders` --
+    the module `read_orders` imports on every request -- and that scan never looked past
+    `keel/web/`. Nothing routes to it, and "nothing routes to it" is what needs asserting.
+
+    So: drive a real request and check that `keel_core.secrets` was never imported. It is the
+    module that reaches the OS keychain, and its absence from `sys.modules` is the difference
+    between "reads a local SQLite file" and "holds live trading keys".
+    """
+    import subprocess
+    import sys
+
+    from keel.data.db import connect, migrate
+
+    db_path = tmp_path / "keel.db"
+    conn = connect(str(db_path))
+    migrate(conn)
+    conn.close()
+
+    probe = "\n".join(
+        (
+            "import sys",
+            "from keel.web import api",
+            "from keel.web.server import ServeConfig",
+            "cfg = ServeConfig(",
+            "    host='127.0.0.1', port=0, token='t',",
+            f"    db_path={str(db_path)!r}, config_path={str(tmp_path / 'nope.yaml')!r},",
+            ")",
+            "api.read_orders(cfg, {}, None, 0)",
+            "print('secrets' if 'keel_core.secrets' in sys.modules else 'clean')",
+        )
+    )
+
+    result = subprocess.run(
+        [sys.executable, "-c", probe], capture_output=True, text=True, check=False
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "clean", (
+        "serving /api/orders imported keel_core.secrets -- the console is no longer "
+        "credential-free"
+    )
+
+
+def test_the_console_never_builds_a_control_that_cancels() -> None:
+    """The button opens instructions. `openCancelHelp` may copy text and close itself, and it may
+    not post, fetch or navigate -- there is nothing to post to (see the route test above), and a
+    client that tried would fail silently rather than loudly."""
+    body = _source("render.js")
+    start = body.index("function openCancelHelp(")
+    end = body.index("\nfunction ", start + 1)
+    modal = body[start:end]
+
+    for forbidden in ("fetch(", "XMLHttpRequest", "location", "submit", "method:", '"POST"'):
+        assert forbidden not in modal, f"the cancel modal reaches for {forbidden}"
+
+
+def test_the_console_hands_over_the_command_rather_than_composing_it() -> None:
+    """Rule 2. A client that concatenated `keel orders cancel ` and an id could print a command
+    that does not exist -- and it would have to read `Field.value` to find the id, which this
+    file may not do."""
+    body = _source("render.js")
+    start = body.index("function openCancelHelp(")
+    end = body.index("\nfunction ", start + 1)
+    modal = body[start:end]
+
+    assert "cancel.invocation" in modal
+    assert "keel orders cancel" not in modal
+
+
+def test_the_orders_payload_carries_the_classification_and_the_command() -> None:
+    from decimal import Decimal
+
+    from keel.commands.orders import gather_orders
+    from keel.data.db import connect, migrate
+    from keel.data.repository import Repository
+    from keel.web import payload
+
+    conn = connect(":memory:")
+    migrate(conn)
+    repo = Repository(conn)
+    order_id = repo.insert_order(
+        {
+            "mode": "live",
+            "product_id": "BTC-USD",
+            "side": "buy",
+            "qty": Decimal("1"),
+            "status": "pending",
+            "created_at": 1_000,
+        }
+    )
+    body = payload.orders_payload(gather_orders(repo, now_ts=2_000, scope="all"))
+
+    (row,) = body["rows"]
+    assert row["cancel"]["invocation"] == f"keel orders cancel {order_id}"
+    assert row["cancel"]["kind"]["value"] == "entry"
+    assert row["cancel"]["typed"]["value"] == "false"
+    assert "#" in row["cancel"]["headline"]
+    # And the page says why it cannot do this itself.
+    assert "read-only" in body["write_posture"]["value"]
+    assert "no venue credentials" in body["write_posture"]["display"]

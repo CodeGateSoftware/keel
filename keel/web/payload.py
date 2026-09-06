@@ -1672,6 +1672,62 @@ _ORDER_STATUS_STATES: dict[str, str] = {
 }
 
 
+#: The state each cancel kind carries. `entry` is NEUTRAL and never GOOD -- cancelling one is
+#: ordinary, not an achievement -- and `protective` warns because acting on it removes a stop.
+_CANCEL_STATES: Mapping[str, str] = {
+    "entry": NEUTRAL,
+    "exit": WARN,
+    "protective": WARN,
+    "unknown": UNKNOWN,
+}
+
+
+def _cancel_payload(decision: Any) -> dict[str, Any]:
+    """How an operator cancels this order, and what cancelling it would mean (#707).
+
+    **There is no route behind any of this, and that is the design rather than a gap.** `keel
+    serve` holds no venue credential and no broker handle; the whole console is a loopback reader
+    of a SQLite file. Cancelling reaches a venue, so it happens in a terminal invocation the
+    operator started -- and what the console does instead is CLASSIFY (a read) and hand over the
+    exact command.
+
+    The `invocation` is composed in `commands/orders.py` and placed here unread. A client building
+    the command itself could print one that does not exist; a payload that omitted it would leave
+    the operator to reconstruct an order id from a table.
+
+    `kind` carries its judgement as a state (Rule 3) because the two readings are not symmetric: an
+    entry is ordinary, and a protective leg is the one an operator should hesitate over.
+    """
+    from keel.commands.orders import CANCEL_NOTES
+
+    return {
+        "headline": decision.headline,
+        "kind": label(
+            decision.kind,
+            display=decision.kind,
+            state=_CANCEL_STATES.get(decision.kind, UNKNOWN),
+        ),
+        "note": CANCEL_NOTES.get(decision.kind, ""),
+        # A flag rather than a bare bool: "this cannot be cancelled" and "this can" are different
+        # sentences, and the reason belongs beside the second one.
+        "cancellable": flag(
+            bool(decision.cancellable),
+            on="resting — cancellable from the terminal",
+            off=decision.reason or "not cancellable",
+            on_state=NEUTRAL,
+            off_state=UNKNOWN,
+        ),
+        "typed": flag(
+            bool(decision.typed),
+            on="typed phrase required",
+            off="asks once",
+            on_state=WARN,
+            off_state=NEUTRAL,
+        ),
+        "invocation": decision.invocation,
+    }
+
+
 def _order_row_payload(row: OrderRow) -> dict[str, Any]:
     """One `OrderRow`, placed. Nothing is decided here.
 
@@ -1789,6 +1845,9 @@ def _order_row_payload(row: OrderRow) -> dict[str, Any]:
         "rule_id": count(row.rule_id),
         "created_at": moment(row.created_at),
         "updated_at": moment(row.updated_at),
+        # #707: how to cancel this, and what cancelling it would mean. No route behind it --
+        # see `_cancel_payload`.
+        "cancel": _cancel_payload(row.cancel),
     }
 
 
@@ -1807,6 +1866,8 @@ def orders_payload(report: OrdersReport) -> dict[str, Any]:
     `modes` is every mode present in the whole book. A deployment book holds one in practice, so
     stating which means a reader never concludes it from an empty section.
     """
+    from keel.commands.orders import WEB_READ_ONLY_BADGE, WEB_READ_ONLY_NOTE
+
     return {
         "as_of": iso(report.now_ts),
         "generated_at": moment(report.now_ts),
@@ -1826,6 +1887,11 @@ def orders_payload(report: OrdersReport) -> dict[str, Any]:
         "modes": [str(mode) for mode in report.modes],
         "empty_reason": report.empty_reason,
         "empty_note": _EMPTY_NOTES.get(report.empty_reason, ""),
+        # The badge the console wears on this page (#707). Written here, not in the client: it is a
+        # claim about how this deployment is built, and Rule 2 keeps claims in Python.
+        "write_posture": label(
+            WEB_READ_ONLY_BADGE, display=WEB_READ_ONLY_NOTE, state=NEUTRAL
+        ),
         "rows": [_order_row_payload(row) for row in report.rows],
     }
 

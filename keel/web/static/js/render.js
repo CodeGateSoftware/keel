@@ -1869,6 +1869,10 @@ export function ordersView(data, sort, onSort, onScope, onStatus) {
 
   const sub = el("p", "sub");
   sub.append(field(data.generated_at));
+  // #707. The badge, on the page where an operator would otherwise expect a Cancel that acts.
+  // It is not an apology for a missing feature: `keel serve` holds no venue credentials, which
+  // is what keeps the worst case of a bug in this layer at "reads a local file".
+  if (data.write_posture) sub.append(" · ", field(data.write_posture));
   fragment.append(sub);
 
   fragment.append(scopeSwitch(plain(data.scope), onScope, "Orders scope"));
@@ -1919,6 +1923,8 @@ export function ordersView(data, sort, onSort, onScope, onStatus) {
         { label: "divergence", numeric: true, key: "fill_divergence" },
         { label: "fee", numeric: true, key: "fee" },
         { label: "placed (UTC)", numeric: false, key: "created_at" },
+        // No `key`: there is nothing to sort by, and the column is an action rather than a fact.
+        { label: "cancel", numeric: false },
       ],
       rows.map(
         /** @param {any} row */ (row) => [
@@ -1938,6 +1944,7 @@ export function ordersView(data, sort, onSort, onScope, onStatus) {
           row.fill_divergence,
           row.fee,
           row.created_at,
+          cancelCell(row),
         ],
       ),
       // Never reached when `rows` is empty, because `emptyOrders` below answers first with the
@@ -1981,6 +1988,99 @@ function emptyOrders(data) {
  * @param {any} row
  * @returns {HTMLElement}
  */
+/**
+ * The cancel cell: a button that opens instructions, never a button that cancels (#707).
+ *
+ * **This console cannot cancel anything, and that is the design.** `keel serve` holds no venue
+ * credential and no broker handle — the whole application is a loopback reader of a SQLite file —
+ * so the worst case of a bug in this layer stays "reads a local database" rather than becoming
+ * "exfiltrates live trading keys". Unlocking the keychain and signing a request to a venue happens
+ * inside a terminal invocation the operator started, never from an ambient daemon.
+ *
+ * So what the button does is CLASSIFY and hand over the exact command. The classification is a
+ * read, it comes off the payload, and it is the same `classify_cancel` the terminal gates on — a
+ * console that decided for itself could call an order a frictionless entry while `keel orders
+ * cancel` demanded the typed phrase for it.
+ *
+ * An order that cannot be cancelled gets the reason instead of a button. Offering a command that
+ * would be refused is worse than offering none.
+ *
+ * @param {any} row
+ * @returns {HTMLElement}
+ */
+function cancelCell(row) {
+  const cancel = row.cancel;
+  if (!cancel) return el("span", "muted", "—");
+  // The INVOCATION's presence is the fact, not a `.value` read: `classify_cancel` composes a
+  // command only for an order that can actually take one, so an empty string here means the
+  // terminal would refuse it too. `render.js` may place `display` and style by `state` and may
+  // never inspect `value` -- and this is a bare string, not a `Field`.
+  if (!plain(cancel.invocation)) {
+    return el("span", "muted", plain(cancel.cancellable.display));
+  }
+  const open = el("button", "linklike", "Cancel…");
+  open.setAttribute("type", "button");
+  open.addEventListener("click", () => openCancelHelp(row));
+  return open;
+}
+
+/**
+ * The modal that tells an operator how to cancel, and copies the command (#707).
+ *
+ * The heading says WHAT the order is, because that is the decision: cancelling an entry refuses
+ * risk, and cancelling a protective leg removes a stop from a position that is relying on it. Both
+ * sentences come from the payload (Rule 2) and both invocations are the same command — the
+ * asymmetry lives in the terminal, where an exit will ask for a typed phrase.
+ *
+ * `<dialog>` rather than a hand-built overlay: focus trapping, Escape, and the backdrop are the
+ * browser's, and a modal that traps focus badly is worse than none on a page an operator reaches
+ * with a keyboard.
+ *
+ * @param {any} row
+ */
+function openCancelHelp(row) {
+  const cancel = row.cancel;
+  // Any dialog still open belongs to a previous read. The view repaints every 15 seconds and
+  // `main.js` replaces `#content`, which this node is deliberately outside of -- so without this
+  // an open modal survives the repaint and can go on offering a command for an order that has
+  // since filled. The CLI would refuse it by name, but a console showing a stale instruction is
+  // the console being wrong rather than the terminal being careful.
+  for (const stale of document.querySelectorAll("dialog.cancelhelp")) stale.remove();
+  const dialog = el("dialog", "cancelhelp");
+
+  // Composed in Python: "Entry order #42" and "Protective bracket #43 — live protection" are two
+  // different warnings, and choosing between them is a judgement (Rule 2).
+  dialog.append(el("h2", undefined, plain(cancel.headline)));
+
+  dialog.append(el("p", undefined, plain(cancel.note)));
+
+  const command = el("pre", "invocation", plain(cancel.invocation));
+  dialog.append(command);
+
+  const actions = el("p", "note");
+  const copy = el("button", "linklike", "Copy command");
+  copy.setAttribute("type", "button");
+  copy.addEventListener("click", () => {
+    // Clipboard writes are permitted on a secure context, and `localhost` is one. Where it is
+    // refused the command is still selectable text above — this is a convenience, never the only
+    // way to get the command.
+    if (navigator.clipboard) void navigator.clipboard.writeText(plain(cancel.invocation));
+    copy.textContent = "Copied";
+  });
+  actions.append(copy, " ");
+  actions.append(field(cancel.typed));
+  dialog.append(actions);
+
+  const close = el("button", "linklike", "Close");
+  close.setAttribute("type", "button");
+  close.addEventListener("click", () => dialog.close());
+  dialog.append(close);
+
+  dialog.addEventListener("close", () => dialog.remove());
+  document.body.append(dialog);
+  dialog.showModal();
+}
+
 function orderDetail(row) {
   const node = el("details", "cycle");
   const summary = el("summary");

@@ -99,6 +99,12 @@ class _RecordingRepo:
         self.calls.append((args, kwargs))
         return list(self.rows)
 
+    def open_bracket_order_ids(self) -> frozenset[int]:
+        """#707. Deliberately NOT recorded in `calls`: this pin is about the arguments
+        `get_orders` is handed, and a second read appearing there would make the assertion below
+        about two calls rather than one."""
+        return frozenset()
+
     def get_rules(self, *args: Any, **kwargs: Any) -> list[dict[str, Any]]:
         # `gather_orders` resolves rule NAMES off this (#700). Recorded nowhere: this stub
         # exists to pin how `get_orders` is called, and that pin is unchanged.
@@ -830,10 +836,18 @@ class _RuleCountingRepo:
         self._rules = rules
         self.order_reads = 0
         self.rule_reads = 0
+        self.bracket_reads = 0
 
     def get_orders(self, *args: Any, **kwargs: Any) -> list[dict[str, Any]]:
         self.order_reads += 1
         return list(self._orders)
+
+    def open_bracket_order_ids(self) -> frozenset[int]:
+        """#707's protective links, batched. Counted like the others: one read for the page, never
+        one per row -- which is the property `classify_cancel`'s `bracket_ids` argument exists
+        for."""
+        self.bracket_reads += 1
+        return frozenset()
 
     def get_rules(self, *args: Any, **kwargs: Any) -> list[dict[str, Any]]:
         self.rule_reads += 1
