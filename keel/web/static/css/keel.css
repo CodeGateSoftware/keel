@@ -256,6 +256,28 @@ header .mode-paper { color: var(--muted); }
 header .mode-confirm,
 header .mode-live { color: var(--accent); border-color: var(--accent); }
 
+/* THE PLANS PAGE's claim list (#706).
+ *
+ * A quoted sentence with its citation beside it, not beneath it: a citation a reader has to go
+ * looking for is one they take on trust, and taking this page on trust is the one thing it cannot
+ * afford. `list-style: none` because the numbering belongs to the document being quoted, not to
+ * this rendering of it -- a page that renumbered the constitution would be paraphrasing it in a
+ * different way. */
+.claims {
+  list-style: none;
+  margin: 0.5rem 0 1rem;
+  padding: 0;
+}
+.claims li {
+  padding: 0.35rem 0;
+  border-bottom: 1px solid var(--line);
+}
+.claims li:last-child { border-bottom: none; }
+.claims code {
+  font-size: 0.8em;
+  color: var(--muted);
+}
+
 /* THE SESSION CHIP (#704): profile · mode · equity state, as one group.
  *
  * A group and not three loose items, because the three are one answer: "which deployment is this

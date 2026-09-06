@@ -2890,6 +2890,128 @@ function venueCard(info) {
 }
 
 /**
+ * The Plans page, inverted (#706).
+ *
+ * A retail broker's Plans & Features page is a tier matrix with "Current plan" and "Upgrade"
+ * badges: radically clear about pricing, and honest as marketing, because every row exists to
+ * move a reader one row down. keel's constitution runs the other way -- "Paper is free and
+ * unlimited, forever" and "The free engine is never a demo" are two of its eight numbered lines.
+ *
+ * So this takes the clarity and refuses the gating. **There is nothing here to click.** No
+ * button, no link, no form, no price a reader can act on -- and not because this function
+ * declines to draw one, but because the payload sends no destination to draw it from. A page that
+ * told someone how to pay would have shipped the tier.
+ *
+ * Every sentence arrives quoted, with the repository path it came from, and this function places
+ * both. It composes nothing: the whole value of the page is that a reader can check it against
+ * the documents, and a renderer that rephrased a promise would be the first place the checking
+ * stopped working.
+ *
+ * @param {any} data  `/api/plans`'s `data`.
+ * @returns {DocumentFragment}
+ */
+export function plansView(data) {
+  const fragment = document.createDocumentFragment();
+  fragment.append(el("h1", undefined, "Plans"));
+  fragment.append(
+    el("p", "sub", "what runs on this device, what it costs, and why"),
+  );
+
+  // The state of play, first and in a card of its own. On a page shaped like a price list, the
+  // one thing a reader must not have to infer is whether any of it is for sale.
+  const state = el("div", "card");
+  state.append(field(data.for_sale));
+  fragment.append(state);
+
+  fragment.append(heading("h-constitution", "What every feature has to pass"));
+  fragment.append(claimList(data.constitution));
+
+  fragment.append(heading("h-tiers", "What a tier would change, if one existed"));
+  fragment.append(
+    table(
+      "h-tiers",
+      [
+        { label: "tier", numeric: false },
+        { label: "price", numeric: false },
+        { label: "what it would buy", numeric: false },
+        { label: "the promise", numeric: false },
+        { label: "status", numeric: false },
+      ],
+      (data.tiers || []).map(/** @param {any} tier */ (tier) => [
+        plain(tier.name),
+        plain(tier.price),
+        plain(tier.buys),
+        plain(tier.promise),
+        tier.status,
+      ]),
+      "No tiers published.",
+    ),
+  );
+
+  fragment.append(heading("h-triggers", "What would have to happen first"));
+  const framing = el("p", "note");
+  framing.append(citation(data.trigger_framing));
+  fragment.append(framing);
+  fragment.append(
+    table(
+      "h-triggers",
+      [
+        { label: "#", numeric: true },
+        { label: "what fires it", numeric: false },
+        { label: "recorded in", numeric: false },
+      ],
+      (data.triggers || []).map(/** @param {any} trigger */ (trigger) => [
+        plain(trigger.number),
+        plain(trigger.text),
+        plain(trigger.source),
+      ]),
+      "No triggers recorded.",
+    ),
+  );
+
+  fragment.append(heading("h-never", "What no tier will ever gate"));
+  fragment.append(claimList(data.never_paywalled));
+
+  return fragment;
+}
+
+/**
+ * A list of quoted claims, each with the file it came from (#706).
+ *
+ * The citation is beside the sentence rather than in a footnote, because a citation a reader has
+ * to go looking for is a citation they will take on trust -- which is the one thing this page
+ * cannot afford, its entire subject being what the project promises.
+ *
+ * @param {any[]} claims
+ * @returns {HTMLElement}
+ */
+function claimList(claims) {
+  const list = el("ul", "claims");
+  for (const claim of claims || []) {
+    const item = el("li");
+    item.append(el("span", undefined, plain(claim.text)), " ");
+    item.append(citation(claim));
+    list.append(item);
+  }
+  return list;
+}
+
+/**
+ * One citation: the repository-relative path a sentence was quoted from.
+ *
+ * A `<code>` and NOT an `<a>`. There is no server here to fetch a document from -- `keel serve`
+ * is a loopback SQLite reader -- and a link that 404ed would be worse than a path a reader can
+ * open in their own checkout. It is also the page's one structural refusal: nothing in this view
+ * builds an anchor, so nothing in it can become a destination.
+ *
+ * @param {any} claim
+ * @returns {HTMLElement}
+ */
+function citation(claim) {
+  return el("code", "muted", plain(claim.source));
+}
+
+/**
  * Gates: `/api/gates`'s payload -- the capability inventory (#436).
  *
  * **This view is the reason a browser interface can be honest about its own limits.** The read

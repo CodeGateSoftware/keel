@@ -140,6 +140,7 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
     # rather than leaving two `JournalReport`s in one namespace to be told apart by context.
     from keel.commands.journal import JournalReport as DiscretionaryJournal
     from keel.commands.orders import OrderRow, OrdersReport
+    from keel.commands.plans import Claim, PlansReport, Tier, Trigger
     from keel.commands.positions import PositionRow, PositionsReport
     from keel.commands.research_record import RuleExploration, TrialRow, TrialsReport
     from keel.commands.slippage import SlippageReport, SlippageRow
@@ -1365,6 +1366,139 @@ def _rules_followed_state(value: bool | None) -> str:
     if value is None:
         return UNKNOWN
     return NEUTRAL if value else WARN
+
+
+# -- plans, inverted (#706) ------------------------------------------------------------------------
+#
+# THE ONE PAGE IN THIS APPLICATION WHOSE SUBJECT IS THE PROJECT RATHER THAN THE DEPLOYMENT, and
+# the only one that reads no repository at all.
+#
+# Every string below is quoted from a document and carries the file it came from, checked by
+# `tests/commands/test_plans.py` against the file itself. Nothing here is composed, summarised or
+# softened on the way to the wire -- the whole value of the page is that a reader can check it,
+# and a payload that rephrased a promise would be the first place the checking stopped working.
+
+
+def _claim_payload(claim: Claim) -> dict[str, Any]:
+    """One quoted sentence and its citation.
+
+    `source` is a repository-relative PATH, not a title, because a reader with the repository in
+    front of them can open it -- and because the test that keeps this page honest opens it too. A
+    citation naming "the evolution plan" would look checkable and be nothing of the kind.
+    """
+    return {"text": claim.text, "source": claim.source}
+
+
+def _tier_payload(tier: Tier) -> dict[str, Any]:
+    """One row of the Phase F table, and whether it exists.
+
+    `status` is a `label` and the readings are NOT good and bad. The free tier is what the
+    reader is already running (`GOOD` -- it is the one thing on this page that is true today), and
+    every other row is `UNKNOWN`: not warned about, not promised, simply not a thing yet. `WARN`
+    would read as a caution about a product, and there is no product to caution anyone about.
+
+    `shipped` and `available_now` are separate fields on the report and collapse to one word here,
+    because a client rendering two booleans would be deciding what their combination means, which
+    is a judgement (Rule 2). The state comes off the SAME word, not off `available_now` -- the
+    first cut read `GOOD if tier.available_now else UNKNOWN`, so the day a Pro tier shipped, the
+    one row that had become real would have worn the same "not a thing yet" badge as the three
+    that had not.
+    """
+    return {
+        "name": tier.name,
+        "price": tier.price,
+        "buys": tier.buys,
+        "promise": tier.promise,
+        "source": tier.source,
+        "status": label(
+            _tier_status(tier),
+            display=_TIER_STATUS_NOTES[_tier_status(tier)],
+            state=_TIER_STATES[_tier_status(tier)],
+        ),
+    }
+
+
+#: What each tier's one-word status MEANS. The word is short enough for a table cell; the sentence
+#: is what stops a reader taking "planned" for "coming soon", which is the reading a page like this
+#: is normally built to encourage.
+_TIER_STATUS_NOTES: Mapping[str, str] = {
+    "running": "this is what you are running now, and it is the whole engine",
+    "planned": "does not exist — a published intention, gated on a trigger that has not fired",
+    # The one status a future PR will actually set, and the first cut left its display collapsed to
+    # the word itself -- so the cell would have read "shipped / shipped" on the only row where a
+    # reader most needs a sentence.
+    "shipped": "this exists and can be bought — see the decision record that superseded ADR 0004",
+}
+
+
+#: The state each status word carries. `running` and `shipped` are both things that EXIST; the
+#: difference between them is price, not reality, and a page that graded the shipped one as unknown
+#: would be contradicting its own table. `planned` is UNKNOWN and never WARN: there is no product
+#: to caution anyone about.
+_TIER_STATES: Mapping[str, str] = {
+    "running": GOOD,
+    "shipped": GOOD,
+    "planned": UNKNOWN,
+}
+
+
+def _tier_status(tier: Tier) -> str:
+    """`running` for the free tier, `planned` for the rest -- and `shipped` for whichever row a
+    future PR flips, which is the only edit this page should ever need."""
+    if tier.shipped:
+        return "shipped"
+    return "running" if tier.available_now else "planned"
+
+
+def _trigger_payload(trigger: Trigger) -> dict[str, Any]:
+    return {
+        "number": str(trigger.number),
+        "text": trigger.text,
+        "source": trigger.source,
+    }
+
+
+def plans_payload(report: PlansReport) -> dict[str, Any]:
+    """The transparency artifact (#706).
+
+    **The refusals are structural, not editorial.** There is no `cta`, no `url`, no `action` and
+    no `contact` key on this payload, and there is nothing for a client to build one out of.
+    `render.js` cannot make a button out of a page that never sends it a destination.
+
+    `for_sale` is a `flag` derived from the tier table rather than a constant, so the sentence and
+    the table cannot come to disagree: flipping one tier's `shipped` is all it takes for the page
+    to stop saying nothing is for sale.
+    """
+    from keel.commands.plans import (
+        NOTHING_FOR_SALE,
+        TRIGGER_FRAMING,
+        TRIGGER_FRAMING_SOURCE,
+    )
+    from keel.commands.plans import (
+        Claim as _Claim,
+    )
+
+    return {
+        # NO `as_of`/`generated_at`, matching `gates_payload` next door, which also describes
+        # capability rather than deployment and also sends none. Nothing on this page was
+        # OBSERVED at a moment -- it changes when a document changes -- and a stamp nobody renders
+        # is a stamp that eventually gets rendered, dating a page that has no date.
+        "for_sale": flag(
+            report.anything_for_sale,
+            on="a tier has shipped — this page is out of date",
+            off=NOTHING_FOR_SALE,
+            on_state=WARN,
+            off_state=NEUTRAL,
+        ),
+        "constitution": [_claim_payload(claim) for claim in report.constitution],
+        "tiers": [_tier_payload(tier) for tier in report.tiers],
+        # The framing rides as a CLAIM like every other sentence here -- it is quoted from ADR
+        # 0004 and is checkable against it, and a trigger measured in revenue rather than users
+        # would turn this page into a countdown.
+        "trigger_framing": _claim_payload(_Claim(TRIGGER_FRAMING, TRIGGER_FRAMING_SOURCE)),
+        "triggers": [_trigger_payload(trigger) for trigger in report.triggers],
+        "never_paywalled": [_claim_payload(claim) for claim in report.never_paywalled],
+    }
 
 
 # -- activity ------------------------------------------------------------------------------------

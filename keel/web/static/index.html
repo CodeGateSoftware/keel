@@ -25,7 +25,7 @@
     2. It is the project's own argument for choosing the web at all (§4 of the spec's
        Philosophy): the structure of the page is readable in view-source without running
        anything.
-    3. The nav is a fixed list of eight links. Building a fixed list at runtime buys nothing and
+    3. The nav is a fixed list of links. Building a fixed list at runtime buys nothing and
        costs the keyboard path before the module has loaded.
 
   ── NO INLINE SCRIPT AND NO INLINE STYLE, AND THAT IS ENFORCED ──────────────────────────────
@@ -134,10 +134,18 @@
       <li><a href="/venues">Venues</a></li>
       <li><a href="/gates">Gates</a></li>
       <!--
-        THE EIGHTH NAV ENTRY IS A LINK, NOT A VIEW (#539).
+        #706. Beside Gates because it belongs to the same half of the app: what this deployment is
+        allowed to do, and what it costs. A transparency artifact rather than a paywall matrix --
+        it lists what is free forever and why, and there is nothing on it to buy.
+      -->
+      <li><a href="/plans">Plans</a></li>
+      <!--
+        THE LAST NAV ENTRY IS A LINK, NOT A VIEW (#539).
 
-        `render.py`'s NAV has eight entries and this client has seven, and the difference is the
-        glossary. keel's `docs/` lives at the REPOSITORY root, outside the `keel/` module that
+        It was "the eighth" when the nav had seven views; it is now the fourteenth, and a count
+        written into prose is a count that goes stale silently -- so it is described by its
+        position rather than numbered. (`render.py`, which this comment used to compare against,
+        was deleted at #540; the difference it named was the glossary.) keel's `docs/` lives at the REPOSITORY root, outside the `keel/` module that
         `uv_build` packages, so no wheel has ever carried it -- every installed deployment
         renders an empty glossary today. That is not fixable with a packaging glob (measured at
         #535: the `artifacts` key is inert on the pinned backend), so the documentation is

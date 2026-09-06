@@ -1908,3 +1908,39 @@ def test_a_profitable_self_reported_day_still_warns() -> None:
     body = payload._discretionary_journal_payload(_notes(dollar_impact=Decimal("250")))
     entry = body["entries"][0]
     assert entry["dollar_impact"]["state"] == "warn"
+
+
+def test_a_shipped_tier_reads_as_something_that_exists() -> None:
+    """#706. The state comes off the STATUS WORD, not off `available_now`.
+
+    The first cut read `GOOD if tier.available_now else UNKNOWN`, so the day a Pro tier shipped,
+    the one row that had become real would have worn the same "not a thing yet" badge as the three
+    that had not -- while the docstring beside it asserted every other row is unknown because it is
+    "simply not a thing yet". `running` and `shipped` are both things that EXIST; the difference
+    between them is price, not reality.
+    """
+    from dataclasses import replace
+
+    from keel.commands.plans import gather_plans
+
+    report = gather_plans()
+    shipped = replace(report, tiers=tuple(replace(t, shipped=True) for t in report.tiers))
+    statuses = {
+        row["status"]["value"]: row["status"] for row in payload.plans_payload(shipped)["tiers"]
+    }
+
+    assert set(statuses) == {"shipped"}
+    assert statuses["shipped"]["state"] == "good"
+    # And a sentence, not the word again: this is the one status a future PR will actually set.
+    assert statuses["shipped"]["display"] != "shipped"
+
+
+def test_a_planned_tier_is_unknown_and_never_a_warning() -> None:
+    """There is no product to caution anyone about. `WARN` would read as a caveat on something a
+    reader might buy."""
+    from keel.commands.plans import gather_plans
+
+    rows = payload.plans_payload(gather_plans())["tiers"]
+    planned = [row["status"] for row in rows if row["status"]["value"] == "planned"]
+    assert len(planned) == 3
+    assert {status["state"] for status in planned} == {"unknown"}
