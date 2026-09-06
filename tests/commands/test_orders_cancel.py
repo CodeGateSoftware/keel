@@ -451,3 +451,222 @@ def test_a_bracket_that_cannot_be_cleared_fails_the_command_loudly(
     conn = connect(str(db_path))
     migrate(conn)
     assert Repository(conn).get_order(entry)["status"] == "canceled"
+
+
+# -- what an entry cancel may and may not take with it ---------------------------------------------
+
+
+def _deployment_with(tmp_path, monkeypatch, refuse: tuple[str, ...] = ()):
+    from tests.conftest import VALID_CONFIG_YAML
+
+    db_path = tmp_path / "keel.db"
+    conn = connect(str(db_path))
+    migrate(conn)
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(VALID_CONFIG_YAML)
+    broker = _Broker(refuse=refuse)
+    monkeypatch.setattr("keel.commands._common._is_interactive", lambda: True)
+    monkeypatch.setattr("keel.commands._common._build_broker", lambda _cfg: broker)
+    return db_path, config_path, broker, conn
+
+
+def test_cancelling_an_entry_NEVER_touches_a_live_tranches_bracket(tmp_path, monkeypatch) -> None:
+    """THE finding this test exists for, and it was a one-`y` path to a naked position.
+
+    The first cut reused `executor._clear_resting_bracket`, whose contract is PRODUCT-WIDE: it
+    cancels every resting SELL for the product. That is right where the executor calls it, because
+    the caller is about to place a replacement SELL over the same inventory. It is catastrophic
+    here -- the entry is going away and nothing replaces the protection, so cancelling an entry on
+    a product that already held an open bracketed tranche stripped that tranche's stop behind a
+    single `y`, on the one code path deliberately built to be frictionless.
+
+    Cancelling that bracket DIRECTLY demands the typed phrase. Reaching it sideways through an
+    entry must not be a shortcut past that.
+
+    The aftermath was silent: the tranche kept pointing at a cancelled order, and
+    `reconcile_unbracketed_positions` skips a tranche with no `unbracketed:` record by design, so
+    nothing healed it and nothing said anything.
+    """
+    db_path, config_path, broker, conn = _deployment_with(tmp_path, monkeypatch)
+    repo = Repository(conn)
+
+    bracket = _order(
+        repo, side="sell", status="pending", raw_response='{"order_id": "venue-bracket"}'
+    )
+    repo.open_position(
+        product_id="BTC-USD",
+        rule_name="breakout",
+        qty=Decimal("1"),
+        entry_fill=Decimal("50000"),
+        entry_fee=Decimal("5"),
+        opened_at=NOW - 500,
+        bracket_order_id=bracket,
+    )
+    entry = _order(repo, side="buy", status="pending", raw_response='{"order_id": "venue-entry"}')
+    conn.close()
+
+    from click.testing import CliRunner
+
+    from keel.cli import cli
+
+    result = CliRunner().invoke(
+        cli,
+        ["--db", str(db_path), "--config", str(config_path), "orders", "cancel", str(entry)],
+        input="y\n",
+    )
+
+    assert result.exit_code == 0, result.output
+    assert broker.cancelled == ["venue-entry"], "the live tranche's bracket was cancelled too"
+
+    conn = connect(str(db_path))
+    migrate(conn)
+    book = Repository(conn)
+    assert book.get_order(entry)["status"] == "canceled"
+    assert book.get_order(bracket)["status"] == "pending", "a live tranche was left with no stop"
+
+
+def test_cancelling_an_entry_does_clear_a_bracket_no_position_relies_on(
+    tmp_path, monkeypatch
+) -> None:
+    """The orphan the rule is actually for: a resting SELL that no OPEN tranche points at commits
+    base inventory nothing acquired, and it goes with the entry."""
+    db_path, config_path, broker, conn = _deployment_with(tmp_path, monkeypatch)
+    repo = Repository(conn)
+
+    orphan = _order(
+        repo, side="sell", status="pending", raw_response='{"order_id": "venue-orphan"}'
+    )
+    entry = _order(repo, side="buy", status="pending", raw_response='{"order_id": "venue-entry"}')
+    conn.close()
+
+    from click.testing import CliRunner
+
+    from keel.cli import cli
+
+    result = CliRunner().invoke(
+        cli,
+        ["--db", str(db_path), "--config", str(config_path), "orders", "cancel", str(entry)],
+        input="y\n",
+    )
+
+    assert result.exit_code == 0, result.output
+    assert broker.cancelled == ["venue-entry", "venue-orphan"]
+
+    conn = connect(str(db_path))
+    migrate(conn)
+    assert Repository(conn).get_order(orphan)["status"] == "canceled"
+
+
+def test_a_fill_landing_while_the_operator_answers_stops_the_cancel(
+    tmp_path, monkeypatch
+) -> None:
+    """A typed phrase is 34 characters, and a resting order can fill while it is being typed.
+
+    The first cut classified once, before the prompt, and everything downstream read that stale
+    decision -- so an entry that had become `filled` still ran the orphan sweep, and
+    `clears_bracket` was answering a question about an order that no longer existed in that
+    state. The operator answered a question about a different order from the one in front of them
+    now, so the honest response is to refuse rather than to proceed on the old answer.
+    """
+    db_path, config_path, broker, conn = _deployment_with(tmp_path, monkeypatch)
+    repo = Repository(conn)
+    entry = _order(repo, side="buy", status="pending", raw_response='{"order_id": "venue-entry"}')
+    conn.close()
+
+    def _fill_then_confirm(*_args: object, **_kwargs: object) -> bool:
+        book = connect(str(db_path))
+        migrate(book)
+        Repository(book).update_order(entry, status="filled", updated_at=NOW)
+        book.close()
+        return True
+
+    monkeypatch.setattr("click.confirm", _fill_then_confirm)
+
+    from click.testing import CliRunner
+
+    from keel.cli import cli
+
+    result = CliRunner().invoke(
+        cli, ["--db", str(db_path), "--config", str(config_path), "orders", "cancel", str(entry)]
+    )
+
+    assert result.exit_code != 0
+    assert "changed while you were answering" in result.output
+    assert broker.cancelled == [], "the venue was asked to cancel an order that had filled"
+
+
+def test_whatever_the_order_filled_is_booked_before_it_is_marked_canceled(
+    tmp_path, monkeypatch
+) -> None:
+    """`execution.reconcile` states the rule: a CANCELLED order can still have SOLD something, and
+    `canceled` is terminal -- `_polled_rows` only revisits resting statuses, so a fill dropped here
+    is dropped for good. `CANCELLABLE_STATUSES` deliberately includes `partially_filled`, which is
+    exactly the row that carries one."""
+    db_path, config_path, broker, conn = _deployment_with(tmp_path, monkeypatch)
+    repo = Repository(conn)
+    entry = _order(
+        repo,
+        side="buy",
+        status="partially_filled",
+        filled_quantity=Decimal("0.4"),
+        raw_response='{"order_id": "venue-entry"}',
+    )
+    conn.close()
+
+    seen: list[str] = []
+
+    def _spy(_broker: object, _repo: object, row: dict, _now: int) -> None:
+        # The status at the moment the fill is read back: still resting, because the terminal
+        # write has not happened yet. Booked after it, the row would be unreachable.
+        seen.append(str(row["status"]))
+
+    monkeypatch.setattr("keel.execution.reconcile._try_record_fill", _spy, raising=False)
+
+    from click.testing import CliRunner
+
+    from keel.cli import cli
+
+    result = CliRunner().invoke(
+        cli,
+        ["--db", str(db_path), "--config", str(config_path), "orders", "cancel", str(entry)],
+        input="y\n",
+    )
+
+    assert result.exit_code == 0, result.output
+    assert seen == ["partially_filled"], "the fill was never read back before the terminal write"
+
+
+def test_a_venue_that_refuses_the_cancel_is_a_message_not_a_traceback(
+    tmp_path, monkeypatch
+) -> None:
+    """`CancelUnavailable` is a `RuntimeError`, and `cli.main` re-raises everything. This is the
+    LIKELY outcome of the window above -- the order filled while the operator typed -- and "the
+    exchange refused" is a sentence they can act on where a Python traceback is not.
+
+    Local state is untouched either way: `_cancel_at_exchange` marks nothing on failure, which is
+    its own first rule.
+    """
+    db_path, config_path, broker, conn = _deployment_with(
+        tmp_path, monkeypatch, refuse=("venue-entry",)
+    )
+    repo = Repository(conn)
+    entry = _order(repo, side="buy", status="pending", raw_response='{"order_id": "venue-entry"}')
+    conn.close()
+
+    from click.testing import CliRunner
+
+    from keel.cli import cli
+
+    result = CliRunner().invoke(
+        cli,
+        ["--db", str(db_path), "--config", str(config_path), "orders", "cancel", str(entry)],
+        input="y\n",
+    )
+
+    assert result.exit_code != 0
+    assert result.exception is None or isinstance(result.exception, SystemExit), result.exception
+    assert "the venue did not cancel" in result.output
+
+    conn = connect(str(db_path))
+    migrate(conn)
+    assert Repository(conn).get_order(entry)["status"] == "pending"

@@ -49,6 +49,7 @@ from __future__ import annotations
 
 import datetime
 import json
+import logging
 import time
 from collections.abc import Mapping
 from dataclasses import dataclass, field
@@ -56,10 +57,13 @@ from decimal import Decimal, InvalidOperation
 from typing import Any
 
 import click
+from keel_core.telemetry import log_exception
 
 from keel.commands._common import _open_repo_ro, with_disclaimer
 from keel.data.repository import Repository
 from keel.execution.executor import RESTING_STATUSES
+
+logger = logging.getLogger(__name__)
 
 #: The scope vocabulary, spelled exactly as `keel.commands.activity.ACTIVITY_SCOPES` spells
 #: it. Two views over the same deployment answering "how far back" with different words would
@@ -214,7 +218,6 @@ class OrderRow:
 
     #: The `orders.id` primary key -- the number `keel doctor` and the log lines name.
     id: int
-
 
     #: `live` or `paper`, per ROW. Never inferred from the book: see the module docstring.
     mode: str
@@ -884,6 +887,9 @@ WEB_READ_ONLY_NOTE = (
 
 #: What each kind of cancel MEANS, for the modal that hands over the command. The word is a term of
 #: art; the sentence is what an operator decides on.
+#: Checked at import: a kind with no headline or no note would render an empty modal, and a table
+#: that has drifted from the vocabulary is exactly the thing nobody notices until a reader sees the
+#: gap. This is what `CANCEL_KINDS` is FOR -- declared and never read, it was decoration.
 CANCEL_HEADLINES: Mapping[str, str] = {
     "entry": "Entry order #{order_id} — resting",
     "exit": "⚠️ Exit order #{order_id} — live liquidation",
@@ -905,6 +911,12 @@ CANCEL_NOTES: Mapping[str, str] = {
     "unknown": "keel could not classify this order, so it is treated as protection.",
 }
 
+
+
+# The vocabulary and its tables, checked here rather than hoped about. `CANCEL_KINDS` existed and
+# nothing read it; now a kind added to the set without a headline or a note fails at import.
+assert set(CANCEL_HEADLINES) == set(CANCEL_KINDS), "CANCEL_HEADLINES does not cover CANCEL_KINDS"
+assert set(CANCEL_NOTES) == set(CANCEL_KINDS), "CANCEL_NOTES does not cover CANCEL_KINDS"
 
 @dataclass(frozen=True)
 class CancelDecision:
@@ -1045,7 +1057,9 @@ def classify_cancel(
 @click.pass_context
 @with_disclaimer
 def orders_cmd(ctx: click.Context, scope: str, limit: int) -> None:
-    """What keel actually bought and sold, and at what price -- read-only.
+    """What keel actually bought and sold, and at what price.
+
+    THE LISTING is read-only; `cancel` below is not, and it is the only write in this group.
 
     `keel orders` still LISTS, with no subcommand and the same options it always took (#707 turned
     it into a group and `invoke_without_command=True` is what keeps that true). `keel orders list`
@@ -1088,9 +1102,12 @@ def _list_orders(ctx: click.Context, *, scope: str, limit: int) -> None:
     help=f"How many rows to show, newest first (1-{MAX_ORDERS_LIMIT}).",
 )
 @click.pass_context
-@with_disclaimer
 def orders_list(ctx: click.Context, scope: str, limit: int) -> None:
-    """The same listing `keel orders` prints, under its own name."""
+    """The same listing `keel orders` prints, under its own name.
+
+    NO `@with_disclaimer`: click runs the group callback first, and it carries one. Both would
+    print it twice -- and on `--help`, print it above the usage text.
+    """
     _list_orders(ctx, scope=scope, limit=limit)
 
 
@@ -1102,7 +1119,6 @@ CANCEL_EXIT_PHRASE = "remove protection from order {order_id}"
 @orders_cmd.command("cancel")
 @click.argument("order_id", type=int)
 @click.pass_context
-@with_disclaimer
 def orders_cancel(ctx: click.Context, order_id: int) -> None:
     """Cancel a resting order. Entries ask once; exits and protective legs are typed.
 
@@ -1120,7 +1136,7 @@ def orders_cancel(ctx: click.Context, order_id: int) -> None:
     that rule and this calls it rather than restating it.
     """
     from keel.commands._common import _build_broker, _is_interactive, _load_cfg, _open_repo
-    from keel.execution.executor import _cancel_at_exchange, _clear_resting_bracket
+    from keel.execution.executor import CancelPending, CancelUnavailable, _cancel_at_exchange
 
     if not _is_interactive():
         raise click.ClickException(
@@ -1149,24 +1165,122 @@ def orders_cancel(ctx: click.Context, order_id: int) -> None:
 
     now_ts = int(time.time())
     broker = _build_broker(_load_cfg(ctx))
+
+    # RE-READ AND RE-CLASSIFY after the prompt. A typed phrase is 34 characters, and a resting
+    # order can fill while it is being typed -- at which point `clears_bracket`, decided before the
+    # prompt, would run an orphan sweep against inventory that now exists. Everything downstream
+    # reads `fresh`, and a status change is a refusal rather than a proceed: the operator answered
+    # a question about a different order than the one in front of them now.
     row = repo.get_order(order_id)
-    assert row is not None  # classify_cancel already read it inside this same process
-    _cancel_at_exchange(broker, repo, row)
+    if row is None:
+        raise click.ClickException(f"order {order_id} vanished from the book while you answered.")
+    fresh = classify_cancel(repo, order_id, row=row)
+    if not fresh.cancellable:
+        raise click.ClickException(
+            f"not cancelling: {fresh.reason}. That changed while you were answering."
+        )
+
+    try:
+        _cancel_at_exchange(broker, repo, row)
+    except (CancelUnavailable, CancelPending) as exc:
+        # A CLI failure, not a traceback. This is the LIKELY outcome of the window above -- the
+        # order filled while the operator typed -- and "the exchange refused" is a sentence they
+        # can act on where a `RuntimeError` is not. Nothing local was written: `_cancel_at_exchange`
+        # marks no state on failure, which is its own first rule.
+        raise click.ClickException(f"the venue did not cancel order {order_id}: {exc}") from exc
+
+    # The fill BEFORE the terminal status, because `canceled` is terminal and `execution.reconcile`
+    # states the rule this would otherwise break: "A CANCELLED/EXPIRED order can still have SOLD
+    # something -- Coinbase reports `filled_size > 0` for an order that partly filled before being
+    # cancelled." `_polled_rows` only revisits RESTING statuses, so a fill dropped here is dropped
+    # for good -- and `CANCELLABLE_STATUSES` deliberately includes `partially_filled`, which is
+    # exactly the row that carries one.
+    _record_fill_before_cancel(broker, repo, row, now_ts)
     repo.update_order(order_id, status="canceled", updated_at=now_ts)
     click.echo(f"cancelled order {order_id} at the venue.")
 
-    if decision.clears_bracket:
-        # The #519 protocol, reused rather than restated. An entry that nothing filled can still
-        # have a bracket -- `executor.execute` places it as soon as the entry is PLACED -- and
-        # that leg now commits base inventory which was never acquired.
-        if _clear_resting_bracket(broker, repo, decision.product_id, now_ts):
-            click.echo(f"cleared the resting bracket on {decision.product_id}.")
-        else:
-            # LOUD. The entry is gone and a protective leg may still be working at the venue
-            # against inventory that does not exist, which is a state an operator has to know
-            # about rather than discover from a fill.
+    if fresh.clears_bracket:
+        cleared, stranded = _clear_orphaned_brackets(broker, repo, fresh.product_id, now_ts)
+        for cleared_id in cleared:
+            click.echo(f"cleared orphaned bracket {cleared_id} on {fresh.product_id}.")
+        if stranded:
+            # LOUD. The entry is gone and a protective leg may still be working at the venue over
+            # inventory that was never acquired, which is a state an operator has to know about
+            # rather than discover from a fill.
             raise click.ClickException(
-                f"order {order_id} was cancelled, but the resting bracket on "
-                f"{decision.product_id} could NOT be cleared -- it may still be live at the "
-                "venue over inventory that was never acquired. Check the venue directly."
+                f"order {order_id} was cancelled, but orphaned bracket(s) "
+                f"{', '.join(str(one) for one in stranded)} on {fresh.product_id} could NOT be "
+                "cleared -- they may still be live at the venue over inventory that was never "
+                "acquired. Check the venue directly."
             )
+
+
+def _record_fill_before_cancel(
+    broker: Any, repo: Repository, row: dict[str, Any], now_ts: int
+) -> None:
+    """Book whatever the order filled before it is marked terminal.
+
+    Reuses `execution.reconcile`'s own recorder rather than restating it: that module owns the
+    rule that a cancelled order can still have filled, and owns what booking a fill means.
+
+    WRAPPED, because this is the one step here that must not be able to strip the cancel it
+    follows. The venue has already confirmed; failing to read back a fill is a reporting gap the
+    next reconcile pass can close, while raising would leave the order live locally and cancelled
+    at the exchange -- the disagreement this whole command exists to avoid.
+    """
+    from keel.execution import reconcile as reconcile_mod
+
+    recorder = getattr(reconcile_mod, "_try_record_fill", None)
+    if recorder is None:  # pragma: no cover - the seam is present in every shipped build
+        return
+    try:
+        recorder(broker, repo, row, now_ts)
+    except Exception:
+        log_exception(logger, "orders.cancel_fill_readback_failed", order_id=row.get("id"))
+
+
+def _clear_orphaned_brackets(
+    broker: Any, repo: Repository, product_id: str, now_ts: int
+) -> tuple[list[int], list[int]]:
+    """Cancel the resting SELLs on `product_id` that NO OPEN TRANCHE relies on.
+
+    `(cleared, stranded)`.
+
+    **Deliberately NOT `executor._clear_resting_bracket`, and the difference nearly shipped as a
+    one-`y` path to a naked position.** That function is product-wide: it cancels every resting
+    SELL for the product, which is right where the executor calls it because the caller is about to
+    place a REPLACEMENT sell over the same inventory. Here nothing replaces anything -- the entry
+    is going away -- so cancelling every resting sell strips the stop from any other open tranche
+    on that product, on the one path built to be frictionless. Cancelling that bracket directly
+    demands the typed phrase; reaching it sideways through an entry must not be a shortcut past
+    that.
+
+    So the filter is `open_bracket_order_ids()`, the same set `classify_cancel` calls `protective`.
+    What is left is a resting sell nothing depends on -- an order committing base inventory that no
+    open position accounts for, which is what "orphan" means here.
+
+    Failures are COLLECTED rather than raised, so one uncancellable orphan does not hide the others
+    from the operator, and the caller reports them all at once.
+    """
+    from keel.execution.executor import CancelPending, CancelUnavailable, _cancel_at_exchange
+
+    protected = repo.open_bracket_order_ids()
+    rows: list[dict[str, Any]] = []
+    for status in CANCELLABLE_STATUSES:
+        rows.extend(repo.get_orders(mode="live", product_id=product_id, status=status))
+
+    cleared: list[int] = []
+    stranded: list[int] = []
+    for row in sorted(rows, key=lambda one: int(one["id"])):
+        order_id = int(row["id"])
+        if str(row.get("side") or "").lower() != "sell" or order_id in protected:
+            continue
+        try:
+            _cancel_at_exchange(broker, repo, row)
+        except (CancelUnavailable, CancelPending):
+            log_exception(logger, "orders.orphan_bracket_cancel_failed", order_id=order_id)
+            stranded.append(order_id)
+            continue
+        repo.update_order(order_id, status="canceled", updated_at=now_ts)
+        cleared.append(order_id)
+    return cleared, stranded

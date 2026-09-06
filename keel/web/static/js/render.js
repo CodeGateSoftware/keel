@@ -2040,6 +2040,12 @@ function cancelCell(row) {
  */
 function openCancelHelp(row) {
   const cancel = row.cancel;
+  // Any dialog still open belongs to a previous read. The view repaints every 15 seconds and
+  // `main.js` replaces `#content`, which this node is deliberately outside of -- so without this
+  // an open modal survives the repaint and can go on offering a command for an order that has
+  // since filled. The CLI would refuse it by name, but a console showing a stale instruction is
+  // the console being wrong rather than the terminal being careful.
+  for (const stale of document.querySelectorAll("dialog.cancelhelp")) stale.remove();
   const dialog = el("dialog", "cancelhelp");
 
   // Composed in Python: "Entry order #42" and "Protective bracket #43 — live protection" are two

@@ -721,12 +721,7 @@ def test_there_is_no_cancel_route_at_all() -> None:
 
 
 def test_the_web_package_cannot_reach_a_broker_or_a_credential() -> None:
-    """The property the whole decision rests on: the worst case of a bug in this layer stays
-    "reads a local SQLite file" rather than becoming "exfiltrates live trading keys".
-
-    Scanned over the source rather than reasoned about, because the tempting shortcut when adding
-    a cancel is one import.
-    """
+    """No web module NAMES the broker or credential seams. The narrow half of the property."""
     import pathlib
 
     web = pathlib.Path(__file__).resolve().parents[2] / "keel" / "web"
@@ -734,6 +729,52 @@ def test_the_web_package_cannot_reach_a_broker_or_a_credential() -> None:
         text = path.read_text(encoding="utf-8")
         for forbidden in ("_build_broker", "cancel_order", "_cancel_at_exchange", "load_secret"):
             assert forbidden not in text, f"{path.name} reaches for {forbidden}"
+
+
+def test_serving_the_orders_page_imports_no_credential_code(tmp_path) -> None:
+    """The property the whole decision rests on, asserted where it actually lives.
+
+    The source scan above would pass either way, and this PR is the demonstration: it put a
+    broker-building, venue-cancelling function (`orders_cancel`) into `keel.commands.orders` --
+    the module `read_orders` imports on every request -- and that scan never looked past
+    `keel/web/`. Nothing routes to it, and "nothing routes to it" is what needs asserting.
+
+    So: drive a real request and check that `keel_core.secrets` was never imported. It is the
+    module that reaches the OS keychain, and its absence from `sys.modules` is the difference
+    between "reads a local SQLite file" and "holds live trading keys".
+    """
+    import subprocess
+    import sys
+
+    from keel.data.db import connect, migrate
+
+    db_path = tmp_path / "keel.db"
+    conn = connect(str(db_path))
+    migrate(conn)
+    conn.close()
+
+    probe = "\n".join(
+        (
+            "import sys",
+            "from keel.web import api",
+            "from keel.web.server import ServeConfig",
+            "cfg = ServeConfig(",
+            "    host='127.0.0.1', port=0, token='t',",
+            f"    db_path={str(db_path)!r}, config_path={str(tmp_path / 'nope.yaml')!r},",
+            ")",
+            "api.read_orders(cfg, {}, None, 0)",
+            "print('secrets' if 'keel_core.secrets' in sys.modules else 'clean')",
+        )
+    )
+
+    result = subprocess.run(
+        [sys.executable, "-c", probe], capture_output=True, text=True, check=False
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "clean", (
+        "serving /api/orders imported keel_core.secrets -- the console is no longer "
+        "credential-free"
+    )
 
 
 def test_the_console_never_builds_a_control_that_cancels() -> None:
