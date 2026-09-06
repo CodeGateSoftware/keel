@@ -1280,6 +1280,21 @@ class Repository:
         sql += " ORDER BY opened_at, id"
         return [self._position_row_to_dict(row) for row in self._conn.execute(sql, params)]
 
+    def open_bracket_order_ids(self) -> frozenset[int]:
+        """Every order id an OPEN tranche relies on for protection, in one query.
+
+        The batch form of `get_position_for_bracket` below, for a caller classifying a page of
+        orders: that method is a query per row, and the orders page is capped at 2,000. Same
+        predicate, same `status = 'open'` -- `commands/orders.py::classify_cancel` takes this set
+        when it has one and falls back to the single lookup when it does not, so there is one
+        rule rather than a fast one and a careful one that can disagree.
+        """
+        rows = self._conn.execute(
+            "SELECT bracket_order_id FROM positions "
+            "WHERE bracket_order_id IS NOT NULL AND status = 'open'"
+        ).fetchall()
+        return frozenset(int(row["bracket_order_id"]) for row in rows)
+
     def get_position_for_bracket(self, bracket_order_id: int) -> dict[str, Any] | None:
         """The OPEN tranche whose bracket is `bracket_order_id`, or `None`.
 

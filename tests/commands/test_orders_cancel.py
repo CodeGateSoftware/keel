@@ -169,12 +169,15 @@ def test_cancelling_a_PARTIALLY_filled_entry_leaves_its_bracket_alone(repo: Repo
 class _Broker:
     """A broker that confirms every cancel, and remembers which ones it was asked for."""
 
-    def __init__(self) -> None:
+    def __init__(self, refuse: tuple[str, ...] = ()) -> None:
         self.cancelled: list[str] = []
+        self.refuse = refuse
 
     def cancel_order(self, native_id: str) -> bool:
         self.cancelled.append(native_id)
-        return True
+        # `False` is a REFUSED cancel on a successful call -- Coinbase answers per order, and
+        # `_cancel_at_exchange` treats anything but CONFIRMED as "still live at the venue".
+        return native_id not in self.refuse
 
 
 @pytest.fixture()
@@ -310,3 +313,141 @@ def test_a_filled_order_is_refused_before_the_broker_is_built(deployment) -> Non
     assert result.exit_code != 0
     assert "filled" in result.output
     assert deployment[2].cancelled == []
+
+
+# -- the report carries the classification, and the console reads it ------------------------------
+#
+# The web console never cancels anything: `keel serve` holds no venue credential and no broker
+# handle, and #707's decision is that it never will. What it CAN do is classify -- that is a read --
+# and hand the operator the exact terminal invocation. The classification therefore has to reach
+# the report, and it has to be the SAME function the CLI gates on, or the console could describe an
+# order one way while the terminal treats it another.
+
+
+def test_the_report_classifies_every_row(repo: Repository) -> None:
+    from keel.commands.orders import gather_orders
+
+    entry = _order(repo, side="buy")
+    exit_order = _order(repo, side="sell")
+    bracket = _order(repo, side="buy")
+    repo.open_position(
+        product_id="BTC-USD",
+        rule_name="breakout",
+        qty=Decimal("1"),
+        entry_fill=Decimal("50000"),
+        entry_fee=Decimal("5"),
+        opened_at=NOW - 200,
+        bracket_order_id=bracket,
+    )
+
+    report = gather_orders(repo, now_ts=NOW, scope="all")
+    kinds = {row.id: row.cancel.kind for row in report.rows}
+
+    assert kinds[entry] == "entry"
+    assert kinds[exit_order] == "exit"
+    assert kinds[bracket] == "protective"
+
+
+def test_the_report_and_the_cli_gate_on_one_classification(repo: Repository) -> None:
+    """One function, two front-ends. If each decided for itself, the console could tell an
+    operator an order is a frictionless entry while the terminal demanded the phrase for it."""
+    from keel.commands.orders import gather_orders
+
+    for side in ("buy", "sell"):
+        _order(repo, side=side)
+    report = gather_orders(repo, now_ts=NOW, scope="all")
+
+    for row in report.rows:
+        assert row.cancel == orders_mod.classify_cancel(repo, row.id)
+
+
+def test_classifying_a_page_of_orders_does_not_query_per_row(repo: Repository) -> None:
+    """`get_position_for_bracket` per row is a query per row, and this page is capped at 2,000.
+
+    The batch and the single lookup are the SAME rule -- `classify_cancel` takes the precomputed
+    set when it has one and looks the row up when it does not -- so there is one classification,
+    not a fast one and a careful one that can disagree.
+
+    Counted through `sqlite3`'s own trace callback rather than by patching `execute`, which is
+    read-only on a Connection.
+    """
+    from keel.commands.orders import gather_orders
+
+    for _ in range(25):
+        _order(repo, side="buy")
+
+    seen: list[str] = []
+    repo._conn.set_trace_callback(seen.append)  # noqa: SLF001
+    try:
+        gather_orders(repo, now_ts=NOW, scope="all")
+    finally:
+        repo._conn.set_trace_callback(None)  # noqa: SLF001
+
+    lookups = [sql for sql in seen if "bracket_order_id" in sql]
+    assert len(lookups) == 1, f"{len(lookups)} bracket queries for 25 rows"
+    assert not [sql for sql in seen if sql.strip().upper().startswith(("INSERT", "UPDATE"))]
+
+
+def test_the_invocation_is_composed_in_python_and_names_the_order(repo: Repository) -> None:
+    """Rule 2: the client places this string and does not build it. A console that concatenated
+    the command itself could drift from the command that exists."""
+    order_id = _order(repo, side="buy")
+    decision = orders_mod.classify_cancel(repo, order_id)
+    assert decision.invocation == f"keel orders cancel {order_id}"
+
+
+def test_an_order_that_cannot_be_cancelled_offers_no_invocation(repo: Repository) -> None:
+    """Handing an operator a command that would be refused is worse than handing them nothing:
+    they run it, it fails, and they learn the console does not know what it is looking at."""
+    order_id = _order(repo, status="filled")
+    decision = orders_mod.classify_cancel(repo, order_id)
+
+    assert decision.cancellable is False
+    assert decision.invocation == ""
+
+
+def test_a_bracket_that_cannot_be_cleared_fails_the_command_loudly(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The entry is gone and a protective leg may still be working at the venue over inventory
+    that was never acquired.
+
+    Reporting the cancel that DID succeed and stopping there would leave the operator believing
+    the position is flat while a sell sits at the exchange. It is the same rule
+    `_clear_resting_bracket` states for the executor -- an uncancellable bracket means we do not
+    know what the exchange will do with that inventory -- and the operator is the only one who can
+    act on it.
+    """
+    from tests.conftest import VALID_CONFIG_YAML
+
+    db_path = tmp_path / "keel.db"
+    conn = connect(str(db_path))
+    migrate(conn)
+    repo = Repository(conn)
+    entry = _order(repo, side="buy", status="pending", raw_response='{"order_id": "venue-entry"}')
+    _order(repo, side="sell", status="pending", raw_response='{"order_id": "venue-bracket"}')
+    conn.close()
+
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(VALID_CONFIG_YAML)
+    broker = _Broker(refuse=("venue-bracket",))
+    monkeypatch.setattr("keel.commands._common._is_interactive", lambda: True)
+    monkeypatch.setattr("keel.commands._common._build_broker", lambda _cfg: broker)
+
+    from click.testing import CliRunner
+
+    from keel.cli import cli
+
+    result = CliRunner().invoke(
+        cli,
+        ["--db", str(db_path), "--config", str(config_path), "orders", "cancel", str(entry)],
+        input="y\n",
+    )
+
+    assert result.exit_code != 0, result.output
+    assert "could NOT be cleared" in result.output
+    # The entry cancel itself still happened and is still recorded -- the failure is about what
+    # is left behind, not about pretending the first call did not occur.
+    conn = connect(str(db_path))
+    migrate(conn)
+    assert Repository(conn).get_order(entry)["status"] == "canceled"

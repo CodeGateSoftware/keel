@@ -51,7 +51,7 @@ import datetime
 import json
 import time
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from decimal import Decimal, InvalidOperation
 from typing import Any
 
@@ -215,6 +215,7 @@ class OrderRow:
     #: The `orders.id` primary key -- the number `keel doctor` and the log lines name.
     id: int
 
+
     #: `live` or `paper`, per ROW. Never inferred from the book: see the module docstring.
     mode: str
 
@@ -311,6 +312,18 @@ class OrderRow:
     rule_id: int | None
     created_at: int | None
     updated_at: int | None
+    #: What cancelling this order would be, and what it would take (#707).
+    #:
+    #: On the ROW rather than looked up by a front-end, because both front-ends need it and the
+    #: classification is the feature: the console renders a modal from it and the CLI gates on it,
+    #: and a console that classified for itself could describe an order as a frictionless entry
+    #: while the terminal demanded the typed phrase for it.
+    #:
+    #: Defaulted and LAST, so every existing `OrderRow(...)` construction in this module and its
+    #: tests is untouched -- a dataclass cannot carry a default ahead of a required field.
+    cancel: CancelDecision = field(
+        default_factory=lambda: CancelDecision(0, "unknown", False, True)
+    )
 
 
 @dataclass(frozen=True)
@@ -474,7 +487,13 @@ def _adverse(side: str, difference: Decimal | None) -> bool | None:
     return None
 
 
-def _row_from_dict(row: dict[str, Any], rule_names: Mapping[int, str] | None = None) -> OrderRow:
+def _row_from_dict(
+    row: dict[str, Any],
+    rule_names: Mapping[int, str] | None = None,
+    *,
+    repo: Repository | None = None,
+    bracket_ids: frozenset[int] | None = None,
+) -> OrderRow:
     """One repository dict, projected. Every judgement this report makes about a row is made
     here, once, so neither renderer has to make it twice.
 
@@ -522,8 +541,14 @@ def _row_from_dict(row: dict[str, Any], rule_names: Mapping[int, str] | None = N
     else:
         book_detail = LIVE_NO_BOOK_DETAIL
 
+    order_id = int(row["id"])
     return OrderRow(
-        id=int(row["id"]),
+        id=order_id,
+        cancel=(
+            CancelDecision(order_id, "unknown", False, True)
+            if repo is None
+            else classify_cancel(repo, order_id, row=row, bracket_ids=bracket_ids)
+        ),
         mode=mode,
         product_id=str(row.get("product_id") or ""),
         side=side,
@@ -635,7 +660,14 @@ def gather_orders(
     # Newest first, HERE. `get_orders` orders by `id` ascending; reversing in each renderer
     # would be the same decision made twice and the second copy is the one that drifts.
     filtered.reverse()
-    shown = tuple(_row_from_dict(row, rule_names) for row in filtered[:resolved_limit])
+    # ONE query for every protective link on the page, not one per row (#707). `classify_cancel`
+    # takes the set when it has one and falls back to the single lookup when it does not, so this
+    # is the same rule applied efficiently rather than a second one.
+    bracket_ids = repo.open_bracket_order_ids()
+    shown = tuple(
+        _row_from_dict(row, rule_names, repo=repo, bracket_ids=bracket_ids)
+        for row in filtered[:resolved_limit]
+    )
 
     # Ordered widest cause first: a book with nothing in it is not a scope problem, and a scope
     # that excluded everything is not the tab's doing. Reporting the narrowest true cause would
@@ -832,6 +864,47 @@ CANCELLABLE_STATUSES = RESTING_STATUSES
 #: stop that stands under a live tranche.
 CANCEL_KINDS: tuple[str, ...] = ("entry", "exit", "protective", "unknown")
 
+#: The command that cancels one order. Composed in Python and placed by the client, so the console
+#: cannot come to print a command that does not exist.
+CANCEL_INVOCATION = "keel orders cancel {order_id}"
+
+
+#: The badge every order page carries, and the sentence behind it (#707).
+#:
+#: Not an apology for a missing feature. `keel serve` holds no venue credential and no broker
+#: handle, and that is the property that keeps the worst case of a bug in the HTTP layer at "reads
+#: a local SQLite file" rather than "exfiltrates live trading keys". Unlocking the keychain and
+#: signing a request to a venue happens during a terminal invocation the operator started, never
+#: from an ambient loopback daemon.
+WEB_READ_ONLY_BADGE = "read-only"
+WEB_READ_ONLY_NOTE = (
+    "The web console is read-only for security: it holds no venue credentials. "
+    "State-changing actions run through the CLI."
+)
+
+#: What each kind of cancel MEANS, for the modal that hands over the command. The word is a term of
+#: art; the sentence is what an operator decides on.
+CANCEL_HEADLINES: Mapping[str, str] = {
+    "entry": "Entry order #{order_id} — resting",
+    "exit": "⚠️ Exit order #{order_id} — live liquidation",
+    "protective": "⚠️ Protective bracket #{order_id} — live protection",
+    "unknown": "⚠️ Order #{order_id} — unclassified",
+}
+
+CANCEL_NOTES: Mapping[str, str] = {
+    "entry": "Cancelling a resting entry refuses risk. Nothing is protecting anything here.",
+    "exit": (
+        "This order liquidates inventory you hold. Cancelling it leaves the position open with "
+        "no exit working."
+    ),
+    "protective": (
+        "This is live downside protection — a position relies on it for its stop. Cancelling it "
+        "leaves that position with nothing beneath it, and the terminal will ask you to type a "
+        "phrase before it does."
+    ),
+    "unknown": "keel could not classify this order, so it is treated as protection.",
+}
+
 
 @dataclass(frozen=True)
 class CancelDecision:
@@ -866,15 +939,42 @@ class CancelDecision:
     #: prevent. The remainder is cancelled; the protection stays.
     clears_bracket: bool = False
     product_id: str = ""
+    #: The exact terminal command, composed HERE (Rule 2) so the console places it rather than
+    #: building it. `""` when the order cannot be cancelled: handing an operator a command that
+    #: would be refused is worse than handing them nothing -- they run it, it fails, and they
+    #: learn the console does not know what it is looking at.
+    invocation: str = ""
+    #: The modal's heading, composed HERE because it is a judgement about what the reader is
+    #: looking at -- "Entry order #42" and "Protective bracket #43 — live protection" are two
+    #: different warnings, and choosing between them is Rule 2's territory. It also keeps the
+    #: client from having to read `Field.value` to find the id, which `render.js` may not do.
+    headline: str = ""
 
 
-def classify_cancel(repo: Repository, order_id: int) -> CancelDecision:
+def classify_cancel(
+    repo: Repository,
+    order_id: int,
+    *,
+    row: dict[str, Any] | None = None,
+    bracket_ids: frozenset[int] | None = None,
+) -> CancelDecision:
     """What cancelling `order_id` would be, and what it therefore takes.
 
     Reads only. It decides nothing about whether the operator may proceed -- that is the caller's
-    gate -- and it never touches a broker.
+    gate -- and it never touches a broker, which is why the web console can call it: `keel serve`
+    holds no venue credential and no broker handle, and #707 settled that it never will.
+
+    ONE function for both front-ends. The CLI turns `typed` into a phrase prompt; the console
+    turns it into a modal that hands over `invocation`. If each classified for itself, the console
+    could describe an order as a frictionless entry while the terminal demanded the phrase for it.
+
+    `row` and `bracket_ids` are the BATCH form, for a caller classifying a whole page: the row is
+    already in hand and `repo.open_bracket_order_ids()` answers every protective link in one query
+    rather than one per order. Same rule either way -- the lookups below are what this function
+    falls back to when a caller has neither, not a second implementation.
     """
-    row = repo.get_order(order_id)
+    if row is None:
+        row = repo.get_order(order_id)
     if row is None:
         return CancelDecision(
             order_id=order_id,
@@ -890,7 +990,11 @@ def classify_cancel(repo: Repository, order_id: int) -> CancelDecision:
     # real hazard rather than the word "sell": a row wearing the BUY side while a position points
     # at it as its protection would pass a side-only rule and be cancelled one-click, stripping a
     # stop from a live tranche.
-    protective = repo.get_position_for_bracket(order_id) is not None
+    protective = (
+        order_id in bracket_ids
+        if bracket_ids is not None
+        else repo.get_position_for_bracket(order_id) is not None
+    )
     if protective:
         kind = "protective"
     elif str(row.get("side") or "").lower() == "sell":
@@ -918,6 +1022,8 @@ def classify_cancel(repo: Repository, order_id: int) -> CancelDecision:
         typed=kind != "entry",
         clears_bracket=kind == "entry" and status == "pending",
         product_id=product_id,
+        invocation=CANCEL_INVOCATION.format(order_id=order_id),
+        headline=CANCEL_HEADLINES[kind].format(order_id=order_id),
     )
 
 
