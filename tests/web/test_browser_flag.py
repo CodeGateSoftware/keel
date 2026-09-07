@@ -13,6 +13,7 @@ flag that vanishes turns a working script into `no such option`.
 from __future__ import annotations
 
 import click
+import pytest
 from click.testing import CliRunner
 
 from keel.cli import cli
@@ -69,13 +70,40 @@ def test_serve_help_still_documents_what_the_flag_does() -> None:
     assert "browser" in result.output.lower()
 
 
-def test_both_spellings_actually_suppress_the_launch(tmp_path, monkeypatch) -> None:
+#: Every combination of the two spellings, and whether a browser should end up launched.
+#:
+#: The conflicting rows are the point. The alias used to win OUTRIGHT whenever it appeared, so
+#: `--no-browser --open` opened a browser -- a HIDDEN, DEPRECATED flag quietly beating the one in
+#: `--help`. Of the three possible rules (last wins, documented wins, refuse), that was the worst,
+#: and the failure it produces is a GUI window at boot on a headless daemon, which is the exact
+#: thing `--no-browser` is in the plists to prevent.
+BROWSER_CASES: tuple[tuple[tuple[str, ...], bool], ...] = (
+    ((), True),
+    (("--browser",), True),
+    (("--no-browser",), False),
+    (("--open",), True),
+    (("--no-open",), False),
+    # Documented spelling wins when it was given EXPLICITLY, whichever order they appear in.
+    (("--no-browser", "--open"), False),
+    (("--open", "--no-browser"), False),
+    (("--browser", "--no-open"), True),
+    (("--no-open", "--browser"), True),
+)
+
+
+@pytest.mark.parametrize(("flags", "should_launch"), BROWSER_CASES)
+def test_the_spellings_compose_the_way_the_help_says(
+    flags: tuple[str, ...], should_launch: bool, tmp_path, monkeypatch
+) -> None:
     """Behaviour, not just parsing.
 
-    Every test above reads the command's declared options, which proves the names exist and
-    nothing about what they DO. A `--no-browser` that parsed and then opened a browser anyway
-    would pass all five -- and on a launchd daemon at boot, that is a window nobody asked for on
-    a machine that may have no GUI session at all.
+    Every structural test above reads the commands' declared options, which proves the names exist
+    and nothing about what they DO. A `--no-browser` that parsed and then opened a browser anyway
+    passes all of them -- and on a launchd daemon at boot that is a window nobody asked for on a
+    machine that may have no GUI session at all.
+
+    The no-flags row is load bearing: without it, "no browser launched" would be satisfied by a
+    build that never launches one, and every other row would be vacuous.
     """
     from keel.web import server as web_server
 
@@ -97,15 +125,8 @@ def test_both_spellings_actually_suppress_the_launch(tmp_path, monkeypatch) -> N
 
     monkeypatch.setattr(serve_mod.webbrowser, "open", lambda url: launched.append(url) or True)
 
-    for spelling in ("--no-browser", "--no-open"):
-        launched.clear()
-        result = CliRunner().invoke(
-            cli, ["--db", str(tmp_path / "keel.db"), "serve", spelling, "--port", "8765"]
-        )
-        assert result.exit_code == 0, (spelling, result.output)
-        assert launched == [], f"{spelling} launched a browser anyway"
-
-    # And the default still does open one, or the flag would be measuring nothing.
-    launched.clear()
-    CliRunner().invoke(cli, ["--db", str(tmp_path / "keel.db"), "serve", "--port", "8765"])
-    assert launched, "the default no longer opens a browser; the assertions above are vacuous"
+    result = CliRunner().invoke(
+        cli, ["--db", str(tmp_path / "keel.db"), "serve", *flags, "--port", "8765"]
+    )
+    assert result.exit_code == 0, (flags, result.output)
+    assert bool(launched) is should_launch, f"{flags} launched={bool(launched)}"

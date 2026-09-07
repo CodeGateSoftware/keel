@@ -870,6 +870,12 @@ the paper ledger under the live profile's name, convincingly. `RunAtLoad` covers
 
 Install all four the same way the detector agents are installed:
 
+**Update the binary before copying the plists, not after.** A plist carrying an option the
+installed `keel` does not know fails with `no such option`, and under `KeepAlive` that is not an
+error anybody reads -- it is a relaunch every ten seconds. (The reverse direction is safe: an
+already-installed plist using the older `--no-open` keeps working, because `keel serve` still
+accepts it as a hidden alias for `--no-browser`.)
+
 ```bash
 cd ~/keel
 # launchd creates the log FILE but not its directory, and a job whose StandardOutPath cannot be

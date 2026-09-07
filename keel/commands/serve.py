@@ -151,10 +151,27 @@ def serve_cmd(
         build_info=build,
     )
 
-    # The deprecated spelling wins only when it was actually given, so `--browser` and
-    # `--no-browser` behave normally for everyone who never used the old name.
+    # The alias applies only when the DOCUMENTED flag was left at its default (#761 review).
+    #
+    # `if legacy is not None` alone let the hidden, deprecated spelling win outright: measured,
+    # `--no-browser --open` opened a browser. Of the three rules available for a conflicting pair
+    # -- last wins, documented wins, refuse -- that is the worst, because the flag doing the
+    # overriding is the one absent from `--help`; and the outcome it produces is a GUI window at
+    # boot on a headless daemon, which is precisely what `--no-browser` is in the console plists
+    # to prevent.
+    #
+    # Refusing was the other candidate and it is the wrong trade HERE: an unparseable invocation
+    # under `KeepAlive` is not an error anybody reads, it is a relaunch every ten seconds. So the
+    # documented spelling wins and the deprecated one keeps working alone, which is all it was
+    # ever kept for.
+    #
+    # `get_parameter_source` is what distinguishes "left at the default" from "explicitly passed
+    # the same value as the default" -- `--browser` and no flag at all are both `True`, and only
+    # one of them should beat `--no-open`.
     if legacy_open_browser is not None:
-        open_browser = legacy_open_browser
+        source = ctx.get_parameter_source("open_browser")
+        if source is None or source is click.core.ParameterSource.DEFAULT:
+            open_browser = legacy_open_browser
 
     if open_browser:
         # Opened BEFORE `serve` blocks, and best-effort: a headless machine, a broken
