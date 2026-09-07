@@ -44,6 +44,7 @@ import {
   gatesView,
   plansView,
   insightsView,
+  deploymentCard,
   modeBadge,
   paperBanner,
   sessionChip,
@@ -153,6 +154,8 @@ const updateNode = must("update");
 const modeNode = must("mode-badge");
 /** The session chip's profile half (#704) -- the database's own name, filled from the boot read. */
 const sessionProfileNode = must("session-profile");
+//: #755. The badge is the disclosure's summary; this is what the disclosure reveals.
+const deploymentCardNode = must("deployment-card");
 /** The session chip's equity-state half (#704). Genuinely absent on a deployment that has never
  * flipped modes, which is why it is a `Field` and not a bare word. */
 const sessionEquityNode = must("session-equity");
@@ -1537,6 +1540,10 @@ void read("config").then((reading) => {
   // process serves cannot change without a restart, and filling the chip here is what puts it on
   // every view rather than only where a status report happens to load.
   sessionChip(sessionProfileNode, sessionEquityNode, config);
+  // #755: the same boot read, for the same reason -- and the card must be filled even
+  // though it is closed, because a `<details>` opens with no JavaScript involved and
+  // there is no event to fill it on.
+  deploymentCard(deploymentCardNode, config);
   paperBanner(modeBannerNode, config);
   registerWorker(config);
   show(booted, false);

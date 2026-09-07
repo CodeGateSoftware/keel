@@ -178,7 +178,7 @@
     (`:empty` in `keel.css`), because an empty pill is a stray mark, and an unreadable config
     should cost the badge rather than guess a mode.
   -->
-<span class="right">
+<div class="right">
     <!--
       THE SESSION CHIP (#704): profile · mode · equity state, on every view.
 
@@ -195,11 +195,30 @@
       Both halves empty in the markup and hidden while empty (`:empty` in `keel.css`), like
       `#mode-badge` and `#build`: a deployment with no readable name is not one called "unknown".
     -->
-    <span id="session-chip">
+    <!--
+      THE DEPLOYMENT CARD (#755): the badge is the SUMMARY of a native disclosure.
+
+      `modeBadge` writes the identifying `--db`/`--config` pair into a `title`, which is a HOVER
+      tooltip -- and there is no hover on a phone, the exact device Phase B is for. So the same
+      facts get a tap-to-reveal path here.
+
+      `<details>` and NOT a button with a handler: it is keyboard-operable, touch-operable and
+      announced with nothing bound, which is what lets the card pass the same no-interactive-node
+      test the chip and the banner answer to (`venueCard` uses the element the same way). Nothing
+      inside it changes anything; switching mode or profile stays a terminal ceremony.
+
+      `#session-chip` and `.right` are DIVs rather than spans because `<details>` is flow content
+      and a `<span>` may only hold phrasing content. Both already set their own `display` in
+      `keel.css`, so the layout is unchanged by the tag.
+    -->
+    <div id="session-chip">
       <span id="session-profile" class="sessionpart"></span>
-      <span id="mode-badge" class="pill mode"></span>
+      <details id="deployment">
+        <summary id="mode-badge" class="pill mode"></summary>
+        <div id="deployment-card"></div>
+      </details>
       <span id="session-equity" class="sessionpart"></span>
-    </span>
+    </div>
   
     <!--
       THE THEME TOGGLE (#597): two states, and the stylesheet is the state machine.
@@ -236,7 +255,7 @@
         <path d="M20.2 13.2A8.2 8.2 0 1 1 10.8 3.8a6.5 6.5 0 0 0 9.4 9.4Z"/>
       </svg>
     </button>
-  </span>
+  </div><!-- .right -->
 </header>
 
 <!--

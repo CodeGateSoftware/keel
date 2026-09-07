@@ -245,6 +245,48 @@ header .mode {
  * pill is a stray mark, and an unreadable config should cost the badge rather than guess a
  * mode. Same pairing as `#build` in the footer, which is also empty until the same read. */
 header .mode:empty { display: none; }
+
+/* ── the deployment card (#755) ───────────────────────────────────────────────────────────────
+ *
+ * The badge is the `<summary>` of a native disclosure, so the identifying `--db`/`--config` pair
+ * -- which `modeBadge` also writes into a `title`, and `title` is hover-only -- is reachable by
+ * tap on a device that has no pointer.
+ *
+ * The whole disclosure hides when the badge is empty, matching `header .mode:empty`: a config
+ * that could not be read is not a deployment called "unknown", and an empty pill with a
+ * disclosure triangle beside it would be worse than nothing. */
+header #deployment:has(> summary:empty) { display: none; }
+
+header #deployment { position: relative; }
+
+/* The default triangle is removed on BOTH spellings -- `::-webkit-details-marker` for older
+ * WebKit, `list-style` for everything current -- because the badge is a pill and a marker glued
+ * to it reads as a chevron on a button, which is the dropdown this is deliberately not. */
+header #deployment > summary { cursor: pointer; list-style: none; }
+header #deployment > summary::-webkit-details-marker { display: none; }
+
+/* Anchored to the badge and OUT of flow: opening it must not reflow the header, which on a narrow
+ * screen would push the nav around under the reader's finger mid-tap. */
+header #deployment > #deployment-card {
+  position: absolute;
+  right: 0;
+  top: calc(100% + 0.4rem);
+  z-index: 2;
+  min-width: min(22rem, 88vw);
+  background: var(--bg);
+  border: 1px solid var(--control-line);
+  border-radius: 6px;
+  padding: 0.6rem;
+  box-shadow: 0 6px 20px rgba(0, 0, 0, 0.18);
+  text-align: left;
+}
+
+/* The paths are the point of the card and they are long. Wrapping beats a horizontal scrollbar
+ * inside a popover no wider than a phone. */
+header #deployment > #deployment-card .v {
+  overflow-wrap: anywhere;
+  font-size: 0.85em;
+}
 /* The emphasis table `render.js::MODE_CLASS` places: paper is the quiet one (muted, like any
  * label), confirm and live carry the accent, because a deployment that can place orders should
  * sit up in the header. NOT `--good`/`--bad` -- those are `state`'s vocabulary and there is no
