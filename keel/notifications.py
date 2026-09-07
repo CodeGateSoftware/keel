@@ -108,8 +108,13 @@ def events_from_state(
     """
     events: list[NotificationEvent] = []
 
+    notified: set[str] = set()
     for finding in attestation_findings:
-        if finding.name in _ATTESTATION_FINDINGS and finding.status in (doctor.WARN, doctor.FAIL):
+        if (
+            finding.name in _ATTESTATION_FINDINGS
+            and finding.name not in notified
+            and finding.status in (doctor.WARN, doctor.FAIL)
+        ):
             events.append(
                 notification_event(
                     "attestation.expiring",
@@ -119,7 +124,13 @@ def events_from_state(
                     detail=finding.detail,
                 )
             )
-            break  # one event per cycle: the finding list carries one rail-17 verdict
+            # One event PER FINDING NAME, not one per cycle. This was a `break`, written when the
+            # registry held rail 17 alone and the list genuinely carried one verdict. With rail 22
+            # in it (#732) a break makes a cash-posture problem invisible whenever a withdrawals
+            # problem also exists -- the same silence, one layer down. The names are unique across
+            # the gatherers, so the guard below is about not repeating one, never about choosing
+            # between two.
+            notified.add(finding.name)
 
     for finding in rail_findings:
         if finding.name in _ARMED_RAIL_FINDINGS and finding.status != doctor.OK:
@@ -229,11 +240,26 @@ def notify_after_cycle(
 
         venue = current_venue() or guards.DEFAULT_VENUE
         subscription = repo.get_broker_subscription(venue)
-        attestation = doctor.attestation_findings(
-            subscription=subscription,
-            withdrawals_attested_at=int(repo.get_state("withdrawals_attested_at", default=0) or 0),
-            now_ts=now_ts,
-        )
+        attestation = [
+            *doctor.attestation_findings(
+                subscription=subscription,
+                withdrawals_attested_at=int(
+                    repo.get_state("withdrawals_attested_at", default=0) or 0
+                ),
+                now_ts=now_ts,
+            ),
+            # #732. `attest.cash_posture` was in `_ATTESTATION_FINDINGS` and this call was not
+            # here, so the registration was real and the delivery path was not: an operator who
+            # wired a webhook for it would never have been told.
+            #
+            # It is the finding that fires when the account is attested MARGIN-ENABLED, when the
+            # posture attestation has expired, or when it was attested with no due date at all --
+            # three states in which rail 22 has stopped letting the agent enter positions. The
+            # symptom otherwise is SILENCE: an agent that looks healthy and never trades again.
+            *doctor.cash_posture_findings(
+                repo.get_venue_cash_posture(venue), venue=venue, now_ts=now_ts
+            ),
+        ]
         rails = doctor.rail_state_findings(
             kill_switch=bool(repo.get_state("kill_switch", default=False)),
             streak_halt_until=int(repo.get_state("streak_halt_until", default=0) or 0),

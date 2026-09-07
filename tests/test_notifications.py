@@ -24,6 +24,7 @@ from keel_core.notifications import NotificationSettings, send_event
 from keel.commands.doctor import attestation_findings, rail_state_findings
 from keel.config import AutoTradeConfig, Caps, Config, MarketDataConfig
 from keel.notifications import (
+    _ATTESTATION_FINDINGS,
     ALLOWANCE_NEARING_USED_PCT,
     UnplacedSetup,
     events_from_state,
@@ -226,6 +227,10 @@ class _Repo:
         self._withdrawals_attested_at = withdrawals_attested_at
         self._held = held
         self.state_writes: list[tuple[str, object]] = []
+        #: #732's read. `None` is the unattested posture, which `cash_posture_findings` reports
+        #: as its own finding -- so the default here is a book where nobody has attested rather
+        #: than one where the question is not asked.
+        self.cash_posture: object | None = None
 
     def get_state(self, key: str, default: object = None) -> object:
         if key == "withdrawals_attested_at":
@@ -240,6 +245,9 @@ class _Repo:
 
     def get_broker_subscription(self, venue: str):  # None: rail 14 is out of scope here
         return None
+
+    def get_venue_cash_posture(self, venue: str):
+        return self.cash_posture
 
     def held_products(self) -> list[str]:
         return list(self._held)
@@ -271,6 +279,12 @@ def _recording_transport(calls: list[tuple[str, str]]):
 def test_notify_after_cycle_reads_doctor_seams_and_sends_only_opted_in_events():
     calls: list[tuple[str, str]] = []
     repo = _Repo(withdrawals_attested_at=NOW - 5 * DAY)  # rail 17: 2 days remain
+    # A HEALTHY posture, so this test stays about rail 17 alone. #732 wired
+    # `cash_posture_findings` into the same path, and the default double carries no posture at
+    # all -- which `doctor` reports as "cash posture never attested", a FAIL, because rail 22
+    # vetoes on it. That is a real second event, not a fixture artefact, and it belongs to the
+    # tests below rather than to this one.
+    repo.cash_posture = _healthy_posture()
     settings = NotificationSettings(events=frozenset({"attestation.expiring"}))
     config = _config_with(settings)
 
@@ -418,3 +432,140 @@ def _config_with(settings: NotificationSettings) -> Config:
         auto_trade=AutoTradeConfig(),
         notifications=settings,
     )
+
+
+def _healthy_posture():
+    """An attested, in-date cash posture -- rail 22 quiet."""
+    from keel_core.cash_posture import CashPostureState, VenueCashPosture
+
+    return VenueCashPosture(
+        venue="coinbase",
+        state=CashPostureState.ATTESTED,
+        attested_posture="SPOT_CASH",
+        attested_ts=NOW - DAY,
+        attest_due_ts=NOW + 200 * DAY,
+        refuted_ts=None,
+        refuted_reason=None,
+        credential_fingerprint="fp-1",
+    )
+
+
+# -- the registry and the call site must agree (#732) ----------------------------------------------
+
+
+def _lapsed_posture_repo(*, withdrawals_attested_at: int) -> _Repo:
+    """A book where BOTH registered attestation findings are unhealthy at once."""
+    from keel_core.cash_posture import CashPostureState, VenueCashPosture
+
+    repo = _Repo(withdrawals_attested_at=withdrawals_attested_at)
+    repo.cash_posture = VenueCashPosture(
+        venue="coinbase",
+        state=CashPostureState.ATTESTED,
+        attested_posture="SPOT_CASH",
+        attested_ts=NOW - 200 * DAY,
+        attest_due_ts=NOW - DAY,  # lapsed
+        refuted_ts=None,
+        refuted_reason=None,
+        credential_fingerprint="fp-1",
+    )
+    return repo
+
+
+def test_every_registered_attestation_finding_is_actually_deliverable():
+    """THE CLASS, not the instance, and driven through the REAL `notify_after_cycle`.
+
+    `_ATTESTATION_FINDINGS` is an opt-in registry; the call site is a hand-written list of doctor
+    gatherers. Two lists that must agree with nothing making them agree -- and they did not:
+    `attest.cash_posture` was registered and never produced, so an operator who wired a webhook
+    for it would never have been told.
+
+    That matters more than a missing warning. It fires when the account is attested
+    MARGIN-ENABLED, when the posture attestation has expired, or when it was attested with no due
+    date at all -- three states in which rail 22 has stopped letting the agent enter positions,
+    where the symptom otherwise is SILENCE.
+
+    A test asserting the two lists match by name would be a third list. This makes every
+    registered finding unhealthy at once and asserts each one ARRIVES, so a registration with no
+    gatherer fails here rather than in production quiet.
+    """
+    calls: list[tuple[str, str]] = []
+    repo = _lapsed_posture_repo(withdrawals_attested_at=NOW - 5 * DAY)
+    config = _config_with(NotificationSettings(events=frozenset({"attestation.expiring"})))
+
+    notify_after_cycle(
+        repo,
+        config,
+        _LoopResult(),
+        NOW,
+        url="https://alerts.example/hook",
+        transport=_recording_transport(calls),
+    )
+
+    delivered = " ".join(body for _url, body in calls)
+    for name in _ATTESTATION_FINDINGS:
+        assert name in delivered, f"{name} is registered and nothing delivers it"
+
+
+def test_both_attestation_rails_are_notified_when_both_are_unhealthy():
+    """The `break` said "one event per cycle: the finding list carries one rail-17 verdict" --
+    true when the registry held rail 17 alone. With rail 22 in it, a break makes a cash-posture
+    problem invisible whenever a withdrawals problem also exists: the same silence, one layer
+    down."""
+    calls: list[tuple[str, str]] = []
+    repo = _lapsed_posture_repo(withdrawals_attested_at=NOW - 5 * DAY)
+    config = _config_with(NotificationSettings(events=frozenset({"attestation.expiring"})))
+
+    sent = notify_after_cycle(
+        repo,
+        config,
+        _LoopResult(),
+        NOW,
+        url="https://alerts.example/hook",
+        transport=_recording_transport(calls),
+    )
+
+    assert sent == 2, f"expected one event per unhealthy rail, got {sent}"
+    delivered = " ".join(body for _url, body in calls)
+    assert "rail 17" in delivered
+    assert "rail 22" in delivered
+
+
+def test_a_healthy_cash_posture_notifies_nothing():
+    """The other direction: an alert that fired on a healthy posture is the alert nobody reads."""
+    calls: list[tuple[str, str]] = []
+    repo = _Repo(withdrawals_attested_at=NOW - DAY)  # rail 17 comfortably in date
+    repo.cash_posture = _healthy_posture()
+    config = _config_with(NotificationSettings(events=frozenset({"attestation.expiring"})))
+
+    sent = notify_after_cycle(
+        repo,
+        config,
+        _LoopResult(),
+        NOW,
+        url="https://alerts.example/hook",
+        transport=_recording_transport(calls),
+    )
+
+    assert sent == 0
+    assert calls == []
+
+
+def test_a_deployment_that_never_attested_a_posture_is_told(monkeypatch):
+    """`cash_posture_findings(None)` is a FAIL -- "cash posture never attested" -- and rail 22
+    vetoes live entries on it. This is the standing case #732 is really about: nothing lapsed,
+    nothing broke, the agent simply cannot enter and had no way to say so."""
+    calls: list[tuple[str, str]] = []
+    repo = _Repo(withdrawals_attested_at=NOW - DAY)  # rail 17 fine; no posture at all
+    config = _config_with(NotificationSettings(events=frozenset({"attestation.expiring"})))
+
+    sent = notify_after_cycle(
+        repo,
+        config,
+        _LoopResult(),
+        NOW,
+        url="https://alerts.example/hook",
+        transport=_recording_transport(calls),
+    )
+
+    assert sent == 1
+    assert "rail 22" in calls[0][1]
