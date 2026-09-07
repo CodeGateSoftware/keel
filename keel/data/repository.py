@@ -401,6 +401,23 @@ class Repository:
         """
         return chain_state(self._conn)
 
+    def table_present(self, name: str) -> bool:
+        """Does this database have `name`? For readers that may not have migrated (#751).
+
+        On the repository rather than reached for through the connection, for the reason
+        `audit_chain` is: "what does this record actually contain" is a question about the record,
+        and the record is what this class owns.
+
+        A reader asks this to tell an ABSENT table from an EMPTY one, which are different
+        statements about a deployment and want different sentences. `get_venue_cash_posture`
+        returning `None` means no human has attested the posture and rail 22 is vetoing entries;
+        the table being absent means the schema predates rail 22 and nothing is wrong yet. Saying
+        the first about the second sends an operator to fix a rail that is not the problem.
+        """
+        from keel.data.db import table_present
+
+        return table_present(self._conn, name)
+
     # -- transactions ---------------------------------------------------
 
     def upsert_transaction(self, tx: dict[str, Any]) -> None:

@@ -1127,3 +1127,63 @@ def test_a_database_without_the_table_is_reported_not_crashed_on() -> None:
     (finding,) = audit_chain_findings(_chain(table_present=False))
     assert finding.status == "ok"
     assert finding.fix == "keel migrate"
+
+
+# -- an un-migrated database reaching a reader (#751) --------------------------------------------
+
+#: What v17-v20 added, in the order a 0.13.3 deployment did not have them. Dropping these from a
+#: current database and winding `user_version` back reproduces exactly what an operator who
+#: installed 0.14.0 and has not yet run `keel migrate` hands a reader: the OLD `_SCHEMA_STATEMENTS`
+#: created none of them, and no migration has run.
+_TABLES_ADDED_SINCE_0_13_3 = (
+    "candle_series_feed",  # v17
+    "venue_cash_postures",  # v18
+    "equity_points",  # v19
+    "audit_events",  # v20
+)
+
+
+def _repo_stopped_at_v16(db_path: Path):
+    """A repo over a database at the schema `v0.13.3` shipped -- opened WITHOUT migrating.
+
+    Deliberately a REAL database rather than a fabricated state object. The guard next door
+    (`test_a_database_without_the_table_is_reported_not_crashed_on`) asserts over
+    `_chain(table_present=False)`, which can only ever exercise the one reader that already has
+    the flag -- so the sibling readers that lacked it stayed invisible to it for three migrations.
+    """
+    conn = connect(str(db_path))
+    migrate(conn)
+    for table in _TABLES_ADDED_SINCE_0_13_3:
+        conn.execute(f"DROP TABLE IF EXISTS {table}")
+    conn.execute("UPDATE schema_version SET version = 16")
+    conn.commit()
+    return Repository(conn)
+
+
+def test_gather_findings_survives_a_database_nobody_has_migrated(tmp_path, valid_config_path):
+    """`keel mcp` opens a repo without migrating, so this is an ordinary deployment state.
+
+    It raised `sqlite3.OperationalError: no such table: venue_cash_postures` -- out of the MCP
+    handler, taking every other finding with it, on the first tool a client typically calls.
+    """
+    repo = _repo_stopped_at_v16(tmp_path / "keel.db")
+    findings = gather_findings(repo, load_config(valid_config_path), [], NOW)
+    assert findings, "an un-migrated database must still produce a report"
+
+
+def test_an_unmigrated_posture_table_is_not_reported_as_an_unattested_posture(
+    tmp_path, valid_config_path
+):
+    """The distinction the audit chain already draws, and the reason a bare `None` will not do.
+
+    `cash_posture_findings(None)` is FAIL "cash posture never attested -- rail 22 vetoes every
+    live ENTRY". That sentence is false about a database that has no posture TABLE: nothing has
+    lapsed, the schema simply predates rail 22. Telling an operator to re-attest sends them to
+    fix a rail that is not the problem.
+    """
+    repo = _repo_stopped_at_v16(tmp_path / "keel.db")
+    findings = gather_findings(repo, load_config(valid_config_path), [], NOW)
+    (posture,) = [f for f in findings if f.name == "attest.cash_posture"]
+    assert posture.status == OK, posture.detail
+    assert posture.fix == "keel migrate"
+    assert "never attested" not in posture.headline

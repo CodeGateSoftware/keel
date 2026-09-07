@@ -189,3 +189,55 @@ def test_trials_chain_errors_are_tail_bounded(tmp_path: Path, monkeypatch: Any) 
     assert all(error.startswith("row ") for error in result["chain_errors"][:20])
     assert result["chain_errors"][-1] == f"+{total - 20} more chain errors"
     assert result["rows"] == total
+
+
+# -- an un-migrated database, across the whole tool surface (#751) --------------------------------
+
+#: Everything v17-v20 added. Dropped from a current database, this is what a deployment that
+#: installed 0.14.0 and has not run `keel migrate` hands the MCP surface.
+_TABLES_ADDED_SINCE_0_13_3 = (
+    "candle_series_feed",
+    "venue_cash_postures",
+    "equity_points",
+    "audit_events",
+)
+
+
+def test_no_tool_raises_against_a_database_nobody_has_migrated(tmp_path, valid_config_path) -> None:
+    """`_open_readonly_repo` deliberately does not migrate, so every handler must tolerate a
+    schema older than itself.
+
+    **Swept across the whole surface rather than asserted on `doctor` alone**, which is the gap
+    that let this ship: `venue_cash_postures` (v18) and `equity_points` (v19) both landed without
+    the guard `audit_events` (v20) has, and the only test of that guard fabricated a state object,
+    so it could never see a reader that lacked one. A tool added later inherits this sweep for
+    free; a table added later needs only to join the tuple above.
+    """
+    from keel.data.db import connect, migrate
+
+    db = tmp_path / "keel.db"
+    conn = connect(str(db))
+    migrate(conn)
+    for table in _TABLES_ADDED_SINCE_0_13_3:
+        conn.execute(f"DROP TABLE IF EXISTS {table}")
+    conn.execute("UPDATE schema_version SET version = 16")
+    conn.commit()
+    conn.close()
+
+    log = tmp_path / "keel.log"
+    log.write_text("")
+    tools = build_tools(db_path=str(db), config_path=str(valid_config_path), log_path=str(log))
+    assert tools, "no tools built"
+
+    for tool in tools:
+        try:
+            tool.handler({})
+        except sqlite3.OperationalError as exc:  # the failure this test exists for
+            raise AssertionError(
+                f"MCP tool {tool.name!r} raised against an un-migrated database: {exc}. "
+                "A reader that does not migrate must report the gap, not propagate it."
+            ) from exc
+        except Exception:
+            # Anything else is that tool's own argument or environment contract, not schema
+            # tolerance, and is covered by its own test above.
+            pass
