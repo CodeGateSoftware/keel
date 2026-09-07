@@ -3355,6 +3355,57 @@ export function modeBadge(node, config) {
   node.title = (config.db_path || "").concat(" · config ", config.config_path || "");
 }
 
+//: What the card says where a control would be. Static copy, not payload prose: `paperBanner`'s
+//: sentence arrives from Python because that function CHOOSES between sentences on the basis of a
+//: config, which is a judgement. This one is the same words on every deployment, so it is UI copy
+//: in the class of `plansView`'s subtitle, and Rule 2 has nothing to say about it.
+const SWITCHING_NOTE = "Mode and profile switching are terminal ceremonies with a runbook. ".concat(
+  "This console reports the deployment it was pointed at and cannot change it.",
+);
+
+/**
+ * The deployment identity card (#755) -- the `title` tooltip's contents, reachable by touch.
+ *
+ * `modeBadge` writes `--db` and `--config` into a `title`, and `title` is a HOVER tooltip. There
+ * is no hover on a phone, which is the device #648/#656 exist for, so the half of the badge that
+ * actually IDENTIFIES a deployment was unreachable exactly where the terminal is least available.
+ * The mode word alone identifies nothing: two paper deployments both say `paper`, and a live
+ * sandbox and a paper-equities profile can both say `confirm`.
+ *
+ * **It reveals and it does not offer.** The disclosure is `<details>` in the shell, so there is no
+ * handler to bind and no button to build, and this function is held to the same
+ * no-interactive-node test as `sessionChip` and `paperBanner` rather than exempted from it. A
+ * "switch to live" affordance arriving through a door marked accessibility is still the growth
+ * funnel the chip's docstring refuses.
+ *
+ * The origin comes from `window.location`, not the payload -- it is a fact about where this
+ * browser is, and in an installed app there is no address bar to read it from. `timelineView`
+ * takes it from the same place for the same reason.
+ *
+ * Empty when the config could not be read, matching `modeBadge`: an absent answer is not `paper`,
+ * and a card naming a deployment nothing could identify would be inventing one.
+ *
+ * @param {HTMLElement} node
+ * @param {any} config  `/api/config`'s `data`, or `null`.
+ */
+export function deploymentCard(node, config) {
+  const mode = config && typeof config.mode === "string" ? config.mode : "";
+  if (!mode) {
+    node.replaceChildren();
+    return;
+  }
+  node.replaceChildren(
+    gridCard([
+      kv("deployment", config.profile || "\u2014"),
+      kv("mode", mode),
+      kv("config", config.config_path || "\u2014"),
+      kv("database", config.db_path || "\u2014"),
+      kv("origin", window.location.origin),
+    ]),
+    el("p", "muted", SWITCHING_NOTE),
+  );
+}
+
 /**
  * The session chip's two halves, from `/api/config` (#704).
  *

@@ -898,7 +898,11 @@ def test_the_header_carries_a_theme_toggle_and_a_mode_badge() -> None:
             f"an icon that is not token-coloured or is self-announcing: {icon}"
         )
 
-    assert '<span id="mode-badge" class="pill mode"' in html, "the mode badge is missing"
+    # A `<summary>` since #755, not a `<span>`: the badge is the summary of the deployment card's
+    # native disclosure, which is what gives a touch device a path to the `--db`/`--config` pair
+    # that `modeBadge` also writes into a hover-only `title`. The id and both classes are
+    # unchanged, and they are what `modeBadge` and `header .mode:empty` actually key on.
+    assert '<summary id="mode-badge" class="pill mode"' in html, "the mode badge is missing"
     # Empty in the markup, like #build: filled from the boot config read, hidden until it is.
     assert html.count('id="mode-badge"') == 1
 
@@ -935,6 +939,9 @@ _CONFIG_READERS: tuple[tuple[str, str], ...] = (
     # empty forever, which is precisely the failure named below.
     ("sessionChip", "config"),
     ("paperBanner", "config"),
+    # #755's card, registered in the same commit that adds it, for the reason above: it reads
+    # four config keys and a rename on either side would leave it rendering em-dashes forever.
+    ("deploymentCard", "config"),
 )
 
 
@@ -2084,7 +2091,9 @@ def test_neither_the_chip_nor_the_banner_builds_anything_clickable() -> None:
     either. So neither function may create an interactive node or bind a handler.
     """
     source = _source("render.js")
-    for name in ("sessionChip", "paperBanner"):
+    # #755's `deploymentCard` joins them rather than getting an exemption: it is the surface where
+    # a reader looks for the control, which makes it the likeliest place for one to be added.
+    for name in ("sessionChip", "paperBanner", "deploymentCard"):
         body = _function_body(source, name)
         for forbidden in _INTERACTIVE_TOKENS:
             assert forbidden not in body, f"{name} builds something interactive: {forbidden}"
