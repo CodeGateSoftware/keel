@@ -161,6 +161,7 @@ from keel.commands.insights import insights_group
 from keel.commands.journal import journal_group
 from keel.commands.mcp import mcp_cmd
 from keel.commands.monitor import run_monitor
+from keel.commands.open_console import open_cmd
 from keel.commands.orders import orders_cmd
 from keel.commands.pnl import build_pnl_report, render_pnl_report
 from keel.commands.posture import posture_group
@@ -1446,6 +1447,9 @@ cli.add_command(orders_cmd)
 # dashboard's autonomy action and the console's three gated actions went. Each of those four
 # mirrored a CLI command that is still here.
 cli.add_command(serve_cmd)
+# #756: the way back to a console nobody watched start. See `keel/web/runtime.py` for why a
+# detached server may leave its token on disk and an interactive one may not.
+cli.add_command(open_cmd)
 
 
 # -- mcp (the read-only research-assistant surface over stdio) -----------------------------------

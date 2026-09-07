@@ -21,9 +21,16 @@ Four independent layers, none of which is sufficient alone:
    user is already viewing. `keel serve` mints it per run, prints it in the URL, and the browser
    exchanges it for a `SameSite=Strict` cookie on first load. `Strict` (not `Lax`) is deliberate:
    `Lax` attaches the cookie to top-level navigations, so a link on a hostile page would arrive
-   authenticated. Nothing is persisted **on this side of the wire** -- the token is minted per
-   process and never written to disk, so closing the server destroys it and every outstanding
-   cookie becomes a string that authenticates nothing. Since #634 the cookie carries a `Max-Age`
+   authenticated. The token is minted per process, so closing the server destroys it and every
+   outstanding cookie becomes a string that authenticates nothing.
+
+   **Whether it is written to disk depends on who is watching, and #756 is why.** Attached to a
+   terminal, nothing is persisted on this side of the wire -- unchanged. Detached (`launchd`, a
+   pipe), `keel/web/runtime.py` records the address in a `0600` file so `keel open` can hand it
+   back; read its module docstring before touching that, because the argument is not "it is fine
+   to persist a token" but "on that path the token is already in `StandardOutPath` at the daemon's
+   umask, and a mode-`0600` file deleted on shutdown is strictly less exposure than the log line
+   that would otherwise be the only way in". Since #634 the cookie carries a `Max-Age`
    so the BROWSER stops throwing away a token that is still valid; `SESSION_COOKIE_MAX_AGE_SECONDS`
    carries the whole argument for why that extends convenience and not authority.
 
