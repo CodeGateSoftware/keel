@@ -798,3 +798,154 @@ def test_get_screen_exceptions_is_scoped_to_the_asset(repo):
 
     assert repo.get_screen_exceptions("PAXG") == {"history": "paxg reason"}
     assert "SOL" not in repo.get_screen_exceptions("PAXG")
+
+
+# -- the two remaining ON CONFLICT windows (#731) -------------------------------------------------
+#
+# `broker_subscriptions` and `venue_cash_postures` both carry `attest_due_ts` and both are written
+# by an `INSERT ... ON CONFLICT DO UPDATE SET`. Both clauses set it, so both are correct -- and
+# deleting either line left the whole suite green, which is the same hole #718 closed for the asset
+# and instrument tables and left open here.
+#
+# `venue_cash_postures.attest_due_ts` is RAIL 22's INPUT. A re-attestation that silently carried
+# the old window forward would keep an expired posture reading as current, and rail 22 would stop
+# vetoing when it should -- the failure direction that costs money rather than opportunity.
+
+
+def _subscription(**overrides):
+    from decimal import Decimal
+
+    from keel_core.subscription import BrokerSubscription, SubscriptionStatus
+
+    fields = {
+        "venue": "coinbase",
+        "tier_name": "advanced",
+        "free_volume_usd": Decimal("10000"),
+        "pacing": "monthly",
+        "subscription_usd_month": Decimal("30"),
+        "status": SubscriptionStatus.ACTIVE,
+        "attested_at": 1_000,
+        "attest_due_ts": 2_000,
+    }
+    fields.update(overrides)
+    return BrokerSubscription(**fields)
+
+
+def _posture(**overrides):
+    from keel_core.cash_posture import CashPostureState, VenueCashPosture
+
+    fields = {
+        "venue": "coinbase",
+        "state": CashPostureState.ATTESTED,
+        "attested_posture": "SPOT_CASH",
+        "attested_ts": 1_000,
+        "attest_due_ts": 2_000,
+        "refuted_ts": None,
+        "refuted_reason": None,
+        "credential_fingerprint": "fp-1",
+    }
+    fields.update(overrides)
+    return VenueCashPosture(**fields)
+
+
+def test_reattesting_a_subscription_overwrites_its_window(repo):
+    """`attest_due_ts` is NOT NULL here, so the slip is even less visible than on the nullable
+    columns: the window can never read as absent, only as stale."""
+    repo.upsert_broker_subscription(_subscription(attest_due_ts=2_000))
+    assert repo.get_broker_subscription("coinbase").attest_due_ts == 2_000
+
+    repo.upsert_broker_subscription(_subscription(attested_at=3_000, attest_due_ts=9_000))
+    assert repo.get_broker_subscription("coinbase").attest_due_ts == 9_000
+
+
+def test_reattesting_a_subscription_does_not_clobber_its_other_columns(repo):
+    """The other half of the ON CONFLICT check: a clause that set the window and dropped a
+    neighbour would pass the test above."""
+    from decimal import Decimal
+
+    repo.upsert_broker_subscription(_subscription())
+    repo.upsert_broker_subscription(
+        _subscription(tier_name="pro", free_volume_usd=Decimal("50000"), attest_due_ts=9_000)
+    )
+
+    stored = repo.get_broker_subscription("coinbase")
+    assert stored.tier_name == "pro"
+    assert stored.free_volume_usd == Decimal("50000")
+    assert stored.attest_due_ts == 9_000
+
+
+def test_reattesting_a_cash_posture_overwrites_its_window(repo):
+    """RAIL 22'S INPUT. `doctor.cash_posture_findings` FAILS an expired posture and rail 22 vetoes
+    live entries on it -- so a window carried forward through a re-attestation is a rail that
+    stops vetoing when it should."""
+    repo.upsert_venue_cash_posture(_posture(attest_due_ts=2_000))
+    assert repo.get_venue_cash_posture("coinbase").attest_due_ts == 2_000
+
+    repo.upsert_venue_cash_posture(_posture(attested_ts=3_000, attest_due_ts=9_000))
+    assert repo.get_venue_cash_posture("coinbase").attest_due_ts == 9_000
+
+
+def test_a_cash_posture_reattested_with_no_window_does_not_inherit_the_old_one(repo):
+    """`VenueCashPosture`'s own docstring: "a record with no due date is a claim that never
+    expires, which this record does not permit". A NULL that inherited the previous window would
+    be exactly the claim it refuses, wearing a date nobody stated this time."""
+    repo.upsert_venue_cash_posture(_posture(attest_due_ts=2_000))
+    repo.upsert_venue_cash_posture(_posture(attested_ts=3_000, attest_due_ts=None))
+
+    assert repo.get_venue_cash_posture("coinbase").attest_due_ts is None
+
+
+def test_reattesting_a_cash_posture_CLEARS_a_previous_refutation(repo):
+    """Every nullable column on this row has to be settable back to NULL by a re-attestation, and
+    the refutation columns are the ones that matter: a posture the venue refuted, then re-attested
+    after the operator fixed it, would otherwise keep reading as refuted forever.
+
+    The method's own docstring states this rule for `credential_fingerprint` -- "could not clear
+    it would let a stale fingerprint outlive the record it described" -- and the same is true of
+    `refuted_ts` and `refuted_reason`. Dropping any of the three from `DO UPDATE SET` left the
+    suite green.
+    """
+    from keel_core.cash_posture import CashPostureState
+
+    repo.upsert_venue_cash_posture(
+        _posture(
+            state=CashPostureState.REFUTED,
+            refuted_ts=1_500,
+            refuted_reason="INTX portfolio present",
+        )
+    )
+    stored = repo.get_venue_cash_posture("coinbase")
+    assert stored.refuted_ts == 1_500
+
+    repo.upsert_venue_cash_posture(
+        _posture(attested_ts=3_000, attest_due_ts=9_000, refuted_ts=None, refuted_reason=None)
+    )
+
+    stored = repo.get_venue_cash_posture("coinbase")
+    assert stored.refuted_ts is None
+    assert stored.refuted_reason is None
+    assert stored.state == CashPostureState.ATTESTED
+
+
+def test_reattesting_a_cash_posture_does_not_clobber_its_other_columns(repo):
+    repo.upsert_venue_cash_posture(_posture())
+    repo.upsert_venue_cash_posture(
+        _posture(attest_due_ts=9_000, credential_fingerprint="fp-2", refuted_reason=None)
+    )
+
+    stored = repo.get_venue_cash_posture("coinbase")
+    assert stored.attest_due_ts == 9_000
+    assert stored.credential_fingerprint == "fp-2"
+
+
+def test_reattesting_a_cash_posture_overwrites_the_posture_ITSELF(repo):
+    """The column the rail actually reads. `attested_posture` is `SPOT_CASH` or `MARGIN_ENABLED`,
+    and rail 22 vetoes on the second -- so an operator who re-attests after moving off margin, and
+    whose re-attestation silently kept `MARGIN_ENABLED`, would go on being vetoed with a record
+    saying the opposite of what they stated. Every other column on this row was pinned and this
+    one was not."""
+    repo.upsert_venue_cash_posture(_posture(attested_posture="MARGIN_ENABLED"))
+    assert repo.get_venue_cash_posture("coinbase").attested_posture == "MARGIN_ENABLED"
+
+    repo.upsert_venue_cash_posture(_posture(attested_ts=3_000, attested_posture="SPOT_CASH"))
+    assert repo.get_venue_cash_posture("coinbase").attested_posture == "SPOT_CASH"
