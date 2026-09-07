@@ -22,6 +22,10 @@ import pytest
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
 WRAPPERS = [
+    # #648's tunnel verification. It is the script an operator runs before trusting a console
+    # reached from another device, so a shell bug in it is a bug in the one check standing between
+    # them and an exposed financial surface.
+    REPO_ROOT / "scripts" / "verify-tunnel-context.sh",
     REPO_ROOT / "keel-live-run.sh",
     REPO_ROOT / "paperforward-run.sh",
     REPO_ROOT / "paper-hourly-run.sh",
