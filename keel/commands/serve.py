@@ -39,11 +39,32 @@ _WILDCARD_BINDS = frozenset({"0.0.0.0", "::", "[::]", "*"})
 @click.option("--host", default=DEFAULT_HOST, show_default=True, help="Address to bind.")
 @click.option("--port", default=DEFAULT_PORT, show_default=True, type=int, help="Port to bind.")
 @click.option(
-    "--open/--no-open",
+    "--browser/--no-browser",
     "open_browser",
     default=True,
     show_default=True,
     help="Open the URL in your default browser.",
+)
+# The spelling this command shipped with, kept working and no longer advertised.
+#
+# `keel open` (#756) called it `--no-browser`, which is what every comparable local daemon uses
+# (`jupyter notebook`, `tensorboard`) and the only one of the two that reads sensibly on a command
+# named `open`: `keel open --no-open` argues with itself. Two words for one idea on adjacent
+# commands is a papercut on its own; the four `com.keel.serve.*.plist` files put both in front of
+# an operator at once, which is what settled it.
+#
+# NOT deleted, because those plists shipped WITH `--no-open` in them and one may already sit in
+# `~/Library/LaunchAgents`. Under `KeepAlive` an unknown option is not an error message anybody
+# reads -- it is a crash loop retried every ten seconds forever.
+#
+# `default=None` so "not given" is distinguishable from "given as false"; without it the alias
+# would silently override the real flag on every invocation that omitted it.
+@click.option(
+    "--open/--no-open",
+    "legacy_open_browser",
+    default=None,
+    hidden=True,
+    help="Deprecated spelling of --browser/--no-browser.",
 )
 @click.option(
     "--external-host",
@@ -62,6 +83,7 @@ def serve_cmd(
     host: str,
     port: int,
     open_browser: bool,
+    legacy_open_browser: bool | None,
     external_hosts: tuple[str, ...],
 ) -> None:
     """Serve keel's read-only view on localhost and open it in your browser.
@@ -128,6 +150,11 @@ def serve_cmd(
         build=_build_line(build),
         build_info=build,
     )
+
+    # The deprecated spelling wins only when it was actually given, so `--browser` and
+    # `--no-browser` behave normally for everyone who never used the old name.
+    if legacy_open_browser is not None:
+        open_browser = legacy_open_browser
 
     if open_browser:
         # Opened BEFORE `serve` blocks, and best-effort: a headless machine, a broken

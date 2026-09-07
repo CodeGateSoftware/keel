@@ -101,7 +101,7 @@ def test_no_daemon_launches_a_browser(label: str, wrapper: str, port: int) -> No
     """`keel serve` opens one by default. At boot that is a browser window nobody asked for, on a
     machine that may have no session at all -- and under launchd the launch would be attributed to
     a process with no GUI context."""
-    assert "--no-open" in _plist(label)["ProgramArguments"]
+    assert "--no-browser" in _plist(label)["ProgramArguments"]
 
 
 @pytest.mark.parametrize(("label", "wrapper", "port"), DAEMONS)

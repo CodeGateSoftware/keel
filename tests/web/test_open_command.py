@@ -161,7 +161,7 @@ def test_open_does_not_offer_a_url_for_a_process_that_has_gone(home: Path) -> No
 def test_open_launches_a_browser_by_default_and_can_be_told_not_to(
     home: Path, monkeypatch: pytest.MonkeyPatch, listening: int
 ) -> None:
-    """Symmetric with `keel serve --no-open`: the URL is printed either way, so a machine with no
+    """Symmetric with `keel serve --no-browser`: the URL is printed either way, so a machine with no
     launcher loses nothing."""
     runtime.record_serving(host="127.0.0.1", port=listening, token="tok", interactive=False)
     opened: list[str] = []
