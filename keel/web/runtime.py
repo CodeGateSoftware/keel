@@ -40,6 +40,7 @@ from __future__ import annotations
 
 import json
 import os
+import socket
 import sys
 import time
 from pathlib import Path
@@ -58,11 +59,31 @@ RUN_DIR_NAME = "run"
 DIR_MODE = 0o700
 FILE_MODE = 0o600
 
+#: How long to wait for the recorded port to answer. Loopback, so a healthy server answers
+#: immediately; anything slower is a machine in trouble worth reporting rather than waiting on.
+PROBE_TIMEOUT_SECONDS = 0.5
 
-def run_dir(*, create: bool = False) -> Path:
-    directory = state_root() / RUN_DIR_NAME
+
+def run_dir(*, create: bool = False) -> Path | None:
+    """The run directory, or `None` when there is no deployment to put one in.
+
+    `parents=False` deliberately (#759 review). `state_root`'s own contract is that "it never
+    creates a deployment folder, because a deployment folder that does not exist is not one this
+    function chose", and `mkdir(parents=True)` reached straight past it -- serving on a machine
+    with no deployment brought one into existence as a side effect. `server.ensure_schema` refuses
+    the identical hazard one directory over ("a read-only view would bring a deployment into
+    existence merely by being started"), and a first-run `keel serve` with no deployment is a
+    supported state, not an error.
+
+    So: record into a deployment that exists, and record nothing into one that does not. The
+    operator on that path is being shown the setup page and has no console to reopen yet.
+    """
+    root = state_root()
+    directory = root / RUN_DIR_NAME
     if create:
-        directory.mkdir(parents=True, exist_ok=True)
+        if not root.is_dir():
+            return None
+        directory.mkdir(parents=False, exist_ok=True)
         # Set explicitly rather than trusting the umask: `mkdir`'s mode is masked, and a
         # deployment running under a permissive umask would otherwise get a group-readable
         # directory holding session tokens.
@@ -77,7 +98,9 @@ def record_path(port: int) -> Path:
     directory even when the file itself is not. Pinned by
     `test_the_token_is_never_in_the_filename`.
     """
-    return run_dir() / f"serve-{int(port)}.json"
+    directory = run_dir()
+    assert directory is not None  # `create=False` always answers a path
+    return directory / f"serve-{int(port)}.json"
 
 
 def record_serving(*, host: str, port: int, token: str, interactive: bool) -> Path | None:
@@ -93,23 +116,37 @@ def record_serving(*, host: str, port: int, token: str, interactive: bool) -> Pa
     if interactive:
         return None
     directory = run_dir(create=True)
+    if directory is None:
+        return None
     path = directory / f"serve-{int(port)}.json"
     # Written through a per-port temporary file and then renamed, so a reader can never see a
     # half-written record: `os.replace` is atomic within a directory. The temporary carries the
     # same `0600`, because it holds the same token for the moment it exists.
     staging = directory / f".serve-{int(port)}.json.tmp"
-    staging.write_text(
-        json.dumps(
-            {
-                "pid": os.getpid(),
-                "host": host,
-                "port": int(port),
-                "token": token,
-                "started_ts": int(time.time()),
-            }
-        )
+    body = json.dumps(
+        {
+            "pid": os.getpid(),
+            "host": host,
+            "port": int(port),
+            "token": token,
+            "started_ts": int(time.time()),
+        }
     )
-    staging.chmod(FILE_MODE)
+    # CREATED at `0600`, not corrected to it (#759 review). `Path.write_text` creates at the
+    # process umask -- measured `0644` under the usual `022` -- and the `chmod` that followed left
+    # the token world-readable for the window between the two calls. The `0700` directory meant no
+    # other account could traverse in, so it was never exploitable; it was also an incidental
+    # mitigation for the one file whose entire purpose is holding a secret, and the fix is one
+    # argument to `os.open`. `O_EXCL` refuses a pre-existing path, so a symlink planted at the
+    # staging name cannot redirect the write either.
+    descriptor = os.open(staging, os.O_CREAT | os.O_EXCL | os.O_WRONLY, FILE_MODE)
+    try:
+        with os.fdopen(descriptor, "w") as handle:
+            handle.write(body)
+    except BaseException:
+        # A half-written staging file must not be left behind to collide with the next `O_EXCL`.
+        staging.unlink(missing_ok=True)
+        raise
     os.replace(staging, path)
     return path
 
@@ -158,6 +195,26 @@ def _process_alive(pid: int) -> bool:
     return True
 
 
+def _port_answers(host: str, port: int) -> bool:
+    """Can a loopback TCP connection be made to `host:port` right now?
+
+    A connect, not a request: this must not send the token anywhere, and "something is bound" is
+    the whole question. `create_connection` resolves the family, so an IPv6 record needs no special
+    case -- and it takes the UNBRACKETED host, unlike `url_for`, because brackets are a URL
+    spelling rather than part of an address.
+
+    A short timeout on purpose. This runs against loopback, where a healthy answer is immediate;
+    anything slower is a machine in trouble, and `keel open` should say so rather than hang.
+    """
+    if not host:
+        return False
+    try:
+        with socket.create_connection((host, int(port)), timeout=PROBE_TIMEOUT_SECONDS):
+            return True
+    except OSError:
+        return False
+
+
 def live_record(port: int) -> dict[str, Any] | None:
     """The record for `port`, but only if the process that wrote it is still around.
 
@@ -172,7 +229,15 @@ def live_record(port: int) -> dict[str, Any] | None:
         pid = int(record.get("pid", 0))
     except TypeError, ValueError:
         return None
-    return record if _process_alive(pid) else None
+    if not _process_alive(pid):
+        return None
+    # AND something must answer on the port (#759 review). A pid check alone is not liveness: keel
+    # dies, the OS hands that pid to anything else, and the record reads as live -- so `keel open`
+    # prints a token the server no longer honours and the browser gets a 403, which is the "keel is
+    # broken rather than stopped" confusion this check exists to prevent. Both checks, because
+    # neither is sufficient alone: a listening port could belong to another program, and a live pid
+    # could be a recycled one.
+    return record if _port_answers(str(record.get("host", "")), port) else None
 
 
 def forget(port: int) -> None:

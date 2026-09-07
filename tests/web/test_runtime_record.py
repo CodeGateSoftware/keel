@@ -126,3 +126,44 @@ def test_an_ipv6_host_is_bracketed_like_serve_prints_it(home: Path) -> None:
     record = runtime.read_record(8765)
     assert record is not None
     assert runtime.url_for(record) == "http://[::1]:8765/?token=tok"
+
+
+# -- review findings (#759) ----------------------------------------------------------------------
+
+
+def test_the_file_is_created_at_0600_rather_than_corrected_afterwards(
+    home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`write_text` then `chmod` leaves the token world-readable for the window between them.
+
+    Measured under `umask 022`, a `write_text` file is born `0644`. The `0700` directory means no
+    other account can traverse in, so the window was not exploitable -- but that is an incidental
+    mitigation, and creating a secret file at the mode it needs is one argument to `os.open`.
+    CodeQL points at this same line.
+
+    THE TEST WORKS BY REMOVING THE SAFETY NET: with `chmod` neutered, a file that is merely
+    corrected afterwards shows its umask mode, and one that is created correctly still shows
+    `0600`.
+    """
+    monkeypatch.setattr(os, "chmod", lambda *args, **kwargs: None)
+    monkeypatch.setattr(os, "umask", lambda mask: 0o022)
+    runtime.record_serving(host="127.0.0.1", port=8765, token="tok", interactive=False)
+    mode = stat.S_IMODE(runtime.record_path(8765).stat().st_mode)
+    assert mode == 0o600, f"created at {oct(mode)}; the mode must not depend on a later chmod"
+
+
+def test_recording_never_brings_a_deployment_root_into_existence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`state_root`: "it never creates a deployment folder, because a deployment folder that does
+    not exist is not one this function chose."
+
+    `mkdir(parents=True)` did exactly that. It is the same hazard `server.ensure_schema` refuses
+    one directory over -- "a read-only view would bring a deployment into existence merely by
+    being started" -- and a first-run `keel serve` on a machine with no deployment is a supported
+    state, not an error.
+    """
+    missing = tmp_path / "no-such-deployment"
+    monkeypatch.setenv("KEEL_HOME", str(missing))
+    assert runtime.record_serving(host="127.0.0.1", port=8765, token="t", interactive=False) is None
+    assert not missing.exists(), "serving created a deployment root as a side effect"
