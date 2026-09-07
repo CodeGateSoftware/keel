@@ -1106,11 +1106,18 @@ def table_present(conn: sqlite3.Connection, name: str) -> bool:
     on a database the agent may be mid-cycle on -- so meeting a table that a later `SCHEMA_VERSION`
     added is an ordinary deployment state for it, not an error.
 
-    **Checked rather than caught**, which is the whole reason this is a function and not a
-    `try`/`except`. `sqlite3.OperationalError` covers "no such table" and "database disk image is
-    malformed" under one clause, so catching it would report an un-upgraded database where the
-    truth is a corrupted one. That distinction is the difference between `keel migrate` and stop
-    trading, and no caller can recover it downstream.
+    **Checked rather than caught.** `sqlite3.OperationalError` covers "no such table" and
+    "database disk image is malformed" under one clause, and that distinction is the difference
+    between `keel migrate` and stop trading.
+
+    The narrower claim, because a sibling already does it the other way and does it correctly:
+    `Repository.get_series_feeds` catches `OperationalError` and re-raises unless the message
+    contains "no such table", which preserves exactly the distinction above. That works. What it
+    costs is a dependency on the TEXT of a sqlite error message, which is not part of sqlite's
+    API and has been reworded across releases before. Asking `sqlite_master` needs no such
+    match, and reads as the question being asked rather than as a filter over a failure -- so it
+    is the preferred idiom for a NEW reader. The existing catch is not a bug to go fix; it is a
+    second correct answer that this one supersedes.
 
     Asking `sqlite_master` rather than the `schema_version` row on purpose: the row says which
     migrations were RUN, and the tables are also created by `_SCHEMA_STATEMENTS` on any fresh

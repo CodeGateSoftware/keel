@@ -193,13 +193,14 @@ def test_trials_chain_errors_are_tail_bounded(tmp_path: Path, monkeypatch: Any) 
 
 # -- an un-migrated database, across the whole tool surface (#751) --------------------------------
 
-#: Everything v17-v20 added. Dropped from a current database, this is what a deployment that
-#: installed 0.14.0 and has not run `keel migrate` hands the MCP surface.
+#: Everything v17-v20 added, dropped together so the fixture is a faithful `v0.13.3` schema.
+#: Which of them any given tool actually READS is the point of the sweep below -- see
+#: `tests/commands/test_doctor.py` for why dropping a table nobody reads proves nothing.
 _TABLES_ADDED_SINCE_0_13_3 = (
-    "candle_series_feed",
-    "venue_cash_postures",
-    "equity_points",
-    "audit_events",
+    "candle_series_feed",  # v17
+    "venue_cash_postures",  # v18
+    "equity_points",  # v19
+    "audit_events",  # v20
 )
 
 
@@ -212,6 +213,13 @@ def test_no_tool_raises_against_a_database_nobody_has_migrated(tmp_path, valid_c
     the guard `audit_events` (v20) has, and the only test of that guard fabricated a state object,
     so it could never see a reader that lacked one. A tool added later inherits this sweep for
     free; a table added later needs only to join the tuple above.
+
+    **Every handler must RETURN A DOCUMENT, not merely fail to raise one exception type.** The
+    first cut asserted `except sqlite3.OperationalError: raise` with a bare `except Exception:
+    pass` beneath it, which could only ever prove "no `OperationalError`" -- so a tool that began
+    wrapping its database errors, or that broke outright for an unrelated reason, would have kept
+    this green while the bug came back. A handler that cannot answer over this schema is a
+    failure here whatever it raises.
     """
     from keel.data.db import connect, migrate
 
@@ -227,17 +235,24 @@ def test_no_tool_raises_against_a_database_nobody_has_migrated(tmp_path, valid_c
     log = tmp_path / "keel.log"
     log.write_text("")
     tools = build_tools(db_path=str(db), config_path=str(valid_config_path), log_path=str(log))
-    assert tools, "no tools built"
+    assert {tool.name for tool in tools} == {
+        "doctor",
+        "capabilities",
+        "profiles",
+        "orders",
+        "veto_log",
+        "purification",
+        "trials",
+        "reports",
+    }, "the sweep must cover the whole surface -- a new tool joins this set deliberately"
 
     for tool in tools:
         try:
-            tool.handler({})
-        except sqlite3.OperationalError as exc:  # the failure this test exists for
+            document = tool.handler({})
+        except Exception as exc:
             raise AssertionError(
-                f"MCP tool {tool.name!r} raised against an un-migrated database: {exc}. "
-                "A reader that does not migrate must report the gap, not propagate it."
+                f"MCP tool {tool.name!r} raised {type(exc).__name__} against an un-migrated "
+                f"database: {exc}. A reader that does not migrate must report the gap, not "
+                "propagate it."
             ) from exc
-        except Exception:
-            # Anything else is that tool's own argument or environment contract, not schema
-            # tolerance, and is covered by its own test above.
-            pass
+        assert isinstance(document, dict), f"{tool.name} answered {type(document).__name__}"
