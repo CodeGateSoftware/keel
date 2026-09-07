@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from keel_broker_api.orders import Side
 from keel_core.types import Candle, Granularity
 
 from keel import agent as agent_mod
@@ -501,3 +502,254 @@ def test_the_products_list_is_in_first_seen_order(repo: Repository, tmp_path: Pa
         "SOL-USD",
         "BTC-USD",
     )
+
+
+# -- the mark this page quotes IS the mark the rails moved on (#701) ------------------------------
+#
+# The module docstring has claimed this since the page shipped -- "THE MARK IS THE RAILS' MARK, AND
+# THAT IS THE POINT" -- and nothing asserted it. A documented invariant with no test is the shape
+# every finding in this milestone has taken, so here it is driven through BOTH real paths rather
+# than reasoned about from the shared helper.
+#
+# It matters because the two answers are not equal in status. `agent._mark_to_market_parts`'
+# number is the one that moved rail 11's drawdown scalars and got written to `equity_points`. If
+# this page ever quoted a different current price, the page would be the wrong one.
+
+
+def _fill_the_entry(repo: Repository, qty: str = "2", price: str = "100") -> None:
+    """The filled live BUY behind the tranche.
+
+    **The two sides read different tables, and that is the whole reason this needs a pin rather
+    than an argument.** `agent._held_position` derives the holding from FILLED LIVE ORDERS -- the
+    audit log, the same source `guards.py` and `executor._held_position` use -- while the page
+    reads the `positions` table's tranches. A real cycle writes both: `executor` fills the order
+    and `run_once` opens the tranche from it.
+
+    A test that seeded only the tranche made the rails see nothing at all and report `unrealized`
+    as zero -- which is a true statement about an empty order log and tells you nothing about
+    whether the two agree.
+    """
+    repo.insert_order(
+        {
+            "mode": "live",
+            "product_id": PRODUCT,
+            # `Side.BUY.value`, which is UPPERCASE. `_held_position` compares against it exactly,
+            # so a lowercase "buy" here reads as a side it does not recognise and the holding
+            # silently weighs nothing -- which is how the first cut of this test "passed" the
+            # rails with an empty order log.
+            "side": Side.BUY.value,
+            "qty": Decimal(qty),
+            "status": "filled",
+            "actual_fill": Decimal(price),
+            "created_at": NOW_TS - DAY,
+        }
+    )
+
+
+def _rails_price_map(repo: Repository, config: Config) -> dict[str, Decimal]:
+    """The price map exactly as `agent.run_once` builds it.
+
+    Not `{PRODUCT: Decimal("150")}` handed in by the test: the point of the pin is that the two
+    paths agree about WHICH candle is the mark, and a literal would assume the answer.
+    """
+    from keel import agent as agent_mod
+
+    finest = agent_mod._finest_granularity(list(config.market_data.granularities))
+    assert finest is not None
+    prices: dict[str, Decimal] = {}
+    for product in (PRODUCT,):
+        candles = repo.get_candles(product, finest)
+        if candles:
+            prices[product] = candles[-1].close
+    return prices
+
+
+def test_the_page_and_the_rails_mark_the_same_holding_at_the_same_price(
+    repo: Repository, tmp_path: Path
+) -> None:
+    """One number, two callers.
+
+    A COARSER series is seeded too, and holds a different close. That is what makes this a test of
+    the granularity choice rather than of "there is only one candle in the database" -- if either
+    path stopped agreeing about which timeframe is finest, they would quote 150 and 999.
+    """
+    config = _config(tmp_path)
+    _open_tranche(repo)
+    _mark(repo, "150")
+    repo.upsert_candles(PRODUCT, Granularity.ONE_DAY, [_candle(NOW_TS - 86_400, "999")])
+
+    prices = _rails_price_map(repo, config)
+    assert prices == {PRODUCT: Decimal("150")}, "the rails' own map did not take the finest close"
+
+    row = gather_positions(repo, config, now_ts=NOW_TS).rows[0]
+    assert row.mark == prices[PRODUCT]
+
+
+def test_the_pages_unrealized_reconciles_with_the_leg_recorded_against_the_rails(
+    repo: Repository, tmp_path: Path
+) -> None:
+    """The figure, not just the price.
+
+    `_mark_to_market_parts` is driven for real, with the price map `run_once` would have handed
+    it, and its `unrealized` leg is the one written to `equity_points` and read by rail 11. The
+    page sums its own per-tranche `unrealized_pnl` from the same mark, so the two must be equal --
+    and a page whose P&L disagreed with the number the drawdown rail acted on would be describing
+    a different account.
+    """
+    from keel import agent as agent_mod
+    from tests.test_agent import FakeBroker
+
+    config = _config(tmp_path)
+    _open_tranche(repo)
+    _fill_the_entry(repo)
+    _mark(repo, "150")
+
+    parts = agent_mod._mark_to_market_parts(
+        repo, FakeBroker(), [PRODUCT], _rails_price_map(repo, config), config.quote_currency
+    )
+    assert parts is not None
+
+    report = gather_positions(repo, config, now_ts=NOW_TS)
+    page_unrealized = sum(
+        (row.unrealized_pnl for row in report.rows if row.unrealized_pnl is not None),
+        Decimal("0"),
+    )
+    assert page_unrealized == parts.unrealized
+
+
+def test_an_unmarked_holding_reconciles_at_ZERO_on_both_sides(
+    repo: Repository, tmp_path: Path
+) -> None:
+    """The agreement has to survive the absent case, which is where two implementations of one
+    idea usually part company: `equity.unrealized_on_marks` contributes ZERO for a holding valued
+    at cost, and this page reports `None` for a figure it has no mark for. Zero and "not known"
+    are different words for the reader and the same number in the total, and the total is what
+    rail 11 read."""
+    from keel import agent as agent_mod
+    from tests.test_agent import FakeBroker
+
+    config = _config(tmp_path)
+    _open_tranche(repo)
+    _fill_the_entry(repo)  # the holding exists in both records; no candles seeded at all
+
+    parts = agent_mod._mark_to_market_parts(
+        repo, FakeBroker(), [PRODUCT], _rails_price_map(repo, config), config.quote_currency
+    )
+    assert parts is not None
+    assert parts.unrealized == Decimal("0")
+
+    row = gather_positions(repo, config, now_ts=NOW_TS).rows[0]
+    assert row.mark is None
+    assert row.unrealized_pnl is None
+
+
+# -- the attestation chip (#701, on #718's window) ------------------------------------------------
+
+
+def _attest(
+    repo: Repository, *, asset: str = "BTC", due: int | None = None, at: int = NOW_TS - DAY
+):
+    repo.upsert_asset_attestation(
+        asset=asset,
+        sector="tech",
+        backing="native",
+        pays_yield=False,
+        source="prospectus",
+        attested_by="operator",
+        attested_at=at,
+        attest_due_ts=due,
+    )
+
+
+def test_an_unattested_holding_says_so_rather_than_reading_as_fine(
+    repo: Repository, tmp_path: Path
+) -> None:
+    """Absent is UNKNOWN, never OK. `keel/compliance/screen.py`'s rule is that an asset nobody has
+    classified is unknown and unknown is a rejection -- a page rendering it as a quiet blank would
+    say the opposite of the gate that governs it."""
+    _open_tranche(repo)
+    _mark(repo, "150")
+    row = gather_positions(repo, _config(tmp_path), now_ts=NOW_TS).rows[0]
+
+    assert row.attestation == "unattested"
+
+
+def test_an_attestation_with_no_window_is_attested_and_not_judged_on_time(
+    repo: Repository, tmp_path: Path
+) -> None:
+    """`attest_due_ts` is OPTIONAL (#718): NULL means the operator recorded no window, which is
+    not the same as an expired one. Doctor's `_attestation_window_findings` states the convention
+    -- a row with no window is in neither the passed nor the approaching group -- and this follows
+    it rather than inventing a deadline."""
+    _open_tranche(repo)
+    _mark(repo, "150")
+    _attest(repo, due=None)
+    row = gather_positions(repo, _config(tmp_path), now_ts=NOW_TS).rows[0]
+
+    assert row.attestation == "attested"
+    assert row.attest_due_ts is None
+
+
+def test_a_window_that_has_passed_reads_as_expired(repo: Repository, tmp_path: Path) -> None:
+    """`due <= now` is closed, the same boundary doctor uses -- and for the reason stated there:
+    with `<`, a window landing exactly on the second falls into no group at all, which is a false
+    all-clear."""
+    _open_tranche(repo)
+    _mark(repo, "150")
+    _attest(repo, due=NOW_TS)
+    row = gather_positions(repo, _config(tmp_path), now_ts=NOW_TS).rows[0]
+
+    assert row.attestation == "expired"
+
+
+def test_a_window_closing_soon_reads_as_due(repo: Repository, tmp_path: Path) -> None:
+    _open_tranche(repo)
+    _mark(repo, "150")
+    _attest(repo, due=NOW_TS + DAY)
+    row = gather_positions(repo, _config(tmp_path), now_ts=NOW_TS).rows[0]
+
+    assert row.attestation == "due"
+    assert row.attest_due_ts == NOW_TS + DAY
+
+
+def test_a_window_far_out_is_simply_attested(repo: Repository, tmp_path: Path) -> None:
+    from keel.commands.doctor import ATTEST_WINDOW_APPROACHING_SEC
+
+    _open_tranche(repo)
+    _mark(repo, "150")
+    _attest(repo, due=NOW_TS + ATTEST_WINDOW_APPROACHING_SEC + DAY)
+    row = gather_positions(repo, _config(tmp_path), now_ts=NOW_TS).rows[0]
+
+    assert row.attestation == "attested"
+
+
+def test_the_approaching_threshold_is_doctors_and_not_a_second_number(
+    repo: Repository, tmp_path: Path
+) -> None:
+    """One threshold, two surfaces. A page warning at 30 days beside a `keel doctor` warning at 14
+    would have an operator believing whichever they looked at last."""
+    from keel.commands import positions as positions_mod
+    from keel.commands.doctor import ATTEST_WINDOW_APPROACHING_SEC
+
+    assert positions_mod.ATTEST_APPROACHING_SEC is ATTEST_WINDOW_APPROACHING_SEC
+
+
+def test_reading_the_attestations_costs_one_query_however_many_tranches(
+    repo: Repository, tmp_path: Path
+) -> None:
+    """A per-row lookup on a page that re-polls every 15 seconds. `get_asset_attestations()`
+    answers the whole book in one read, the same shape #707's `open_bracket_order_ids` uses."""
+    for _ in range(12):
+        _open_tranche(repo)
+    _mark(repo, "150")
+    _attest(repo)
+
+    seen: list[str] = []
+    repo._conn.set_trace_callback(seen.append)  # noqa: SLF001
+    try:
+        gather_positions(repo, _config(tmp_path), now_ts=NOW_TS)
+    finally:
+        repo._conn.set_trace_callback(None)  # noqa: SLF001
+
+    reads = [sql for sql in seen if "asset_attestations" in sql]
+    assert len(reads) == 1, f"{len(reads)} attestation queries for 12 tranches"

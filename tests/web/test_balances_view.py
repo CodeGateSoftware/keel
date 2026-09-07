@@ -295,3 +295,56 @@ def test_the_view_stamps_the_recorded_figures() -> None:
 def test_the_view_names_the_settled_split_as_unrecorded() -> None:
     """Omitting the tiles would let a reader take the available figure for the settled one."""
     assert "settled_breakdown" in _view_body()
+
+
+# -- the staleness verdict on the wire (#702) -----------------------------------------------------
+
+
+def _stale_report(tmp_path: Path, *, ages: tuple[int, ...]):
+    """A book whose live readings sit at `ages` seconds before now, oldest first."""
+    from tests.commands.test_balances import NOW_TS as B_NOW
+    from tests.commands.test_balances import _config, _reading
+
+    conn = connect(str(tmp_path / "stale.db"))
+    migrate(conn)
+    repo = Repository(conn)
+    repo.set_state("equity_state_mode", "live")
+    for age in ages:
+        repo.record_equity_point(_reading(B_NOW - age, "live", "250"))
+    return gather_balances(repo, _config(tmp_path), now_ts=B_NOW)
+
+
+def test_a_current_reading_is_neutral_and_never_green(tmp_path: Path) -> None:
+    """A fresh reading is the ORDINARY state. Grading it green would make the absence of green
+    read as a fault on every page that has only just started."""
+    body = web_payload.balances_payload(_stale_report(tmp_path, ages=(900, 60)))
+    assert body["freshness"]["state"] == "neutral"
+    assert body["freshness"]["value"] == "current"
+
+
+def test_a_stale_reading_warns_and_says_how_old(tmp_path: Path) -> None:
+    body = web_payload.balances_payload(_stale_report(tmp_path, ages=(900_000, 864_000)))
+    chip = body["freshness"]
+
+    assert chip["state"] == "warn"
+    assert chip["value"] == "stale"
+    assert "STALE" in chip["display"]
+    assert "days" in chip["display"], "an operator needs the age, not just the word"
+
+
+def test_a_deployment_that_has_never_cycled_is_unknown_not_stale(tmp_path: Path) -> None:
+    body = web_payload.balances_payload(_stale_report(tmp_path, ages=()))
+    assert body["freshness"]["state"] == "unknown"
+    assert "STALE" not in body["freshness"]["display"]
+
+
+def test_the_client_places_the_verdict_and_computes_no_age(tmp_path: Path) -> None:
+    """Rule 2 and the arithmetic ban together: `render.js` may not subtract two timestamps, so the
+    sentence has to arrive composed."""
+    source = _source("render.js")
+    start = source.index("export function balancesView(")
+    end = source.index("\nexport function ", start)
+    view = source[start:end]
+
+    assert "data.freshness" in view
+    assert "STALE" not in view, "the wording belongs to payload._staleness_payload"

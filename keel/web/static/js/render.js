@@ -1646,6 +1646,10 @@ export function balancesView(data, sort, onSort) {
 
   const sub = el("p", "sub");
   sub.append(field(data.generated_at), " · ", field(data.recorded));
+  // #702. Every tile on this page is a recorded figure with a stamp, and a stamp only separates a
+  // current reading from a stale one if somebody does the subtraction. The payload does it, judged
+  // against the cadence this deployment actually cycles at, and this places the verdict.
+  if (data.freshness) sub.append(" · ", field(data.freshness));
   fragment.append(sub);
 
   fragment.append(
@@ -1789,6 +1793,12 @@ export function positionsView(data, sort, onSort) {
           // on different timeframes has two verdicts -- a single chip above the table would
           // state one of them over the other.
           { label: "entry gate", numeric: false, key: "freshness" },
+          // #701. BESIDE the entry gate, never merged with it. One is a claim about the WORLD --
+          // what this token is, and whether the operator's claim is still in date -- and the
+          // other is a claim about DATA. They disagree in both directions, and a row flagged for
+          // one reason must not read as flagged for the other. No sort key: an attestation state
+          // is not a figure to rank tranches by.
+          { label: "attestation", numeric: false },
         ],
         held.map(/** @param {any} row */ (row) => [
           row.opened_at,
@@ -1803,6 +1813,7 @@ export function positionsView(data, sort, onSort) {
           row.stop_distance,
           row.stop_distance_pct,
           row.freshness,
+          row.attestation,
         ]),
         "No open tranches for this product.",
         { sort: sort, onSort: onSort },
