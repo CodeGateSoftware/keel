@@ -90,3 +90,59 @@ def test_out_of_scope_reports_are_named():
         "SECURITY.md must name strategy performance and market losses as out of scope"
     )
     assert "key" in text, "SECURITY.md must name a user's own key handling as out of scope"
+
+
+# -- the tunnel verification script (#648) ---------------------------------------------------------
+
+
+def _verify_script() -> str:
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parent.parent
+    return (root / "scripts" / "verify-tunnel-context.sh").read_text(encoding="utf-8")
+
+
+def test_the_tunnel_script_refuses_a_plain_http_origin() -> None:
+    """Every check in it is about what HTTPS provides. Run against `http://`, it would report a
+    pass for a page that is not a secure context -- and `127.0.0.1`'s exemption does not extend to
+    a tunnel's hostname."""
+    source = _verify_script()
+    assert "REFUSED" in source
+    assert "is not https" in source
+
+
+def test_the_tunnel_script_does_not_claim_what_only_a_browser_knows() -> None:
+    """`window.isSecureContext`, service-worker registration and the install prompt are browser
+    state. A script asserting them from curl would be reporting something it never looked at, so
+    they live in a printed checklist that the operator has to actually do.
+
+    This is the half of #648 a shell cannot close, and the script says so rather than implying its
+    exit code covers it.
+    """
+    source = _verify_script()
+    assert "part 2" in source
+    assert "isSecureContext" in source
+
+    # The EXECUTABLE region only -- between the shebang block's explanation and the checklist.
+    # The header comment names `isSecureContext` precisely to say it cannot be answered here, and
+    # a scan that could not tell an explanation from a claim would forbid the file explaining
+    # itself.
+    body = source.split("set -euo pipefail", 1)[1].split("part 2", 1)[0]
+    assert "isSecureContext" not in body, "part 1 claims a property only a browser can report"
+    assert "serviceWorker" not in body
+
+
+def test_the_tunnel_script_still_expects_a_spoofed_host_to_be_refused() -> None:
+    """The check that matters most. `--external-host` teaches the server ONE name; a deployment
+    where a spoofed Host is answered is one where the allowlist has been widened until it stopped
+    being one."""
+    source = _verify_script()
+    assert "Host: evil.example" in source
+    assert "the allowlist is too wide" in source
+
+
+def test_the_tunnel_script_exits_nonzero_when_a_check_fails() -> None:
+    """An operator wiring this into anything needs the status to mean something."""
+    source = _verify_script()
+    assert 'exit "$FAILED"' in source
+    assert "set -euo pipefail" in source

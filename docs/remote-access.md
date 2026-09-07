@@ -106,3 +106,32 @@ One requirement remains, and it is not a formality:
   than assumed from the loopback behaviour. That needs a real deployed origin, so it cannot be
   closed from a checkout — and until it is, an installed console reached through a tunnel is
   untested, not merely unsupported.
+
+### Verifying it, once you have an origin
+
+```
+scripts/verify-tunnel-context.sh https://keel.example.com <session-token>
+```
+
+The token is the one `keel serve` printed in its URL. The script has two parts and **only the
+first one is automated**, which is the honest shape of this requirement rather than a limitation
+of the script:
+
+**Part 1 — what HTTP can answer.** That the shell is served over the external origin; that the
+token is exchanged for a `SameSite=Strict` session cookie there; that `manifest.webmanifest` and
+`sw.js` are actually served; that responses carry `nosniff`; and — the one that matters most —
+that **a spoofed `Host:` is still refused**. `--external-host` teaches the server one name, and a
+deployment where `Host: evil.example` is answered is one where the allowlist has been widened
+until it stopped being one. Exits non-zero on any failure.
+
+It refuses a plain `http://` origin outright. Every check in it is about what HTTPS provides, and
+run against `http://` it would report a pass for a page that is not a secure context.
+
+**Part 2 — what only a browser can answer.** `window.isSecureContext`, whether the service worker
+registered and with what scope, whether the cache is genuinely per-origin, whether the manifest
+installs, and how the installed console behaves when the tunnel dies. The script prints these as a
+checklist and does not pretend its exit code covers them: a script claiming
+`window.isSecureContext` from `curl` would be reporting something it never looked at.
+
+**#648 closes when part 2 has been done on a device and recorded on the issue.** Part 1 passing is
+not sufficient, and no amount of scripting will make it so.
