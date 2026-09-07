@@ -11,6 +11,7 @@ from keel.agent import build_rule_from_params
 from keel.cli import cli
 from keel.data.db import connect, migrate
 from keel.data.repository import Repository
+from keel.research import ledger
 from keel.research import ledger as trials_ledger
 from keel.research.montecarlo import equity_curve, max_drawdown
 from keel.strategy.backtest import backtest
@@ -514,3 +515,175 @@ def test_monte_carlo_caps_paths_at_2000(tmp_path):
     db = _mc_db(tmp_path)
     result = _invoke_mc(CliRunner(), db, tmp_path / "t.jsonl", "--paths", "2001", "--seed", "1")
     assert result.exit_code != 0
+
+
+# -- the gauntlet records what it computed (#726) --------------------------------------------------
+#
+# keel computed evidence and kept only the prose. `trials pbo` printed ten figures and wrote none;
+# `trials deflate` printed a DSR whose inputs the ledger could not supply, so the number could
+# never be recomputed or checked; `trials monte-carlo` stored a distribution's ends and not its
+# shape. All three surfaced as "the UI cannot show this" and none was a UI problem.
+
+
+def _seeded_columns(path, sessions: int = 4):
+    """Enough synchronous per-bar series for `build_matrix` to make a CSCV matrix from."""
+    from decimal import Decimal as D
+
+    for index in range(sessions):
+        ledger.append_trial(
+            path,
+            trial_id=f"col-{index}",
+            session="s1",
+            rule="turtle_breakout",
+            params={"n": 20 + index},
+            provenance="fitted",
+            kind="sweep_node",
+            decision="selected" if index == 0 else "rejected",
+            per_bar_pnl=[D(str((row * (index + 1)) % 7 - 3)) for row in range(64)],
+        )
+
+
+def test_trials_pbo_records_every_figure_it_computed(tmp_path) -> None:
+    path = tmp_path / "ledger.jsonl"
+    _seeded_columns(path)
+
+    result = CliRunner().invoke(cli, ["trials", "pbo", "--ledger", str(path), "--blocks", "4"])
+    assert result.exit_code == 0, result.output
+
+    recorded = [row for row in ledger.read_trials(path) if row.kind == "cscv"]
+    assert len(recorded) == 1
+    summary = recorded[0].summary
+    for field in (
+        "pbo",
+        "degradation_slope",
+        "degradation_intercept",
+        "prob_loss",
+        "dominance_1st",
+        "dominance_2nd",
+        "n_columns",
+        "n_blocks",
+        "n_combinations",
+        "rows_used",
+        "rows_dropped",
+    ):
+        assert field in summary, f"{field} was computed and not recorded"
+
+
+def test_a_recorded_cscv_row_can_never_become_a_column_in_the_next_run(tmp_path) -> None:
+    """The row is a measurement ABOUT a set of columns, not a trial with a series of its own.
+    `matrix.build_matrix` refuses `series_missing` rows, so recording one cannot feed it back into
+    the next PBO over the same file -- a diagnostic that changed the thing it measured."""
+    from keel.research import matrix as matrix_mod
+
+    path = tmp_path / "ledger.jsonl"
+    _seeded_columns(path)
+
+    # `--session s1`, so the recorded row lands in the SAME session the matrix is built from.
+    # Without it the row is written under session "all" and the session filter excludes it -- the
+    # test would then pass whether or not `series_missing` did any work, which is how the first
+    # version of this passed against a mutant that gave the row a real series.
+    for _ in range(2):
+        outcome = CliRunner().invoke(
+            cli,
+            ["trials", "pbo", "--ledger", str(path), "--session", "s1", "--blocks", "4"],
+        )
+        assert outcome.exit_code == 0, outcome.output
+
+    recorded = [row for row in ledger.read_trials(path) if row.kind == "cscv"]
+    assert len(recorded) == 2, "the premise: both runs recorded into session s1"
+    assert all(row.session == "s1" for row in recorded)
+    assert all(row.series_missing for row in recorded)
+
+    assert len(matrix_mod.build_matrix(ledger.read_trials(path), session="s1").columns) == 4
+
+
+def test_trials_deflate_records_the_inputs_the_operator_supplied(tmp_path) -> None:
+    """`--sharpe` is a REQUIRED operator input and the ledger stores no per-trial Sharpe, so DSR
+    is impossible to recompute later without synthesising it. Recording the inputs at the moment
+    they were stated turns the figure into one that can be CHECKED."""
+    path = tmp_path / "ledger.jsonl"
+    _seeded_columns(path)
+
+    result = CliRunner().invoke(
+        cli,
+        [
+            "trials", "deflate", "--ledger", str(path),
+            "--sharpe", "1.8", "--trial-sharpe-variance", "0.25", "--rho", "0.5",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+
+    (recorded,) = [row for row in ledger.read_trials(path) if row.kind == "deflated_sharpe"]
+    for field in (
+        "observed_annual_sharpe",
+        "trades_per_year",
+        "skewness",
+        "kurtosis",
+        "trial_sharpe_variance",
+        "dsr",
+        "expected_max_sharpe",
+        "min_trades",
+    ):
+        assert field in recorded.summary, f"{field} is needed to recompute DSR and is not stored"
+    assert recorded.summary["observed_annual_sharpe"] == Decimal("1.8")
+
+
+def test_deflate_without_the_variance_records_nothing_rather_than_a_guess(tmp_path) -> None:
+    """The command already refuses to COMPUTE a DSR it has no variance for. It must not record a
+    row implying it did -- a stored figure nobody ran is worse than an honest gap."""
+    path = tmp_path / "ledger.jsonl"
+    _seeded_columns(path)
+
+    result = CliRunner().invoke(
+        cli, ["trials", "deflate", "--ledger", str(path), "--sharpe", "1.8"]
+    )
+    assert result.exit_code == 0, result.output
+    assert "NOT COMPUTED" in result.output
+    assert [row for row in ledger.read_trials(path) if row.kind == "deflated_sharpe"] == []
+
+
+def test_every_recorded_gauntlet_row_keeps_the_chain_intact(tmp_path) -> None:
+    """All three writers append to a hash-chained, append-only file. A row that broke the chain
+    would take the whole record with it."""
+    path = tmp_path / "ledger.jsonl"
+    _seeded_columns(path)
+    CliRunner().invoke(cli, ["trials", "pbo", "--ledger", str(path), "--blocks", "4"])
+    CliRunner().invoke(
+        cli,
+        ["trials", "deflate", "--ledger", str(path), "--sharpe", "1.8",
+         "--trial-sharpe-variance", "0.25"],
+    )
+
+    assert ledger.verify_chain(path) == []
+
+
+def test_monte_carlo_records_the_distributions_SHAPE_not_only_its_ends(tmp_path):
+    """#726. `distribution_min/median/max` say how far the resampling reached; the ladder says
+    what its shape WAS -- which is what a histogram needs and what nothing recorded until now, so
+    #708's Monte Carlo panel had no stored figures and would have had to re-run a backtest inside
+    a web request.
+
+    Flat keys, because `ledger._validate_summary` refuses a nested value: one would make this
+    append-only file unreadable on the next read, permanently.
+    """
+    from keel.research.montecarlo import QUANTILE_LADDER
+
+    db = _mc_db(tmp_path)
+    ledger_path = tmp_path / "trials.jsonl"
+    result = _invoke_mc(
+        CliRunner(), db, ledger_path, "--mode", "trades", "--paths", "40", "--seed", "7"
+    )
+    assert result.exit_code == 0, result.output
+
+    (row,) = trials_ledger.read_trials(ledger_path)
+    for percent in QUANTILE_LADDER:
+        for prefix in ("final", "drawdown"):
+            key = f"{prefix}_p{percent:02d}"
+            assert key in row.summary, f"{key} was computed and not recorded"
+            assert isinstance(row.summary[key], Decimal)
+
+    # A LADDER, not seven copies of one number: a distribution whose quantiles were all equal
+    # would satisfy a presence check and describe nothing.
+    ladder = [row.summary[f"drawdown_p{percent:02d}"] for percent in QUANTILE_LADDER]
+    assert ladder == sorted(ladder)
+    assert len(set(ladder)) > 1, "every drawdown quantile is identical -- the ladder says nothing"

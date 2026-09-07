@@ -229,3 +229,65 @@ def test_the_tracked_ledger_still_verifies_after_the_canonicaliser_moved() -> No
     # errors for zero rows, which is not the same as "verified" (see `verify_records`).
     assert len(records) > 1, "the tracked ledger must hold a chain, not a single row"
     assert ledger.verify_chain(tracked) == []
+
+
+# -- the summary is FLAT, and the guard is at write time (#726) -----------------------------------
+
+
+def test_a_nested_summary_value_is_refused_at_append_time(tmp_path) -> None:
+    """The reason #726's quantile ladder is flat keys rather than a list.
+
+    `_decode_summary` maps every summary value to `None`, an `int`, or `Decimal(value)`. A list
+    raises `ValueError` and a dict raises `TypeError` -- and it raises on READ, in `read_trials`,
+    which every later `verify_chain`, `trials list`, `trials pbo` and web page goes through. One
+    such row would make an APPEND-ONLY file unreadable forever, with no way to take it back.
+
+    That is not hypothetical: the module's own docstring records a null summary value doing
+    exactly this once already ("one such row made every later read_trials/verify_chain of the
+    append-only chain raise forever").
+
+    So the check moved to the write, where it is still a refusal rather than a catastrophe.
+    """
+    path = tmp_path / "ledger.jsonl"
+    for value in ([Decimal("1")], {"p50": Decimal("1")}, (1, 2)):
+        with pytest.raises(ValueError, match="summary"):
+            ledger.append_trial(
+                path,
+                trial_id="t1",
+                session="s",
+                rule="r",
+                provenance="a_priori",
+                kind="sweep_node",
+                decision="diagnostic_only",
+                series_missing=True,
+                summary={"quantiles": value},
+            )
+    assert not path.exists(), "a refused append must not have written a row"
+
+
+def test_the_scalar_summary_values_the_gauntlet_writes_all_round_trip(tmp_path) -> None:
+    """Everything #726 stores: Decimals, ints, bools and explicit nulls."""
+    path = tmp_path / "ledger.jsonl"
+    ledger.append_trial(
+        path,
+        trial_id="t1",
+        session="s",
+        rule="r",
+        provenance="a_priori",
+        kind="sweep_node",
+        decision="diagnostic_only",
+        series_missing=True,
+        summary={
+            "pbo": Decimal("0.8810"),
+            "n_columns": 12,
+            "dominance_1st": True,
+            "trial_sharpe_variance": None,
+        },
+    )
+    (stored,) = ledger.read_trials(path)
+
+    assert stored.summary["pbo"] == Decimal("0.8810")
+    assert stored.summary["n_columns"] == 12
+    assert stored.summary["dominance_1st"] is True
+    assert stored.summary["trial_sharpe_variance"] is None
+    assert ledger.verify_chain(path) == []

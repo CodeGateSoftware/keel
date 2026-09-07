@@ -34,6 +34,7 @@ call bit-for-bit. A resample that cannot reproduce itself is not evidence.
 
 from __future__ import annotations
 
+import math
 import random
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -113,6 +114,39 @@ def max_drawdown(curve: Sequence[Decimal]) -> Decimal:
         peak = max(peak, point)
         deepest = max(deepest, peak - point)
     return deepest
+
+
+#: The quantile ladder every resampled distribution is stored at (#726).
+#:
+#: A FIXED ladder, and a small one. The raw array of `n_paths` finals is what a chart would love
+#: and what an append-only text file must not carry: at the default path count it is thousands of
+#: Decimals per row, and the ledger is git-tracked. Seven quantiles are what a histogram or a
+#: polyline actually needs, are bounded, and are the same seven whatever `--paths` was.
+#:
+#: Stored FLAT (`final_p05`, `final_p50`, ...), never as a nested list: `ledger._validate_summary`
+#: refuses anything else, because a nested value makes the whole file unreadable on the next read.
+QUANTILE_LADDER: tuple[int, ...] = (1, 5, 25, 50, 75, 95, 99)
+
+
+def quantile(values: Sequence[Decimal], percent: int) -> Decimal:
+    """The `percent`-th quantile by NEAREST-RANK, on the sorted values.
+
+    Nearest-rank rather than interpolating: every value in this distribution is a resampled
+    equity that the model actually produced, and an interpolated quantile is a number no path
+    reached. For a distribution being read as "what could have happened", that distinction is the
+    whole point -- the same reason `median` below averages the two middle values only for an even
+    count, where no single observation is the middle.
+    """
+    if not values:
+        raise ValueError("no values to take a quantile of")
+    ordered = sorted(values)
+    rank = max(1, math.ceil(Decimal(percent) / Decimal(100) * Decimal(len(ordered))))
+    return ordered[int(rank) - 1]
+
+
+def quantile_ladder(values: Sequence[Decimal], prefix: str) -> dict[str, Decimal]:
+    """`{f"{prefix}_p05": ..., ...}` over `QUANTILE_LADDER` -- the flat form the ledger stores."""
+    return {f"{prefix}_p{percent:02d}": quantile(values, percent) for percent in QUANTILE_LADDER}
 
 
 def median(values: Sequence[Decimal]) -> Decimal:
