@@ -506,7 +506,22 @@ async function paint(route, rebuild, force) {
 
   if (!rebuild) return;
 
-  if (primary.data === null) {
+  // `try`/`finally` around the swap, and the flag comes down in the `finally` (#757 review).
+  // `read` resolves on a transport failure rather than rejecting, but `mount` is a renderer and a
+  // renderer can throw -- and `paint` is called as `void paint(...)`, so nothing catches it. Left
+  // raised, `aria-busy` is no longer the harmless assistive-only signal it was before #754: it now
+  // carries `opacity` and `pointer-events: none`, so a throw here would leave the view dimmed and
+  // every control inside it dead. The stale-but-usable view we had before is strictly better than
+  // that, and this is what keeps it.
+  //
+  // `commitNavigation` stays INSIDE the try, after the swap: a render that threw is not an
+  // arrival, and claiming one would put the nav label back out of step with the rows -- the exact
+  // bug #754 exists to remove.
+  //
+  // Nothing awaits between the `route !== current` guard above and here, so `current` cannot move
+  // under this block and the flag being lowered is always this route's own.
+  try {
+    if (primary.data === null) {
     // `data: null` is the ONLY route into these two views, and `payload.envelope` guarantees the
     // key is `null` rather than `{}` for exactly this reason -- see `render.stoppedView`.
     //
@@ -515,20 +530,23 @@ async function paint(route, rebuild, force) {
     // refused this browser. The two 403s (`_admitted`'s host check and its session check) share
     // this branch on purpose. They have the same remedy from the operator's side: the address
     // keel printed is what admits this browser, and pasting it is the action either one needs.
-    if (primary.error && primary.error.status === REFUSED_STATUS) {
-      rebuildInto(refusedView(primary, reconnect), Boolean(force));
+      if (primary.error && primary.error.status === REFUSED_STATUS) {
+        rebuildInto(refusedView(primary, reconnect), Boolean(force));
+      } else {
+        rebuildInto(stoppedView(primary, pathFor(SETUP_ROUTE)), Boolean(force));
+      }
     } else {
-      rebuildInto(stoppedView(primary, pathFor(SETUP_ROUTE)), Boolean(force));
+      rebuildInto(mount(route, readings), Boolean(force));
     }
-  } else {
-    rebuildInto(mount(route, readings), Boolean(force));
+    // AFTER the swap, never before: this is the point at which the nav label, the tab title and
+    // the rows on screen describe the same route (#754). Reached by all three branches above -- a
+    // stopped view and a refused view are outcomes of this navigation too, and leaving the nav
+    // pointing at the previous route while the content reports on this one is the same mismatch.
+    commitNavigation(route);
+  } finally {
+    clearPending();
+    contentNode.setAttribute("aria-busy", "false");
   }
-  // AFTER the swap, never before: this is the point at which the nav label, the tab title and the
-  // rows on screen describe the same route (#754). Reached by all three branches above -- a
-  // stopped view and a refused view are outcomes of this navigation too, and leaving the nav
-  // pointing at the previous route while the content reports on this one is the same mismatch.
-  commitNavigation(route);
-  contentNode.setAttribute("aria-busy", "false");
 }
 
 /**
@@ -655,8 +673,19 @@ function commitNavigation(route) {
     const isCurrent = link.getAttribute("href") === pathFor(route);
     if (isCurrent) link.setAttribute("aria-current", "page");
     else link.removeAttribute("aria-current");
-    link.removeAttribute(PENDING_ATTR);
   }
+}
+
+/**
+ * Drop the click acknowledgement, however the read ended.
+ *
+ * Separate from `commitNavigation` because the two answer different questions. Arrival is a claim
+ * about where you ARE and must not be made when the render failed; the acknowledgement is about a
+ * read being over, which is true whether it succeeded, failed, or was superseded. Folding it into
+ * the commit left a link marked pending forever on any path that never arrived.
+ */
+function clearPending() {
+  for (const link of document.querySelectorAll("header nav a")) link.removeAttribute(PENDING_ATTR);
 }
 
 function show(route, focus) {

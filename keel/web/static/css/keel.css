@@ -489,10 +489,19 @@ header a[data-pending] {
  * sends one response, not a stream of them, and a fake percentage would be a claim about
  * something nothing is counting.
  *
- * On `#view` rather than `#content` so it sits above the dimmed rows without inheriting the
- * dim. Reduced motion is handled by the blanket rule further down, which flattens the animation
- * to a static bar rather than removing the signal. */
-#content[aria-busy="true"] #view::before {
+ * On `#view` rather than `#content` so it sits above the dimmed rows without inheriting the dim
+ * -- `opacity` creates a stacking context and would take the bar down with the content.
+ *
+ * `:has(> ...)` and NOT a descendant combinator, because the nesting runs the OTHER WAY:
+ * `main#view > div#content`. The first cut of this rule was `#content[aria-busy="true"]
+ * #view::before`, which asks for a `#view` INSIDE `#content` -- true of no document this shell
+ * ever produces, so it matched nothing and the bar never drew. CSS fails silently, and the test
+ * asserting the selector's text passed the whole time;
+ * `test_the_busy_bar_selector_matches_the_shell_it_targets` is what makes that failure loud.
+ *
+ * Reduced motion is handled by the blanket rule further down, which flattens the animation to a
+ * static bar rather than removing the signal. */
+#view:has(> #content[aria-busy="true"])::before {
   content: "";
   position: fixed;
   top: 0;

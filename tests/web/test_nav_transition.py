@@ -32,6 +32,61 @@ _CSS = (staticfiles.STATIC_ROOT / "css" / "keel.css").read_text()
 #: assertion below green, because the comment ABOVE the rule still said "aria-busy". Caught by
 #: mutation, which is the only thing that finds a scan satisfied by its own explanation.
 _CSS_RULES = re.sub(r"/\*.*?\*/", "", _CSS, flags=re.S)
+_INDEX = (staticfiles.STATIC_ROOT / "index.html").read_text()
+
+
+def _ancestors(html: str, element_id: str) -> list[str]:
+    """The ids enclosing `element_id`, outermost first, read from the shipped markup.
+
+    Deliberately a real nesting walk over the file rather than a guess: the whole point is to
+    compare a SELECTOR against the document it targets, and a helper that inferred the document
+    would only restate the selector's own assumption.
+    """
+    body = re.sub(r"<!--.*?-->", "", html, flags=re.S)
+    open_stack: list[str] = []
+    for match in re.finditer(r"<(/?)([a-zA-Z][a-zA-Z0-9]*)\b([^>]*?)(/?)>", body):
+        closing, tag, attrs, self_closing = match.groups()
+        if tag.lower() in {"meta", "link", "br", "img", "input", "path", "rect", "use"}:
+            continue
+        found = re.search(r'id="([^"]+)"', attrs)
+        if closing:
+            if open_stack:
+                open_stack.pop()
+            continue
+        if found and found.group(1) == element_id:
+            return list(open_stack)
+        if not self_closing:
+            open_stack.append(found.group(1) if found else "")
+    raise AssertionError(element_id + " is not in the shipped markup")
+
+
+def test_the_busy_bar_selector_matches_the_shell_it_targets() -> None:
+    """The rule must describe the REAL nesting, which is `main#view > div#content`.
+
+    THE BUG THIS EXISTS FOR. The first cut was `#content[aria-busy="true"] #view::before` -- a
+    `#view` inside `#content`, which is backwards. It matched nothing, the bar never drew, and
+    `test_the_stylesheet_gives_the_busy_state_a_visible_form` stayed green the entire time,
+    because a selector's TEXT being present says nothing about whether it selects anything. CSS
+    has no other way to fail.
+
+    So this one asserts against `index.html` rather than against the stylesheet's own claim.
+    """
+    assert "content" in _ancestors(_INDEX, "view") or "view" in _ancestors(_INDEX, "content"), (
+        "neither element encloses the other; the busy rule cannot be written as a relationship"
+    )
+    # `#content` is the one carrying `aria-busy`, and `#view` is its PARENT.
+    assert "view" in _ancestors(_INDEX, "content"), "the shell moved; re-derive the rule"
+    assert "content" not in _ancestors(_INDEX, "view")
+
+    bar = [line for line in _CSS_RULES.splitlines() if "::before" in line and "aria-busy" in line]
+    assert bar, "the busy bar rule is gone"
+    selector = bar[0]
+    assert ':has(> #content[aria-busy="true"])' in selector, (
+        "the bar hangs off a descendant relationship that does not exist in the shell: " + selector
+    )
+    assert selector.index("#view") < selector.index("#content"), (
+        "ancestor and descendant are the wrong way round: " + selector
+    )
 
 
 def _body(source: str, name: str) -> str:
@@ -131,11 +186,43 @@ def test_a_click_is_acknowledged_without_claiming_arrival() -> None:
     assert _code_only(_MAIN).count('PENDING_ATTR = "data-pending"') == 1
 
 
-def test_the_pending_marker_is_always_cleared_where_arrival_is_claimed() -> None:
-    """A `data-pending` left behind outlives the read and marks a link forever."""
-    commit = _body(_MAIN, "commitNavigation")
-    assert "removeAttribute" in commit
-    assert "PENDING_ATTR" in commit or "data-pending" in commit
+def test_the_pending_marker_is_cleared_however_the_read_ends() -> None:
+    """A `data-pending` left behind marks a link as loading forever.
+
+    It used to be cleared inside `commitNavigation`, which is only reached when the render
+    SUCCEEDS -- so a renderer that threw left the link pending for the life of the page. Clearing
+    says the read is over, which is true on every path, so it belongs in the `finally` beside the
+    busy flag. Arrival does not: claiming it after a failed render would put the nav label back
+    out of step with the rows, which is the bug this whole change removes.
+    """
+    assert "function clearPending(" in _MAIN
+    clearer = _code_only(_body(_MAIN, "clearPending"))
+    assert "removeAttribute" in clearer
+    assert "PENDING_ATTR" in clearer
+    assert "aria-current" not in clearer, "clearing an acknowledgement must not touch arrival"
+
+    paint = _code_only(_body(_MAIN, "paint"))
+    assert "} finally {" in paint, "paint does not guarantee cleanup"
+    tail = paint[paint.index("} finally {") :]
+    assert "clearPending(" in tail, "the marker is not cleared on the failure path"
+    assert "commitNavigation(" not in tail, (
+        "arrival is claimed in the finally -- a render that threw would still say you got there"
+    )
+
+
+def test_the_busy_flag_comes_down_even_when_the_render_throws() -> None:
+    """`aria-busy` is no longer decorative. Since #754 it carries `opacity` and
+    `pointer-events: none`, so a flag left raised leaves the view dimmed and every control inside
+    it dead -- worse than the stale-but-usable view that preceded this change.
+
+    `read` resolves rather than rejects on a transport failure, but `mount` is a renderer and
+    `paint` is invoked as `void paint(...)`, so nothing catches what a renderer throws.
+    """
+    paint = _code_only(_body(_MAIN, "paint"))
+    lowered = chr(34) + "aria-busy" + chr(34) + ", " + chr(34) + "false" + chr(34)
+    assert lowered in paint
+    tail = paint[paint.index("} finally {") :]
+    assert lowered in tail, "the flag is lowered on the success path only"
 
 
 def test_only_navigation_raises_the_busy_flag() -> None:
