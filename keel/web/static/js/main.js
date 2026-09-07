@@ -108,7 +108,7 @@ const ROUTES = [
   { name: "balances", label: "Balances", endpoints: ["balances"] },
   { name: "timeline", label: "Timeline", endpoints: ["timeline"] },
   { name: "insights", label: "Insights", endpoints: ["insights", "journal"] },
-  { name: "research", label: "Research", endpoints: ["research/trials", "research/gauntlet", "research/slippage"] },
+  { name: "research", label: "Research", endpoints: ["research/trials", "research/gauntlet", "research/slippage", "research/matrix"] },
   { name: "rules", label: "Rules", endpoints: ["rules"] },
   { name: "venues", label: "Venues", endpoints: ["venues"] },
   { name: "gates", label: "Gates", endpoints: ["gates"] },
@@ -463,10 +463,12 @@ function mount(route, readings) {
     // rather than taking the whole research record down.
     const gauntlet = readings[1];
     const slippage = readings[2];
+    const matrix = readings[3];
     return researchView(
       data,
       gauntlet ? gauntlet.data : null,
       slippage ? slippage.data : null,
+      matrix ? matrix.data : null,
     );
   }
   if (route.name === "rules") return rulesView(data, primary.sort, onSort);

@@ -1762,6 +1762,8 @@ _ROW_ENDPOINTS: tuple[tuple[str, str, str, str, str], ...] = (
     ("rulesView", "data", "rules", "/api/rules", "rules"),
     ("researchView", "slippage", "rows", "/api/research/slippage", "none"),
     ("researchView", "gauntlet", "rows", "/api/research/gauntlet", "gauntlet"),
+    # #708 view 2. Registered WITH the code that reads it -- the rule `_ROW_ENDPOINTS` states.
+    ("researchView", "matrix", "rows", "/api/research/matrix", "matrix"),
     # #705's discretionary journal, registered WITH the code that reads it. It hangs off
     # `/api/journal`'s `notes`, and the seeder writes one entry through the repository because the
     # CLI writer refuses to run without a terminal.
@@ -1839,6 +1841,37 @@ def _seed_for(kind: str, db_path: str) -> None:
         _seed_orders(db_path, (("BTC-USD", "buy", "50000"),))
     elif kind == "rules":
         _seed_rules(db_path, ("breakout",))
+    elif kind == "matrix":
+        # A recorded CSCV run, appended through the real ledger writer -- the page has no way to
+        # produce one and must not: it READS what `trials pbo` recorded.
+        from decimal import Decimal
+
+        from keel.research import ledger as _ledger
+
+        _ledger.append_trial(
+            _ledger.DEFAULT_LEDGER_PATH,
+            trial_id="cscv-s1-s16",
+            session="s1",
+            rule="(cscv over the recorded columns)",
+            provenance="a_priori",
+            kind="cscv",
+            decision="diagnostic_only",
+            series_missing=True,
+            summary={
+                "pbo": Decimal("0.88"),
+                "degradation_slope": Decimal("-0.4"),
+                "degradation_intercept": Decimal("0.05"),
+                "prob_loss": Decimal("0.7"),
+                "dominance_1st": False,
+                "dominance_2nd": True,
+                "n_columns": 12,
+                "n_blocks": 16,
+                "n_combinations": 12870,
+                "rows_used": 1819,
+                "rows_dropped": 9,
+                "columns_refused": 0,
+            },
+        )
     elif kind == "journal":
         # Through the REPOSITORY, not the CLI: `keel journal add` refuses to run without a
         # terminal (#705), which is the property that makes the record an attestation and is
