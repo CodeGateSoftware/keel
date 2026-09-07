@@ -1,0 +1,86 @@
+"""`keel open` -- reach a console that is already running (#756).
+
+`keel serve` prints its URL once, at startup, with the session token in it. That is enough when a
+human is watching the terminal and useless when nothing is: under `launchd` the line goes to
+`StandardOutPath`, and the way back into your own console becomes `grep`-ing a log for a token.
+
+So a detached `serve` records how to reach itself (`keel/web/runtime.py`, which carries the
+argument for why that is acceptable and how it is bounded), and this reads that record back.
+
+**It mints nothing and it extends nothing.** The token it prints is the one the running server
+already minted; stopping keel still revokes it, and this command has no way to bring it back.
+
+**It refuses rather than guesses.** Three different absences look identical from here -- no server,
+a server started from a terminal, and a server that was killed -- and each gets its own sentence,
+because "not found" would send an operator hunting for a bug in the two cases where nothing is
+wrong.
+"""
+
+from __future__ import annotations
+
+import webbrowser
+
+import click
+
+from keel.commands.serve import DEFAULT_PORT
+from keel.web import runtime
+
+
+@click.command("open")
+@click.option(
+    "--port",
+    default=DEFAULT_PORT,
+    show_default=True,
+    type=int,
+    help="Which console. One `keel serve` process per port; see `keel serve --port`.",
+)
+@click.option(
+    "--no-browser",
+    is_flag=True,
+    default=False,
+    help="Print the address without launching a browser.",
+)
+def open_cmd(port: int, no_browser: bool) -> None:
+    """Print (and open) the address of a running `keel serve`, token included."""
+    record = runtime.live_record(port)
+    if record is None:
+        _refuse(port)
+        return
+
+    url = runtime.url_for(record)
+    click.echo(f"Opening the keel console at:\n\n    {url}\n")
+    click.echo("This address carries the running server's session token. Stopping keel revokes it.")
+
+    if no_browser:
+        return
+    try:
+        # Best-effort, exactly as `keel serve` treats its own launch: the URL is already printed,
+        # so a headless machine, a broken BROWSER variable or a sandbox with no launcher costs the
+        # operator nothing they cannot recover by pasting.
+        webbrowser.open(url)
+    except Exception as exc:  # noqa: BLE001 -- any launcher failure is survivable here
+        click.echo(f"(could not launch a browser: {exc})")
+
+
+def _refuse(port: int) -> None:
+    """Say which of the three absences this is, and what to do about each.
+
+    A stale record is reported as a STOPPED server rather than as no server: the file is evidence
+    that one ran, and telling an operator "nothing is serving" when a crashed process left its
+    record behind hides the thing they most need to know.
+    """
+    stale = runtime.read_record(port)
+    if stale is not None:
+        raise click.ClickException(
+            f"a keel server was recorded on port {port} but its process is gone -- it crashed or "
+            "was killed. Its token died with it; start a new one with `keel serve` (or "
+            "`launchctl kickstart` the agent that runs it)."
+        )
+    raise click.ClickException(
+        f"no recorded keel server on port {port}.\n\n"
+        "  If one is running, it was started from a terminal -- an interactive `keel serve` "
+        "deliberately records nothing, and its URL is printed in that terminal. Only a detached "
+        "server (launchd, or any run whose stdout is not a terminal) leaves a record here, "
+        "because that is the case where nobody can read the printed line.\n\n"
+        f"  If none is running, start one: `keel serve --port {port}`."
+    )

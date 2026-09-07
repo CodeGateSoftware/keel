@@ -51,7 +51,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlsplit
 
-from keel.web import api, events, staticfiles
+from keel.web import api, events, runtime, staticfiles
 from keel.web.security import (
     CSRF_HEADER,
     REMOTE_SESSION_MAX_AGE_SECONDS,
@@ -988,7 +988,21 @@ def serve(cfg: ServeConfig, *, echo: Callable[[str], None] = print) -> int:
     # way to sign out. Said here rather than only in a docstring, because the operator who needs
     # to revoke is the operator reading this terminal, and the gesture is the one they already
     # have: stopping keel invalidates the token, so every browser holding it is out.
-    echo("Stopping keel revokes it: the token is new every run and is never written to disk.")
+    # #756. The sentence an operator is owed depends on which of these two runs this is, and
+    # printing the wrong one would be a false safety assurance about a live credential -- the
+    # class of thing `payload._session_banner` refuses to do about mode.
+    interactive = runtime.stdout_is_interactive()
+    recorded = runtime.record_serving(
+        host=running.host, port=running.port, token=running.token, interactive=interactive
+    )
+    if recorded is None:
+        echo("Stopping keel revokes it: the token is new every run and is never written to disk.")
+    else:
+        echo("Stopping keel revokes it: the token is new every run.")
+        echo(
+            f"Nothing is reading this output, so the address is also in {recorded} (0600) -- "
+            f"run `keel open --port {running.port}` to get it back. It is deleted on shutdown."
+        )
 
     try:
         server.serve_forever()
@@ -996,6 +1010,10 @@ def serve(cfg: ServeConfig, *, echo: Callable[[str], None] = print) -> int:
         echo("")
         echo("stopped.")
     finally:
+        # Before `server_close`, so a record never outlives the port it names by more than the
+        # instant between these two lines. A crash skips this entirely, which is what
+        # `runtime.live_record`'s pid check is for.
+        runtime.forget(running.port)
         server.server_close()
     return 0
 
