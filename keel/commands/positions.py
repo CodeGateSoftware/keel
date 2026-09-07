@@ -40,9 +40,47 @@ from typing import Any
 from keel_core.types import Granularity
 
 from keel import agent as agent_mod
+from keel.commands.doctor import ATTEST_WINDOW_APPROACHING_SEC as _DOCTOR_APPROACHING_SEC
 from keel.config import Config
 from keel.data import freshness as freshness_mod
 from keel.data.repository import Repository
+
+#: What a holding's asset attestation says, as a closed vocabulary (#701).
+#:
+#: FOUR words for four different facts, and the middle two are why this is not a boolean:
+#: `unattested` is the screen's own rejection, `expired` is a claim that has run out, `due` is one
+#: about to, and `attested` covers both "in date" and "no window recorded" -- which #718 made a
+#: legitimate state rather than a missing one.
+ATTESTATION_STATES: tuple[str, ...] = ("attested", "due", "expired", "unattested")
+
+#: How near a window has to be before the page says so. `doctor`'s own threshold, IMPORTED rather
+#: than restated: a page warning at one horizon beside a `keel doctor` warning at another would
+#: have an operator believing whichever they read last.
+ATTEST_APPROACHING_SEC = _DOCTOR_APPROACHING_SEC
+
+
+def _attestation_state(row: dict[str, Any] | None, *, now_ts: int) -> tuple[str, int | None]:
+    """`(state, due_ts)` for one asset's attestation row.
+
+    The window rules are `doctor._attestation_window_findings`', deliberately: `due <= now_ts` is
+    CLOSED (with `<`, a window landing exactly on the second falls into no group at all, which is
+    a false all-clear), and a NULL window is not judged at all.
+
+    **Reporting only, like doctor's.** `screen_asset` never reads `attest_due_ts`, so an expired
+    window does not veto anything -- #718 left that decision to a human. This page says what the
+    record holds and does not imply a block that is not there.
+    """
+    if row is None:
+        return "unattested", None
+    raw = row.get("attest_due_ts") if hasattr(row, "get") else row["attest_due_ts"]
+    if raw is None:
+        return "attested", None
+    due = int(raw)
+    if due <= now_ts:
+        return "expired", due
+    if due - now_ts <= ATTEST_APPROACHING_SEC:
+        return "due", due
+    return "attested", due
 
 
 @dataclass(frozen=True)
@@ -102,6 +140,26 @@ class PositionRow:
     #: "unconfirmed"`, or `None` when ready.
     ready: bool
     ready_reason: str | None
+
+    #: What the operator has sworn about this holding's ASSET, and whether that claim is in date
+    #: (#701, on #718's recorded window). One of `ATTESTATION_STATES`.
+    #:
+    #: A holding is a claim about the world -- what the token is, what backs it -- and
+    #: `keel/compliance/screen.py`'s rule is that an asset nobody has classified is unknown and
+    #: unknown is a REJECTION. So absent reads `unattested`, never a quiet blank: a page rendering
+    #: it as fine would say the opposite of the gate that governs it.
+    #:
+    #: Distinct from `ready` above, which is the entry-gate verdict about DATA. The two disagree in
+    #: both directions and a reader needs to know which is which: an asset can be perfectly
+    #: attested with a cold series, or freshly priced with a lapsed claim.
+    #:
+    #: Defaulted and trailing, so every existing `PositionRow(...)` construction is untouched.
+    attestation: str = "unattested"
+
+    #: The recorded window's close, or `None` when the operator recorded none. NULL is NOT judged
+    #: -- `doctor._attestation_window_findings` states that convention and #718 made the column
+    #: optional deliberately, so no window is not an expired one.
+    attest_due_ts: int | None = None
 
 
 @dataclass(frozen=True)
@@ -286,6 +344,12 @@ def gather_positions(
     gates = _gate_granularities(repo, config) if with_readiness else {}
     fallback = _fallback_granularity(config) if with_readiness else None
 
+    # ONE read for the whole book, not one per tranche: this page re-polls every 15 seconds, and
+    # `get_asset_attestation` per row would be a query per row. Same shape as #707's
+    # `open_bracket_order_ids`.
+    attestations = {
+        str(row.get("asset") or "").upper(): row for row in repo.get_asset_attestations()
+    }
     marks: dict[str, tuple[Decimal | None, int | None]] = {}
     # Keyed on (product, gate granularity), NOT on product alone: one product can hold tranches
     # opened by rules on different timeframes, and a per-product cache would hand the second
@@ -307,8 +371,22 @@ def gather_positions(
         else:
             ready, ready_reason = False, None
         mark, mark_ts = marks[product_id]
-        rows.append(_row_from_dict(raw, mark, mark_ts, ready, ready_reason))
+        attestation, attest_due = _attestation_state(
+            attestations.get(_base_asset(product_id)), now_ts=now_ts
+        )
+        rows.append(
+            _row_from_dict(
+                raw, mark, mark_ts, ready, ready_reason, attestation, attest_due
+            )
+        )
     return PositionsReport(now_ts=now_ts, rows=tuple(rows))
+
+
+def _base_asset(product_id: str) -> str:
+    """`BTC-USD` -> `BTC`, the same split `compliance/screen.py` and `execution/guards.py` use to
+    key an asset attestation off a product. Upper-cased because `asset_attestations` is keyed on
+    the operator's own spelling and a page must not miss a claim over a letter case."""
+    return str(product_id).split("-")[0].upper()
 
 
 def _row_from_dict(
@@ -317,6 +395,8 @@ def _row_from_dict(
     mark_ts: int | None,
     ready: bool,
     ready_reason: str | None,
+    attestation: str = "unattested",
+    attest_due_ts: int | None = None,
 ) -> PositionRow:
     """One repository dict, projected. Every judgement this report makes is made here, once, so
     no renderer has to make it twice."""
@@ -358,4 +438,6 @@ def _row_from_dict(
         realized_fees=raw.get("realized_fees") or Decimal("0"),
         ready=ready,
         ready_reason=ready_reason,
+        attestation=attestation,
+        attest_due_ts=attest_due_ts,
     )

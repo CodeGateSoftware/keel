@@ -242,3 +242,99 @@ def test_the_positions_view_names_the_stop_distance_both_ways() -> None:
     view = _function_body("render.js", "positionsView")
     assert "stop_distance" in view
     assert "stop_distance_pct" in view
+
+
+# -- the attestation chip on the wire (#701) ------------------------------------------------------
+
+
+def _payload_mod():
+    from keel.web import payload as payload_mod
+
+    return payload_mod
+
+
+def _attested_report(tmp_path: Path, *, due, **overrides):
+    from tests.commands.test_positions import NOW_TS as POS_NOW
+    from tests.commands.test_positions import _config, _mark, _open_tranche
+
+    conn = connect(str(tmp_path / "attest.db"))
+    migrate(conn)
+    repo = Repository(conn)
+    _open_tranche(repo)
+    _mark(repo, "150")
+    if due is not ...:
+        repo.upsert_asset_attestation(
+            asset="BTC",
+            sector="tech",
+            backing="native",
+            pays_yield=False,
+            source="prospectus",
+            attested_by="operator",
+            attested_at=POS_NOW - 86_400,
+            attest_due_ts=due,
+        )
+    return gather_positions(repo, _config(tmp_path), now_ts=POS_NOW)
+
+
+def test_an_expired_attestation_warns_on_the_wire(tmp_path: Path) -> None:
+    from tests.commands.test_positions import NOW_TS as POS_NOW
+
+    body = _payload_mod().positions_payload(_attested_report(tmp_path, due=POS_NOW - 10))
+    chip = body["rows"][0]["attestation"]
+
+    assert chip["value"] == "expired"
+    assert chip["state"] == "warn"
+    assert "EXPIRED" in chip["display"]
+
+
+def test_an_absent_attestation_is_unknown_and_not_a_failure(tmp_path: Path) -> None:
+    """`screen_asset` already rejects an unclassified asset, so the holding is gated. The page
+    reports a missing claim rather than grading the operator for it."""
+    body = _payload_mod().positions_payload(_attested_report(tmp_path, due=...))
+    chip = body["rows"][0]["attestation"]
+
+    assert chip["value"] == "unattested"
+    assert chip["state"] == "unknown"
+
+
+def test_no_attestation_state_is_ever_bad(tmp_path: Path) -> None:
+    """WARN and never FAIL, which is doctor's own choice for this column and for the same reason:
+    an expired window vetoes nothing (#718 left that to a human), and a `bad` chip would tell an
+    operator the opposite."""
+    from tests.commands.test_positions import NOW_TS as POS_NOW
+
+    for due in (..., None, POS_NOW - 10, POS_NOW + 86_400, POS_NOW + 400 * 86_400):
+        body = _payload_mod().positions_payload(_attested_report(tmp_path, due=due))
+        assert body["rows"][0]["attestation"]["state"] != "bad", due
+
+
+def test_the_window_crosses_as_a_moment_not_an_epoch(tmp_path: Path) -> None:
+    from tests.commands.test_positions import NOW_TS as POS_NOW
+
+    body = _payload_mod().positions_payload(_attested_report(tmp_path, due=POS_NOW + 86_400))
+    assert body["rows"][0]["attest_due_at"]["display"]
+    assert isinstance(body["rows"][0]["attest_due_at"]["value"], str)
+
+
+def test_the_attestation_chip_is_separate_from_the_freshness_chip(tmp_path: Path) -> None:
+    """The two disagree in both directions -- a perfectly attested asset with a cold series, or a
+    freshly priced one with a lapsed claim -- and a reader has to be able to tell which is which."""
+    from tests.commands.test_positions import NOW_TS as POS_NOW
+
+    row = _payload_mod().positions_payload(_attested_report(tmp_path, due=POS_NOW - 10))["rows"][0]
+    assert row["attestation"]["value"] == "expired"
+    assert "ready" in row or "freshness" in row
+
+
+def test_the_positions_view_shows_the_attestation_chip_beside_the_entry_gate() -> None:
+    """Two columns, not one merged verdict. A reader has to be able to tell a lapsed claim about
+    the asset from a cold price series."""
+    source = _source("render.js")
+    start = source.index("export function positionsView(")
+    end = source.index("\nfunction ", start)
+    view = source[start:end]
+
+    assert 'label: "attestation"' in view
+    assert "row.attestation" in view
+    assert 'label: "entry gate"' in view
+    assert "row.freshness" in view

@@ -775,6 +775,32 @@ def _bracket_field(position: OpenPositionStatus, mode: str) -> Field:
     return label("n/a", display="n/a -- paper resolves stop/target on candle touch", state=NEUTRAL)
 
 
+#: What each attestation state MEANS and how it reads (#701).
+#:
+#: `unattested` is UNKNOWN, not BAD: `screen_asset` rejects an unclassified asset, so the holding
+#: is already gated -- the page reports a missing claim rather than grading the operator for it.
+#: `expired` and `due` WARN and never FAIL, which is doctor's own choice for the same column and
+#: for the same reason: an expired window vetoes nothing (#718 left that decision to a human), and
+#: a FAIL would tell an operator the opposite.
+_ATTESTATION_CHIP: Mapping[str, tuple[str, str]] = {
+    "attested": ("attested", NEUTRAL),
+    "due": ("attestation window closing", WARN),
+    "expired": ("ATTESTATION EXPIRED", WARN),
+    "unattested": ("no attestation on record", UNKNOWN),
+}
+
+
+def _attestation_chip(row: PositionRow) -> Field:
+    """The chip, and the window behind it.
+
+    A `label` rather than a `flag`, because there are FOUR readings and two of them are not the
+    negation of the others: "no window recorded" and "window passed" are different facts about an
+    attestation that exists, and "never attested" is a different fact again.
+    """
+    display, state = _ATTESTATION_CHIP.get(row.attestation, ("unknown", UNKNOWN))
+    return label(row.attestation, display=display, state=state)
+
+
 def _position_payload(position: OpenPositionStatus, mode: str) -> dict[str, Any]:
     """One open position.
 
@@ -1985,6 +2011,12 @@ def _position_row_payload(row: PositionRow) -> dict[str, Any]:
         "realized_proceeds": money(row.realized_proceeds),
         "realized_fees": money(row.realized_fees),
         "freshness": _readiness_field(row.ready, row.ready_reason),
+        # #701. BESIDE the freshness verdict, never merged with it: one is a claim about the
+        # WORLD (what this token is, and whether the claim is in date) and the other is a
+        # claim about DATA. They disagree in both directions, and a reader needs to know
+        # which of the two is the reason a row is flagged.
+        "attestation": _attestation_chip(row),
+        "attest_due_at": moment(row.attest_due_ts),
     }
 
 
@@ -2028,6 +2060,55 @@ def _asset_balance_payload(row: AssetBalanceRow) -> dict[str, Any]:
         "mark_as_of": moment(row.mark_as_of),
         "market_value": money(row.market_value),
     }
+
+
+def _human_span(seconds: int) -> str:
+    """A duration a reader can act on -- "3 days", "4 hours". No arithmetic in the client (Rule 2),
+    and no bare epoch difference on a page whose whole subject is when things were recorded."""
+    if seconds >= 172_800:
+        return f"{seconds // 86_400} days"
+    if seconds >= 7_200:
+        return f"{seconds // 3_600} hours"
+    if seconds >= 120:
+        return f"{seconds // 60} minutes"
+    return f"{seconds} seconds"
+
+
+def _staleness_payload(report: BalancesReport) -> Field:
+    """Whether the figures on this page describe now, and how confidently that can be said (#702).
+
+    THREE readings, and the middle one is why this is not a `flag`:
+
+    * **nothing recorded** -- a deployment before its first cycle. UNKNOWN: a reading that does
+      not exist is not an old one, and a stale badge here would be a false alarm about a
+      non-event.
+    * **behind this deployment's own cadence** -- WARN, and it names the age. A venue outage holds
+      the last row for as long as it lasts, so this is the difference between a current figure and
+      one that merely looks current.
+    * **current** -- NEUTRAL and never GOOD. A fresh reading is the ordinary state, and grading it
+      green would make the absence of green read as a fault on every page that has just started.
+
+    The JUDGEMENT is the report's (`cash_stale`), made against the cadence this deployment
+    actually cycles at rather than the one its config declares -- see `_stale_window_sec` for the
+    live profile that would otherwise be marked stale twenty-three hours a day.
+    """
+    if not report.has_recorded_cash:
+        return label(
+            "unrecorded",
+            display="no cycle has recorded a reading yet",
+            state=UNKNOWN,
+        )
+    age = report.now_ts - (report.cash_as_of or report.now_ts)
+    if report.cash_stale:
+        return label(
+            "stale",
+            display=(
+                f"STALE — the last reading is {_human_span(age)} old, past this deployment's "
+                f"own {_human_span(report.stale_window_sec)} window"
+            ),
+            state=WARN,
+        )
+    return label("current", display=f"recorded {_human_span(age)} ago", state=NEUTRAL)
 
 
 def balances_payload(report: BalancesReport) -> dict[str, Any]:
@@ -2089,6 +2170,9 @@ def balances_payload(report: BalancesReport) -> dict[str, Any]:
         ),
         "asset_count": count(report.asset_count),
         "assets": [_asset_balance_payload(row) for row in report.assets],
+        # #702. The judgement, not the subtraction: "is 3 days old a problem" depends on how
+        # often this deployment cycles, and Rule 2 keeps that in Python.
+        "freshness": _staleness_payload(report),
     }
 
 

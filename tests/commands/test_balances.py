@@ -551,3 +551,84 @@ def test_the_recorded_split_carries_the_instant_it_was_observed(
 
     assert report.settled_as_of == NOW_TS - 3600
 
+
+
+# -- staleness, judged in Python (#702) ------------------------------------------------------------
+
+
+NOW = NOW_TS
+
+
+def _record_reading(repo: Repository, *, ts: int) -> None:
+    """One live reading at `ts`, and the mode stamp every balances read goes through."""
+    repo.set_state("equity_state_mode", "live")
+    repo.record_equity_point(_reading(ts, "live", "250"))
+
+
+def test_a_fresh_reading_is_not_stale(repo, tmp_path) -> None:
+    _record_reading(repo, ts=NOW - 60)
+    report = gather_balances(repo, _config(tmp_path), now_ts=NOW)
+    assert report.cash_stale is False
+
+
+def test_a_reading_older_than_the_threshold_is_stale(repo, tmp_path) -> None:
+    _record_reading(repo, ts=NOW - (10 * 86_400))
+    report = gather_balances(repo, _config(tmp_path), now_ts=NOW)
+    assert report.cash_stale is True
+
+
+def test_a_deployment_that_cycles_DAILY_is_not_called_stale_all_day(repo, tmp_path) -> None:
+    """The threshold cannot be `2 × auto_trade.interval_sec` alone, and this is the deployment
+    that proves it.
+
+    The config ships `interval_sec: 900`, and the live profile is driven by a wrapper that runs
+    the agent ONCE PER UTC DAY -- the scheduler fires more often and the wrapper decides. Scaling
+    a staleness window off the config value would mark that deployment stale for roughly
+    twenty-three and a half hours out of every twenty-four, on a page that is working perfectly.
+
+    `agent._finest_granularity` records the identical hazard for the identical reason: a slow
+    series "would spuriously flag a perfectly healthy feed as stale". A badge that cries wolf
+    daily is a badge an operator learns to ignore, which costs more than never having shipped it.
+
+    So the window is the LARGER of the configured interval and the deployment's own observed
+    cadence, and a book whose readings arrive a day apart is judged against a day.
+    """
+    day = 86_400
+    for index in range(4, 0, -1):
+        _record_reading(repo, ts=NOW - (index * day))
+
+    # TWELVE HOURS after the last reading, which is the interesting moment. Sixty seconds after it
+    # nothing would call the page stale and the test would pass against a config-only window too;
+    # half a day in, a window scaled off `interval_sec: 900` says STALE and the deployment is
+    # perfectly healthy.
+    report = gather_balances(repo, _config(tmp_path), now_ts=NOW - day + (12 * 3_600))
+    assert report.observed_interval_sec == day
+    assert report.cash_stale is False, "a healthy daily deployment was called stale mid-cycle"
+
+
+def test_a_daily_deployment_that_actually_stops_IS_stale(repo, tmp_path) -> None:
+    """The other half. Widening the window for a slow cadence must not widen it to useless: a
+    deployment that cycled daily and then stopped for a week is exactly what this badge is for."""
+    day = 86_400
+    for index in range(4, 0, -1):
+        _record_reading(repo, ts=NOW - (7 * day) - (index * day))
+
+    report = gather_balances(repo, _config(tmp_path), now_ts=NOW)
+    assert report.cash_stale is True
+
+
+def test_a_single_reading_cannot_be_judged_and_says_so(repo, tmp_path) -> None:
+    """One reading is no cadence. There is nothing to compare against, so the honest answer is
+    "not known", never "fine" -- the same refusal `_chain_payload` and the session chip make."""
+    _record_reading(repo, ts=NOW - 60)
+    report = gather_balances(repo, _config(tmp_path), now_ts=NOW)
+    assert report.observed_interval_sec is None
+
+
+def test_a_deployment_with_no_reading_at_all_is_not_stale_it_is_unrecorded(repo, tmp_path) -> None:
+    """Nothing was read, so nothing is old. `has_recorded_cash` is what says there is no reading,
+    and a stale badge over a deployment that has never run would be a false alarm about a
+    non-event."""
+    report = gather_balances(repo, _config(tmp_path), now_ts=NOW)
+    assert report.has_recorded_cash is False
+    assert report.cash_stale is False

@@ -41,6 +41,7 @@ from decimal import Decimal
 from keel.commands.positions import PositionRow, gather_positions
 from keel.config import Config
 from keel.data.repository import Repository
+from keel.types import EquityReading
 
 
 @dataclass(frozen=True)
@@ -154,11 +155,78 @@ class BalancesReport:
 
     assets: tuple[AssetBalanceRow, ...]
 
+    #: Whether the newest reading has fallen behind this deployment's own cadence (#702).
+    #:
+    #: Decided HERE, not by a client counting seconds (Rule 2): "is 3 days old a problem" depends
+    #: on how often this deployment cycles, and that is a judgement. FALSE when there is no
+    #: reading at all -- a reading that does not exist is not an old one.
+    cash_stale: bool = False
+
+    #: The gap this deployment's recent readings actually arrive at, or `None` when there are
+    #: fewer than two to measure. `None` is not "fast": it is nothing to compare against, which is
+    #: why `_stale_window_sec` falls back to the configured interval rather than to zero.
+    observed_interval_sec: int | None = None
+
+    #: How far behind a reading may fall before `cash_stale`. Carried so the page can SAY the
+    #: threshold rather than leave a reader guessing why a stamp is or is not flagged.
+    stale_window_sec: int = 0
+
     @property
     def asset_count(self) -> int:
         """How many products this report holds. Derived, and held here rather than measured by a
         renderer: Rule 6e bans `len()` in `keel/web/payload.py`."""
         return len(self.assets)
+
+
+#: How many cycle intervals a reading may fall behind before the page calls it stale.
+#:
+#: Three, not two: a deployment that misses ONE cycle -- a restart, a slow venue, a laptop asleep
+#: for a beat -- is not a deployment that has stopped, and a badge that fires on a single skipped
+#: run is a badge an operator learns to ignore.
+STALE_INTERVALS = 3
+
+#: How many recent readings the observed cadence is measured over.
+STALE_SAMPLE = 8
+
+
+def _observed_interval_sec(readings: Sequence[EquityReading]) -> int | None:
+    """The deployment's own cadence, as the MEDIAN gap between its recent readings.
+
+    `None` when there are fewer than two readings, because one reading is no cadence -- and the
+    honest answer to "is this old?" with nothing to compare against is "not known", never "fine".
+
+    The MEDIAN rather than the mean or the last gap: a deployment that was off for a week has one
+    enormous gap in its history, and a mean would let that single outage widen the window
+    permanently. A median describes what this deployment normally does.
+    """
+    stamps = sorted(reading.ts for reading in readings)
+    if len(stamps) < 2:
+        return None
+    gaps = sorted(later - earlier for earlier, later in zip(stamps, stamps[1:], strict=False))
+    middle = len(gaps) // 2
+    if len(gaps) % 2:
+        return int(gaps[middle])
+    return int((gaps[middle - 1] + gaps[middle]) // 2)
+
+
+def _stale_window_sec(config: Config, observed: int | None) -> int:
+    """How far behind a reading may fall before it is stale.
+
+    **The LARGER of the configured interval and the deployment's own observed cadence, and the
+    second half is not a refinement -- it is what stops this badge crying wolf on the live
+    profile.**
+
+    `auto_trade.interval_sec` ships as 900, and the live deployment is driven by a wrapper that
+    runs the agent once per UTC DAY: the scheduler fires far more often and the wrapper decides.
+    Scaling the window off the config value alone would mark that deployment stale for about
+    twenty-three and a half hours out of every twenty-four, while it worked perfectly.
+
+    `agent._finest_granularity` records exactly this hazard for exactly this reason -- a slow
+    series "would spuriously flag a perfectly healthy feed as stale" -- and the answer here is the
+    same: judge a deployment against what it actually does.
+    """
+    configured = int(getattr(getattr(config, "auto_trade", None), "interval_sec", 0) or 0)
+    return STALE_INTERVALS * max(configured, observed or 0)
 
 
 def gather_balances(repo: Repository, config: Config, *, now_ts: int) -> BalancesReport:
@@ -172,10 +240,15 @@ def gather_balances(repo: Repository, config: Config, *, now_ts: int) -> Balance
 
     reading = None
     balance = None
+    # Empty when no mode is stamped -- a deployment before its first cycle. The staleness read
+    # below runs over it either way and answers "nothing to judge", which is the honest answer.
+    recorded: list[EquityReading] = []
     if mode:
-        recorded = repo.get_equity_points(mode=mode, limit=1)
-        # `limit=1` keeps the MOST RECENT reading (`get_equity_points`' own contract), so this is
-        # one row off an index rather than the whole series read to take its last element.
+        # `STALE_SAMPLE`, not 1. The newest reading is still `recorded[-1]` (`get_equity_points`
+        # keeps the most recent and returns them oldest-first), and the ones behind it are what
+        # the observed cadence is measured over -- see `_stale_window_sec` for why a cadence read
+        # off the deployment matters more than the one the config declares.
+        recorded = repo.get_equity_points(mode=mode, limit=STALE_SAMPLE)
         reading = recorded[-1] if recorded else None
 
         # Same `limit=1`-keeps-the-newest contract, narrowed to the SETTLEMENT currency (#719) --
@@ -189,6 +262,8 @@ def gather_balances(repo: Repository, config: Config, *, now_ts: int) -> Balance
     # gate, so computing one would be three of every four candle reads plus a rules read and
     # a rule construction, per request, on a view the console re-polls every 15 seconds.
     positions = gather_positions(repo, config, now_ts=now_ts, with_readiness=False)
+    observed = _observed_interval_sec(recorded)
+    window = _stale_window_sec(config, observed)
     return BalancesReport(
         now_ts=now_ts,
         mode=mode,
@@ -198,6 +273,12 @@ def gather_balances(repo: Repository, config: Config, *, now_ts: int) -> Balance
         unrealized=None if reading is None else reading.unrealized,
         hwm=None if reading is None else reading.hwm,
         has_recorded_cash=reading is not None,
+        observed_interval_sec=observed,
+        stale_window_sec=window,
+        # A reading that does not exist is not an OLD one. `has_recorded_cash` says there is none,
+        # and a stale badge over a deployment that has never run would be a false alarm about a
+        # non-event.
+        cash_stale=reading is not None and (now_ts - reading.ts) > window,
         paper_cash=repo.get_state("paper_cash_usdc") if mode == "paper" else None,
         settled_cash=None if balance is None else balance.available,
         total_cash=None if balance is None else balance.total,
