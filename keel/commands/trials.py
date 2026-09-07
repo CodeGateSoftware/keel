@@ -215,6 +215,41 @@ def trials_deflate(
     click.echo(f"\nSR_0 (rejection bar)      : {sr0:.4f}")
     click.echo(f"DSR                       : {dsr:.4f}")
 
+    # #726. THE INPUTS AS WELL AS THE OUTPUTS, and the inputs are the point.
+    #
+    # `--sharpe` is a REQUIRED operator input: the ledger stores no observed annualised Sharpe per
+    # trial, so DSR is not merely expensive to recompute later -- it is impossible without
+    # synthesising a number the operator supplied, which is the one thing this codebase refuses.
+    # Recording them at the moment they were stated turns DSR from a re-run into a read, and lets
+    # the figure be CHECKED rather than trusted.
+    recorded = trials_ledger.append_trial(
+        _ledger_path(ledger),
+        trial_id=f"dsr-{n_decisions}n-sr{sharpe:g}",
+        session="deflate",
+        rule="(deflated sharpe over the recorded decisions)",
+        params={"rho": rho, "n_decisions": n_decisions},
+        provenance="a_priori",
+        kind="deflated_sharpe",
+        decision="diagnostic_only",
+        series_missing=True,
+        summary={
+            "observed_annual_sharpe": Decimal(str(sharpe)),
+            "trades_per_year": Decimal(str(trades_per_year)),
+            "skewness": Decimal(str(skew)),
+            "kurtosis": Decimal(str(kurtosis)),
+            "trial_sharpe_variance": Decimal(str(trial_sharpe_variance)),
+            "m_total": m_total,
+            "n_decisions": n_decisions,
+            "n_hat": Decimal(str(n_hat)),
+            "expected_max_sharpe": Decimal(str(deflate_mod.expected_max_sharpe(effective))),
+            "sharpe_rejection_threshold": Decimal(str(sr0)),
+            "min_trades": Decimal(str(deflate_mod.min_trades(effective, sharpe, trades_per_year))),
+            "observations": observations,
+            "dsr": Decimal(str(dsr)),
+        },
+    )
+    click.echo(f"\nrecorded {recorded.trial_id} hash={recorded.row_hash[:12]}")
+
 
 @trials_group.command("pbo")
 @_LEDGER_OPTION
@@ -257,6 +292,44 @@ def trials_pbo(ledger: Path | None, session: str | None, blocks: int) -> None:
         "PBO with a flat, positive OOS scatter is the GOOD outcome -- a broad plateau of "
         "near-identical configurations produces high PBO by construction."
     )
+
+    # #726. Ten figures were computed and one reached the ledger, in prose. Recording the rest is
+    # what lets a reader ask "how overfit was this?" without a 12-second re-run -- measured on the
+    # real ledger, three sessions cost ~39 s of CPU, on a page that polls every 15 s.
+    #
+    # `series_missing=True` and always: this row is a measurement ABOUT a set of columns, not a
+    # trial with a series of its own, and `matrix.build_matrix` refuses `series_missing` rows --
+    # so a recorded PBO can never become a column in the next PBO run over the same file.
+    #
+    # ⛔ THE STRATHERN RAIL. Every figure here is a diagnostic. Storing them makes them easier to
+    # rank by, which is exactly why `PBOResult` carries no configuration field and why nothing
+    # written here names a winning parameter set.
+    recorded = trials_ledger.append_trial(
+        _ledger_path(ledger),
+        trial_id=f"cscv-{session or 'all'}-s{blocks}",
+        session=session or "all",
+        rule="(cscv over the recorded columns)",
+        params={"session": session, "blocks": blocks},
+        provenance="a_priori",
+        kind="cscv",
+        decision="diagnostic_only",
+        series_missing=True,
+        summary={
+            "pbo": result.pbo,
+            "degradation_slope": result.degradation_slope,
+            "degradation_intercept": result.degradation_intercept,
+            "prob_loss": result.prob_loss,
+            "dominance_1st": result.dominance_1st,
+            "dominance_2nd": result.dominance_2nd,
+            "n_columns": result.n_columns,
+            "n_blocks": result.n_blocks,
+            "n_combinations": result.n_combinations,
+            "rows_used": result.rows_used,
+            "rows_dropped": result.rows_dropped,
+            "columns_refused": len(build.refused),
+        },
+    )
+    click.echo(f"\nrecorded {recorded.trial_id} hash={recorded.row_hash[:12]}")
 
 
 # -- monte-carlo resampling (#441) ----------------------------------------------------------------
@@ -482,6 +555,16 @@ def trials_monte_carlo(
                 "drawdown_percentile": report.drawdown_percentile,
                 "n_trades": len(pnls),
                 "n_paths": paths,
+                # #726: the DISTRIBUTION, not just its ends. `distribution_min/median/max` say
+                # how far the resampling reached; the ladder says what its shape was, which is
+                # what a histogram needs and what nothing recorded until now -- so #708's Monte
+                # Carlo panel had no stored figures to draw and would have had to re-run a
+                # backtest inside a web request.
+                #
+                # FLAT keys, never a nested ladder: `ledger._validate_summary` refuses anything
+                # else, because one nested value makes this append-only file unreadable forever.
+                **mc_mod.quantile_ladder(finals, "final"),
+                **mc_mod.quantile_ladder(drawdowns, "drawdown"),
             },
         )
     except ValueError as exc:

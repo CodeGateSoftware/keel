@@ -20,6 +20,7 @@ from decimal import Decimal
 
 import pytest
 
+from keel.research import montecarlo
 from keel.research.montecarlo import (
     MonteCarloReport,
     equity_curve,
@@ -299,3 +300,49 @@ def test_a_reshuffled_sample_reports_the_median_by_construction() -> None:
     finals = final_equities(reshuffle(pnls, 30, seed=8), Decimal(0))
     assert min(finals) == observed == max(finals)
     assert percentile_of(observed, finals) == Decimal("0.5")
+
+
+# -- the quantile ladder (#726) --------------------------------------------------------------------
+
+
+def test_a_quantile_is_a_value_the_distribution_actually_produced() -> None:
+    """NEAREST-RANK, not interpolation.
+
+    Every value here is a resampled equity the model actually reached, and an interpolated
+    quantile is a number no path produced. For a distribution being read as "what could have
+    happened", that distinction is the whole point.
+    """
+    from decimal import Decimal as D
+
+    values = [D("1"), D("2"), D("3"), D("4")]
+    for percent in (1, 5, 25, 50, 75, 95, 99):
+        assert montecarlo.quantile(values, percent) in values
+
+
+def test_the_ladder_is_ordered_and_spans_the_distribution() -> None:
+    from decimal import Decimal as D
+
+    values = [D(str(n)) for n in range(1, 101)]
+    ladder = montecarlo.quantile_ladder(values, "final")
+
+    ordered = [ladder[f"final_p{percent:02d}"] for percent in montecarlo.QUANTILE_LADDER]
+    assert ordered == sorted(ordered)
+    assert ordered[0] == D("1")
+    assert ordered[-1] == D("99")
+
+
+def test_the_ladder_keys_are_flat_and_zero_padded() -> None:
+    """`final_p05`, not `final_p5`: the keys sort lexically in the order they read, and the ledger
+    stores them side by side with every other scalar."""
+    from decimal import Decimal as D
+
+    ladder = montecarlo.quantile_ladder([D("1"), D("2")], "final")
+    assert sorted(ladder) == [
+        "final_p01", "final_p05", "final_p25", "final_p50", "final_p75", "final_p95", "final_p99"
+    ]
+    assert all(isinstance(value, D) for value in ladder.values())
+
+
+def test_a_quantile_of_nothing_is_refused_rather_than_invented() -> None:
+    with pytest.raises(ValueError, match="quantile"):
+        montecarlo.quantile([], 50)

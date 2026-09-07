@@ -48,6 +48,14 @@ KINDS = frozenset(
         "threshold_nudge",
         "monte_carlo",
         "walk_forward",
+        # #726. Two more DIAGNOSTIC kinds, for the two gauntlet components that computed a full
+        # result and printed it. `cscv` is a PBO run over a session's columns; `deflated_sharpe`
+        # is one E[max SR]/MinBTL/DSR evaluation under the operator's stated inputs. Both are
+        # measurements ABOUT a set of trials rather than trials themselves, which is why both are
+        # always `series_missing` -- and `matrix.build_matrix` refuses `series_missing` rows, so
+        # neither can ever become a column in a later PBO run over the same ledger.
+        "cscv",
+        "deflated_sharpe",
     }
 )
 DECISIONS = frozenset({"selected", "rejected", "diagnostic_only"})
@@ -128,6 +136,31 @@ def compute_row_hash(record: TrialRecord) -> str:
     return chain_hash(_row_payload(record))
 
 
+#: What a `summary` value may be. Everything else is refused at append time.
+#:
+#: `_decode_summary` maps a value to `None`, an `int` or `Decimal(value)`. A list raises
+#: `ValueError` there and a dict raises `TypeError` -- and it raises on READ, inside
+#: `read_trials`, which every later `verify_chain`, `trials list`, `trials pbo` and web page goes
+#: through. ONE such row would make an APPEND-ONLY file unreadable forever, with no way to take it
+#: back. That is not hypothetical: this module's own `_decode_summary` records a null value doing
+#: exactly this once already.
+#:
+#: So the check is here, at the write, where it is a refusal rather than a catastrophe. It is also
+#: why #726's gauntlet artifacts are FLAT keys -- `final_p05`, `final_p50` -- rather than a nested
+#: quantile ladder: the shape a reader can survive is the shape a writer may use.
+_SUMMARY_SCALARS = (Decimal, int, float, str, bool)
+
+
+def _validate_summary(summary: Mapping[str, Any]) -> None:
+    for key, value in summary.items():
+        if value is not None and not isinstance(value, _SUMMARY_SCALARS):
+            raise ValueError(
+                f"summary[{key!r}] is a {type(value).__name__}; a summary value must be a scalar "
+                "or None. A nested value would make this append-only ledger unreadable on the "
+                "next read_trials, permanently -- store a flat key per figure instead"
+            )
+
+
 def _validate(record: TrialRecord) -> None:
     if record.provenance not in PROVENANCE:
         raise ValueError(f"provenance: {record.provenance!r} not in {sorted(PROVENANCE)}")
@@ -135,6 +168,7 @@ def _validate(record: TrialRecord) -> None:
         raise ValueError(f"kind: {record.kind!r} not in {sorted(KINDS)}")
     if record.decision not in DECISIONS:
         raise ValueError(f"decision: {record.decision!r} not in {sorted(DECISIONS)}")
+    _validate_summary(record.summary)
     if not record.series_missing and not (record.per_trade_pnl or record.per_bar_pnl):
         raise ValueError(
             "series_missing is False but no P&L series was supplied; a trial with no series "
