@@ -872,6 +872,9 @@ Install all four the same way the detector agents are installed:
 
 ```bash
 cd ~/keel
+# launchd creates the log FILE but not its directory, and a job whose StandardOutPath cannot be
+# opened does not start. Every plist here writes under logs/, as the detector agents already do.
+mkdir -p logs
 for job in live paperforward paper-hourly paper-equities; do
   cp "com.keel.serve.$job.plist" ~/Library/LaunchAgents/
   launchctl bootstrap "gui/$(id -u)" ~/Library/LaunchAgents/"com.keel.serve.$job.plist"
@@ -897,7 +900,9 @@ immediately, which launchd retries on its throttle (10s) forever, appending to t
 status.
 
 To stop one deliberately, `bootout` it; a plain `launchctl stop` is undone by `KeepAlive` within
-seconds:
+seconds. `bootout` sends `SIGTERM`, which `keel serve` handles so that it shuts down cleanly and
+takes its runtime record with it -- Python's default disposition for that signal would have killed
+the process without running any cleanup, leaving the record behind holding a dead token:
 
 ```bash
 launchctl bootout "gui/$(id -u)/com.keel.serve.live"

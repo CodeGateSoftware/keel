@@ -246,3 +246,67 @@ def test_a_server_that_is_actually_listening_is_offered(home: Path) -> None:
         assert "token=tok" in result.output
     finally:
         listener.close()
+
+
+# -- stopping deliberately (#760 review) ---------------------------------------------------------
+
+
+def test_a_sigterm_stops_cleanly_and_takes_the_record_with_it(
+    monkeypatch: pytest.MonkeyPatch, home: Path
+) -> None:
+    """`launchctl bootout` sends SIGTERM, and that is the documented way to stop a console.
+
+    Python's default SIGTERM disposition terminates the process WITHOUT unwinding, so `serve`'s
+    `finally` never ran and `runtime.forget` never fired: every deliberate stop left the record
+    behind, holding a dead token, while the plists and the runbook both said the file is deleted
+    on shutdown. Measured with a probe process before this was written: marker still present.
+
+    THE SIGNAL IS NOT ACTUALLY DELIVERED HERE. A first cut called `os.kill(os.getpid(), SIGTERM)`
+    and, in the un-fixed state, killed pytest itself -- a red that takes the runner with it is
+    worse than useless, because a later regression would look like a crashed suite rather than a
+    failing test. Invoking the handler `serve` installed is what delivery does, and it fails
+    politely.
+    """
+    import signal
+
+    class _Terminating(_StubServer):
+        def serve_forever(self) -> None:
+            handler = signal.getsignal(signal.SIGTERM)
+            assert callable(handler), f"serve installed no SIGTERM handler (got {handler!r})"
+            handler(signal.SIGTERM, None)  # what the kernel does, minus the risk
+            raise AssertionError("the SIGTERM handler did not interrupt serve_forever")
+
+    stub = _Terminating(("127.0.0.1", 8765))
+    monkeypatch.setattr(web_server, "ensure_schema", lambda _path: None)
+    monkeypatch.setattr(web_server, "build_server", lambda _cfg: stub)
+    monkeypatch.setattr(runtime, "stdout_is_interactive", lambda: False)
+    lines: list[str] = []
+    cfg = web_server.ServeConfig(
+        host="127.0.0.1",
+        port=8765,
+        token=new_session_token(),
+        db_path=str(home / "keel.db"),
+        config_path=str(home / "config.yaml"),
+    )
+    assert web_server.serve(cfg, echo=lines.append) == 0
+    assert stub.closed, "the socket was not closed"
+    assert runtime.read_record(8765) is None, "a deliberate stop left its record behind"
+    assert any("stopped" in line for line in lines), lines
+
+
+def test_the_previous_sigterm_handler_is_put_back(
+    monkeypatch: pytest.MonkeyPatch, home: Path
+) -> None:
+    """`serve` is a library function as well as a command; leaving its handler installed would
+    change the behaviour of whatever called it."""
+    import signal
+
+    def _mine(_signum: int, _frame: object) -> None:
+        return None
+
+    previous = signal.signal(signal.SIGTERM, _mine)
+    try:
+        _serve(monkeypatch, home, interactive=False)
+        assert signal.getsignal(signal.SIGTERM) is _mine, "serve kept the handler it installed"
+    finally:
+        signal.signal(signal.SIGTERM, previous)
