@@ -57,13 +57,24 @@ def test_the_section_names_every_view() -> None:
         assert view in section, view
 
 
-def test_the_section_documents_the_one_time_token() -> None:
+def test_the_section_documents_the_one_time_token_and_where_it_can_land() -> None:
     """The single most confusing thing about this server on first contact: the URL carries a
-    token, it is new every run, and it is never written to disk."""
+    token and it is new every run.
+
+    This asserted "never written to disk" until #756, which made that TRUE ONLY OF AN INTERACTIVE
+    RUN. A detached server records its address so `keel open` can hand it back, and a runbook
+    still promising the unconditional version would be telling an operator their live credential
+    is nowhere on disk while a file holds it. So the requirement is now that the section draws the
+    distinction, not that it repeats the older, simpler sentence.
+    """
     section = _section().lower()
     assert "token" in section
     assert "loopback" in section
-    assert "never written to disk" in section
+    assert "new every run" in section
+    # Both halves of the condition, so a section that mentioned only the reassuring one fails.
+    assert "detached" in section, "the section does not say when the token DOES touch disk"
+    assert "0600" in section
+    assert "keel open" in section, "no way back into a console nobody watched start"
 
 
 def test_the_section_says_what_the_browser_cannot_do() -> None:
@@ -84,7 +95,7 @@ def test_the_section_says_what_the_browser_cannot_do() -> None:
 
 
 def test_the_section_answers_the_headless_case() -> None:
-    """"But SSH" is the first objection to deleting a terminal UI, and the runbook must answer it
+    """ "But SSH" is the first objection to deleting a terminal UI, and the runbook must answer it
     where an operator will be standing when they ask."""
     section = _section()
     assert "ssh -L 8765:127.0.0.1:8765" in section

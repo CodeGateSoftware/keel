@@ -1,0 +1,76 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.keel.serve.paper-hourly</string>
+
+    <!-- NOTE ON COMMENT STYLE, and it is load bearing. XML forbids a DOUBLE HYPHEN inside a
+         comment, which rules out writing any of keel's long options in prose here: the first
+         draft of this file said "keel open port" with the option spelled out and every one of
+         the four plists failed to parse. So this comment names options in words. The rest of the
+         repo separates asides with a double hyphen; com.keel.live.plist carries the same warning
+         for the same reason. tests/test_serve_agents.py parses these with a STRICT parser to
+         keep it true. Do not "fix" the punctuation back.
+
+         The hourly paper console (config.paper-hourly.yaml with keel-paperhourly.db).
+
+         WHAT THIS IS NOT. It is not a detector and it places nothing. The four
+         com.keel.{live,paperforward,paper-hourly,paper-equities} agents run the CYCLES on their
+         own schedules; this one only serves the read-only view of what they recorded. Two jobs
+         per profile, deliberately: a console that crashed must not take the trading agent with
+         it, and an agent mid-cycle must not be restarted because a browser tab died.
+
+         WHY RunAtLoad AND KeepAlive, which are two different promises. RunAtLoad starts it at
+         login or boot. KeepAlive restarts it if it exits for any reason: a crash, an OOM kill, a
+         stray signal. Neither implies the other, and a file carrying only the first is the shape
+         that looks correct until something dies at 3am. Stop it deliberately with
+         `launchctl bootout gui/$(id &#45;u)/com.keel.serve.paper-hourly`; a plain `launchctl stop` is undone by
+         KeepAlive within seconds, which is the point.
+
+         THE COST OF KeepAlive, stated rather than discovered. A server that cannot BIND exits
+         non-zero at once, and launchd relaunches it on its throttle (10s by default) forever,
+         appending to the log each time. That is what a port collision looks like from the
+         outside, and `launchctl print gui/$(id &#45;u)/com.keel.serve.paper-hourly` reports the exit status. Each
+         console pins its own port below, so a collision cannot happen between keel's own jobs.
+
+         HOW TO GET IN. This process prints its URL, carrying a one-time session token, to
+         StandardOutPath, where nobody is reading. Do not grep the log for it. Run keel's open
+         command from the deployment directory, giving it this job's port (8767); it reads the
+         record a detached server leaves (mode 0600, deleted on shutdown) and opens the browser.
+         See keel/web/runtime.py for why a detached server may leave that record and an
+         interactive one may not. The token is new on every restart, so each KeepAlive relaunch
+         invalidates open tabs, and the open command is how you come back.
+
+         WHY THE WRAPPER AND NOT THE keel BINARY DIRECTLY. The database option defaults to
+         keel.db, so a plist spelling the arguments itself could serve the PAPER ledger under
+         this profile's name and be entirely convincing about it. keel-paperhourly pins config and
+         database together as a pair, which is the footgun it was written to remove. -->
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>/Users/elmehdiaitbrahim/keel/keel-paperhourly</string>
+        <string>serve</string>
+        <string>--port</string>
+        <string>8767</string>
+        <string>--no-open</string>
+    </array>
+
+    <!-- No browser at startup. At boot there may be no GUI session at all, and a window nobody
+         asked for is not how a background service should announce itself. -->
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>KeepAlive</key>
+    <true/>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/elmehdiaitbrahim/keel</string>
+
+    <key>StandardOutPath</key>
+    <string>/Users/elmehdiaitbrahim/keel/logs/keel-serve-paper-hourly.out.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/elmehdiaitbrahim/keel/logs/keel-serve-paper-hourly.err.log</string>
+</dict>
+</plist>

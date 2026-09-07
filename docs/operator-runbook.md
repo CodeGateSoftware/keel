@@ -842,8 +842,66 @@ front-end renders and dispatches, and every behaviour comes from the services.
 keel --config config.live-sandbox.yaml --db keel-live.db serve
 ```
 
-It binds loopback and prints a URL carrying a one-time token for that run. The token is never
-written to disk, so stopping the server invalidates it.
+It binds loopback and prints a URL carrying a one-time token for that run. Stopping the server
+invalidates it: the token is new every run.
+
+**Whether that token touches disk depends on who is watching (#756).** Started from a terminal --
+the command above -- nothing is written, and the URL exists only in your scrollback. Started
+*detached*, where nothing can read stdout, `keel serve` records the address in
+`<deployment>/run/serve-<port>.json` (mode `0600`, deleted on shutdown) so `keel open` can hand it
+back. That is the only reason the daemons below are usable; `keel/web/runtime.py` carries the
+argument for why a detached server may leave that record and an interactive one may not.
+
+### Running a console per profile, surviving reboots and crashes
+
+The deployment has four profiles, and each console is one `keel serve` process on its own port:
+
+| profile | plist | port | config + database |
+|---|---|---|---|
+| supervised-live | `com.keel.serve.live` | 8765 | `config.live-sandbox.yaml` + `keel-live.db` |
+| paper-forward | `com.keel.serve.paperforward` | 8766 | `config.paperforward.yaml` + `keel.db` |
+| paper-hourly | `com.keel.serve.paper-hourly` | 8767 | `config.paper-hourly.yaml` + `keel-paperhourly.db` |
+| paper-equities | `com.keel.serve.paper-equities` | 8768 | `config.paper-equities.yaml` + `keel-equities.db` |
+
+Each invokes its profile's **wrapper** (`keel-live`, `keel-paper`, ...) rather than `keel`
+directly, because `--db` defaults to `keel.db` and a plist spelling its own arguments could serve
+the paper ledger under the live profile's name, convincingly. `RunAtLoad` covers the reboot and
+`KeepAlive` covers the crash; they are two different keys and neither implies the other.
+
+Install all four the same way the detector agents are installed:
+
+```bash
+cd ~/keel
+for job in live paperforward paper-hourly paper-equities; do
+  cp "com.keel.serve.$job.plist" ~/Library/LaunchAgents/
+  launchctl bootstrap "gui/$(id -u)" ~/Library/LaunchAgents/"com.keel.serve.$job.plist"
+done
+launchctl print "gui/$(id -u)/com.keel.serve.live"   # verify: state = running
+```
+
+Then, to reach one:
+
+```bash
+cd ~/keel && ./.venv/bin/keel open --port 8765     # live
+cd ~/keel && ./.venv/bin/keel open --port 8766     # paper-forward
+```
+
+**Do not grep the log for the URL.** `keel open` reads the record, checks the process is alive
+*and* that something answers on the port, and opens the browser. If it says the server is gone,
+it is gone -- the log is then the right place to find out why.
+
+**Two things to expect.** Every `KeepAlive` restart mints a new token, so open tabs stop working
+and `keel open` is how you come back. And a console that cannot bind its port exits non-zero
+immediately, which launchd retries on its throttle (10s) forever, appending to the log each time
+-- that is what a port collision looks like from outside, and `launchctl print` reports the exit
+status.
+
+To stop one deliberately, `bootout` it; a plain `launchctl stop` is undone by `KeepAlive` within
+seconds:
+
+```bash
+launchctl bootout "gui/$(id -u)/com.keel.serve.live"
+```
 
 **`keel tui` was the console until #541, and it is gone.** It needed a terminal, and there were two
 places it could not go: Windows, where CPython ships no `curses`, and a macOS app launched from
