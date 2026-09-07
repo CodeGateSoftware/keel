@@ -3636,8 +3636,22 @@ def test_confirming_replaces_a_stale_fingerprint_rather_than_carrying_it_forward
         credential_fingerprint="stale" + "0" * 27,
     )
 
-    with mock.patch.object(
-        executor, "current_credential_fingerprint", return_value="fresh" + "0" * 27
+    # BOTH import sites, and they are patched to DIFFERENT values on purpose (#742).
+    # `current_credential_fingerprint` is imported independently by `execution/guards.py`
+    # (rail 20) and by `execution/executor.py`. This test is about what the EXECUTOR writes on
+    # confirmation, so rail 20 must not veto first -- and it vetoes on a resolvable fingerprint
+    # that disagrees with the stored "stale000...". `None` is exactly the "no evidence to
+    # disagree with" case that lets the entry through to the confirm step.
+    #
+    # That None was previously supplied by the machine rather than the test: CI has no
+    # credentials, so the unpatched `guards` call returned None and the test passed. On a
+    # contributor's box with a `.env`, it returned a real fingerprint, rail 20 vetoed, `execute`
+    # never reached the confirm, and this assertion failed with the fingerprint still stale.
+    with (
+        mock.patch.object(
+            executor, "current_credential_fingerprint", return_value="fresh" + "0" * 27
+        ),
+        mock.patch.object(guards, "current_credential_fingerprint", return_value=None),
     ):
         execute(_enter_signal(), FakeBroker(), repo, _config(), mode="autonomous", now_ts=NOW_TS)
 

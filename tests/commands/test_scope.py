@@ -269,14 +269,22 @@ def test_attest_writes_none_when_no_current_credential_resolves(
     db_path: Path, valid_config_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     _at_a_terminal(monkeypatch, yes=False)
+    # STATED, not inherited from the machine (#742). This asserted that the real
+    # `current_credential_fingerprint` resolves to None, which is true only when the process
+    # environment, the `.env` at `default_env_path()` and the OS keychain are ALL empty -- true
+    # in CI, false for any contributor with a configured deployment, where `CDP_API_KEY`
+    # resolves from the `.env` and this failed. The behaviour under test is what the command
+    # WRITES when nothing resolves, so the "nothing resolves" half belongs in the fixture.
+    monkeypatch.setattr(
+        "keel.commands.scope.current_credential_fingerprint", lambda venue: None
+    )
     result = _run(
         db_path, valid_config_path, "scope", "attest", "--read-only", "--venue", "coinbase",
     )
     assert result.exit_code == 0, result.output
     record = _repo_at(db_path).get_venue_trade_scope("coinbase")
     assert record is not None
-    # No credentials are configured in this test's environment, so the real
-    # `current_credential_fingerprint` resolves to None -- written as-is, not defaulted away.
+    # An unresolvable credential is written AS None, not defaulted away.
     assert record.credential_fingerprint is None
 
 
