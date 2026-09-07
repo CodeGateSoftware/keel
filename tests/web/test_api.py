@@ -66,6 +66,7 @@ API_ROUTES = (
     "/api/research/trials",
     "/api/research/slippage",
     "/api/research/gauntlet",
+    "/api/research/matrix",
     "/api/rules",
     "/api/venues",
     "/api/gates",

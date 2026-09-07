@@ -465,6 +465,19 @@ def read_gauntlet(cfg: ServeConfig, _query: Query, _state: Any, now_ts: int) -> 
     return payload.gauntlet_payload(gather_gauntlet(_ledger_path(cfg), now_ts=now_ts))
 
 
+def read_matrix(cfg: ServeConfig, _query: Query, _state: Any, now_ts: int) -> dict[str, Any]:
+    """The Evidence Matrix (#708 view 2) -- recorded CSCV runs, READ.
+
+    No database and no computation. `matrix.build_matrix` costs 11.9-14.3 s per session on the
+    real ledger and raises over the ledger as a whole (columns are only synchronous within a
+    session), and this route answers a page that polls every 15 s. #726 made `trials pbo` record
+    its whole result; this reads it.
+    """
+    from keel.commands.evidence_matrix import gather_matrix
+
+    return payload.matrix_payload(gather_matrix(_ledger_path(cfg), now_ts=now_ts))
+
+
 def read_slippage(cfg: ServeConfig, _query: Query, _state: Any, now_ts: int) -> dict[str, Any]:
     """What a fill is assumed to cost, per product (#708, view 4).
 
@@ -997,6 +1010,16 @@ API_ROUTES: dict[str, ApiRoute] = {
         # `profit_factor`, and at that point the research record is a leaderboard -- which turns
         # a record of what was TRIED into an argument for what to TRADE, the exact reversal the
         # trials ledger exists to prevent. See `keel/commands/research_record.py` on the rail.
+        collection="",
+        sortable=(),
+    ),
+    # #708 view 2. The rail again: no `collection`, no `sortable`. A matrix ordered by PBO is a
+    # leaderboard of overfitting scores, and `cscv.py` forbids PBO as a ranking key in its own
+    # source.
+    "/api/research/matrix": ApiRoute(
+        html_route="/research",
+        read=read_matrix,
+        needs_database=False,
         collection="",
         sortable=(),
     ),

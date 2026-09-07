@@ -1347,7 +1347,7 @@ function kindSwitch(current, kinds, onKind) {
  * @param {any} slippage  the `/api/research/slippage` payload, or `null` if that read failed.
  * @returns {DocumentFragment}
  */
-export function researchView(data, gauntlet, slippage) {
+export function researchView(data, gauntlet, slippage, matrix) {
   const fragment = document.createDocumentFragment();
   fragment.append(el("h1", undefined, "Research"));
 
@@ -1445,9 +1445,89 @@ export function researchView(data, gauntlet, slippage) {
     ),
   );
 
+  fragment.append(matrixSection(matrix));
   fragment.append(gauntletSection(gauntlet));
   fragment.append(slippageSection(slippage));
 
+  return fragment;
+}
+
+/**
+ * The Evidence Matrix (#708 view 2): recorded CSCV runs, never a computed one.
+ *
+ * **The empty state is the point of this section, and it is the state it ships in.** Building a
+ * matrix costs 11.9-14.3 seconds per session on the real ledger and raises over the ledger as a
+ * whole, on a page that re-polls every 15 seconds — so the console shows what an operator RAN and
+ * hands them the command when they have not run one.
+ *
+ * That command comes off the payload and names a session that actually has columns.
+ * `--session all` is the obvious thing to print and would filter to a session literally called
+ * "all", find nothing, and refuse — teaching the reader that the page does not know what it is
+ * talking about.
+ *
+ * ⛔ No sort control on any column. A matrix ordered by PBO is a leaderboard of overfitting
+ * scores, and `cscv.py` forbids PBO as a ranking key in its own source.
+ *
+ * @param {any} matrix  `/api/research/matrix`'s `data`, or `null` if that read failed.
+ * @returns {DocumentFragment}
+ */
+function matrixSection(matrix) {
+  const fragment = document.createDocumentFragment();
+  fragment.append(heading("h-matrix", "Evidence matrix"));
+  if (!matrix) {
+    fragment.append(el("p", "empty", "The evidence matrix could not be read."));
+    return fragment;
+  }
+
+  const state = el("p", "sub");
+  state.append(field(matrix.state));
+  fragment.append(state);
+
+  // The command, only where there is one to give: the payload sends an empty string once a run
+  // has been recorded, and a page still telling an operator to run something they have run would
+  // be reading its own table wrong.
+  if (plain(matrix.invocation)) {
+    fragment.append(el("pre", "invocation", plain(matrix.invocation)));
+  }
+
+  fragment.append(
+    table(
+      "h-matrix",
+      [
+        { label: "when (UTC)", numeric: false },
+        { label: "session", numeric: false },
+        { label: "columns", numeric: true },
+        { label: "blocks", numeric: true },
+        { label: "combinations", numeric: true },
+        { label: "rows used", numeric: true },
+        { label: "rows dropped", numeric: true },
+        { label: "PBO", numeric: true },
+        { label: "degradation slope", numeric: true },
+        { label: "P[OOS < 0]", numeric: true },
+        { label: "1st-order dominance", numeric: false },
+        { label: "2nd-order dominance", numeric: false },
+      ],
+      (matrix.rows || []).map(/** @param {any} row */ (row) => [
+        row.at,
+        plain(row.session) || "—",
+        row.n_columns,
+        row.n_blocks,
+        row.n_combinations,
+        row.rows_used,
+        row.rows_dropped,
+        // PBO carries no state, deliberately: a high PBO beside a flat, positive OOS scatter is
+        // the GOOD outcome, so a colour here would be a verdict the number does not support.
+        row.pbo,
+        row.degradation_slope,
+        row.prob_loss,
+        row.dominance_1st,
+        row.dominance_2nd,
+      ]),
+      // From the payload: "no ledger", "no run yet" and "no session with columns" are three
+      // different sentences and choosing between them is a judgement (Rule 2).
+      plain(matrix.state.display),
+    ),
+  );
   return fragment;
 }
 

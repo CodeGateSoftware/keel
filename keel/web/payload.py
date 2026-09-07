@@ -121,6 +121,7 @@ from keel.venue_readiness import VenueReadiness
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from keel.commands.activity import ActivityCycle, ActivityEvent, ActivityFeed
     from keel.commands.balances import AssetBalanceRow, BalancesReport
+    from keel.commands.evidence_matrix import MatrixReport, MatrixRow
     from keel.commands.gauntlet import GauntletReport, GauntletRow
     from keel.commands.insights import (
         AccountSummary,
@@ -1392,6 +1393,133 @@ def _rules_followed_state(value: bool | None) -> str:
     if value is None:
         return UNKNOWN
     return NEUTRAL if value else WARN
+
+
+# -- the evidence matrix (#708 view 2) -------------------------------------------------------------
+#
+# READ, never computed. `build_matrix` costs 11.9-14.3 s per session on the real ledger and raises
+# over the ledger as a whole; this page polls every 15 s. #726 made `trials pbo` record its whole
+# `PBOResult` and this serialises what it recorded.
+#
+# ⛔ THE STRATHERN RAIL, on the wire. No sortable column on the route and no sort key in the view.
+# A matrix ordered by PBO is a leaderboard of overfitting scores, and `cscv.py` carries the
+# warning: PBO "evaluates the quality of a selection process and must never become the objective
+# that selection relies on".
+
+
+def _matrix_row_payload(row: MatrixRow) -> dict[str, Any]:
+    """One recorded CSCV run.
+
+    **`pbo` carries NO state.** It is the one figure a reader will want graded, and grading it is
+    exactly what the rail refuses: a high PBO beside a flat, positive OOS scatter is the GOOD
+    outcome -- a broad plateau of near-identical configurations produces high PBO by construction
+    -- so a colour here would be a verdict the number does not support. `trials pbo`'s own closing
+    sentence says to read it alongside the degradation slope, never alone, and both cross plainly
+    so a reader does exactly that.
+
+    The dominance flags DO carry a state, because they are already verdicts: stochastic dominance
+    either held or it did not. Three-valued, so an unrecorded flag is not read as a denial.
+    """
+    return {
+        "at": moment(row.timestamp),
+        "trial_id": row.trial_id,
+        "session": row.session,
+        "pbo": ratio(row.pbo, places=4),
+        "degradation_slope": ratio(row.degradation_slope, places=4),
+        "degradation_intercept": ratio(row.degradation_intercept, places=4),
+        "prob_loss": ratio(row.prob_loss, places=4),
+        "dominance_1st": _dominance_payload(row.dominance_1st),
+        "dominance_2nd": _dominance_payload(row.dominance_2nd),
+        "n_columns": count(row.n_columns),
+        "n_blocks": count(row.n_blocks),
+        "n_combinations": count(row.n_combinations),
+        "rows_used": count(row.rows_used),
+        "rows_dropped": count(row.rows_dropped),
+        "columns_refused": count(row.columns_refused),
+    }
+
+
+def _dominance_payload(value: bool | None) -> Field:
+    """A verdict that already happened, in three readings.
+
+    `flag()` would collapse the third: `False` says the in-sample distribution did NOT dominate,
+    and `None` says nobody recorded whether it did.
+    """
+    if value is None:
+        return label("", display="not recorded", state=UNKNOWN)
+    return label(
+        "yes" if value else "no",
+        display="dominated" if value else "did not dominate",
+        state=NEUTRAL,
+    )
+
+
+def _matrix_state_payload(report: MatrixReport) -> Field:
+    """Which of the three states this deployment is in, as the one sentence the page leads with.
+
+    An unrun matrix is not an empty one, and the middle state is why this is not a `flag`:
+
+    * **no ledger** -- a deployment without the research repository beside it. Nothing to run.
+    * **columns, no run** -- the honest common case, and the one that can be acted on.
+    * **recorded runs** -- the matrix.
+    """
+    if not report.ledger_present:
+        return label(
+            "no-ledger",
+            display="No research ledger beside this deployment — there is nothing to compile.",
+            state=UNKNOWN,
+        )
+    if report.any_recorded:
+        return label(
+            "recorded",
+            display=(
+                "Compiled from recorded gauntlet runs — nothing here was computed "
+                "for this page."
+            ),
+            state=NEUTRAL,
+        )
+    if report.suggested_session:
+        return label(
+            "unrun",
+            display=(
+                "No recorded evidence matrix. Matrix data is compiled from combinatorial gauntlet "
+                "runs, which are never computed for this page — run one in your terminal."
+            ),
+            state=UNKNOWN,
+        )
+    return label(
+        "no-columns",
+        display=(
+            "No recorded evidence matrix, and no session holds enough usable columns to run one: "
+            "a matrix needs trials with a per-bar P&L series, and every recorded trial is "
+            "series_missing."
+        ),
+        state=UNKNOWN,
+    )
+
+
+def matrix_payload(report: MatrixReport) -> dict[str, Any]:
+    """The Evidence Matrix (#708 view 2).
+
+    `invocation` is composed HERE and placed by the client, the same rule #707's cancel modal
+    follows: a client concatenating `keel trials pbo --session ` and a name could print a command
+    that does not exist, and the session it names has to be one that ACTUALLY HAS COLUMNS --
+    `--session all` would filter to a session literally named "all" and refuse.
+    """
+    from keel.commands.evidence_matrix import MATRIX_INVOCATION
+
+    return {
+        "as_of": iso(report.now_ts),
+        "generated_at": moment(report.now_ts),
+        "state": _matrix_state_payload(report),
+        "recorded_count": count(report.recorded_count),
+        "invocation": (
+            MATRIX_INVOCATION.format(session=report.suggested_session)
+            if report.suggested_session and not report.any_recorded
+            else ""
+        ),
+        "rows": [_matrix_row_payload(row) for row in report.rows],
+    }
 
 
 # -- plans, inverted (#706) ------------------------------------------------------------------------

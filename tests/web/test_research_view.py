@@ -611,7 +611,7 @@ def test_the_slippage_section_is_wired_into_the_research_view() -> None:
 
     assert '"research/slippage"' in main_code
     assert "function slippageSection" in _code("render.js")
-    assert "export function researchView(data, gauntlet, slippage)" in _code("render.js")
+    assert "export function researchView(data, gauntlet, slippage, matrix)" in _code("render.js")
 
 
 def test_the_slippage_section_states_the_basis_and_declares_no_sort_key() -> None:
@@ -824,7 +824,7 @@ def test_the_gauntlet_section_is_wired_into_the_research_view() -> None:
 
     assert '"research/gauntlet"' in main_code
     assert "function gauntletSection" in _code("render.js")
-    assert "export function researchView(data, gauntlet, slippage)" in _code("render.js")
+    assert "export function researchView(data, gauntlet, slippage, matrix)" in _code("render.js")
 
 
 def test_the_gauntlet_section_shows_the_seed_and_both_expectancies() -> None:
@@ -860,3 +860,137 @@ def _section_body(name: str) -> str:
     if exported != -1 and (end == -1 or exported < end):
         end = exported
     return after if end == -1 else after[:end]
+
+
+# -- the evidence matrix (#708 view 2) -------------------------------------------------------------
+
+
+def test_the_matrix_section_is_wired_into_the_research_view() -> None:
+    source = _code("render.js")
+    start = source.index("export function researchView(")
+    end = source.index("\nfunction ", start)
+    view = source[start:end]
+    assert "matrixSection(matrix)" in view
+
+
+def test_the_matrix_section_offers_no_sort_control() -> None:
+    """A matrix ordered by PBO is a leaderboard of overfitting scores, and `cscv.py` forbids PBO
+    as a ranking key in its own source. `table()` draws a control only when handed a sort pair."""
+    source = _code("render.js")
+    start = source.index("function matrixSection(")
+    end = (
+        source.index("\nexport function ", start)
+        if "\nexport function " in source[start:]
+        else len(source)
+    )
+    section = source[start:end]
+
+    assert "onSort" not in section
+    assert "sort:" not in section
+
+
+def test_the_matrix_route_declares_no_sortable_column_either() -> None:
+    from keel.web.api import API_ROUTES
+
+    route = API_ROUTES["/api/research/matrix"]
+    assert route.sortable == ()
+    assert route.collection == ""
+
+
+def test_the_matrix_view_places_the_command_and_never_builds_it() -> None:
+    """Rule 2, and the session matters: `--session all` would filter to a session literally
+    called "all", find nothing, and refuse."""
+    source = _code("render.js")
+    start = source.index("function matrixSection(")
+    section = source[start : start + 4000]
+
+    assert "matrix.invocation" in section
+    assert "keel trials pbo" not in section
+
+
+def test_the_unrun_state_names_a_session_that_actually_has_columns(tmp_path: Path) -> None:
+    """The state this ships in. The page must hand over a command that WORKS, not one shaped
+    like the answer."""
+    from keel.commands.evidence_matrix import gather_matrix
+    from keel.web import payload as payload_mod
+
+    tracked = Path(__file__).resolve().parents[2] / "docs/experiments/trials-ledger.jsonl"
+    body = payload_mod.matrix_payload(gather_matrix(tracked, now_ts=1_800_000_000))
+
+    assert body["state"]["value"] == "unrun"
+    assert body["invocation"].startswith("keel trials pbo --session ")
+    named = body["invocation"].rsplit(" ", 1)[-1]
+    assert named in gather_matrix(tracked, now_ts=0).candidate_sessions
+
+
+def test_a_recorded_run_stops_telling_the_operator_to_run_one(tmp_path: Path) -> None:
+    """A page still printing the command after a run would be reading its own table wrong."""
+    from decimal import Decimal
+
+    from keel.commands.evidence_matrix import gather_matrix
+    from keel.research import ledger
+    from keel.web import payload as payload_mod
+
+    path = tmp_path / "ledger.jsonl"
+    # COLUMNS TOO, so `suggested_session` is non-empty. Without them the ledger has no candidate
+    # session at all, the invocation is empty whatever the rule says, and this test passes against
+    # a page that goes on printing the command forever.
+    for index in range(2):
+        ledger.append_trial(
+            path,
+            trial_id=f"col-{index}",
+            session="s1",
+            rule="turtle_breakout",
+            params={"n": 20 + index},
+            provenance="fitted",
+            kind="sweep_node",
+            decision="rejected",
+            per_bar_pnl=[Decimal("1"), Decimal("-1")],
+        )
+    ledger.append_trial(
+        path,
+        trial_id="cscv-s1-s16",
+        session="s1",
+        rule="(cscv)",
+        provenance="a_priori",
+        kind="cscv",
+        decision="diagnostic_only",
+        series_missing=True,
+        summary={"pbo": Decimal("0.5"), "n_columns": 12},
+    )
+    report = gather_matrix(path, now_ts=1_800_000_000)
+    assert report.suggested_session, "the premise: a session a run COULD be suggested for"
+
+    body = payload_mod.matrix_payload(report)
+    assert body["state"]["value"] == "recorded"
+    assert body["invocation"] == ""
+
+
+def test_pbo_crosses_without_a_judgement(tmp_path: Path) -> None:
+    """The one figure a reader wants graded, and grading it is what the rail refuses: a high PBO
+    beside a flat, positive OOS scatter is the GOOD outcome, so a colour would be a verdict the
+    number does not support. `trials pbo`'s own closing sentence says to read it alongside the
+    degradation slope, never alone."""
+    from decimal import Decimal
+
+    from keel.commands.evidence_matrix import gather_matrix
+    from keel.research import ledger
+    from keel.web import payload as payload_mod
+
+    path = tmp_path / "ledger.jsonl"
+    for label_id, pbo in (("low", "0.05"), ("high", "0.95")):
+        ledger.append_trial(
+            path,
+            trial_id=f"cscv-{label_id}",
+            session="s1",
+            rule="(cscv)",
+            provenance="a_priori",
+            kind="cscv",
+            decision="diagnostic_only",
+            series_missing=True,
+            summary={"pbo": Decimal(pbo)},
+        )
+    body = payload_mod.matrix_payload(gather_matrix(path, now_ts=1_800_000_000))
+
+    states = {row["pbo"]["state"] for row in body["rows"]}
+    assert states == {"neutral"}, f"PBO carries a judgement: {states}"
