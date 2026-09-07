@@ -41,6 +41,7 @@ than a long-lived reader that could sit inside someone else's transaction.
 from __future__ import annotations
 
 import json
+import signal
 import socket
 import sys
 import time
@@ -127,9 +128,7 @@ class ServeConfig:
 
     @property
     def host_policy(self) -> HostPolicy:
-        return HostPolicy(
-            bound_host=self.host, port=self.port, external_hosts=self.external_hosts
-        )
+        return HostPolicy(bound_host=self.host, port=self.port, external_hosts=self.external_hosts)
 
     def url(self) -> str:
         host = f"[{self.host}]" if ":" in self.host else self.host
@@ -666,7 +665,7 @@ class KeelHandler(BaseHTTPRequestHandler):
             for chunk in events.stream(self.cfg):
                 self.wfile.write(chunk.encode("utf-8"))
                 self.wfile.flush()
-        except (BrokenPipeError, ConnectionResetError):
+        except BrokenPipeError, ConnectionResetError:
             return
 
     def _serve_static(self, url_path: str) -> None:
@@ -949,6 +948,37 @@ def build_server(cfg: ServeConfig) -> KeelServer:
     return BoundKeelServer((cfg.host, cfg.port), BoundKeelHandler)
 
 
+def _stop_on_sigterm() -> Any:
+    """Make SIGTERM unwind the stack instead of killing the process outright (#760 review).
+
+    `launchctl bootout` -- the documented way to stop a console daemon -- sends SIGTERM, and
+    Python's default disposition for it terminates WITHOUT running `finally`. So `serve`'s cleanup
+    never fired on the one stop gesture an operator is told to use: the runtime record survived
+    every deliberate shutdown, holding a dead token, while the plists, the runbook and
+    `security.py` all said the file is deleted on shutdown. Measured before this existed, with a
+    probe process carrying the same `try`/`finally`: the marker was still there afterwards.
+
+    Raising `KeyboardInterrupt` rather than inventing an exception, because that is precisely what
+    this is -- an operator asking the server to stop -- and `serve` already prints "stopped." for
+    it. `server.shutdown()` would be the other candidate and it deadlocks here: it blocks until
+    the serve loop exits, and the loop cannot exit while the main thread is inside this handler.
+
+    Returns the previous handler so the caller can put it back; `serve` is a library function as
+    well as a command, and leaving a handler installed would change the behaviour of whatever
+    called it. `None` when no handler could be installed at all -- `signal.signal` refuses to run
+    off the main thread, and a server started from a worker thread is not a reason to fail to
+    serve.
+    """
+
+    def _raise(_signum: int, _frame: Any) -> None:
+        raise KeyboardInterrupt
+
+    try:
+        return signal.signal(signal.SIGTERM, _raise)
+    except ValueError, OSError, AttributeError:
+        return None
+
+
 def serve(cfg: ServeConfig, *, echo: Callable[[str], None] = print) -> int:
     """Bind, announce, and run until interrupted. Returns a process exit code."""
     try:
@@ -1004,12 +1034,20 @@ def serve(cfg: ServeConfig, *, echo: Callable[[str], None] = print) -> int:
             f"run `keel open --port {running.port}` to get it back. It is deleted on shutdown."
         )
 
+    previous_sigterm = _stop_on_sigterm()
     try:
         server.serve_forever()
     except KeyboardInterrupt:
         echo("")
         echo("stopped.")
     finally:
+        # Put the handler back before anything else in this block: the cleanup below must run
+        # under the caller's own signal disposition, not under one this function installed.
+        if previous_sigterm is not None:
+            try:
+                signal.signal(signal.SIGTERM, previous_sigterm)
+            except ValueError, OSError:
+                pass
         # Before `server_close`, so a record never outlives the port it names by more than the
         # instant between these two lines. A crash skips this entirely, which is what
         # `runtime.live_record`'s pid check is for.
