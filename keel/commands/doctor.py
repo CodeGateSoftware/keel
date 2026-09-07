@@ -305,9 +305,12 @@ def audit_chain_findings(state: Any) -> list[Finding]:
 
     THREE readings, and the middle one is the whole reason this is not a boolean:
 
-    * **no `audit_events` table** -- a database this build has not migrated. Both the web server
-      and `keel mcp` open a repo WITHOUT migrating (a view must not take a schema write lock), so
-      an un-upgraded database reaching a reader is ordinary, not an error.
+    * **no `audit_events` table** -- a database this build has not migrated. `keel mcp` opens a
+      repo WITHOUT migrating (a view must not take a schema write lock), so an un-upgraded
+      database reaching a reader is ordinary, not an error. (This said "both the web server and
+      `keel mcp`" until #751. Only the PER-REQUEST open skips migration; `web/server.serve` calls
+      `ensure_schema` once at bind time, so a served database is never behind. The imprecision
+      mattered: it is what left the sibling readers looking already covered.)
     * **a table with no events** -- nothing has been written since the chain shipped. Reported as
       OK, and the headline says UNVERIFIED rather than verified: an empty chain has no breaks
       because it has nothing in it to break, and calling that "verified" is a positive claim over
@@ -389,6 +392,30 @@ def _utc_date(ts: int) -> str:
     epoch like `1750000000`; `keel scope attest`'s own doctor-facing rendering uses this same
     shape, so a refusal date reads identically everywhere an operator sees one."""
     return datetime.fromtimestamp(ts, tz=UTC).date().isoformat()
+
+
+def cash_posture_schema_finding(venue: str) -> list[Finding]:
+    """Rail 22's posture table is not on this database (#751).
+
+    The same shape `audit_chain_findings` gives an absent `audit_events`, and for the same
+    reason: `keel mcp` opens a repo WITHOUT migrating, so an un-upgraded database reaching a
+    reader is ordinary, not an error.
+
+    OK rather than WARN. Nothing has lapsed and nothing is unsafe -- the engine that would
+    enforce rail 22 migrates on the way in, so a live cycle can never be running against this
+    schema. What is true is only that this READER is looking at a database older than the rail,
+    and the fix is one idempotent command.
+    """
+    return [
+        Finding(
+            "attest.cash_posture",
+            OK,
+            "cash posture not on this database",
+            f"schema predates rail 22's posture record, so there is nothing recorded for "
+            f"{venue} to check -- this reader does not migrate; the engine does",
+            "keel migrate",
+        )
+    ]
 
 
 def cash_posture_findings(
@@ -1524,8 +1551,10 @@ def gather_findings(repo: Any, config: Any, log_lines: Iterable[str], now_ts: in
     that counts `sqlite3`'s own change counter around a call, because "the tool is read-only"
     is a property of the gather, not of whoever happens to call it this time.
 
-    The caller owns opening: the command migrates on the way in, the MCP tool deliberately
-    does not (the `keel/web/server.py` rule -- a view must not take a schema write lock).
+    The caller owns opening, and they do not open alike: the command migrates on the way in and
+    `keel serve` migrates once at bind, but the MCP tool deliberately does not at all (the
+    `keel/web/server.py` rule -- a view must not take a schema write lock). So every read below
+    must tolerate a schema older than this build; `repo.table_present` is how (#751).
     `log_lines` are the engine log's own lines, read by the caller so each front-end can
     point at the file it was wired with.
     """
@@ -1577,9 +1606,14 @@ def gather_findings(repo: Any, config: Any, log_lines: Iterable[str], now_ts: in
     findings += trade_scope_findings(repo.get_venue_trade_scope(venue), venue)
     # #691. Venue-keyed the same way, and reported BEFORE it bites: rail 22 vetoes silently on
     # a lapse, and the live profile runs unattended.
-    findings += cash_posture_findings(
-        repo.get_venue_cash_posture(venue), venue=venue, now_ts=now_ts
-    )
+    # The table itself may be absent (#751): this seam is shared with `keel mcp`, which opens a
+    # repo without migrating, and `get_venue_cash_posture` would raise rather than answer.
+    if not repo.table_present("venue_cash_postures"):
+        findings += cash_posture_schema_finding(venue)
+    else:
+        findings += cash_posture_findings(
+            repo.get_venue_cash_posture(venue), venue=venue, now_ts=now_ts
+        )
     findings += rail_state_findings(
         kill_switch=bool(repo.get_state("kill_switch", default=False)),
         streak_halt_until=int(repo.get_state("streak_halt_until", default=0) or 0),

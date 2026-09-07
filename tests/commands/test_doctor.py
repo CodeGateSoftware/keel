@@ -14,9 +14,11 @@ from __future__ import annotations
 import json
 from decimal import Decimal
 from pathlib import Path
+from typing import Any
 
 from keel_core.trade_scope import READ_ONLY, TRADING, TradeScopeState, VenueTradeScope
 
+from keel.commands._products import _default_sim_products
 from keel.commands.doctor import (
     OK,
     AdmissibilityRow,
@@ -44,7 +46,7 @@ from keel.config import load_config
 from keel.data.db import connect, migrate
 from keel.data.freshness import Freshness
 from keel.data.repository import Repository
-from keel.types import Granularity
+from keel.types import Candle, Granularity
 
 NOW = 1_784_500_000
 DAY = 86_400
@@ -1127,3 +1129,114 @@ def test_a_database_without_the_table_is_reported_not_crashed_on() -> None:
     (finding,) = audit_chain_findings(_chain(table_present=False))
     assert finding.status == "ok"
     assert finding.fix == "keel migrate"
+
+
+# -- an un-migrated database reaching a reader (#751) --------------------------------------------
+
+#: Everything v17-v20 added, dropped together so the fixture is a faithful `v0.13.3` schema: the
+#: OLD `_SCHEMA_STATEMENTS` created none of them, and no migration has run.
+#:
+#: **Faithful is not the same as covered**, and the difference is spelled out because the first
+#: cut of this test got it wrong. Dropping a table only proves something if a reader in this seam
+#: READS it: `venue_cash_postures` (v18) is read on every gather and `audit_events` (v20) likewise,
+#: but `candle_series_feed` (v17) is read only for a series that HAS bars -- hence the seeded
+#: candle below -- and nothing in `gather_findings` touches `equity_points` (v19) at all. That
+#: last one is dropped for fidelity alone; the reader that would exercise it lives in `keel/web`,
+#: behind `ensure_schema`.
+_TABLES_ADDED_SINCE_0_13_3 = (
+    "candle_series_feed",  # v17
+    "venue_cash_postures",  # v18
+    "equity_points",  # v19
+    "audit_events",  # v20
+)
+
+
+def _repo_stopped_at_v16(db_path: Path, config: Any):
+    """A repo over a database at the schema `v0.13.3` shipped -- opened WITHOUT migrating.
+
+    Deliberately a REAL database rather than a fabricated state object. The guard next door
+    (`test_a_database_without_the_table_is_reported_not_crashed_on`) asserts over
+    `_chain(table_present=False)`, which can only ever exercise the one reader that already has
+    the flag -- so the sibling readers that lacked it stayed invisible to it for three migrations.
+
+    **The candle is load-bearing.** `feed_scope_findings` reads provenance only for a series with
+    `n_candles > 0`, so against an empty database `get_series_feeds` is never called and dropping
+    `candle_series_feed` would prove exactly nothing. Seeded before the drop, in the product and
+    granularity `gather_findings` will actually ask about, so the v17 reader is on the path.
+
+    The version is wound back in the `schema_version` TABLE, which is what `migrate` reads. Not
+    `PRAGMA user_version`, which this codebase does not use for schema versioning.
+    """
+    conn = connect(str(db_path))
+    migrate(conn)
+    repo = Repository(conn)
+    product = _default_sim_products(config)[0]
+    granularity = list(config.market_data.granularities)[0]
+    repo.upsert_candles(
+        product,
+        granularity,
+        [
+            Candle(
+                ts=NOW - 3_600,
+                open=Decimal("1"),
+                high=Decimal("1"),
+                low=Decimal("1"),
+                close=Decimal("1"),
+                volume=Decimal("1"),
+            )
+        ],
+    )
+    for table in _TABLES_ADDED_SINCE_0_13_3:
+        conn.execute(f"DROP TABLE IF EXISTS {table}")
+    conn.execute("UPDATE schema_version SET version = 16")
+    conn.commit()
+    return repo
+
+
+def test_gather_findings_survives_a_database_nobody_has_migrated(tmp_path, valid_config_path):
+    """`keel mcp` opens a repo without migrating, so this is an ordinary deployment state.
+
+    It raised `sqlite3.OperationalError: no such table: venue_cash_postures` -- out of the MCP
+    handler, taking every other finding with it, on the first tool a client typically calls.
+    """
+    config = load_config(valid_config_path)
+    repo = _repo_stopped_at_v16(tmp_path / "keel.db", config)
+    findings = gather_findings(repo, config, [], NOW)
+    assert findings, "an un-migrated database must still produce a report"
+
+
+def test_the_v17_provenance_reader_is_actually_on_the_path(tmp_path, valid_config_path):
+    """The pin on the fixture's seeded candle, so `candle_series_feed` is covered and not merely
+    dropped.
+
+    Without a bar, `feed_scope_findings` is handed an empty mapping and `get_series_feeds` is
+    never called -- measured: 0 calls. The tuple above would then name a table nothing reads,
+    which is coverage in appearance only.
+    """
+    config = load_config(valid_config_path)
+    repo = _repo_stopped_at_v16(tmp_path / "keel.db", config)
+    calls = []
+    inner = repo.get_series_feeds
+    repo.get_series_feeds = lambda *a, **k: (calls.append(a), inner(*a, **k))[1]  # type: ignore[method-assign]
+    findings = gather_findings(repo, config, [], NOW)
+    assert calls, "get_series_feeds was never reached -- the dropped v17 table proves nothing"
+    assert [f for f in findings if f.name == "data.feed_scope"]
+
+
+def test_an_unmigrated_posture_table_is_not_reported_as_an_unattested_posture(
+    tmp_path, valid_config_path
+):
+    """The distinction the audit chain already draws, and the reason a bare `None` will not do.
+
+    `cash_posture_findings(None)` is FAIL "cash posture never attested -- rail 22 vetoes every
+    live ENTRY". That sentence is false about a database that has no posture TABLE: nothing has
+    lapsed, the schema simply predates rail 22. Telling an operator to re-attest sends them to
+    fix a rail that is not the problem.
+    """
+    config = load_config(valid_config_path)
+    repo = _repo_stopped_at_v16(tmp_path / "keel.db", config)
+    findings = gather_findings(repo, config, [], NOW)
+    (posture,) = [f for f in findings if f.name == "attest.cash_posture"]
+    assert posture.status == OK, posture.detail
+    assert posture.fix == "keel migrate"
+    assert "never attested" not in posture.headline

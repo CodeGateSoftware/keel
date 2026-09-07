@@ -320,10 +320,15 @@ def _latest(rows: list[sqlite3.Row]) -> dict[tuple[str, str], EntityHash]:
 
 
 def _table_present(conn: sqlite3.Connection) -> bool:
-    row = conn.execute(
-        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'audit_events'"
-    ).fetchone()
-    return row is not None
+    """Delegates to `db.table_present` (#751), which is the same check generalised.
+
+    It lived here first, as the only reader that had one. Three later tables (`venue_cash_postures`,
+    `equity_points`, `candle_series_feed`) needed the identical guard and did not get it, so the
+    check moved to where the schema is defined and every reader can reach it.
+    """
+    from keel.data.db import table_present
+
+    return table_present(conn, "audit_events")
 
 
 def chain_state(conn: sqlite3.Connection) -> ChainState:
