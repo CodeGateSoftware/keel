@@ -19,7 +19,7 @@ def test_serve_is_registered_and_documents_itself() -> None:
     assert result.exit_code == 0
     assert "--host" in result.output
     assert "--port" in result.output
-    assert "--no-open" in result.output
+    assert "--no-browser" in result.output
 
 
 def test_the_default_bind_is_loopback() -> None:
@@ -142,6 +142,10 @@ def _policy_from_cli(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, *args: str
     monkeypatch.setattr(web_server, "build_server", build)
     result = CliRunner().invoke(
         cli,
+        # DELIBERATELY the deprecated spelling. `--no-browser` is the documented flag since the
+        # #760 review; keeping one call site on `--no-open` means the hidden alias is exercised
+        # end to end by a test that was not written for it, which is the cheapest kind of
+        # regression cover for a flag that must keep working for already-installed plists.
         ["--db", str(tmp_path / "keel.db"), "serve", "--no-open", *args],
     )
     return result, captured.get("cfg")

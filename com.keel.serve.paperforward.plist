@@ -53,7 +53,7 @@
         <string>serve</string>
         <string>--port</string>
         <string>8766</string>
-        <string>--no-open</string>
+        <string>--no-browser</string>
     </array>
 
     <!-- No browser at startup. At boot there may be no GUI session at all, and a window nobody
