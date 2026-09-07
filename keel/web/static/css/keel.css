@@ -451,6 +451,75 @@ header a {
 header a:hover { color: var(--fg); }
 header a[aria-current="page"] { color: var(--fg); border-bottom-color: var(--accent); }
 
+/* ── the navigation transition (#754) ─────────────────────────────────────────────────────────
+ *
+ * `show()` used to set `aria-current` and the tab title before awaiting the read, so for the
+ * length of the fetch the nav said "Balances" over Positions' rows -- a stale figure under a
+ * fresh label. The claim now waits for the DOM (`commitNavigation`), which leaves two states to
+ * draw here, and they must not look alike:
+ *
+ *   [data-pending]           your click was heard; the rows are still the old route's
+ *   [aria-current="page"]    you are here, and what is on screen is this route
+ *
+ * Pending is deliberately WEAKER than current -- dotted rather than solid, and it does not take
+ * the foreground colour. A pending link that looked identical to the current one would restore
+ * exactly the confusion the deferral removes. */
+header a[data-pending] {
+  border-bottom-style: dotted;
+  border-bottom-color: var(--muted);
+}
+
+/* The busy state, which `main.js` raises ONLY on navigation -- never on the 15-second poll or an
+ * SSE repaint, both of which would otherwise flash the page four times a minute on a route
+ * nobody navigated. `index.html` ships `aria-busy="true"` so the first paint is covered too.
+ *
+ * Dimmed rather than emptied. Clearing would be the stronger claim and it costs a layout jump on
+ * every navigation; dimming says "this is not current" while leaving the reader's place. The
+ * figures beneath are still the previous route's and are still legible, which is why the nav no
+ * longer says otherwise -- the two halves of this fix only work together. */
+#content[aria-busy="true"] {
+  opacity: 0.55;
+  /* The rows underneath are stale by definition here. Nothing beneath should be clickable while
+   * it is: acting on a figure that is about to be replaced is the failure mode of a dimmed view
+   * that stays live. */
+  pointer-events: none;
+}
+
+/* An indeterminate bar, because the read has no measurable progress to report -- the server
+ * sends one response, not a stream of them, and a fake percentage would be a claim about
+ * something nothing is counting.
+ *
+ * On `#view` rather than `#content` so it sits above the dimmed rows without inheriting the dim
+ * -- `opacity` creates a stacking context and would take the bar down with the content.
+ *
+ * `:has(> ...)` and NOT a descendant combinator, because the nesting runs the OTHER WAY:
+ * `main#view > div#content`. The first cut of this rule was `#content[aria-busy="true"]
+ * #view::before`, which asks for a `#view` INSIDE `#content` -- true of no document this shell
+ * ever produces, so it matched nothing and the bar never drew. CSS fails silently, and the test
+ * asserting the selector's text passed the whole time;
+ * `test_the_busy_bar_selector_matches_the_shell_it_targets` is what makes that failure loud.
+ *
+ * Reduced motion is handled by the blanket rule further down, which flattens the animation to a
+ * static bar rather than removing the signal. */
+#view:has(> #content[aria-busy="true"])::before {
+  content: "";
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: 2px;
+  background: var(--accent);
+  transform-origin: 0 50%;
+  animation: keel-busy 1.1s ease-in-out infinite;
+  z-index: 1;
+}
+
+@keyframes keel-busy {
+  0%   { transform: scaleX(0); }
+  50%  { transform: scaleX(0.7); }
+  100% { transform: scaleX(1); }
+}
+
 /* ── layout ───────────────────────────────────────────────────────────────────────────────────
  *
  * `max-width: 62rem` is render.py's measure, kept: it is the line length the existing page was
@@ -997,10 +1066,15 @@ footer {
   .grid { grid-template-columns: repeat(auto-fit, minmax(0, 1fr)); }
 }
 
-/* Honour a reader who has asked the operating system for less motion. There is no animation in
- * this stylesheet today; the rule is here so that the first one added inherits the courtesy
- * rather than depending on its author remembering -- the same reasoning `server.needs_database`
- * gives for guarding a whole route set instead of one page. */
+/* Honour a reader who has asked the operating system for less motion. Written before there was
+ * any animation to honour, so that the first one added inherited the courtesy rather than
+ * depending on its author remembering -- the same reasoning `server.needs_database` gives for
+ * guarding a whole route set instead of one page. #754's `keel-busy` is that first animation,
+ * and it arrived already covered, which is what the rule was for.
+ *
+ * Note what this does to it: `animation-duration: 0.01ms` plus `iteration-count: 1` leaves the
+ * busy bar drawn at its final frame -- a static full-width rule -- rather than removing it. The
+ * signal survives; only the movement goes. */
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after {
     animation-duration: 0.01ms !important;
