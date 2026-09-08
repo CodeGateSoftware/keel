@@ -173,8 +173,12 @@ def read_record(port: int) -> dict[str, Any] | None:
     return parsed
 
 
-def _process_alive(pid: int) -> bool:
+def process_alive(pid: int) -> bool:
     """Is `pid` a process this user could signal?
+
+    Public since #763: `keel open`'s refusal needs it to tell a server that CRASHED from one
+    that is alive but not answering on its port -- two different investigations, and asserting
+    the wrong one sends an operator looking in the wrong place.
 
     `signal 0` is the standard existence check: it validates the pid and permissions without
     delivering anything. `pid <= 0` is refused before the call, because `os.kill(0, 0)` signals
@@ -229,7 +233,7 @@ def live_record(port: int) -> dict[str, Any] | None:
         pid = int(record.get("pid", 0))
     except TypeError, ValueError:
         return None
-    if not _process_alive(pid):
+    if not process_alive(pid):
         return None
     # AND something must answer on the port (#759 review). A pid check alone is not liveness: keel
     # dies, the OS hands that pid to anything else, and the record reads as live -- so `keel open`

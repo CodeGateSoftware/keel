@@ -352,3 +352,52 @@ def test_the_help_says_the_deployment_comes_from_the_working_directory() -> None
     assert result.exit_code == 0
     lowered = result.output.lower()
     assert "directory" in lowered or "deployment" in lowered, result.output
+
+
+def test_a_live_pid_that_is_not_listening_is_not_reported_as_dead(home: Path) -> None:
+    """`live_record` has had TWO failure modes since the port probe arrived, and the refusal knew
+    about one.
+
+    Measured against a record whose pid was the running test process: the message said "its
+    process is gone -- it crashed or was killed" about the very process printing it. A server that
+    is alive but not yet listening, or bound to a host other than the one recorded, got told it
+    had crashed -- pointing the operator at the wrong investigation entirely.
+    """
+    port = _a_closed_port()
+    runtime.record_serving(host="127.0.0.1", port=port, token="tok", interactive=False)
+    result = CliRunner().invoke(cli, ["open", "--port", str(port), "--no-browser"])
+    assert result.exit_code != 0
+    assert "crashed" not in result.output, result.output
+    assert str(os.getpid()) in result.output, "the message does not name the pid it checked"
+    assert str(port) in result.output
+
+
+def test_a_dead_pid_still_reads_as_a_server_that_stopped(home: Path) -> None:
+    """The other branch, and the one that must not be lost while fixing the first."""
+    port = _a_closed_port()
+    runtime.record_serving(host="127.0.0.1", port=port, token="tok", interactive=False)
+    path = runtime.record_path(port)
+    path.write_text(path.read_text().replace('"pid": ' + str(os.getpid()), '"pid": 0'))
+    result = CliRunner().invoke(cli, ["open", "--port", str(port), "--no-browser"])
+    assert result.exit_code != 0
+    assert "crashed" in result.output or "gone" in result.output, result.output
+
+
+def test_the_refusal_is_typed_as_never_returning() -> None:
+    """Both branches raise, so the `return` that used to follow the call was unreachable.
+    `NoReturn` lets a type checker prove that rather than a reader assuming it."""
+    import typing
+
+    from keel.commands.open_console import _refuse
+
+    assert typing.get_type_hints(_refuse).get("return") is typing.NoReturn
+
+
+def test_the_refusal_does_not_claim_the_path_came_from_the_directory_when_it_may_not(
+    home: Path,
+) -> None:
+    """`state_root` honours `KEEL_HOME` FIRST, and this fixture sets it -- so "the deployment this
+    directory belongs to" was false for exactly the reader most likely to have set it."""
+    port = _a_closed_port()
+    result = CliRunner().invoke(cli, ["open", "--port", str(port), "--no-browser"])
+    assert "KEEL_HOME" in result.output, result.output

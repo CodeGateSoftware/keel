@@ -19,6 +19,7 @@ wrong.
 from __future__ import annotations
 
 import webbrowser
+from typing import NoReturn
 
 import click
 
@@ -50,7 +51,6 @@ def open_cmd(port: int, no_browser: bool) -> None:
     record = runtime.live_record(port)
     if record is None:
         _refuse(port)
-        return
 
     url = runtime.url_for(record)
     click.echo(f"Opening the keel console at:\n\n    {url}\n")
@@ -67,7 +67,7 @@ def open_cmd(port: int, no_browser: bool) -> None:
         click.echo(f"(could not launch a browser: {exc})")
 
 
-def _refuse(port: int) -> None:
+def _refuse(port: int) -> NoReturn:
     """Say which of the three absences this is, and what to do about each.
 
     A stale record is reported as a STOPPED server rather than as no server: the file is evidence
@@ -86,18 +86,34 @@ def _refuse(port: int) -> None:
 
     stale = runtime.read_record(port)
     if stale is not None:
+        # WHICH of the two liveness checks failed. `live_record` requires a live pid AND something
+        # answering on the port, and this branch used to assert the first had failed regardless --
+        # measured saying "its process is gone" about the very process printing the sentence. A
+        # server that is alive but not yet listening, or bound to a host other than the one
+        # recorded, is a bind problem, and telling its operator it crashed sends them to the wrong
+        # investigation. This codebase refuses that kind of confident wrong claim elsewhere
+        # (`_session_banner` renders nothing rather than name a mode it cannot verify).
+        pid = int(stale.get("pid", 0) or 0)
+        if runtime.process_alive(pid):
+            raise click.ClickException(
+                f"a keel server was recorded on port {port} and its process ({pid}) is still "
+                f"running, but nothing answers on {stale.get('host', '?')}:{port}.\n\n"
+                "  That is a server that failed to bind, or one still starting. Its log says "
+                f"which: `Address already in use` is the common one.\n\n"
+                f"  The record is in {searched}."
+            )
         raise click.ClickException(
-            f"a keel server was recorded on port {port} but its process is gone -- it crashed or "
-            "was killed. Its token died with it; start a new one with `keel serve` (or "
-            f"`launchctl kickstart` the agent that runs it).\n\n"
+            f"a keel server was recorded on port {port} but its process ({pid}) is gone -- it "
+            "crashed or was killed. Its token died with it; start a new one with `keel serve` "
+            f"(or `launchctl kickstart` the agent that runs it).\n\n"
             f"  The record is in {searched}."
         )
     raise click.ClickException(
         f"no recorded keel server on port {port}.\n\n"
-        f"  Looked in {searched}, which is the deployment this directory belongs to. If your "
-        "server is a different deployment, run this from ITS directory -- `keel open` takes the "
-        "same bare-invocation path as everything else, so a source checkout resolves to the "
-        "checkout.\n\n"
+        f"  Looked in {searched} -- the deployment resolved from $KEEL_HOME if that is set, "
+        "and otherwise from the current directory. If your server is a different deployment, run "
+        "this from ITS directory: `keel open` takes the same bare-invocation path as everything "
+        "else, so a source checkout resolves to the checkout.\n\n"
         "  If one is running here, it was started from a terminal -- an interactive `keel serve` "
         "deliberately records nothing, and its URL is printed in that terminal. Only a detached "
         "server (launchd, or any run whose stdout is not a terminal) leaves a record, because "
