@@ -876,13 +876,47 @@ error anybody reads -- it is a relaunch every ten seconds. (The reverse directio
 already-installed plist using the older `--no-open` keeps working, because `keel serve` still
 accepts it as a hidden alias for `--no-browser`.)
 
+**The plists and the wrappers are authored in the DEV REPO and deployed by copying**, exactly as
+`keel-live`'s own header says of itself ("Authored in the dev repo. DEPLOY (copy) to ~/keel"). The
+first cut of this block started `cd ~/keel` and copied from there, which fails with `No such file
+or directory` on a deployment that has never seen these files -- which is every deployment, the
+first time.
+
+**Free the ports first.** An interactive `keel serve` already on 8765 means
+`com.keel.serve.live` cannot bind, exits non-zero, and is relaunched every ten seconds forever --
+which is what the first real install of these hit. The block below checks, but stop anything you
+find before running it.
+
+Run it from your keel checkout (wherever you cloned this repository), not from `~/keel`:
+
 ```bash
-cd ~/keel
+cd ~/Development/work/CodeGate/keel        # YOUR checkout of this repo, NOT the deployment
+
+# Anything already holding a console port makes that job a crash loop rather than a console.
+# Stop it before continuing; this only reports.
+lsof -nP -iTCP -sTCP:LISTEN | grep -E ':(8765|8766|8767|8768) ' || echo "ports 8765-8768 are free"
+
+# The wrapper each console plist invokes. `keel-equities` is the one the deployment is most
+# likely to be missing: the equities DETECTOR runs `paper-equities-run.sh`, so nothing needed
+# the wrapper until the console did, and a plist pointing at an absent program is a KeepAlive
+# crash loop rather than a message anybody reads.
+for wrapper in keel-live keel-paper keel-paperhourly keel-equities; do
+  cp "$wrapper" ~/keel/ && chmod +x ~/keel/"$wrapper"
+done
+
 # launchd creates the log FILE but not its directory, and a job whose StandardOutPath cannot be
 # opened does not start. Every plist here writes under logs/, as the detector agents already do.
-mkdir -p logs
+mkdir -p ~/keel/logs
+
+# To ~/keel as the deployed copy (matching the detector plists), and to LaunchAgents to run.
+cp com.keel.serve.*.plist ~/keel/
+cp com.keel.serve.*.plist ~/Library/LaunchAgents/
+# `bootout` first, so this block is safe to re-run. `launchctl bootstrap` on a job that is
+# already loaded fails with `Input/output error` -- the same uninformative message a first-time
+# operator meets, which would make an ordinary redeploy look like a fresh breakage. The detector
+# section above draws the same distinction between install and re-install.
 for job in live paperforward paper-hourly paper-equities; do
-  cp "com.keel.serve.$job.plist" ~/Library/LaunchAgents/
+  launchctl bootout "gui/$(id -u)/com.keel.serve.$job" 2>/dev/null || true
   launchctl bootstrap "gui/$(id -u)" ~/Library/LaunchAgents/"com.keel.serve.$job.plist"
 done
 launchctl print "gui/$(id -u)/com.keel.serve.live"   # verify: state = running
