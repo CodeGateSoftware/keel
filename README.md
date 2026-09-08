@@ -10,7 +10,7 @@ possession) encoded as an executable check — with a reference auto-trading age
 of it for Coinbase. Plenty of people have a trading bot; almost nobody has this compliance
 machinery, which is the part worth reading. There is also a fourth way to read all of this:
 `keel mcp` speaks [MCP](docs/mcp-server.md) over stdio, so Claude Code, Cursor, Codex or any
-other assistant can ask keel the same questions the browser view and the TUI answer — and,
+other assistant can ask keel the same questions the browser view answers — and,
 by construction rather than promise, cannot attest a subscription, promote a rule, arm
 autonomy, or place an order, because the write surface does not exist in that package at all.
 
