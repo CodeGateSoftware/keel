@@ -35,8 +35,14 @@ def _current_facing() -> list[Path]:
     return [p for p in docs if p.is_file()]
 
 
-#: Surfaces that were deleted, and the issue that deleted each. A line may name one only if it
-#: names the issue too.
+#: Surfaces that were deleted, and the issue that deleted each. A paragraph may name one only if
+#: it names the issue too.
+#:
+#: **Entries must be DISTINCTIVE tokens.** The match is `\b<surface>\b` case-insensitively over
+#: whole documents, which is safe for `tui` and would be useless for something like `api` -- it
+#: would fire on every page, and the next author would loosen the rule to escape the noise rather
+#: than fix a document. If a retired surface has a common name, match its command
+#: (`keel <name>`) instead of the bare word.
 RETIRED: tuple[tuple[str, str], ...] = (("tui", "#541"),)
 
 
