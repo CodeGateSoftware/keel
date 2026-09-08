@@ -1,11 +1,6 @@
-# 0005 — Options: ⟨VERDICT UNSIGNED⟩
+# 0005 — keel does not trade options; the permissibility question is not reached
 
-Date: 2026-09-08 · Issue: #637 · Status: **DRAFT — the Decision section is unsigned**
-
-> **This record does not decide anything yet.** Everything below the Options section is written so
-> the maintainer can strike one line and sign the other. The jurisprudential question — whether a
-> cash-secured option is admissible — is deliberately **not** answered here and not answerable by
-> anyone but the maintainer; see "What this record refuses to do".
+Date: 2026-09-08 · Issue: #637 · Status: decided
 
 ## Context
 
@@ -92,42 +87,45 @@ being re-litigated by drift, and a third deferral with no trigger is drift with 
 **It does not answer whether a cash-secured option is admissible.** That is a fiqh-methodology
 question — gharar, the nature of the premium, whether full collateralisation changes the character
 of the contract — and constitution line 5 ("every attestation is human-sourced, or refused") means
-it cannot be settled by a machine reading documentation. Option A below is drafted as *"not now, on
-operational grounds, question expressly not reached"* precisely so that signing it does **not**
-commit the project to a jurisprudential position it has not taken.
+it cannot be settled by a machine reading documentation. The decision below was written, and is
+signed, as *"not now, on operational grounds, question expressly not reached"* precisely so that
+signing it does **not** commit the project to a jurisprudential position it has not taken.
 
 If the maintainer wants the fiqh question answered rather than side-stepped, that is a different
 record, sourced the way `docs/research/2026-08-18-*` sourced its scholarship.
 
 ## Decision
 
-> ⟨**UNSIGNED.** Strike one, keep the other, set Status to `decided`, and date it.⟩
-
-**A — HOLD THE LINE.** keel does not trade options. Rail 19, the cash rail and the screen are
+**keel does not trade options.** Rail 19, the cash rail and the screen are
 unamended. The refusal rests on **operational grounds that do not require the permissibility
 question to be answered**: options are unexecutable at this deployment's size (F7), admitting them
 means amending the rail that calls itself the charter (F5), and the venue may not permit them on the
 posture keel requires — with the failure mode being loss of the equities path that already works
 (F1). **The question of whether cash-secured options are permissible is expressly not reached.**
 
-**B — AMEND.** keel admits cash-secured options under the exception ceremony, per the slice in
-#637. Requires, before any code: a recorded human attestation on the permissibility question with
-its sources; #636 reopened and closed against a real paper account rather than documentation; and a
-capital plan under which a position is executable.
+Signed by the maintainer on 2026-09-08. The alternative considered and not taken was to amend to
+the narrowest slice — cash-secured only, exception-gated — which is Option B under **Options**
+above; it is left there rather than deleted, because a decision record that shows only the chosen
+branch is a record of an outcome and not of a decision.
 
 ## Consequences
 
-**If A is signed.** Nothing changes in the code — the value is that the refusal is recorded and
-citable, so the next reader does not re-derive it. #636 stays closed. The three findings above
-become the standing answer to "why not options", and the triggers below become the only route back.
+**Nothing changes in the code.** No rail is amended, no order kind is added, no capability row
+appears. `verify_cash_account`, rail 19 and the screen stand exactly as they were, and #636 stays
+closed.
 
-**If B is signed.** Rail 19's grammar must widen to admit an instrument shape, and its comment must
-stop calling itself the charter or the comment becomes false — the rail's own text is load-bearing
-here, not decoration. The exception book needs its reporting story before any order kind lands.
-`BrokerCapabilities` needs no multi-leg shape for Level 1, which is the one piece of good news.
-`keel serve` remains credential-free either way; nothing here touches that boundary.
+**The value is that the refusal is now citable.** The three findings above are the standing answer
+to "why not options", so the next reader does not re-derive them and the question stops returning
+by drift — which is the whole reason #637 exists.
 
-## The triggers that reopen this (for A)
+**What was NOT decided is as load-bearing as what was.** This record refuses options for reasons
+that would hold for a non-Muslim operator running keel on the same account: the position is
+unexecutable at this size, the rail admits no rehearsal path, and the venue posture is unverified.
+It takes no position on gharar, on the character of a fully collateralised premium, or on whether
+full collateralisation changes the contract. **Anyone citing this record as keel's jurisprudential
+answer on options is citing it wrongly**, and trigger 3 below is what would produce that answer.
+
+## The triggers that reopen this
 
 Each is a fact, not a feeling, in ADR 0002's style:
 
@@ -139,7 +137,7 @@ Each is a fact, not a feeling, in ADR 0002's style:
    not provisionally: it would mean options and keel's cash posture are mutually exclusive at this
    venue.
 3. **The permissibility question is answered by a human, with sources**, in a record of its own.
-   Without this, triggers 1 and 2 firing together still do not reopen B.
+   Without this, triggers 1 and 2 firing together still do not reopen the question.
 4. **F3 is judged acceptable** — a venue that auto-exercises and liquidates on its own timetable,
    and reports assignment only by polling, is compatible with keel's claim that nothing disposes of
    inventory but its own exit policy.
