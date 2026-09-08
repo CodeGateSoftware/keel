@@ -181,3 +181,65 @@ def test_no_plist_carries_a_credential_VALUE(label: str, wrapper: str, port: int
         bare = text.strip()
         looks_secret = len(bare) >= 32 and "/" not in bare and " " not in bare and "." not in bare
         assert not looks_secret, f"{label} carries something secret-shaped: {bare[:12]}..."
+
+
+# -- what the runbook must actually deploy (#756 install failure) ---------------------------------
+
+_RUNBOOK = (REPO_ROOT / "docs" / "operator-runbook.md").read_text()
+
+
+def _install_block() -> str:
+    """The fenced block that bootstraps the CONSOLE daemons.
+
+    Bounded to that one block deliberately: asserting against the whole runbook would let a
+    wrapper mentioned anywhere in a 900-line document satisfy a check about what the INSTALL step
+    copies.
+
+    Anchored on `com.keel.serve` and NOT on `launchctl bootstrap`, which was the first attempt and
+    found the wrong block -- the DETECTOR agents are installed with the same command earlier in
+    the file, so both assertions below failed against a correct runbook. A locator that can select
+    the wrong region is a test about a region nobody chose.
+    """
+    blocks = [
+        body
+        for body in (chunk.split("```")[0] for chunk in _RUNBOOK.split("```bash")[1:])
+        if "com.keel.serve" in body and "launchctl bootstrap" in body
+    ]
+    # Both conditions, because either alone selects the wrong region: `launchctl bootstrap` also
+    # installs the DETECTOR agents earlier in the file, and `com.keel.serve` also appears in the
+    # `bootout` block that stops one. Each mistake was made in turn while writing this.
+    assert len(blocks) == 1, f"expected one console install block, found {len(blocks)}"
+    # COMMANDS ONLY. The block explains itself in `#` comments, and one of them names
+    # `keel-equities` -- so deleting that wrapper from the `for` loop left the wrapper assertion
+    # green, satisfied by the prose describing why it matters. Caught by mutation, which is the
+    # only thing that finds a scan answered by its own explanation.
+    return "\n".join(line.split("#", 1)[0] for line in blocks[0].splitlines())
+
+
+def test_the_install_block_deploys_every_wrapper_the_plists_invoke() -> None:
+    """The failure this exists for, and it is the one the other tests structurally cannot see.
+
+    `test_each_serves_its_own_deployment_through_its_own_wrapper` asserts the wrapper exists in
+    THIS REPOSITORY, which it always does -- the plists and the wrappers are authored here. What
+    matters at runtime is whether it exists in `~/keel`, and no test can look there: the
+    deployment is outside the repo and differs per machine.
+
+    What IS checkable is that the documented install step copies each one. `keel-equities` was
+    the live example: the equities DETECTOR runs `paper-equities-run.sh`, so nothing needed that
+    wrapper until the console plist did, and it had never been deployed. `launchctl bootstrap`
+    reported `Input/output error` -- a plist pointing at an absent program is a KeepAlive crash
+    loop, not a message anybody reads.
+    """
+    block = _install_block()
+    for _label, wrapper, _port in DAEMONS:
+        assert wrapper in block, f"the install block never deploys {wrapper}"
+
+
+def test_the_install_block_copies_from_the_repository_not_the_deployment() -> None:
+    """The first cut opened with `cd ~/keel` and copied the plists from there, which fails with
+    `No such file or directory` on every deployment that has not already been through this --
+    that is, on all of them, the first time. These files are authored here and deployed by
+    copying, exactly as `keel-live`'s own header says of itself."""
+    block = _install_block()
+    assert "cd ~/keel\n" not in block, "the install block runs from the deployment, not the repo"
+    assert "com.keel.serve" in block
