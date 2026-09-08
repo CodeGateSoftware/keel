@@ -41,7 +41,12 @@ from keel.web import runtime
     help="Print the address without launching a browser.",
 )
 def open_cmd(port: int, no_browser: bool) -> None:
-    """Print (and open) the address of a running `keel serve`, token included."""
+    """Print (and open) the address of a running `keel serve`, token included.
+
+    The deployment is the one the CURRENT DIRECTORY belongs to (or `KEEL_HOME`), the same way
+    every other bare invocation resolves state -- so run this from the deployment, not from a
+    checkout of the source.
+    """
     record = runtime.live_record(port)
     if record is None:
         _refuse(port)
@@ -69,18 +74,33 @@ def _refuse(port: int) -> None:
     that one ran, and telling an operator "nothing is serving" when a crashed process left its
     record behind hides the thing they most need to know.
     """
+    # WHERE IT LOOKED, in every branch. The first real install of the console daemons succeeded
+    # and read as a failure: `keel open` was run from a source checkout, which is itself a
+    # deployment root (it has a `keel.db` and a `config.yaml`), so it searched that tree while
+    # four healthy servers wrote to `~/keel/run/`. The message listed three explanations and the
+    # true one was not among them -- it could not be, because it never said where it had looked.
+    #
+    # This command takes no `--db` and no `--config`, so nothing in its signature hints that the
+    # answer depends on the working directory. The path is the hint.
+    searched = runtime.run_dir()
+
     stale = runtime.read_record(port)
     if stale is not None:
         raise click.ClickException(
             f"a keel server was recorded on port {port} but its process is gone -- it crashed or "
             "was killed. Its token died with it; start a new one with `keel serve` (or "
-            "`launchctl kickstart` the agent that runs it)."
+            f"`launchctl kickstart` the agent that runs it).\n\n"
+            f"  The record is in {searched}."
         )
     raise click.ClickException(
         f"no recorded keel server on port {port}.\n\n"
-        "  If one is running, it was started from a terminal -- an interactive `keel serve` "
+        f"  Looked in {searched}, which is the deployment this directory belongs to. If your "
+        "server is a different deployment, run this from ITS directory -- `keel open` takes the "
+        "same bare-invocation path as everything else, so a source checkout resolves to the "
+        "checkout.\n\n"
+        "  If one is running here, it was started from a terminal -- an interactive `keel serve` "
         "deliberately records nothing, and its URL is printed in that terminal. Only a detached "
-        "server (launchd, or any run whose stdout is not a terminal) leaves a record here, "
-        "because that is the case where nobody can read the printed line.\n\n"
+        "server (launchd, or any run whose stdout is not a terminal) leaves a record, because "
+        "that is the case where nobody can read the printed line.\n\n"
         f"  If none is running, start one: `keel serve --port {port}`."
     )

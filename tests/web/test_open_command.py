@@ -310,3 +310,45 @@ def test_the_previous_sigterm_handler_is_put_back(
         assert signal.getsignal(signal.SIGTERM) is _mine, "serve kept the handler it installed"
     finally:
         signal.signal(signal.SIGTERM, previous)
+
+
+# -- saying WHERE it looked (found by an install that worked) -------------------------------------
+
+
+def test_the_refusal_names_the_directory_it_searched(home: Path) -> None:
+    """The reason the first real install read as a failure when it had actually succeeded.
+
+    `keel open` resolves the deployment from the CURRENT DIRECTORY (`state_root`), and the dev
+    repo is itself a deployment root -- it has a `keel.db` and a `config.yaml`. So a command
+    chained as `cd <repo> && ... && keel open` searched `<repo>/run/` while four healthy daemons
+    were writing to `~/keel/run/`. The message offered three explanations and not the true one,
+    because none of them could be: it never said where it had looked.
+
+    A path in the refusal turns that from a hunt into a glance.
+    """
+    port = _a_closed_port()
+    result = CliRunner().invoke(cli, ["open", "--port", str(port), "--no-browser"])
+    assert result.exit_code != 0
+    assert str(runtime.run_dir()) in result.output, result.output
+
+
+def test_the_stale_refusal_names_it_too(home: Path) -> None:
+    """The other branch. A crashed server and a wrong directory are different problems and an
+    operator staring at either one needs the same fact to tell them apart."""
+    port = _a_closed_port()
+    runtime.record_serving(host="127.0.0.1", port=port, token="Z9-stale-Z9", interactive=False)
+    path = runtime.record_path(port)
+    path.write_text(path.read_text().replace('"pid": ' + str(os.getpid()), '"pid": 0'))
+    result = CliRunner().invoke(cli, ["open", "--port", str(port), "--no-browser"])
+    assert result.exit_code != 0
+    assert str(runtime.run_dir()) in result.output, result.output
+    assert "Z9-stale-Z9" not in result.output, "a stale token was printed anyway"
+
+
+def test_the_help_says_the_deployment_comes_from_the_working_directory() -> None:
+    """`keel open` takes no `--db` and no `--config`, so nothing in its signature hints that the
+    answer depends on where you are standing. That is invisible until it bites."""
+    result = CliRunner().invoke(cli, ["open", "--help"])
+    assert result.exit_code == 0
+    lowered = result.output.lower()
+    assert "directory" in lowered or "deployment" in lowered, result.output
