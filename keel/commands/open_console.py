@@ -93,7 +93,7 @@ def _refuse(port: int) -> NoReturn:
         # recorded, is a bind problem, and telling its operator it crashed sends them to the wrong
         # investigation. This codebase refuses that kind of confident wrong claim elsewhere
         # (`_session_banner` renders nothing rather than name a mode it cannot verify).
-        pid = int(stale.get("pid", 0) or 0)
+        pid = runtime.recorded_pid(stale)
         if runtime.process_alive(pid):
             raise click.ClickException(
                 f"a keel server was recorded on port {port} and its process ({pid}) is still "

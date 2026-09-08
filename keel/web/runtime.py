@@ -173,6 +173,25 @@ def read_record(port: int) -> dict[str, Any] | None:
     return parsed
 
 
+def recorded_pid(record: dict[str, Any]) -> int:
+    """The pid a record claims, or `0` when it claims nothing usable.
+
+    ONE conversion, because two is how a bug got in (#763 review). `live_record` wrapped its copy
+    in `try`/`except` and `_refuse` repeated it bare, so a record carrying `"pid": "not-a-number"`
+    -- which `read_record` admits, since it validates only that a token is present -- raised
+    `ValueError` out of the refusal path. That is the one path whose entire job is to fail
+    gracefully.
+
+    `0` is the safe answer for anything unparseable: `process_alive` refuses it before signalling
+    (`os.kill(0, ...)` would hit this process's own group), so an unreadable pid reports as not
+    running rather than as anything else.
+    """
+    try:
+        return int(record.get("pid", 0) or 0)
+    except TypeError, ValueError, OverflowError:
+        return 0
+
+
 def process_alive(pid: int) -> bool:
     """Is `pid` a process this user could signal?
 
@@ -229,11 +248,7 @@ def live_record(port: int) -> dict[str, Any] | None:
     record = read_record(port)
     if record is None:
         return None
-    try:
-        pid = int(record.get("pid", 0))
-    except TypeError, ValueError:
-        return None
-    if not process_alive(pid):
+    if not process_alive(recorded_pid(record)):
         return None
     # AND something must answer on the port (#759 review). A pid check alone is not liveness: keel
     # dies, the OS hands that pid to anything else, and the record reads as live -- so `keel open`

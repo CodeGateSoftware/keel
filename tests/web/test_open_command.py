@@ -8,6 +8,7 @@ that `open` refuses clearly in every case where it cannot help.
 
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
 
@@ -401,3 +402,32 @@ def test_the_refusal_does_not_claim_the_path_came_from_the_directory_when_it_may
     port = _a_closed_port()
     result = CliRunner().invoke(cli, ["open", "--port", str(port), "--no-browser"])
     assert "KEEL_HOME" in result.output, result.output
+
+
+def test_a_malformed_pid_refuses_cleanly_instead_of_raising(home: Path) -> None:
+    """The refusal path is the one that must never traceback, and it was the one that did.
+
+    `live_record` wrapped the pid conversion in `try/except (TypeError, ValueError)`; `_refuse`
+    repeated the conversion bare, and `read_record` validates only that a token is present. So a
+    record carrying `"pid": "not-a-number"` produced `ValueError: invalid literal for int()` out
+    of the code whose docstring promises the opposite -- "`keel open` must not traceback at an
+    operator whose server has just died".
+    """
+    port = _a_closed_port()
+    runtime.record_serving(host="127.0.0.1", port=port, token="tok", interactive=False)
+    path = runtime.record_path(port)
+    path.write_text(json.dumps({**json.loads(path.read_text()), "pid": "not-a-number"}))
+
+    result = CliRunner().invoke(cli, ["open", "--port", str(port), "--no-browser"])
+    assert result.exception is None or isinstance(result.exception, SystemExit), result.exception
+    assert result.exit_code != 0
+    assert "Error:" in result.output
+
+
+def test_one_place_parses_the_recorded_pid(home: Path) -> None:
+    """Two conversions of one field is how the bug above existed: `live_record` guarded its copy
+    and `_refuse` did not. `recorded_pid` is the single answer both ask for."""
+    assert runtime.recorded_pid({"pid": 42}) == 42
+    assert runtime.recorded_pid({"pid": "7"}) == 7
+    for junk in ({}, {"pid": None}, {"pid": "not-a-number"}, {"pid": [1]}, {"pid": 1.5e400}):
+        assert runtime.recorded_pid(junk) == 0, junk
