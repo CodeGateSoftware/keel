@@ -15,4 +15,5 @@ by writing a new record that supersedes it, never by quietly editing an old one.
    assumed](0003-commands-layer-survey.md) · #525
 4. [0004 — Monetisation is not now, and affiliate links are a permanent
    no](0004-monetisation-not-now.md) · #603
-5. [0005 — Options: verdict unsigned (**DRAFT**)](0005-options.md) · #637
+5. [0005 — keel does not trade options; the permissibility question is not
+   reached](0005-options.md) · #637
