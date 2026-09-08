@@ -8,6 +8,7 @@ that `open` refuses clearly in every case where it cannot help.
 
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
 
@@ -310,3 +311,123 @@ def test_the_previous_sigterm_handler_is_put_back(
         assert signal.getsignal(signal.SIGTERM) is _mine, "serve kept the handler it installed"
     finally:
         signal.signal(signal.SIGTERM, previous)
+
+
+# -- saying WHERE it looked (found by an install that worked) -------------------------------------
+
+
+def test_the_refusal_names_the_directory_it_searched(home: Path) -> None:
+    """The reason the first real install read as a failure when it had actually succeeded.
+
+    `keel open` resolves the deployment from the CURRENT DIRECTORY (`state_root`), and the dev
+    repo is itself a deployment root -- it has a `keel.db` and a `config.yaml`. So a command
+    chained as `cd <repo> && ... && keel open` searched `<repo>/run/` while four healthy daemons
+    were writing to `~/keel/run/`. The message offered three explanations and not the true one,
+    because none of them could be: it never said where it had looked.
+
+    A path in the refusal turns that from a hunt into a glance.
+    """
+    port = _a_closed_port()
+    result = CliRunner().invoke(cli, ["open", "--port", str(port), "--no-browser"])
+    assert result.exit_code != 0
+    assert str(runtime.run_dir()) in result.output, result.output
+
+
+def test_the_stale_refusal_names_it_too(home: Path) -> None:
+    """The other branch. A crashed server and a wrong directory are different problems and an
+    operator staring at either one needs the same fact to tell them apart."""
+    port = _a_closed_port()
+    runtime.record_serving(host="127.0.0.1", port=port, token="Z9-stale-Z9", interactive=False)
+    path = runtime.record_path(port)
+    path.write_text(path.read_text().replace('"pid": ' + str(os.getpid()), '"pid": 0'))
+    result = CliRunner().invoke(cli, ["open", "--port", str(port), "--no-browser"])
+    assert result.exit_code != 0
+    assert str(runtime.run_dir()) in result.output, result.output
+    assert "Z9-stale-Z9" not in result.output, "a stale token was printed anyway"
+
+
+def test_the_help_says_the_deployment_comes_from_the_working_directory() -> None:
+    """`keel open` takes no `--db` and no `--config`, so nothing in its signature hints that the
+    answer depends on where you are standing. That is invisible until it bites."""
+    result = CliRunner().invoke(cli, ["open", "--help"])
+    assert result.exit_code == 0
+    lowered = result.output.lower()
+    assert "directory" in lowered or "deployment" in lowered, result.output
+
+
+def test_a_live_pid_that_is_not_listening_is_not_reported_as_dead(home: Path) -> None:
+    """`live_record` has had TWO failure modes since the port probe arrived, and the refusal knew
+    about one.
+
+    Measured against a record whose pid was the running test process: the message said "its
+    process is gone -- it crashed or was killed" about the very process printing it. A server that
+    is alive but not yet listening, or bound to a host other than the one recorded, got told it
+    had crashed -- pointing the operator at the wrong investigation entirely.
+    """
+    port = _a_closed_port()
+    runtime.record_serving(host="127.0.0.1", port=port, token="tok", interactive=False)
+    result = CliRunner().invoke(cli, ["open", "--port", str(port), "--no-browser"])
+    assert result.exit_code != 0
+    assert "crashed" not in result.output, result.output
+    assert str(os.getpid()) in result.output, "the message does not name the pid it checked"
+    assert str(port) in result.output
+
+
+def test_a_dead_pid_still_reads_as_a_server_that_stopped(home: Path) -> None:
+    """The other branch, and the one that must not be lost while fixing the first."""
+    port = _a_closed_port()
+    runtime.record_serving(host="127.0.0.1", port=port, token="tok", interactive=False)
+    path = runtime.record_path(port)
+    path.write_text(path.read_text().replace('"pid": ' + str(os.getpid()), '"pid": 0'))
+    result = CliRunner().invoke(cli, ["open", "--port", str(port), "--no-browser"])
+    assert result.exit_code != 0
+    assert "crashed" in result.output or "gone" in result.output, result.output
+
+
+def test_the_refusal_is_typed_as_never_returning() -> None:
+    """Both branches raise, so the `return` that used to follow the call was unreachable.
+    `NoReturn` lets a type checker prove that rather than a reader assuming it."""
+    import typing
+
+    from keel.commands.open_console import _refuse
+
+    assert typing.get_type_hints(_refuse).get("return") is typing.NoReturn
+
+
+def test_the_refusal_does_not_claim_the_path_came_from_the_directory_when_it_may_not(
+    home: Path,
+) -> None:
+    """`state_root` honours `KEEL_HOME` FIRST, and this fixture sets it -- so "the deployment this
+    directory belongs to" was false for exactly the reader most likely to have set it."""
+    port = _a_closed_port()
+    result = CliRunner().invoke(cli, ["open", "--port", str(port), "--no-browser"])
+    assert "KEEL_HOME" in result.output, result.output
+
+
+def test_a_malformed_pid_refuses_cleanly_instead_of_raising(home: Path) -> None:
+    """The refusal path is the one that must never traceback, and it was the one that did.
+
+    `live_record` wrapped the pid conversion in `try/except (TypeError, ValueError)`; `_refuse`
+    repeated the conversion bare, and `read_record` validates only that a token is present. So a
+    record carrying `"pid": "not-a-number"` produced `ValueError: invalid literal for int()` out
+    of the code whose docstring promises the opposite -- "`keel open` must not traceback at an
+    operator whose server has just died".
+    """
+    port = _a_closed_port()
+    runtime.record_serving(host="127.0.0.1", port=port, token="tok", interactive=False)
+    path = runtime.record_path(port)
+    path.write_text(json.dumps({**json.loads(path.read_text()), "pid": "not-a-number"}))
+
+    result = CliRunner().invoke(cli, ["open", "--port", str(port), "--no-browser"])
+    assert result.exception is None or isinstance(result.exception, SystemExit), result.exception
+    assert result.exit_code != 0
+    assert "Error:" in result.output
+
+
+def test_one_place_parses_the_recorded_pid(home: Path) -> None:
+    """Two conversions of one field is how the bug above existed: `live_record` guarded its copy
+    and `_refuse` did not. `recorded_pid` is the single answer both ask for."""
+    assert runtime.recorded_pid({"pid": 42}) == 42
+    assert runtime.recorded_pid({"pid": "7"}) == 7
+    for junk in ({}, {"pid": None}, {"pid": "not-a-number"}, {"pid": [1]}, {"pid": 1.5e400}):
+        assert runtime.recorded_pid(junk) == 0, junk
