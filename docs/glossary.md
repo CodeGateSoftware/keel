@@ -1,9 +1,15 @@
 # The keel glossary
 
 The single source for the console's vocabulary. Every term a keel screen can show is
-defined HERE and nowhere else: the TUI's Help menu renders this file directly (bounded
-read, cached by mtime -- the same reader discipline the Research corpus keeps), and the
-docs link to it rather than restating a definition that could drift.
+defined HERE and nowhere else, and the docs link to it rather than restating a definition
+that could drift.
+
+**Nothing renders this file in-app.** `render_glossary` was deleted at #540 and the
+in-console Help menu went with `keel tui` at #541; since #539 a term on a keel screen
+becomes an OUTBOUND link to this file's published copy on keeltrading.com, built from
+`TERMS` in `keel/web/static/js/docs.js`. That table is the answer to "which words on this
+screen are defined somewhere", so a term added here is not linked until it is added there
+too.
 
 Two honesty rules this file inherits from `docs/fiqh-basis.md`:
 

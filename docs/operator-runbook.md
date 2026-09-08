@@ -211,9 +211,12 @@ exception: a `keel serve` left running keeps the build it started with until you
 The four commands above — plus the per-database `keel migrate --db` step the updater also
 runs (the four commands don't include it; it runs for every `keel*.db` with the new build,
 between install and verify) — are what `keel update` runs for you (issue #415) — same order,
-same tools, one service (`keel/commands/update.py`) behind two front-ends: the `keel update`
-CLI command and the Account menu's `update` entry in the TUI console (see "The TUI console"
-for the ceremony). `keel update --check` mutates nothing: it prints current vs latest and the
+same tools, one service (`keel/commands/update.py`) behind ONE front-end: the `keel update`
+CLI command. It had two until #541 — the TUI's Account menu was the other — and that is the
+whole of what the deletion cost this path. (The browser console's "A newer build is ready"
+button reloads the service worker; it does not replace the binary, and replacing the binary
+stays a typed terminal ceremony like every other capability-increasing action.)
+`keel update --check` mutates nothing: it prints current vs latest and the
 whole plan. All of this is for **venv deployments only** — a packaged (desktop) install never
 self-updates; it updates by downloading the new installer
 (docs/desktop-install.md, "How updates arrive"; decided in docs/decisions/0001-desktop-update-path.md),
@@ -1032,7 +1035,7 @@ unchanged by the notification layer below and stays independent of it.
 
 **Opt-in event notifications (default OFF).** The events an operator most needs are silent
 precisely because they are not errors — rail 17's attestation nearing expiry fails CLOSED and
-quietly vetoed a real setup for weeks before anyone opened the TUI. The notification layer
+quietly vetoed a real setup for weeks before anyone opened the TUI, the console of the day (#541). The notification layer
 (#444) delivers those over the SAME generic webhook, per-event opt-in in Freqtrade's
 `notification_settings` shape:
 
