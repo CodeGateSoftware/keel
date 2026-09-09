@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="keel/web/static/icons/keel.svg" alt="keel" width="96" height="96">
+</p>
+
 <div dir="rtl">
 
 # كيل (keel)
