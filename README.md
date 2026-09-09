@@ -283,6 +283,15 @@ adapter, deliberately divergent, that the conformance suite runs against.
   and why your computer warns you about it: the builds are not code-signed, because Apple's
   certificate costs $99/yr and keel cannot currently afford it. Says what to do, and how to
   verify what you downloaded instead.
+- [`docs/decisions/`](docs/decisions) — the decision records: standing rules that outlive the
+  code implementing them, each naming the trigger that would reopen it. Five so far, including
+  [0005](docs/decisions/0005-options.md), which refuses options on operational grounds and says
+  in terms that the permissibility question is **not** reached.
+- [`docs/architecture.md`](docs/architecture.md) — the system as verified rather than as
+  imagined: the packages keel ships in, the choices holding them up, and, issue by issue, what
+  is not built yet.
+- [`docs/glossary.md`](docs/glossary.md) — the single source for the vocabulary every keel
+  screen can show, defined once so a definition cannot drift between surfaces.
 - [`docs/RELEASING.md`](docs/RELEASING.md) — how a release is cut.
 
 ## Asking questions, and contributing
