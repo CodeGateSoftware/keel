@@ -8,8 +8,8 @@
 safety rails, attested asset screening that fails closed, and §65.4 *qabd* (constructive
 possession) encoded as an executable check — with a reference auto-trading agent built on top
 of it for Coinbase. Plenty of people have a trading bot; almost nobody has this compliance
-machinery, which is the part worth reading. There is also a fourth way to read all of this:
-`keel mcp` speaks [MCP](docs/mcp-server.md) over stdio, so Claude Code, Cursor, Codex or any
+machinery, which is the part worth reading. There is also `keel mcp`, which speaks
+[MCP](docs/mcp-server.md) over stdio, so Claude Code, Cursor, Codex or any
 other assistant can ask keel the same questions the browser view answers — and,
 by construction rather than promise, cannot attest a subscription, promote a rule, arm
 autonomy, or place an order, because the write surface does not exist in that package at all.
