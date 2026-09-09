@@ -239,16 +239,21 @@ keel/                          the agent and CLI
 ├── execution/guards.py        the 21 rails (where enforcement lives)
 ├── execution/sizing.py        position sizing
 ├── compliance/screen.py       attested allowlist admission (fails closed)
+├── research/                  the thirteen modules behind `keel research`
+├── web/                       the local console `keel serve` renders, read-only
+├── mcp/                       the read-only MCP server `keel mcp` speaks
 └── commands/                  CLI command implementations
 
 packages/
 ├── keel-core/                 shared domain types, config, logging
 ├── keel-broker-api/           the broker PORT: the contract every adapter codes against
-├── keel-broker-coinbase/      Coinbase Advanced Trade adapter
+├── keel-broker-coinbase/      Coinbase Advanced Trade adapter (the default venue)
+├── keel-broker-alpaca/        Alpaca adapter — US equities, cash account only
 ├── keel-broker-robinhood/     Robinhood adapter (optional venue)
+├── keel-broker-kraken/        Kraken: port-complete stub, every data method raises (#313)
 └── keel-broker-fake/          deliberately divergent fake venue, dev-only
 
-tests/                         ~3,000 tests, including the port's conformance suite
+tests/                         the suite, including the port's conformance suite
 ```
 
 A new broker plugs in as a package under `packages/keel-broker-*`, implementing the
