@@ -30,6 +30,16 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 _README = (REPO_ROOT / "README.md").read_text()
 
 
+def _shipped_packages() -> set[str]:
+    """Every distribution under `packages/`. ONE definition, because two disagreed.
+
+    The first cut filtered on `pyproject.toml` in one test and on `is_dir()` in the other. Both
+    sets happen to be equal today, so nothing failed -- which is precisely the shape that fails
+    later, at a stray directory, in only one of two tests that are supposed to be opposites.
+    """
+    return {p.name for p in (REPO_ROOT / "packages").iterdir() if (p / "pyproject.toml").is_file()}
+
+
 def _architecture_block() -> str:
     """The fenced block under `## Architecture`, verbatim."""
     start = _README.index("## Architecture")
@@ -37,12 +47,31 @@ def _architecture_block() -> str:
     return _README[fence : _README.index("```", fence + 3)]
 
 
+def test_the_block_locator_finds_the_diagram_and_not_the_document() -> None:
+    """The guard the other assertions rest on.
+
+    `_architecture_block` takes the FIRST fence after the heading; a fence inserted between the
+    two silently retargets it, and `.index` raises only if the heading itself goes. Measured by
+    mutation: with the locator returning the whole README, both package tests still PASSED --
+    the file names `keel-broker-` nine times and only six are inside the diagram, so prose
+    elsewhere satisfies them. A scan that can select the wrong region is a scan about a region
+    nobody chose.
+
+    The same guard `test_retired_surfaces` and `test_nav_transition` already carry; this file
+    shipped without it.
+    """
+    block = _architecture_block()
+    assert len(block) < len(_README) / 3, (
+        "the located block is not a block -- every test below is vacuous"
+    )
+    assert "packages/" in block, "the located block is not the architecture diagram"
+    assert "## Documentation map" not in block, "the slice ran past the section it names"
+
+
 def test_every_shipped_package_is_in_the_diagram() -> None:
     """A package absent from the diagram is a venue a reader does not know exists. `alpaca` was
     the live example: shipped, in the release set, and unmentioned."""
-    shipped = {
-        p.name for p in (REPO_ROOT / "packages").iterdir() if (p / "pyproject.toml").is_file()
-    }
+    shipped = _shipped_packages()
     block = _architecture_block()
     missing = sorted(name for name in shipped if name not in block)
     assert not missing, f"packages/ ships these and the README does not name them: {missing}"
@@ -50,7 +79,7 @@ def test_every_shipped_package_is_in_the_diagram() -> None:
 
 def test_the_diagram_names_no_package_that_does_not_exist() -> None:
     """The other direction, which a removal would break rather than an addition."""
-    shipped = {p.name for p in (REPO_ROOT / "packages").iterdir() if p.is_dir()}
+    shipped = _shipped_packages()
     named = set(re.findall(r"\bkeel-broker-[a-z]+\b|\bkeel-core\b", _architecture_block()))
     invented = sorted(named - shipped)
     assert not invented, f"the README names packages that are not in packages/: {invented}"
