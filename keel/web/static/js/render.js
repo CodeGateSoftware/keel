@@ -609,9 +609,11 @@ export function refusedView(reading, onReconnect) {
  * because an unbracketed position is a position with no stop.
  *
  * @param {any} data  `/api/status`'s `data`, known non-null by the caller.
+ * @param {string} [section]  which section to show -- a `STATUS_SECTIONS` key, or `""`.
+ * @param {(key: string) => void} [onSection]  omitted, and the whole page renders. See `sectioned`.
  * @returns {DocumentFragment}
  */
-export function statusView(data) {
+export function statusView(data, section, onSection) {
   const fragment = document.createDocumentFragment();
   fragment.append(el("h1", undefined, "Status"));
 
@@ -619,6 +621,43 @@ export function statusView(data) {
   sub.append(field(data.generated_at));
   fragment.append(sub);
 
+  fragment.append(sectioned(data, STATUS_SECTIONS, section, onSection, "Status section"));
+  return fragment;
+}
+
+/**
+ * The five sections of the status page, in the order it used to scroll them.
+ *
+ * **Reading order is preserved, and that is the point of a table rather than five branches.** An
+ * operator who knew where "Data freshness" sat on the long page finds its tab in the same place,
+ * and the tab bar cannot list a section the page has no builder for -- the two come from one
+ * declaration.
+ *
+ * **The label is written ONCE and serves as both the tab and the section's own heading**, which
+ * is why every builder below takes the entry it was reached through. A tab reading "Open
+ * positions" over a heading reading something else is a drift this shape cannot have.
+ *
+ * @type {Section[]}
+ */
+const STATUS_SECTIONS = [
+  { key: "status", label: "Status", build: statusState },
+  { key: "positions", label: "Open positions", build: statusPositions },
+  { key: "rules", label: "Rules", build: statusRules },
+  { key: "freshness", label: "Data freshness", build: statusFreshness },
+  { key: "subscriptions", label: "Subscriptions", build: statusSubscriptions },
+];
+
+/**
+ * The four state cards: mode and autonomy, equity and drawdown, rail 17, market session.
+ *
+ * No heading of its own -- the page's `<h1>` already says "Status", and the tab bar says which
+ * section is on. The four tables below DO carry one, because a table needs an accessible name.
+ *
+ * @param {any} data
+ * @returns {DocumentFragment}
+ */
+function statusState(data) {
+  const fragment = document.createDocumentFragment();
   fragment.append(
     gridCard([
       kv("mode", plain(data.mode)),
@@ -661,7 +700,19 @@ export function statusView(data) {
     ]),
   );
 
-  fragment.append(heading("h-positions", "Open positions"));
+  return fragment;
+}
+
+/**
+ * Open positions, with the `bracket` column the rendered page never had.
+ *
+ * @param {any} data
+ * @param {Section} entry
+ * @returns {DocumentFragment}
+ */
+function statusPositions(data, entry) {
+  const fragment = document.createDocumentFragment();
+  fragment.append(heading("h-positions", entry.label));
   fragment.append(
     table(
       "h-positions",
@@ -686,8 +737,19 @@ export function statusView(data) {
       "No open positions.",
     ),
   );
+  return fragment;
+}
 
-  fragment.append(heading("h-rules", "Rules"));
+/**
+ * The live rules, under the counts by status.
+ *
+ * @param {any} data
+ * @param {Section} entry
+ * @returns {DocumentFragment}
+ */
+function statusRules(data, entry) {
+  const fragment = document.createDocumentFragment();
+  fragment.append(heading("h-rules", entry.label));
   const counts = el("p", "note");
   if (data.rule_counts.length === 0) {
     counts.textContent = "no rules";
@@ -696,10 +758,10 @@ export function statusView(data) {
     // The order is the server's -- `payload.status_payload` emits `rule_counts` as a LIST of
     // pairs rather than an object precisely so that ordering stays a presentation decision made
     // in Python, matching `render_human`'s own sort.
-    for (const [index, entry] of data.rule_counts.entries()) {
+    for (const [index, count] of data.rule_counts.entries()) {
       if (index) counts.append(el("span", "muted", " · "));
-      counts.append(plain(entry.status), " ");
-      counts.append(field(entry.count));
+      counts.append(plain(count.status), " ");
+      counts.append(field(count.count));
     }
   }
   fragment.append(counts);
@@ -723,8 +785,19 @@ export function statusView(data) {
       "No live rules.",
     ),
   );
+  return fragment;
+}
 
-  fragment.append(heading("h-freshness", "Data freshness"));
+/**
+ * How old the newest candle is, per allowlisted product.
+ *
+ * @param {any} data
+ * @param {Section} entry
+ * @returns {DocumentFragment}
+ */
+function statusFreshness(data, entry) {
+  const fragment = document.createDocumentFragment();
+  fragment.append(heading("h-freshness", entry.label));
   fragment.append(
     table(
       "h-freshness",
@@ -745,8 +818,19 @@ export function statusView(data) {
       "No market data yet.",
     ),
   );
+  return fragment;
+}
 
-  fragment.append(heading("h-subscriptions", "Subscriptions"));
+/**
+ * The venue subscription attestations, stored beside effective.
+ *
+ * @param {any} data
+ * @param {Section} entry
+ * @returns {DocumentFragment}
+ */
+function statusSubscriptions(data, entry) {
+  const fragment = document.createDocumentFragment();
+  fragment.append(heading("h-subscriptions", entry.label));
   fragment.append(
     table(
       "h-subscriptions",
@@ -771,7 +855,6 @@ export function statusView(data) {
       "No subscription attestations.",
     ),
   );
-
   return fragment;
 }
 
@@ -833,13 +916,63 @@ export function statusView(data) {
  * shape as #548, found while porting this view.
  *
  * @param {any} data  `/api/setup`'s `data`, known non-null by the caller.
+ * @param {string} [section]  which section to show -- a `SETUP_SECTIONS` key, or `""`.
+ * @param {(key: string) => void} [onSection]  omitted, and the whole page renders. See `sectioned`.
  * @returns {DocumentFragment}
  */
-export function setupView(data) {
+export function setupView(data, section, onSection) {
   const fragment = document.createDocumentFragment();
   fragment.append(el("h1", undefined, "Setup"));
   fragment.append(el("p", "sub", plain(data.root)));
 
+  fragment.append(sectioned(data, SETUP_SECTIONS, section, onSection, "Setup section"));
+  return fragment;
+}
+
+/**
+ * The three sections of the setup page: where this deployment stands, then the two runbook
+ * stages in the order the runbook works down.
+ *
+ * **This is the `STAGES` table it replaces, with the tab bar folded into it.** The stage wording
+ * is `render.py::render_setup`'s own, because it carries an argument rather than a label: paper
+ * "places nothing" is the sentence that makes paper the safe default, and paraphrasing it in a
+ * second front-end weakens it. It is written HERE, once, and reaches both the tab and the
+ * stage's heading through `entry.label` -- a tab and a heading that could disagree about which
+ * stage a reader is looking at is precisely what one table forecloses.
+ *
+ * `blurb` is what the stage sections add and the summary has none of: the summary's own
+ * argument is the deployment card under it.
+ *
+ * @type {Section[]}
+ */
+const SETUP_SECTIONS = [
+  { key: "setup", label: "Setup", build: setupSummary },
+  {
+    key: "paper",
+    label: "To run in paper",
+    build: setupPaper,
+    blurb: "Evaluates rules against real market data and places nothing.",
+  },
+  {
+    key: "live",
+    label: "To go live",
+    build: setupLive,
+    blurb: "Everything the go-live runbook adds before real money moves.",
+  },
+];
+
+/**
+ * Where this deployment stands, and the one thing to do next.
+ *
+ * No heading -- the page's `<h1>` says "Setup" and the tab bar says which section is on. The
+ * running job's panel belongs here rather than under a stage: a fetch started from the paper
+ * stage keeps reporting its progress to a reader who has since moved on to the live one.
+ *
+ * @param {any} data
+ * @returns {DocumentFragment}
+ */
+function setupSummary(data) {
+  const fragment = document.createDocumentFragment();
   fragment.append(
     gridCard([
       kv("deployment", data.is_new),
@@ -862,6 +995,57 @@ export function setupView(data) {
     nextCard.append(el("p", undefined, "Nothing outstanding."));
   }
   fragment.append(nextCard);
+  return fragment;
+}
+
+/**
+ * The paper stage's steps.
+ *
+ * @param {any} data
+ * @param {Section} entry
+ * @returns {DocumentFragment}
+ */
+function setupPaper(data, entry) {
+  return stageSteps(data, entry);
+}
+
+/**
+ * The live stage's steps.
+ *
+ * A function of its own rather than a shared one bound to a key, so that `SETUP_SECTIONS` reads
+ * as three sections with three builders and a table pointing two entries at one function -- the
+ * mutation that renders the paper checklist under the "To go live" tab -- is not spellable.
+ *
+ * @param {any} data
+ * @param {Section} entry
+ * @returns {DocumentFragment}
+ */
+function setupLive(data, entry) {
+  return stageSteps(data, entry);
+}
+
+/**
+ * One runbook stage: its heading, its argument, and the steps that belong to it.
+ *
+ * The step cards, the actions map and the not-automated map are all built HERE rather than once
+ * for the page, because only one stage renders at a time now -- building the other stage's maps
+ * would be work for a section nobody is looking at.
+ *
+ * @param {any} data
+ * @param {Section} entry
+ * @returns {DocumentFragment}
+ */
+function stageSteps(data, entry) {
+  const fragment = document.createDocumentFragment();
+  fragment.append(heading("h-stage-".concat(entry.key), entry.label));
+  fragment.append(note(entry.blurb || ""));
+
+  const steps = data.steps || [];
+  const here = steps.filter(/** @param {any} step */ (step) => step.stage === entry.key);
+  if (here.length === 0) {
+    fragment.append(el("p", "empty", "No steps in this stage."));
+    return fragment;
+  }
 
   const notAutomated = new Map(
     (data.not_automated || []).map(/** @param {any} row */ (row) => [row.key, row.why]),
@@ -869,42 +1053,9 @@ export function setupView(data) {
   const actions = new Map(
     (data.actions || []).map(/** @param {any} action */ (action) => [action.key, action]),
   );
-
-  for (const stage of STAGES) {
-    const here = steps.filter(/** @param {any} step */ (step) => step.stage === stage.key);
-    fragment.append(heading("h-stage-".concat(stage.key), stage.heading));
-    fragment.append(note(stage.blurb));
-    if (here.length === 0) {
-      fragment.append(el("p", "empty", "No steps in this stage."));
-      continue;
-    }
-    for (const step of here) fragment.append(stepCard(step, actions, notAutomated));
-  }
-
+  for (const step of here) fragment.append(stepCard(step, actions, notAutomated));
   return fragment;
 }
-
-/**
- * The two stages, in the order the runbook works down.
- *
- * A table rather than a branch, and the wording is `render.py::render_setup`'s own, because it
- * carries an argument rather than a label: paper "places nothing" is the sentence that makes
- * paper the safe default, and paraphrasing it in a second front-end weakens it.
- *
- * @type {Array<{key: string, heading: string, blurb: string}>}
- */
-const STAGES = [
-  {
-    key: "paper",
-    heading: "To run in paper",
-    blurb: "Evaluates rules against real market data and places nothing.",
-  },
-  {
-    key: "live",
-    heading: "To go live",
-    blurb: "Everything the go-live runbook adds before real money moves.",
-  },
-];
 
 /**
  * One checklist step.
@@ -2378,6 +2529,103 @@ function scopeSwitch(current, onScope, label) {
 
 /** `ACTIVITY_SCOPES`, in the order `t` cycles them. @type {string[]} */
 const SCOPES = ["today", "7d", "all"];
+
+/**
+ * One section of a page that shows one section at a time.
+ *
+ * `label` is the tab's wording AND the section's own heading -- `build` is handed the entry it
+ * was reached through so that it can write the second from the first. `blurb` is optional and is
+ * the sentence a section makes about itself under that heading.
+ *
+ * @typedef {{key: string, label: string, build: Function, blurb?: string}} Section
+ */
+
+/**
+ * A long page, cut into sections, with a tab bar to choose between them (#773).
+ *
+ * ── WHY THIS IS NOT A FILTER, AND WHAT FOLLOWS FROM THAT ─────────────────────────────────────
+ *
+ * `statusSwitch` and `scopeSwitch` above both re-ask the SERVER, because both narrow a collection
+ * the server capped on the way out -- filtering a received page in the browser would present "the
+ * rows that happened to arrive" as the whole answer. This control narrows NOTHING. `/api/status`
+ * sends every section of the status page in one document and always did; choosing which of them
+ * to draw is presentation, which is what this file is for, and no section is ever unreachable --
+ * every one of them has a tab, always, so there is no filter here to be stuck inside.
+ *
+ * That is also why there is no "all" tab. The Orders bar needs one because a reader who has
+ * clicked Canceled otherwise has no way back short of knowing that the empty string means every
+ * status. Here, the way back to any section is that section's own tab, and an "all" tab would
+ * re-create the page these two views were cut up to stop being.
+ *
+ * ── AN UNWIRED SWITCH RENDERS THE WHOLE PAGE ─────────────────────────────────────────────────
+ *
+ * `onSection` is optional, and a caller that omits it gets every section, in order, with no tab
+ * bar -- the page exactly as it read before it was cut up. The alternative degradation, one
+ * section and no way to reach the others, would be a client hiding information that is sitting
+ * in a payload it already has. Same guard as `ordersView`'s `onStatus`, and the same reason:
+ * a control nobody wired must not cost a reader anything.
+ *
+ * `current` is resolved against the table rather than trusted: a key that names no section --
+ * a section renamed while a reader had its tab open -- falls back to the first, which is a page
+ * that renders rather than a blank one.
+ *
+ * @param {any} data  the view's payload, passed through to whichever builder runs.
+ * @param {Section[]} table
+ * @param {string} [current]  a `table` key, or `""` for the first section.
+ * @param {(key: string) => void} [onSection]
+ * @param {string} [label]  how this page's tab bar announces itself.
+ * @returns {DocumentFragment}
+ */
+function sectioned(data, table, current, onSection, label) {
+  const fragment = document.createDocumentFragment();
+  if (!onSection) {
+    for (const entry of table) fragment.append(entry.build(data, entry));
+    return fragment;
+  }
+  const chosen = table.find(/** @param {Section} entry */ (entry) => entry.key === current);
+  const here = chosen || table[0];
+  fragment.append(sectionSwitch(here.key, table, onSection, label));
+  fragment.append(here.build(data, here));
+  return fragment;
+}
+
+/**
+ * The tab bar itself.
+ *
+ * Built from the same table the page draws from, so a tab that leads nowhere is not spellable.
+ *
+ * **Every tab stays a button, including the current one**, for `scopeSwitch`'s reason: pressing
+ * the section you are on re-reads it, which is a refresh, and taking the control away is what
+ * makes focus vanish when the view is rebuilt underneath a keyboard user who just pressed it.
+ *
+ * `data-focus` is how `main.js` puts focus back on the button's replacement -- pressing a tab
+ * replaces the whole view, which destroys the button that was pressed, and without this a
+ * keyboard user is returned to the top of the document on every press.
+ *
+ * `aria-label` is REQUIRED to differ per page. Two tab bars on one site announcing themselves
+ * identically would leave a screen-reader user unable to tell which page's sections they had
+ * landed in -- the lesson `scopeSwitch` learned at #659 when it grew a second caller.
+ *
+ * @param {string} current  the resolved section key -- never the raw request.
+ * @param {Section[]} table
+ * @param {(key: string) => void} onSection
+ * @param {string} [label]
+ * @returns {HTMLElement}
+ */
+function sectionSwitch(current, table, onSection, label) {
+  const wrap = el("nav", "scopes");
+  wrap.setAttribute("aria-label", label || "Section");
+  wrap.append(el("span", "k", "section"));
+  for (const entry of table) {
+    const button = el("button", "scopekey", entry.label);
+    button.setAttribute("type", "button");
+    button.setAttribute("data-focus", "section:".concat(entry.key));
+    if (entry.key === current) button.setAttribute("aria-current", "true");
+    button.addEventListener("click", () => onSection(entry.key));
+    wrap.append(button);
+  }
+  return wrap;
+}
 
 /**
  * What to say when the chosen scope holds no cycles.

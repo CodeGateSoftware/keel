@@ -246,6 +246,62 @@ function paramsFor(endpoint) {
 }
 
 /**
+ * Which section each sectioned view is showing (#773).
+ *
+ * **Keyed by `route.name`, not held once for the client.** Status and Setup are two pages with
+ * two section tables, and a single shared "current section" would have a reader who opened
+ * Setup's "To go live" find Status showing whichever of its five sections happened to sit at
+ * that key -- or, for a key Status does not have, falling back to its first section every time.
+ *
+ * Not in the query string, and not in the URL: nothing is asked of the server here. `sectioned`
+ * chooses which part of a document the client already holds to draw, and a `?section=` would be
+ * a second source of truth about a decision the server never participates in. Same argument
+ * `params` makes about `?sort=` one level down, arrived at from the other end.
+ *
+ * State survives navigation, so walking to another view and back finds the section you left.
+ *
+ * @type {Map<string, string>}
+ */
+const sections = new Map();
+
+/**
+ * The section a route is showing, or `""` -- which `sectioned` resolves to the first one.
+ *
+ * @param {Route} route
+ * @returns {string}
+ */
+function sectionOf(route) {
+  return sections.get(route.name) || "";
+}
+
+/**
+ * A section handler for one route: record the section, re-read, repaint.
+ *
+ * **The repaint is FORCED**, which is the whole of why this is not a plain re-render. The click
+ * has just put focus on the button inside `#content`, and an unforced rebuild is DEFERRED while
+ * focus is in there -- so pressing a tab would do nothing until focus happened to leave, and a
+ * control that does nothing is indistinguishable from a broken one. `rebuildInto` puts focus
+ * back on the pressed tab's replacement through its `data-focus` key.
+ *
+ * It re-reads on the way, unlike the sort and scope handlers, which re-read because the SERVER
+ * decides what they ask for. Nothing here needs the server: the whole document is already in
+ * hand. Going through `paint` anyway is what keeps every path that replaces the view -- the
+ * poll, a live tick, a sort, a scope, a section -- running through the one function that
+ * restores focus, open disclosures, the chart's viewBox and each action's last outcome. A
+ * section press that swapped the fragment directly would have to re-implement all four, and the
+ * cost it avoids is one read of a local endpoint.
+ *
+ * @param {Route} route
+ * @returns {(key: string) => void}
+ */
+function onSectionFor(route) {
+  return (key) => {
+    sections.set(route.name, key);
+    void paint(route, true, true);
+  };
+}
+
+/**
  * A sort handler for one endpoint: record the column, re-read, repaint.
  *
  * @param {Route} route
@@ -402,7 +458,7 @@ function mount(route, readings) {
     // document that was just fetched rather than stored anywhere: it dies with the process that
     // minted it, and a stale one produces a 403 the view shows rather than a silent no-op.
     remember(data);
-    return setupView(data);
+    return setupView(data, sectionOf(route), onSectionFor(route));
   }
   if (route.name === "activity") {
     return activityView(data, primary.sort, onSort, (scope) => {
@@ -478,7 +534,7 @@ function mount(route, readings) {
   if (route.name === "venues") return venuesView(data, primary.sort, onSort);
   if (route.name === "gates") return gatesView(data);
   if (route.name === "plans") return plansView(data);
-  return statusView(data);
+  return statusView(data, sectionOf(route), onSectionFor(route));
 }
 
 /**
