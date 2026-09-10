@@ -1015,8 +1015,8 @@ function setupSummary(data) {
  * @param {Section} entry
  * @returns {DocumentFragment}
  */
-function setupPaper(payload, entry) {
-  return stageSteps(payload, entry);
+function setupPaper(data, entry) {
+  return stageSteps(data, entry);
 }
 
 /**
@@ -1030,8 +1030,8 @@ function setupPaper(payload, entry) {
  * @param {Section} entry
  * @returns {DocumentFragment}
  */
-function setupLive(payload, entry) {
-  return stageSteps(payload, entry);
+function setupLive(data, entry) {
+  return stageSteps(data, entry);
 }
 
 /**
@@ -2587,10 +2587,16 @@ const SCOPES = ["today", "7d", "all"];
  * would go on passing while a `table(...)` added inside either one resolved to an array and
  * shipped a runtime `TypeError`. That test's own docstring records this class of miss from #701.
  *
- * **`payload`, not `data`.** These two helpers sit between `activityView` and `insightsView`, so
- * `_view_keys` counts them inside `activityView`'s region: any `data.<key>` written here would
- * be checked against `/api/activity`, which is not the endpoint it came from. Naming the
- * parameter something else makes that mistake unspellable rather than merely unmade.
+ * **`payload`, not `data` -- HERE, and only here.** These two helpers sit between `activityView`
+ * and `insightsView`, so `_view_keys` counts them inside `activityView`'s region: any
+ * `data.<key>` written here would be checked against `/api/activity`, which is not the endpoint
+ * it came from. Naming the parameter something else makes that mistake unspellable.
+ *
+ * The same rename applied to `setupPaper`/`setupLive` was an own-goal and is reverted (#776
+ * review): those two sit INSIDE `setupView`'s region, where `data.` is exactly what the parity
+ * pin scans for, so `payload` there would hide a wrong key rather than expose one. Proved with a
+ * controlled pair -- `payload.made_up_key` in `setupPaper` escaped the suite; the identical
+ * `data.made_up_key` in `setupSummary` was caught. The rule is regional, not global.
  *
  * @param {any} payload  the view's payload, passed through to whichever builder runs.
  * @param {Section[]} sections

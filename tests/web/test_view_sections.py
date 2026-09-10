@@ -30,7 +30,20 @@ reject. The harness that proves it is not in the repository -- it applies each d
 of the client, checks the mutated bytes actually reached disk (a no-op mutation looks exactly
 like a killed one), runs this file, and restores. Its results are recorded in #775.
 
-Two structural traps this file fell into, kept named so they are not re-dug:
+**It happened again, and that is the more useful lesson.** The rewrite killed all thirteen and
+was reviewed against a list generated independently of it: 24 further defects, and the fitted
+suite let every one of them through. `sectionSwitch` -- the control the whole feature is -- had
+no test that its buttons did ANYTHING: deleting the click listener, deleting `wrap.append`, or
+showing `entry.key` instead of the label all passed the full 843-test suite. So did a
+`stageSteps` whose filter is computed and then not used, a `statusView` handed `SETUP_SECTIONS`,
+and dropping the `if (data.job)` guard, which throws and blanks the Setup page.
+
+A suite that kills the defects someone already listed and nothing else has been FITTED to the
+list. The count is not the property; the property is that every element a reader depends on --
+the text, the handler, the append, the guard, the order -- is pinned by something. Where a test
+below reads a whole construct (`_tab_loop`) rather than a scattered substring, that is why.
+
+Three structural traps this file fell into, kept named so they are not re-dug:
 
   * **`_decl` bounds at the next TOP-LEVEL declaration, not at the next `\\nfunction `.** The
     first spelling sailed past `export function` and `const`, so what it called
@@ -40,6 +53,11 @@ Two structural traps this file fell into, kept named so they are not re-dug:
     made the label-to-heading check assert NOTHING for all three Setup sections, because Setup's
     heading is written one level down in `stageSteps`. A guard that decides whether to assert
     must be a guard whose falseness is itself asserted somewhere.
+  * **`count(a) == count(b)` is the same trap wearing a number.** Replacing that guard with
+    `count("heading(") == count(", entry.label)")` was green at `0 == 0`, so deleting the stage
+    heading passed -- the identical hole, one refactor later. The count is written down as an
+    EXPECTED number now (`_HEADED_SECTIONS`), because two counts always agree at zero. `_delegate`
+    carried a third instance of the shape in its own `if hop else body`.
 """
 
 from __future__ import annotations
@@ -85,12 +103,15 @@ def _decl(code: str, name: str) -> str:
     `statusSubscriptions` came back with `setupView` and `SETUP_SECTIONS` inside it, so a
     heading moved into the wrong function would have been reported as still in the right one.
     """
-    for match in _TOP_LEVEL.finditer(code):
-        if match.group(1) != name:
-            continue
-        after = _TOP_LEVEL.search(code, match.end())
-        return code[match.start() : after.start() if after else len(code)]
-    raise AssertionError(name + " is not declared at the top level of the module")
+    found = [match for match in _TOP_LEVEL.finditer(code) if match.group(1) == name]
+    # **Exactly one, because JavaScript hoists and the LAST declaration wins.** Returning the
+    # first of two would have this module inspect a function the browser never runs: appending a
+    # second `function stageSteps` leaves all four of its assertions green while every Setup
+    # stage renders nothing (#776 review).
+    assert len(found) == 1, name + " is declared " + str(len(found)) + " times at the top level"
+    match = found[0]
+    after = _TOP_LEVEL.search(code, match.end())
+    return code[match.start() : after.start() if after else len(code)]
 
 
 def _sections(code: str, name: str) -> list[tuple[str, str, str]]:
@@ -108,6 +129,18 @@ def _sections(code: str, name: str) -> list[tuple[str, str, str]]:
     return [(key, label, build) for key, label, build in found]
 
 
+def _tab_loop(code: str) -> str:
+    """The body of `sectionSwitch`'s per-entry loop -- one tab's construction, in full.
+
+    Read as a unit rather than as scattered substrings over the whole function, so that every
+    part of a tab (its text, its type, its focus key, its current-ness, its handler and its
+    append) is asserted in the one place they all have to agree."""
+    body = _decl(code, "sectionSwitch")
+    marker = "for (const entry of sections) {"
+    assert marker in body, "the bar must build one button per section, from the table"
+    return body.split(marker)[1].split("\n  }")[0]
+
+
 def _delegate(code: str, builder: str) -> str:
     """The function that actually draws a section, following one `return <fn>(...)` hop.
 
@@ -116,8 +149,13 @@ def _delegate(code: str, builder: str) -> str:
     which is exactly how the label check came to assert nothing for the whole Setup page.
     """
     body = _decl(code, builder)
-    hop = re.search(r"return ([A-Za-z_][A-Za-z0-9_]*)\(", body)
-    return _decl(code, hop.group(1)) if hop else body
+    hops = re.findall(r"return ([A-Za-z_][A-Za-z0-9_]*)\(", body)
+    # **At most one, or this helper is guessing.** The first spelling took the FIRST such return
+    # anywhere in the body, so an early `return note("...")` sent it into `note` and every
+    # assertion written over the result went vacuous -- the helper itself becoming the
+    # "guard that decides whether to assert" this module's docstring forbids (#776 review).
+    assert len(hops) <= 1, builder + " has more than one delegating return: " + repr(hops)
+    return _decl(code, hops[0]) if hops else body
 
 
 # -- the two tables ----------------------------------------------------------------------------
@@ -201,7 +239,10 @@ def test_an_unwired_switch_runs_every_builder_and_returns_before_the_bar() -> No
     assert "if (!onSection)" in body, "the unwired fallback is gone"
     fallback = body.split("if (!onSection)")[1].split("}")[0]
     assert "for (const entry of sections)" in fallback, "the fallback must run EVERY section"
-    assert "entry.build(" in fallback, "the fallback must build them, not merely walk them"
+    assert "entry.build(payload, entry)" in fallback, (
+        "each section must be built with ITS OWN entry -- `entry.build(payload)` renders every "
+        "heading as undefined and throws in stageSteps"
+    )
     assert "return fragment;" in fallback, "it must return before the tab bar is appended"
 
 
@@ -219,6 +260,12 @@ def test_the_shown_section_is_resolved_from_the_request_with_a_fallback_to_the_f
     assert "entry.key === current" in body, "the shown section must be resolved from the request"
     assert "|| sections[0]" in body, "an unknown key must fall back to the first section"
 
+    # And the RESOLVED entry is what gets built. Pinning the two lines above and not this one
+    # left `here.build(payload, sections[0])` green -- every section built with section one's
+    # entry, so `stageSteps` filters on "setup" under all three tabs -- and `chosen.build(...)`
+    # green too, which throws on the very fallback the lines above describe (#776 review).
+    assert "here.build(payload, here)" in body, "the resolved entry is what must be built"
+
 
 def test_the_tab_bar_is_drawn_exactly_once_when_the_switch_is_wired() -> None:
     """**Kills: deleting the `sectionSwitch` append.**
@@ -229,6 +276,16 @@ def test_the_tab_bar_is_drawn_exactly_once_when_the_switch_is_wired() -> None:
     body = _decl(_code("render.js"), "sectioned")
 
     assert body.count("sectionSwitch(") == 1, "the wired path draws the bar once"
+
+    # With the RESOLVED key, and BEFORE the section. `sectionSwitch(current, ...)` leaves no tab
+    # marked current on an unknown key, and a bar appended after the content puts the control
+    # after the thing it controls in both DOM and tab order (#776 review).
+    assert "sectionSwitch(here.key, sections, onSection, label)" in body, (
+        "the bar takes the resolved key and this page's own label"
+    )
+    assert body.index("sectionSwitch(") < body.index("here.build("), (
+        "the bar is appended before the section it chooses between"
+    )
 
 
 # -- the tab bar -------------------------------------------------------------------------------
@@ -251,6 +308,39 @@ def test_every_tab_carries_a_focus_key_derived_from_its_own_section() -> None:
     )
 
 
+def test_every_tab_is_a_button_that_calls_back_with_its_own_section() -> None:
+    """**Kills: deleting the click listener; `onSection(current)`; deleting `wrap.append`;
+    `entry.label` -> `entry.key` as the tab text; deleting `type="button"`.**
+
+    All five passed the whole 843-test suite before this test existed. Nothing anywhere asserted
+    that a tab does ANYTHING: the bar rendered with the right wording, the right `aria-current`
+    and the right focus keys, and pressing one was a no-op. The label assertions elsewhere are
+    over the TABLE and over the BUILDERS -- never over the control that puts the label on screen.
+
+    `type="button"` is not cosmetic: without it a `<button>` inside a form submits it.
+    """
+    loop = _tab_loop(_code("render.js"))
+
+    assert 'el("button", "scopekey", entry.label)' in loop, "the tab shows the label, not the key"
+    assert 'setAttribute("type", "button")' in loop, "a bare button submits its form"
+    assert 'addEventListener("click", () => onSection(entry.key))' in loop, (
+        "the tab must call back with ITS OWN key"
+    )
+    assert "wrap.append(button)" in loop, "a button nobody appends is a bar with no tabs"
+
+
+def test_the_bar_announces_itself_with_the_label_its_caller_passed() -> None:
+    """**Kills: `aria-label` hardcoded to `"Section"`, and dropping the argument at the call.**
+
+    Two tab bars on one site announcing themselves identically leave a screen-reader user unable
+    to tell which page's sections they landed in -- the #659 lesson this docstring cites. The
+    predecessor checked only that the two CALL SITES pass distinct strings, never that
+    `sectionSwitch` uses the parameter at all."""
+    body = _decl(_code("render.js"), "sectionSwitch")
+
+    assert 'setAttribute("aria-label", label' in body, "the bar must use the label it was given"
+
+
 def test_only_the_tab_that_is_on_is_marked_current() -> None:
     """**Kills: setting `aria-current` unconditionally.**
 
@@ -261,8 +351,16 @@ def test_only_the_tab_that_is_on_is_marked_current() -> None:
     lines = [line for line in body.splitlines() if "aria-current" in line]
 
     assert len(lines) == 1, "aria-current is set in exactly one place: " + repr(lines)
-    assert "if (" in lines[0] and "current" in lines[0], (
-        "aria-current must be conditional on the resolved section: " + lines[0].strip()
+    # The CONDITION, spelled out. `"current" in line` was the first spelling and it is satisfied
+    # by the attribute's own name -- `"current"` is a substring of `"aria-current"` -- so
+    # `if (entry.key)` (every tab current) and `if (entry.key !== current)` (every tab EXCEPT the
+    # live one) both passed. The same substring trap this whole module exists to remove, dug
+    # inside the fix for it (#776 review).
+    condition = re.search(r"if \(([^)]*)\)", lines[0])
+    assert condition, "aria-current must be conditional: " + lines[0].strip()
+    assert condition.group(1) == "entry.key === current", (
+        "the condition must compare the entry's key to the resolved section, not "
+        + condition.group(1)
     )
 
 
@@ -274,6 +372,14 @@ def test_one_switch_serves_both_pages_and_each_announces_itself_by_name() -> Non
 
     assert code.count("function sectionSwitch(") == 1, "one control, declared once"
     assert code.count("function sectioned(") == 1, "one dispatcher, declared once"
+
+    # The TABLE as well as the label. `[A-Z_]+` accepted any table, so handing `statusView` the
+    # `SETUP_SECTIONS` list passed -- the Status page rendering Setup's three sections. The two
+    # call lines are otherwise identical, which is what makes that the likely copy-paste when a
+    # third sectioned view arrives (#776 review).
+    for view, table in (("statusView", "STATUS_SECTIONS"), ("setupView", "SETUP_SECTIONS")):
+        wiring = "sectioned(data, " + table + ", section, onSection, "
+        assert wiring in _decl(code, view), view + " must be wired to " + table
 
     labels = re.findall(r'sectioned\(data, [A-Z_]+, section, onSection, "([^"]+)"\)', code)
     assert len(labels) == 2, "both views must wire the switch: " + repr(labels)
@@ -297,6 +403,16 @@ def test_a_stage_shows_its_own_steps_and_never_another_stages() -> None:
         "the filter must come from the entry, not a literal: " + filt.group(1)
     )
 
+    # And the loop must READ the filtered list. Pinning the filter alone left
+    # `for (const step of here)` -> `of steps` green: the filter is computed, ignored, and both
+    # stage tabs render all fifteen steps -- the live checklist under "To run in paper", which is
+    # the exact failure the filter exists to prevent, one line lower (#776 review).
+    assert "for (const step of here)" in body, "the step loop must read the FILTERED list"
+    assert "stepCard(step, actions, notAutomated)" in body, (
+        "the two maps are same-arity and opposite in meaning -- swapped, every not-automated "
+        "note becomes an action lookup"
+    )
+
 
 def test_a_stage_states_its_own_argument() -> None:
     """**Kills: deleting the blurb.**
@@ -310,6 +426,20 @@ def test_a_stage_states_its_own_argument() -> None:
     assert "entry.blurb" in body, "a stage must state its own argument, from its entry"
 
 
+def test_the_two_stages_do_not_share_a_heading_id() -> None:
+    """**Kills: `heading("h-stage", ...)` -- the id no longer derived from the stage.**
+
+    Harmless while one section renders at a time, and a duplicate `id` the moment the unwired
+    path draws both stages. `heading`'s whole purpose is to be a table's accessible name, and two
+    elements answering to one id makes `aria-labelledby` resolve to whichever comes first."""
+    ident = re.search(r"heading\(([^,]+),", _delegate(_code("render.js"), "setupPaper"))
+
+    assert ident, "a stage must write a heading"
+    assert "entry.key" in ident.group(1), (
+        "the heading id must be derived from the stage: " + ident.group(1).strip()
+    )
+
+
 def test_an_empty_stage_says_so_rather_than_rendering_a_bare_heading() -> None:
     """**Kills: deleting the empty-stage sentence.**
 
@@ -318,6 +448,10 @@ def test_an_empty_stage_says_so_rather_than_rendering_a_bare_heading() -> None:
     body = _delegate(_code("render.js"), "setupLive")
 
     assert "No steps in this stage." in body
+    # Guarded on the STAGE's own list. `here.length === 0` -> `steps.length === 0` leaves the
+    # sentence in the source and unreachable, rendering the bare heading this test names
+    # (#776 review) -- the difference between a sentence existing and a sentence being shown.
+    assert "if (here.length === 0)" in body, "the empty case is the stage's own list, not the book"
 
 
 def test_a_delegating_builder_forwards_its_own_entry_and_not_a_table_index() -> None:
@@ -367,9 +501,22 @@ def test_each_status_heading_is_written_once_by_the_builder_its_entry_names() ->
         written = code.count('heading("' + heading + '"')
         assert written == 1, heading + " is written by " + str(written) + " headings, want 1"
         builder = next(entry[2] for entry in table if entry[0] == key)
-        assert 'heading("' + heading + '"' in _decl(code, builder), (
-            heading + " is not written by " + builder
+        body = _decl(code, builder)
+        assert 'heading("' + heading + '"' in body, heading + " is not written by " + builder
+        # TWICE in the builder: once as the heading's id, once as the `table()` id that becomes
+        # its `aria-labelledby`. Pinning the heading alone left the id in the `table(...)` call
+        # free to drift, which silently unnames the table for a screen reader while the heading
+        # above it still looks right (#776 review).
+        assert body.count('"' + heading + '"') == 2, (
+            heading + " must name both the heading and the table it labels"
         )
+
+
+#: The sections that carry a heading of their own. The other two -- `status` and `setup` -- are
+#: the page each tab bar sits on, so their `<h1>` already says it and a second heading would
+#: repeat the title. Written down because the count test below needs an EXPECTED number: without
+#: one it can only compare two counts, and two counts agree at zero.
+_HEADED_SECTIONS = frozenset({"positions", "rules", "freshness", "subscriptions", "paper", "live"})
 
 
 @pytest.mark.parametrize("name", ["STATUS_SECTIONS", "SETUP_SECTIONS"])
@@ -386,11 +533,44 @@ def test_a_section_heading_is_the_tab_wording_and_never_a_second_copy_of_it(name
     was the section nothing was checking. `_delegate` follows the hop."""
     code = _code("render.js")
 
-    for _key, label, builder in _sections(code, name):
+    for key, label, builder in _sections(code, name):
         body = _delegate(code, builder)
         assert '"' + label + '"' not in body, builder + " re-spells its own label: " + label
-        assert body.count("heading(") == body.count(", entry.label)"), (
+        # An EXPECTED count, not a comparison of two counts. `count("heading(") ==
+        # count(", entry.label)")` is satisfied at 0 == 0, so deleting `stageSteps`' heading
+        # passed -- all three Setup tabs rendering a blurb and a step list under no heading at
+        # all. That is the self-skipping shape this module's docstring says was "kept named so it
+        # is not re-dug", re-dug in a new form (#776 review).
+        wanted = 1 if key in _HEADED_SECTIONS else 0
+        assert body.count("heading(") == wanted, (
+            builder + " writes " + str(body.count("heading(")) + " headings, want " + str(wanted)
+        )
+        assert body.count(", entry.label)") == wanted, (
             builder + " writes a heading whose text is not entry.label"
+        )
+
+
+def test_the_setup_builders_name_their_payload_so_the_parity_pin_can_see_it() -> None:
+    """**Kills: renaming a Setup builder's payload parameter away from `data`.**
+
+    `_view_keys("setupView", "data")` scans this view's whole region for `data.<key>` and checks
+    each against `/api/setup`. Every builder in that region therefore has to spell its payload
+    `data` -- a `payload.<key>` read there is invisible to the pin, so a key the endpoint does
+    not send would render blank forever with nothing failing.
+
+    Proved as a controlled pair rather than reasoned: `payload.made_up_key` inserted into
+    `setupPaper` escaped the suite; the identical `data.made_up_key` in `setupSummary` was caught
+    (#776 review). `sectioned` and `sectionSwitch` take `payload` for the opposite reason -- they
+    sit in `activityView`'s region, where a `data.` read would be checked against the wrong
+    endpoint. The rule is regional, which is why it is written down rather than left to taste."""
+    code = _code("render.js")
+
+    for builder in ("setupSummary", "setupPaper", "setupLive", "stageSteps"):
+        signature = re.search(r"function " + builder + r"\(([^)]*)\)", code)
+        assert signature, builder + " is not declared"
+        first = signature.group(1).split(",")[0].strip()
+        assert first == "data", (
+            builder + " names its payload " + repr(first) + ", which _view_keys cannot see"
         )
 
 
@@ -407,8 +587,16 @@ def test_the_job_panel_is_page_level_and_not_inside_any_section() -> None:
     It is page-level state, like the `<h1>`, so it renders above the switch."""
     code = _code("render.js")
 
-    assert "jobPanel(" in _decl(code, "setupView"), (
-        "the job panel must render above the section switch, not inside a section"
+    view = _decl(code, "setupView")
+    # The GUARD and the ARGUMENT, not merely the name. `jobPanel` opens `plain(job.key)`, so
+    # dropping `if (data.job)` throws on every deployment with no job running and renders the
+    # Setup page blank; `jobPanel(data)` renders every field undefined. Both passed the whole
+    # 843-test suite, on the one line this change moved (#776 review).
+    assert "if (data.job) fragment.append(jobPanel(data.job));" in view, (
+        "the job panel is guarded and takes data.job"
+    )
+    assert view.index("jobPanel(") < view.index("sectioned("), (
+        "the panel is page-level: it renders ABOVE the switch, not after it"
     )
     for _key, _label, builder in _sections(code, "SETUP_SECTIONS"):
         assert "jobPanel(" not in _delegate(code, builder), (
@@ -491,7 +679,11 @@ def test_each_sectioned_route_remembers_its_own_section() -> None:
         call = view + "(data, sectionOf(route), onSectionFor(route))"
         assert call in code, "the shell must mount " + view + " with its own section: " + call
 
-    assert "route.name" in _decl(code, "sectionOf"), "the section is READ per route"
+    # The whole expression. `route.name` alone left a fallback to another route's bucket green
+    # -- Setup showing whatever section Status was on (#776 review).
+    assert 'return sections.get(route.name) || "";' in _decl(code, "sectionOf"), (
+        "a route with no section falls back to its own table's first, never another route's"
+    )
 
 
 def test_a_section_press_writes_into_its_own_routes_bucket() -> None:
@@ -513,3 +705,8 @@ def test_pressing_a_section_repaints_at_once_rather_than_waiting_for_focus_to_le
     body = _decl(_code("main.js"), "onSectionFor")
 
     assert "paint(route, true, true)" in body, "the section press forces the rebuild"
+    # AFTER recording it. Repainting first re-reads and re-renders the section the reader is
+    # leaving, and the press only takes effect on the NEXT paint (#776 review).
+    assert body.index("sections.set(") < body.index("paint("), (
+        "the section is recorded before the repaint that reads it"
+    )

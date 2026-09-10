@@ -297,9 +297,10 @@ function sectionOf(route) {
  * (the fifteen-second poll does the same thing, and has since #537), and the section survives it
  * in `sections` so the next successful paint lands where the reader asked. But it is the one
  * place where routing a purely local decision through the server is visible, and a reader who
- * hits it should find it written down here rather than conclude the tab is broken. `paint` also
- * sets no `aria-busy`, so a slow read leaves the press with no feedback -- unlike a nav click,
- * which goes through `show`.
+ * hits it should find it written down here rather than conclude the tab is broken. Nor does the
+ * press raise `aria-busy`: `show` is what raises it and a section press does not go through
+ * `show`, so `paint`'s `finally` lowers a flag that was never up and a slow read leaves the tab
+ * with no feedback at all -- unlike a nav click, which dims the view while it waits.
  *
  * @param {Route} route
  * @returns {(key: string) => void}
