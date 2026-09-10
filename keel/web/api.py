@@ -319,7 +319,7 @@ def read_setup(cfg: ServeConfig, _query: Query, state: Any, _now_ts: int) -> dic
     )
 
 
-def read_activity(cfg: ServeConfig, query: Query, _state: Any, _now_ts: int) -> dict[str, Any]:
+def read_activity(cfg: ServeConfig, query: Query, _state: Any, now_ts: int) -> dict[str, Any]:
     """The engine's own log, scoped.
 
     An unrecognised `?scope=` is NORMALISED rather than refused, unlike an unrecognised `?sort=`,
@@ -344,10 +344,10 @@ def read_activity(cfg: ServeConfig, query: Query, _state: Any, _now_ts: int) -> 
         # A read that failed and a window that held nothing are different facts; the reader's
         # status is the more specific one and must not be flattened into "empty".
         feed = feed_from_lines((), source=str(path))
-    return payload.activity_payload(apply_scope(feed, scope, now_ts=time.time()))
+    return payload.activity_payload(apply_scope(feed, scope, now_ts=now_ts))
 
 
-def read_orders(cfg: ServeConfig, query: Query, _state: Any, _now_ts: int) -> dict[str, Any]:
+def read_orders(cfg: ServeConfig, query: Query, _state: Any, now_ts: int) -> dict[str, Any]:
     """The audit trail: what keel actually bought and sold, and at what price (#659).
 
     **No `mode` reaches the service, and none may.** `gather_orders` calls `get_orders()`
@@ -381,9 +381,7 @@ def read_orders(cfg: ServeConfig, query: Query, _state: Any, _now_ts: int) -> di
     limit = DEFAULT_ORDERS_LIMIT if not raw_limit else _whole_number(raw_limit, MAX_ORDERS_LIMIT)
     repo = open_repo(cfg.db_path)
     try:
-        report = gather_orders(
-            repo, now_ts=int(time.time()), scope=scope, status=status, limit=limit
-        )
+        report = gather_orders(repo, now_ts=now_ts, scope=scope, status=status, limit=limit)
     finally:
         close_repo(repo)
     return payload.orders_payload(report)
@@ -621,9 +619,7 @@ def _log_cycles(config: Any) -> tuple[tuple[Any, ...], str]:
     window = read_log_window(log_path)
     # `LogWindow` carries the lines and a read status, not the path -- `source` is the feed's own
     # label for where the lines came from, so it is passed the path we resolved.
-    cycles = feed_from_lines(
-        window.lines, source=str(log_path), truncated=window.truncated
-    ).cycles
+    cycles = feed_from_lines(window.lines, source=str(log_path), truncated=window.truncated).cycles
     return cycles, window.status
 
 
@@ -748,9 +744,7 @@ def read_journal(cfg: ServeConfig, query: Query, _state: Any, now_ts: int) -> di
         notes = gather_journal(repo, now_ts=now_ts, limit=DEFAULT_NOTES_LIMIT)
     finally:
         close_repo(repo)
-    return payload.journal_payload(
-        report, curve=build_equity_curve(report.entries), notes=notes
-    )
+    return payload.journal_payload(report, curve=build_equity_curve(report.entries), notes=notes)
 
 
 def read_plans(_cfg: ServeConfig, _query: Query, _state: Any, _now_ts: int) -> dict[str, Any]:
@@ -1202,6 +1196,13 @@ def respond(cfg: ServeConfig, path: str, query: Query) -> tuple[int, dict[str, A
     two need different words on screen. The request succeeded; the answer is that there is nothing
     to report.
     """
+    # **Read ONCE, here, and threaded to everything below.** `now_ts` is this request's instant:
+    # the envelope's `generated_at`, every scope boundary and every expiry are answered from it,
+    # so a document cannot report a boundary belonging to one instant beside a timestamp
+    # belonging to another. Two readers used to read the clock again for themselves; across a
+    # UTC midnight that divergence is real, and #777 is the day it cost a red CI run. It also
+    # made those two the only readers a test could not choose a clock for without patching the
+    # `time` module process-wide (#779).
     now_ts = int(time.time())
     route = API_ROUTES.get(path)
     if route is None:
