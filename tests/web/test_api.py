@@ -1303,7 +1303,14 @@ def test_the_trade_limit_does_not_truncate_the_operators_journal(tmp_path: Path)
 
 
 def _book_at(tmp_path: Path, now_ts: int) -> Any:
-    """A deployment holding one order inside `now_ts`'s UTC day and one two days before it."""
+    """A book holding one order inside `now_ts`'s UTC day and two before it.
+
+    **Three rows, and the middle one is the point.** The scope is a lower bound with no upper
+    bound, so a clock shifted BACKWARDS only widens the window -- with rows only at the boundary
+    and two days out, `now_ts - 86_400` changes nothing and escapes. The row one second before
+    the boundary sits in the gap that shift opens, so a backward shift now changes the count
+    (#782).
+    """
     from keel.commands.orders import scope_start_ts
     from keel.data.db import connect, migrate
     from keel.data.repository import Repository
@@ -1314,7 +1321,7 @@ def _book_at(tmp_path: Path, now_ts: int) -> Any:
     conn = connect(str(db_path))
     migrate(conn)
     repo = Repository(conn)
-    for created in (boundary, boundary - 2 * 86_400):
+    for created in (boundary, boundary - 1, boundary - 2 * 86_400):
         repo.insert_order(
             {
                 "mode": "paper",
@@ -1368,39 +1375,179 @@ def test_read_orders_scopes_by_the_clock_it_was_handed(
 
     assert body["scope"] == "today"
     assert body["scoped_count"]["value"] == scoped, label
-    assert body["total_count"]["value"] == "2", label + ": the book itself is unchanged"
+    assert body["total_count"]["value"] == "3", label + ": the book itself is unchanged"
+
+
+def test_respond_hands_the_reader_the_same_instant_it_stamped(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """**The seam the whole change is about, and the one nothing tested.**
+
+    Every other test here calls a reader directly, so all of them pass while `respond` hands down
+    something other than what it stamped. Three defects escaped 204 tests for exactly that reason
+    (#782): a day-old clock threaded to every reader, `now_ts` hoisted to a module constant read
+    once at import -- which would have a long-running `keel serve` answering every request on its
+    boot instant -- and the value floored to UTC midnight.
+
+    Patching the clock is right HERE and nowhere else in this module: this is a test OF the
+    dispatcher's single read, and the one place it reads is the only place to observe it. #780
+    removed the need to patch for READER tests, which is a different thing.
+
+    Both halves are asserted because they fail to different mutations. `as_of` catches a value
+    the dispatcher altered before stamping; `scoped_count` catches one it altered before handing
+    down. Neither alone is enough."""
+    frozen = 1_788_998_400 + 3652 * 86_400 + 43_200
+    boundary = frozen - 43_200
+    monkeypatch.setattr(web_api.time, "time", lambda: frozen)
+    cfg = _book_at(tmp_path, frozen)
+
+    status, document = web_api.respond(cfg, "/api/orders", {"scope": ["today"]})
+
+    assert status == 200, document
+    assert document["as_of"] == _iso(frozen), "the envelope stamps the instant it read"
+    assert document["data"]["scoped_count"]["value"] == "1", (
+        "only the row on the boundary is inside the day the envelope claims"
+    )
+    assert document["data"]["total_count"]["value"] == "3"
+    assert boundary < frozen, "the fixture's rows straddle the boundary this asserts about"
+
+
+def _iso(ts: int) -> str:
+    """The rendering `payload.iso` gives an epoch second, derived rather than restated."""
+    import datetime
+
+    return datetime.datetime.fromtimestamp(ts, datetime.UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def test_read_activity_scopes_by_the_clock_it_was_handed(tmp_path: Path) -> None:
-    """**Kills: `apply_scope(feed, scope, now_ts=time.time())`.**
+    """**Kills: `apply_scope(feed, scope, now_ts=time.time())`, and filtering on a second clock.**
 
-    Same argument as the orders reader, and the same fix. Asserted through `scope_start_at`,
-    which the payload echoes: it is the boundary the report actually applied, so it is the one
-    field that cannot agree with an injected clock by accident."""
+    Two cycles, one either side of the injected day's boundary, in a log this test actually
+    OWNS. The first version pointed `tmp_path` at a config and asserted `scope_start_at` -- but
+    `resolve_log_path`'s default is RELATIVE and resolves against the process CWD, so the reader
+    read `<checkout>/logs/keel.log` and the fixture never reached it. The one assertion left was
+    on a pure function of `now_ts`, which no feed can influence: filtering on the wall clock
+    while echoing the injected boundary passed the whole suite (#782).
+
+    So the count is asserted, not the label. `logging.file` is written ABSOLUTE for the same
+    reason the relative default exists -- see `resolve_log_path` -- because a test that depends
+    on its own working directory is the bug this one is fixing."""
     import datetime
 
     from keel.commands.activity import scope_start_ts as activity_scope_start_ts
     from keel.web.api import read_activity
+    from tests.commands.test_activity import _cycle_at
+
+    chosen = 1_788_998_400 + 3652 * 86_400 + 43_200
+    boundary = activity_scope_start_ts("today", chosen)
+    assert boundary is not None
+
+    log_path = tmp_path / "keel.log"
+    inside = _cycle_at(boundary + 3_600, "cycle-inside")
+    outside = _cycle_at(boundary - 3_600, "cycle-yesterday")
+    log_path.write_text("\n".join(outside + inside) + "\n", encoding="utf-8")
 
     config_path = tmp_path / "config.yaml"
-    config_path.write_text(VALID_CONFIG_YAML)
+    config_path.write_text(VALID_CONFIG_YAML + f"\nlogging:\n  file: {log_path}\n")
     cfg = _serve_config(str(tmp_path / "keel.db"), str(config_path))
-    chosen = 1_788_998_400 + 3652 * 86_400
 
     body = read_activity(cfg, {"scope": ["today"]}, None, chosen)
 
-    # Derived from the service's own boundary function rather than restated, so this cannot drift
-    # into asserting a literal that agrees with nothing.
-    boundary = activity_scope_start_ts("today", chosen)
-    assert boundary is not None
+    # The FEED, which only reaches this assertion if the fixture reached the reader.
+    assert len(body["cycles"]) == 1, "one cycle is inside the injected day: " + repr(body["cycles"])
+    assert body["cycles"][0]["cycle_id"] == "cycle-inside", "and it is the RIGHT one"
+
+    # And the label, derived from the service's own boundary rather than restated.
     expected = datetime.datetime.fromtimestamp(boundary, datetime.UTC).strftime(
         "%Y-%m-%dT%H:%M:%SZ"
     )
-
-    assert body["scope_start_at"]["value"] == expected, (
-        "the boundary must be midnight of the INJECTED day, not of today"
-    )
+    assert body["scope_start_at"]["value"] == expected
     assert expected.startswith("2036-"), "the injected instant is a decade from any wall clock"
+
+
+def test_the_orders_scope_boundary_is_exactly_utc_midnight() -> None:
+    """**Kills: an off-by-one in `orders.scope_start_ts`.**
+
+    Against a LITERAL, which is the only way this can be pinned from here. `_book_at` places its
+    boundary row by calling the same function, so a mutation moves the row and the boundary
+    together and cancels itself out -- `+ 1` on the return passed the whole suite (#782). A test
+    that computes its expectation from the code under test cannot see that code move.
+
+    1_789_041_600 is 2026-09-10 12:00:00 UTC; 1_788_998_400 is midnight of that day."""
+    from keel.commands.orders import scope_start_ts as orders_scope_start_ts
+
+    assert orders_scope_start_ts("today", 1_789_041_600) == 1_788_998_400
+    assert orders_scope_start_ts("today", 1_788_998_400) == 1_788_998_400, (
+        "an instant exactly on the boundary belongs to the day it starts"
+    )
+
+
+def _reader_clock_calls() -> dict[str, list[str]]:
+    """Every `read_*` in `api.py`, and the clock calls in ITS OWN body.
+
+    An `ast` walk, not a text scan, and the difference is four defects rather than a preference:
+
+      * a text scan for the literal `"time.time()"` misses `datetime.now(tz=UTC).timestamp()`
+        -- both names are already imported in `api.py`, so that is a one-line in-idiom offender;
+      * it misses one hidden a call deep in a module helper, which is the shape the two original
+        offenders take after any extract-method;
+      * it FALSE-POSITIVES on a module constant like `_SERVER_STARTED_AT = int(time.time())`,
+        blaming whichever reader happens to precede it, and on any docstring quoting the call;
+      * and its region bound was described as "the next top-level statement" while actually
+        being the next `def`/`class`, which is the same kind of bound that once reported five
+        clock reads inside `read_gates` -- a function with none.
+
+    Resolved names, so `time.time()`, `datetime.now(...)` and a call to a local helper are all
+    visible as what they are (#782).
+    """
+    import ast
+
+    tree = ast.parse(Path(web_api.__file__).read_text(encoding="utf-8"))
+    module_helpers = {
+        node.name: node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef) and not node.name.startswith("read_")
+    }
+
+    def clock_calls(node: ast.AST, seen: frozenset[str] = frozenset()) -> list[str]:
+        found: list[str] = []
+        for child in ast.walk(node):
+            if not isinstance(child, ast.Call):
+                continue
+            name = ast.unparse(child.func)
+            if name in {"time.time", "datetime.datetime.now", "datetime.now"}:
+                found.append(name)
+            # One hop into a module-level helper, which is where an extracted clock read hides.
+            elif name in module_helpers and name not in seen:
+                found.extend(clock_calls(module_helpers[name], seen | {name}))
+        return found
+
+    return {
+        node.name: clock_calls(node)
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name.startswith("read_")
+    }
+
+
+def test_the_reader_scan_sees_every_reader_there_is() -> None:
+    """**The population, pinned before anything is asserted about it.**
+
+    `assert offenders == []` is satisfied by a scan that found nothing, and the first version of
+    the rule below could be made to scan zero functions by narrowing its regex by two characters
+    -- passing green while checking the empty set. A test that can pass without exercising
+    anything is worse than no test (#782).
+
+    Cross-checked against `API_ROUTES`, which is the list the server actually dispatches to, so
+    this cannot drift into pinning a number nobody maintains."""
+    scanned = set(_reader_clock_calls())
+    dispatched = {route.read.__name__ for route in web_api.API_ROUTES.values()}
+
+    assert dispatched <= scanned, "the scan misses readers the server dispatches to: " + repr(
+        sorted(dispatched - scanned)
+    )
+    assert len(scanned) >= len(dispatched) >= 15, (
+        "the scan found " + str(len(scanned)) + " readers, which is too few to be believable"
+    )
 
 
 def test_no_reader_reads_the_clock_a_second_time() -> None:
@@ -1408,20 +1555,7 @@ def test_no_reader_reads_the_clock_a_second_time() -> None:
 
     `respond` reads `time.time()` once and hands it down; a reader that reads it again puts the
     envelope's `generated_at` and its own answer on two different instants, which across a UTC
-    midnight is a real divergence and not a theoretical one (#777). Scanned over each function's
-    OWN body, bounded at the next top-level statement -- a bound taken at the next `def read_`
-    instead swept helper functions in and reported five clock reads inside `read_gates`, which
-    has none."""
-    import re
+    midnight is a real divergence and not a theoretical one (#777)."""
+    offenders = {name: calls for name, calls in _reader_clock_calls().items() if calls}
 
-    source = Path(web_api.__file__).read_text(encoding="utf-8").splitlines()
-    tops = [i for i, line in enumerate(source) if re.match(r"^(def |class )", line)]
-    offenders = []
-    for index in tops:
-        end = next((j for j in tops if j > index), len(source))
-        body = "\n".join(source[index:end])
-        name = re.match(r"def ([a-z_]+)\(", source[index])
-        if name and name.group(1).startswith("read_") and "time.time()" in body:
-            offenders.append(name.group(1))
-
-    assert offenders == [], "these readers ignore the clock they were handed: " + repr(offenders)
+    assert offenders == {}, "these readers ignore the clock they were handed: " + repr(offenders)
