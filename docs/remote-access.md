@@ -85,6 +85,38 @@ wrong one by which refusal comes back. A loopback-only server has none, and that
 the argument rather than an exemption. Restarting `keel serve` remains the instant revocation
 gesture in both postures.
 
+## Capability-increasing actions are refused unless the bind is loopback
+
+`keel serve` serves a read surface. Three of the nine capability-increasing actions in
+`keel/capabilities.py` are being admitted to it behind a second gate (#781) -- releasing the
+kill-switch halt, clearing rail 16's consecutive-loss halt, and re-seeding rail 11's drawdown
+breaker. `keel.web.security.gated_action_permitted` decides, and it requires **three** things:
+a loopback peer, no `--external-host`, and a **loopback bind**.
+
+The third exists because the second is a declaration and two ordinary deployments never make it:
+
+* **A local reverse proxy the operator did not declare.** nginx's documented default is
+  `proxy_set_header Host $proxy_host`, so `proxy_pass http://127.0.0.1:8765;` presents
+  `Host: 127.0.0.1:8765` -- a name this server did bind, from a proxy on this machine. Every
+  check above passes and nothing was typed.
+* **`--host 192.168.1.5`**, which needs no `--external-host` because only wildcard binds are
+  refused. The LAN is served, and the declaration is empty.
+
+A bind is observable where a declaration is not: a server reachable from off-box is one an
+operator had to bind off-box. So a tunnelled, proxied or LAN-bound deployment serves every read
+and refuses every gated action -- and says so on the page, rather than presenting a button that
+returns 403.
+
+**`ssh -L 8765:127.0.0.1:8765` is not closed by this, and that is deliberate.** The peer is
+genuinely loopback and the bind is loopback, so the gate opens for a remote human. Ordinarily
+that grants nothing: `-L` implies SSH access, and an SSH session with a pty already satisfies the
+CLI's TTY gate, so the same operator could run `keel resume` directly. It grants more only under
+a restricted key (`command=`, `no-pty`, `permitopen=`) whose purpose is forwarding without a
+shell. Narrow, real, and left open until #656 gives the browser an identity of its own rather
+than inferring one from the transport.
+
+This is a floor. Relaxing it belongs to #648 and #656, in their PRs, not in a quiet edit.
+
 ## Binding every interface
 
 `--host 0.0.0.0` (or `::`) used to produce a server that refused **every** request: `HostPolicy`

@@ -6,8 +6,12 @@ would pass just as well against a server with no checks at all.
 
 from __future__ import annotations
 
+import hashlib
+import hmac
+
 import pytest
 
+from keel.web import security
 from keel.web.security import (
     SESSION_COOKIE,
     SESSION_COOKIE_MAX_AGE_SECONDS,
@@ -18,6 +22,9 @@ from keel.web.security import (
     split_host_header,
     tokens_match,
 )
+
+#: The bind these tests hold fixed when they are varying something else.
+LOOPBACK = "127.0.0.1"
 
 
 def _cookie_parts(header: str) -> tuple[str, str, dict[str, str]]:
@@ -265,3 +272,208 @@ def test_no_external_hosts_is_the_default() -> None:
     the point. A default that admitted anything would make every other test here decoration."""
     assert HostPolicy(bound_host="127.0.0.1", port=8765).external_hosts == frozenset()
     assert not HostPolicy(bound_host="127.0.0.1", port=8765).permits("keel.example.com:8765")
+
+
+# -- the Tier 1 gate: loopback, and a token that cannot be borrowed (#781) ------------------------
+#
+# Stage 1 of #781 builds the GATE and wires no action to a rail. The order is deliberate: at no
+# point should a half-built surface exist that can reach `disengage_kill_switch`.
+
+
+def test_the_gates_token_is_not_the_setup_write_token() -> None:
+    """**Domain separation, so a token minted for one surface cannot be replayed on the other.**
+
+    `csrf_token` already derives the setup write token from the session token under a label; this
+    is the same construction under a different one. Same secret, different derivation, so a value
+    captured from the setup page -- which is written into the document, unlike the `HttpOnly`
+    cookie -- cannot be presented to a route that releases a rail.
+
+    Asserted as INEQUALITY rather than as a format, because the failure this prevents is the two
+    collapsing into one value, which no format check would notice."""
+    session = security.new_session_token()
+
+    assert security.gates_token(session) != security.csrf_token(session)
+    assert security.gates_token(session) != session, "and neither is the session token itself"
+
+
+def test_the_gates_token_is_stable_for_a_session_and_dies_with_it() -> None:
+    """Derived, not stored: there is no table to expire or leak, and stopping `keel serve`
+    invalidates it because the session token it comes from is gone."""
+    first, second = security.new_session_token(), security.new_session_token()
+
+    assert security.gates_token(first) == security.gates_token(first), "stable within a session"
+    assert security.gates_token(first) != security.gates_token(second), "and not across sessions"
+
+
+@pytest.mark.parametrize(
+    ("peer", "loopback"),
+    [
+        (("127.0.0.1", 51234), True),
+        (("::1", 51234, 0, 0), True),
+        (("127.0.0.53", 51234), True),
+        (("192.168.1.10", 51234), False),
+        (("10.0.0.4", 51234), False),
+        (("0.0.0.0", 51234), False),
+        (("::ffff:127.0.0.1", 51234, 0, 0), True),
+        (("::ffff:192.168.1.10", 51234, 0, 0), False),
+        (("2001:db8::1", 51234, 0, 0), False),
+    ],
+)
+def test_a_gated_action_recognises_only_a_loopback_peer(peer: tuple, loopback: bool) -> None:
+    """**The PEER address, which is the one thing in a request an attacker cannot choose.**
+
+    `Host:` and `X-Forwarded-For:` are both attacker-controlled through a tunnel -- a header is a
+    claim, and this defence exists precisely for the case where the claim is a lie. The socket's
+    remote address is not a claim.
+
+    `127.0.0.53` is in the list because loopback is the whole `127.0.0.0/8` block, not one
+    address; systemd-resolved uses `.53` and a check written as `== "127.0.0.1"` would refuse a
+    legitimate local operator. The IPv4-mapped IPv6 forms are there because a dual-stack bind
+    presents `::ffff:127.0.0.1` for a v4 client, and reading that as remote would refuse every
+    local request on such a bind."""
+    assert security._is_loopback_peer(peer) is loopback
+
+
+def test_a_missing_or_malformed_peer_is_not_loopback() -> None:
+    """Fails CLOSED. A peer this cannot parse is one it cannot vouch for, and the safe reading of
+    "I do not know where this came from" is "not from here"."""
+    for peer in (None, (), ("",), ("", 51234), ("not-an-address", 1), ("127.0.0.1",)):
+        assert security._is_loopback_peer(peer) is False, repr(peer)
+
+    # A TUPLE, specifically. `client_address` is one, and accepting any sized sequence would let
+    # a caller hand this something shaped like a peer that is not one -- the narrowing the
+    # docstring argues for, asserted rather than described. A list of the right contents is the
+    # case that tells `isinstance` apart from a `__len__` check.
+    assert security._is_loopback_peer(["127.0.0.1", 51234]) is False
+    assert security._is_loopback_peer("127.0.0.1") is False, "a bare string is not a peer"
+
+
+def test_a_tunnelled_request_is_refused_even_though_its_peer_is_loopback() -> None:
+    """**The peer check alone is not enough, and this is the case that proves it.**
+
+    A Cloudflare Tunnel runs `cloudflared` ON THIS MACHINE and connects to keel over loopback. So
+    a request that began on the public internet arrives with `client_address` of `127.0.0.1` --
+    `is_loopback_peer` says yes, truthfully, and the answer is useless on its own.
+
+    `external_hosts` is how this codebase already spells "remote posture": `session_expired_at`
+    switches a session from never-expiring to 30 days on exactly that field, with the argument
+    that a remote origin "changes the population to anyone who can reach the tunnel". A gated
+    action must read the same signal, or a deployment behind a tunnel would arm autonomy for that
+    same population before #648 and #656 land.
+
+    So both, and neither alone."""
+    local = ("127.0.0.1", 51234)
+    remote = ("192.168.1.10", 51234)
+    tunnelled = frozenset({"keel.example.com"})
+
+    assert (
+        security.gated_action_permitted(local, external_hosts=frozenset(), bound_host=LOOPBACK)
+        is True
+    )
+    assert (
+        security.gated_action_permitted(local, external_hosts=tunnelled, bound_host=LOOPBACK)
+        is False
+    ), "a loopback peer on a tunnelled deployment is the cloudflared daemon, not the operator"
+    assert (
+        security.gated_action_permitted(remote, external_hosts=frozenset(), bound_host=LOOPBACK)
+        is False
+    )
+    assert (
+        security.gated_action_permitted(remote, external_hosts=tunnelled, bound_host=LOOPBACK)
+        is False
+    )
+
+
+def test_the_gate_fails_closed_on_a_peer_it_cannot_read() -> None:
+    """Same rule as `is_loopback_peer`, restated at the level that decides: an unparseable peer
+    on a loopback-only deployment is still a refusal."""
+    assert (
+        security.gated_action_permitted(None, external_hosts=frozenset(), bound_host=LOOPBACK)
+        is False
+    )
+
+
+def test_an_undeclared_local_reverse_proxy_does_not_open_the_gate() -> None:
+    """**`external_hosts` is a DECLARATION, and this is the deployment that never makes it.**
+
+    nginx's documented default is `proxy_set_header Host $proxy_host` -- the UPSTREAM address --
+    so `proxy_pass http://127.0.0.1:8765;` sends `Host: 127.0.0.1:8765`, which `HostPolicy`
+    permits. The proxy runs on this machine, so the peer is loopback too. Both stated conditions
+    passed, and the request came from the internet.
+
+    The operator never types `--external-host` because with that default rewrite everything
+    already works, so nothing in the configuration records the exposure. Reading the BIND address
+    is what closes it: a server reachable from off-box is one an operator had to bind off-box, and
+    that is observable where the declaration is not."""
+    assert (
+        security.gated_action_permitted(
+            ("127.0.0.1", 51234), external_hosts=frozenset(), bound_host="0.0.0.0"
+        )
+        is False
+    )
+
+
+@pytest.mark.parametrize("bound", ["192.168.1.5", "0.0.0.0", "::", "10.0.0.7", "example.internal"])
+def test_only_a_loopback_BIND_is_loopback_only_posture(bound: str) -> None:
+    """`keel serve --host 192.168.1.5` needs no `--external-host` -- only WILDCARD binds are
+    refused at the CLI -- so `external_hosts` stays empty on a server exposed to the whole LAN.
+    The gate survived that only because a LAN client's peer is not loopback, which is luck rather
+    than the rule it states.
+
+    A hostname that is not an address is refused too: this decides a security question, and
+    "I could not tell" is not "yes"."""
+    assert (
+        security.gated_action_permitted(
+            ("127.0.0.1", 51234), external_hosts=frozenset(), bound_host=bound
+        )
+        is False
+    )
+
+
+@pytest.mark.parametrize("bound", ["127.0.0.1", "localhost", "::1", "[::1]", "127.0.0.53"])
+def test_a_loopback_bind_with_a_loopback_peer_is_permitted(bound: str) -> None:
+    """The one configuration Tier 1 runs in, in every spelling `keel serve --host` accepts for
+    it. A rule that refused `localhost` would refuse the default the CLI prints."""
+    assert (
+        security.gated_action_permitted(
+            ("127.0.0.1", 51234), external_hosts=frozenset(), bound_host=bound
+        )
+        is True
+    )
+
+
+def test_the_gates_token_cannot_be_inverted_back_to_the_session_token() -> None:
+    """**The property the docstring claims, asserted.**
+
+    Inequality and determinism are satisfied by `return session_token[::-1]`, which passed the
+    whole module -- and that mutant hands the session token to anything that can read the page,
+    because stage 2 writes this value into the served document exactly as `csrf_token` already
+    is. The cookie is `HttpOnly` precisely so the session token never reaches the DOM.
+
+    So: the construction is pinned, and the token is checked for the one property no reordering
+    or truncation of the input can fake -- that neither the session token nor any rotation of it
+    appears in the derived value."""
+    session = security.new_session_token()
+    derived = security.gates_token(session)
+
+    assert (
+        derived
+        == hmac.new(session.encode("utf-8"), b"keel/web/gates/v1", hashlib.sha256).hexdigest()
+    ), "the derivation is HMAC(session_token, label), not a rearrangement of the input"
+
+    for rotation in (session, session[::-1], session.lower(), session.upper()):
+        assert rotation not in derived, "the session token must not be recoverable from the token"
+    assert len(derived) == 64, "a full sha256 hexdigest, not a truncation"
+
+
+def test_a_non_ascii_credential_is_refused_rather_than_raising() -> None:
+    """`secrets.compare_digest` refuses non-ASCII strings with a `TypeError`, and `http.server`
+    decodes headers as latin-1 -- so `Cookie: keel_session=\\xff\\xfe` reached this comparison and
+    crashed the handler with no response at all, before any authentication.
+
+    Not a bypass, but an unauthenticated crash-per-request, and it made one refusal path
+    distinguishable by HOW it failed rather than by what it said."""
+    assert security.tokens_match("\xff\xfe", security.gates_token("s")) is False
+    assert security.tokens_match("naïve", "naïve") is False, (
+        "even a matching one: refuse, never raise"
+    )

@@ -57,6 +57,7 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import ipaddress
 import secrets
 from dataclasses import dataclass
 
@@ -190,9 +191,122 @@ def csrf_token(session_token: str) -> str:
     return hmac.new(session_token.encode("utf-8"), _CSRF_LABEL, hashlib.sha256).hexdigest()
 
 
+#: Domain separation for the GATES derivation (#781). A different label from `_CSRF_LABEL`, and
+#: that difference is the whole security property: the setup write token is written into
+#: `/api/setup`'s document, so anything that can read that page holds it -- and a value that
+#: opened a rail as well as a setup step would make "can create a deployment" and "can release a
+#: halt" the same permission. Same secret, two derivations, neither usable as the other.
+_GATES_LABEL = b"keel/web/gates/v1"
+
+
+def gates_token(session_token: str) -> str:
+    """The write token for a Tier 1 gated action, derived like `csrf_token` and separately.
+
+    Everything `csrf_token`'s docstring says about derivation applies here: no server-side table
+    to keep, expire or leak, and it dies with the session token it comes from, so stopping
+    `keel serve` revokes it.
+
+    What it adds is that the two are not interchangeable. `csrf_token` guards
+    `keel.commands.setup.ACTIONS` -- idempotent, non-destructive, `MECHANICAL` steps. This guards
+    actions that release a rail. Deriving both from one label would mean a single captured value
+    covered both, and the two surfaces could never be revoked independently.
+    """
+    return hmac.new(session_token.encode("utf-8"), _GATES_LABEL, hashlib.sha256).hexdigest()
+
+
+def _is_loopback_peer(peer: object) -> bool:
+    """Whether a socket's REMOTE address is this machine.
+
+    **The peer address, never a header.** `Host:` and `X-Forwarded-For:` are claims the client
+    writes, and this check exists for exactly the case where the claim is a lie -- an operator
+    who has put `keel serve` behind a tunnel, where every request arrives carrying whatever the
+    proxy chose to say. `HostPolicy.permits` reads the header and defends a different thing (DNS
+    rebinding); this reads the socket and cannot be talked out of its answer.
+
+    **The whole 127.0.0.0/8 block, not one address.** systemd-resolved answers on 127.0.0.53, and
+    a check spelled `== "127.0.0.1"` would refuse a local operator on such a host -- a
+    false refusal that reads as a broken button. `ipaddress` decides this rather than a string
+    comparison, so the block, the IPv6 `::1`, and the IPv4-mapped `::ffff:127.0.0.1` a dual-stack
+    bind presents for a v4 client are all handled by one rule. The `ipv4_mapped` unwrap below is
+    belt-and-braces rather than the mechanism: since 3.13 `IPv6Address.is_loopback` already
+    delegates to it, so on this package's `>=3.14` floor the mapped form is handled either way.
+
+    **Fails closed.** A peer this cannot parse -- absent, empty, a hostname, a malformed tuple --
+    is one it cannot vouch for, and the only safe reading of "I do not know where this came from"
+    is "not from here".
+
+    `object` rather than `Any` for the parameter, deliberately: `Any` would let a caller pass
+    anything and silently skip every check below, where `object` makes the narrowing explicit and
+    mypy enforce it. What arrives here is `BaseHTTPRequestHandler.client_address`, which typeshed
+    declares as a 2-tuple and which is a 4-tuple on an IPv6 socket -- so the validation is real,
+    not defensive decoration.
+    """
+    if not isinstance(peer, tuple) or len(peer) < 2:
+        return False
+    host = peer[0]
+    if not isinstance(host, str) or not host:
+        return False
+    try:
+        address = ipaddress.ip_address(host)
+    except ValueError:
+        return False
+    mapped = getattr(address, "ipv4_mapped", None)
+    return bool((mapped or address).is_loopback)
+
+
+def gated_action_permitted(
+    peer: object, *, external_hosts: frozenset[str], bound_host: str
+) -> bool:
+    """Whether a Tier 1 gated action may run for this request (#781).
+
+    **Three conditions, because the obvious one is not enough and the second one lies.**
+
+    *The peer must be loopback.* Not the `Host:` header, which the client writes; the socket's
+    remote address, which it cannot choose.
+
+    *This must not be a declared remote deployment.* The peer check alone is insufficient because
+    a tunnel forwards to loopback -- `docs/remote-access.md`, "Why a tunnel is refused by
+    default", states it: "A Cloudflare Tunnel forwards to loopback and presents the app's public
+    domain in `Host:`." So an internet-origin request arrives with `client_address` of
+    `127.0.0.1` and the peer check answers truthfully and uselessly. `external_hosts` is how this
+    module already spells remote posture; `session_expired_at` reads the same field for the same
+    reason, one decision earlier.
+
+    *And the BIND must be loopback*, because `external_hosts` is a DECLARATION and two ordinary
+    deployments never make it. nginx's documented default is
+    `proxy_set_header Host $proxy_host`, so `proxy_pass http://127.0.0.1:8765;` presents
+    `Host: 127.0.0.1:8765` -- which `HostPolicy` permits, from a local proxy, with nothing typed.
+    And `--host 192.168.1.5` is accepted with no `--external-host` at all, since only WILDCARD
+    binds are refused. Both left this gate resting on the peer alone; the LAN case survived by
+    luck, because a LAN client's peer is not loopback, and the proxy case did not survive at all.
+
+    A bind is observable where a declaration is not: a server reachable from off-box is one an
+    operator had to bind off-box.
+
+    **This is a floor, not the final policy.** It holds until #648 (the remote-exposure security
+    pass) and #656 (device pairing) land; relaxing it is their job and belongs in their PR, not
+    in a quiet edit here. Until then a tunnelled deployment serves the read surface and refuses
+    every gated action, which is the posture that fails safe.
+    """
+    if external_hosts:
+        return False
+    # The bind, by the same rule as the peer, so `127.0.0.53` and `::1` are loopback here too and
+    # a name that is not an address ("example.internal") is refused -- this decides a security
+    # question, and "I could not tell" is not "yes".
+    if bound_host not in _LOOPBACK_NAMES and not _is_loopback_peer((bound_host, 0)):
+        return False
+    return _is_loopback_peer(peer)
+
+
 def tokens_match(presented: str | None, expected: str) -> bool:
-    """Constant-time comparison, tolerant of a missing value."""
-    if not presented:
+    """Constant-time comparison, tolerant of a missing value and of one that is not ASCII.
+
+    `secrets.compare_digest` raises `TypeError` on a non-ASCII `str`, and `http.server` decodes
+    headers as latin-1 -- so `Cookie: keel_session=\xff\xfe` reached here and crashed the handler
+    with no response at all, before any authentication. Not a bypass, but an unauthenticated
+    crash-per-request, and it made one refusal distinguishable by HOW it failed rather than by
+    what it said. A credential that cannot be compared is a credential that does not match."""
+    if not presented or not presented.isascii():
         return False
     return secrets.compare_digest(presented, expected)
 
