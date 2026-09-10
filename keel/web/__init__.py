@@ -19,9 +19,23 @@ now is stronger than the one it replaced, and it is the one anyone actually care
   deployment. "No POST at all" was a clean property that was also satisfied by a server which
   could not set anything up.
 * **Not one of the nine capability-increasing actions in `keel/capabilities.py` is reachable
-  from this package**, asserted by a test that scans this source rather than by inspection. The
+  from this package**, asserted by tests that scan this source rather than by inspection. The
   server cannot arm, release or spend. Attesting, promoting, releasing a halt and arming autonomy
   remain CLI-only, behind the TTY gate; D3 (#436) is where a browser gate for those would go.
+
+  **Three scans, because the first one alone was hollow (#788).** It forbade this package from
+  naming any `Capability.function` -- and those are the CLI COMMANDS, Click callbacks taking a
+  `ctx` that no web module would ever call. What releases a rail is the operation underneath, and
+  none of those were scanned: an ungated `disengage_kill_switch(repo)` planted here passed the
+  entire safety suite. The guarantee had held because nobody had written the line, not because
+  the test would have caught it.
+
+  So the effects are scanned too, DERIVED from what each gated command actually calls rather than
+  from a hand-written map that would go stale the way `capabilities.py` exists to prevent. And
+  because four of the nine do their work through a generic `repo.set_state(...)` that no
+  derivation can tell from any other write, a third scan states the posture directly: **this
+  package calls none of the repository's writers.** `keel serve` reads. Everything it can change
+  goes through `keel.commands.setup.ACTIONS`, which lives outside this package.
 * The JSON API (#534, `keel/web/api.py`) is **reads only**. Every route in its table answers a GET
   and 404s a POST, and it did not widen `API_PREFIX`'s existing `X-Keel-Client` gate by one byte.
 """
