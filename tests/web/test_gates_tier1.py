@@ -29,6 +29,7 @@ from pathlib import Path
 import pytest
 
 from keel.capabilities import CAPABILITIES
+from keel.commands import trading
 from keel.web import gates
 
 #: Every gated action, by the key `TIER1_ACTIONS` would use. Derived from the inventory rather
@@ -79,13 +80,36 @@ def test_the_table_cannot_be_widened_at_runtime() -> None:
     with pytest.raises(TypeError):
         gates.TIER1_ACTIONS["autonomy-on"] = next(iter(gates.TIER1_ACTIONS.values()))  # type: ignore[index]
 
+    # And no BACKING STORE is reachable. A proxy over a module-level `_TIER1_RAW` passes the
+    # assertion above while `gates._TIER1_RAW["autonomy-on"] = ...` is the one-liner the proxy
+    # exists to prevent -- and stage 2b's dispatch reads the proxy over it (#791 review).
+    mutable = [
+        name
+        for name, value in vars(gates).items()
+        if isinstance(value, dict)
+        and value
+        and all(isinstance(v, gates.Tier1Action) for v in value.values())
+    ]
+    assert not mutable, f"a mutable copy of the table is reachable as gates.{mutable}"
 
-def test_an_action_is_frozen_once_declared() -> None:
-    """Same argument one level down: a mutable row would let the phrase or the operation be
-    rewritten after import."""
-    action = gates.TIER1_ACTIONS["resume"]
-    with pytest.raises(Exception):
-        action.phrase = "ANYTHING"  # type: ignore[misc]
+
+def test_every_field_of_every_row_is_frozen() -> None:
+    """Same argument one level down: a mutable row lets the phrase OR the operation be rewritten
+    after import.
+
+    Every row and every field, because a `__setattr__` guarding only `phrase` passed when this
+    checked one field of one row -- leaving `operation`, `action` and `detail` rewritable. And
+    `FrozenInstanceError` by name, because `pytest.raises(Exception)` cannot tell the intended
+    refusal from a typo in the test (#791 review)."""
+    import dataclasses
+
+    assert gates.TIER1_ACTIONS
+    for key, action in gates.TIER1_ACTIONS.items():
+        for field in dataclasses.fields(action):
+            before = getattr(action, field.name)
+            with pytest.raises(dataclasses.FrozenInstanceError):
+                setattr(action, field.name, "ANYTHING")
+            assert getattr(action, field.name) is before, f"{key}.{field.name}"
 
 
 # -- the phrase, and what it is bound to -------------------------------------------------------
@@ -129,6 +153,12 @@ def test_the_typed_phrase_must_match_exactly(key: str) -> None:
     for wrong in (phrase.lower(), phrase + " ", " " + phrase, phrase[:-1], phrase.replace(" ", "")):
         assert gates.phrase_matches(key, wrong) is False, repr(wrong)
 
+    # And phrases that are not near misses at all. Every negative above is a MUTATION of the
+    # right answer, so `if presented == "OPEN SESAME": return True` passed all 24 tests -- a
+    # hardcoded master phrase, invisible to a suite that only ever tries typos (#791 review).
+    for unrelated in ("OPEN SESAME", "yes", "y", "ARM AUTONOMY", "true", "1", key, "*"):
+        assert gates.phrase_matches(key, unrelated) is False, repr(unrelated)
+
 
 def test_no_two_actions_share_a_phrase_or_a_first_word() -> None:
     """A shared phrase would prove a human but not INTENT. A shared FIRST WORD is the near miss:
@@ -160,9 +190,29 @@ def test_an_unknown_action_never_matches() -> None:
     assert gates.phrase_matches("", "") is False
     assert gates.phrase_matches(None, "RESUME TRADING") is False  # type: ignore[arg-type]
 
+    # The KEY refuses and never raises, on the inputs the phrase is tested with. Dropping the
+    # `isinstance` guard passed the whole suite, and a list key then raised `TypeError:
+    # unhashable` -- the same 500-instead-of-refusal bug, on the argument nothing covered.
+    for bad in (5, ["resume"], {"resume": 1}, True, b"resume"):
+        assert gates.phrase_matches(bad, "RESUME TRADING") is False, repr(bad)  # type: ignore[arg-type]
+
+    # And it is not normalised: looked up as given, or not at all.
+    for near in ("RESUME", " resume ", "resume\n", "Resume"):
+        assert gates.phrase_matches(near, "RESUME TRADING") is False, repr(near)
+
 
 @pytest.mark.parametrize(
-    "presented", ["RESUME TRADINGé", "RESUME TRADING", 5, ["RESUME TRADING"], True, None, b"x"]
+    "presented",
+    [
+        "RESUME TRADING\u00e9",
+        "RESUME\u00a0TRADING",  # a non-breaking space -- SPELLED; typed it is invisible
+        b"RESUME TRADING",  # the correct bytes: `b"x"` alone is refused for its VALUE
+        5,
+        ["RESUME TRADING"],
+        True,
+        None,
+        b"x",
+    ],
 )
 def test_an_unusable_phrase_is_refused_rather_than_raising(presented: object) -> None:
     """**The identical bug fixed in `tokens_match` one PR earlier, repeated here (#790).**
@@ -211,6 +261,46 @@ def test_the_phrase_comparison_returns_a_constant_time_call() -> None:
     assert isinstance(final, ast.Call), ast.unparse(returns[-1])
     assert ast.unparse(final.func) == "secrets.compare_digest", ast.unparse(final)
 
+    # The ARGUMENTS, because the spelling alone is theatre. `compare_digest('y' if presented ==
+    # action.phrase else 'n', 'y')` satisfies everything above while the real comparison is a
+    # plain `==` over a one-byte constant (#791 review).
+    assert [ast.unparse(arg) for arg in final.args] == ["presented", "action.phrase"], ast.unparse(
+        final
+    )
+
+    # And the NAME is the stdlib module, not a shim. `secrets = SimpleNamespace(compare_digest=
+    # lambda a, b: a == b)` also satisfies the spelling.
+    import secrets as stdlib_secrets
+
+    assert gates.secrets is stdlib_secrets
+
+
+def test_the_ceremony_wording_is_imported_and_never_restated() -> None:
+    """**The rule this module states three times and enforced nowhere (#791 review).**
+
+    `keel/commands/trading.py` holds the wording so that "the CLI imports and prints these; the
+    console imports and renders these; neither re-words them". Re-declaring the four constants as
+    literals in `gates.py` passed the whole suite -- the value comparisons all still held, on the
+    day the copy was made, which is exactly when a copy is indistinguishable from the original.
+
+    Asserted over the AST, so the mechanism is pinned and not just today's values."""
+    import ast
+
+    tree = ast.parse(Path(gates.__file__).read_text(encoding="utf-8"))
+    imported = {
+        alias.name
+        for node in ast.walk(tree)
+        if isinstance(node, ast.ImportFrom) and node.module == "keel.commands.trading"
+        for alias in node.names
+    }
+
+    assert {
+        "RESUME_ACTION",
+        "RESUME_DETAIL",
+        "RESUME_ENTRIES_ACTION",
+        "RESUME_ENTRIES_DETAIL",
+    } <= imported, sorted(imported)
+
 
 # -- what each action reaches, and what it tells the operator ----------------------------------
 
@@ -218,8 +308,8 @@ def test_the_phrase_comparison_returns_a_constant_time_call() -> None:
 #: The OPERATION each Tier 1 action performs -- the state service, never the Click command.
 #: Pinned as literals because this is the field stage 2b dispatches on.
 _EXPECTED_OPERATIONS = {
-    "resume": "keel.commands.trading.disengage_kill_switch",
-    "resume-entries": "keel.commands.trading.clear_consecutive_loss_halt",
+    "resume": trading.disengage_kill_switch,
+    "resume-entries": trading.clear_consecutive_loss_halt,
 }
 
 
@@ -236,6 +326,10 @@ def test_each_action_names_the_operation_and_not_the_click_command() -> None:
     assert {key: action.operation for key, action in gates.TIER1_ACTIONS.items()} == (
         _EXPECTED_OPERATIONS
     )
+    # IDENTITY: the row holds the very function the state service exports, so a look-alike
+    # defined elsewhere cannot satisfy it.
+    for key, expected in _EXPECTED_OPERATIONS.items():
+        assert gates.TIER1_ACTIONS[key].operation is expected, key
 
 
 def test_no_two_actions_reach_the_same_operation() -> None:
@@ -246,16 +340,15 @@ def test_no_two_actions_reach_the_same_operation() -> None:
     assert len(set(operations)) == len(operations), operations
 
 
-def test_every_operation_exists_and_is_callable() -> None:
-    """A name that resolves to nothing would be a table that passes every test here and fails at
-    the first request."""
-    import importlib
+def test_every_operation_is_a_function_of_the_state_service() -> None:
+    """Not a `click.Command`, not a class, and defined in `keel.commands.trading` -- the module
+    its own docstring designates as the one home for these mutations."""
+    import inspect
 
     assert gates.TIER1_ACTIONS
-    for action in gates.TIER1_ACTIONS.values():
-        module_name, _, function = action.operation.rpartition(".")
-        module = importlib.import_module(module_name)
-        assert callable(getattr(module, function, None)), action.operation
+    for key, action in gates.TIER1_ACTIONS.items():
+        assert inspect.isfunction(action.operation), f"{key}: {action.operation!r}"
+        assert action.operation.__module__ == "keel.commands.trading", key
 
 
 def test_the_operator_sees_the_cli_s_own_words_and_not_a_paraphrase() -> None:
@@ -265,9 +358,16 @@ def test_the_operator_sees_the_cli_s_own_words_and_not_a_paraphrase() -> None:
     "Any real, unrecovered drawdown stops being visible to the rail" while the browser was to
     show "re-seeding the high-water mark" -- the destructive consequence gone. Two front-ends
     printing one ceremony out of two copies is the drift that module forbids."""
-    from keel.commands import trading
+    expected = {
+        "resume": (trading.RESUME_ACTION, trading.RESUME_DETAIL),
+        "resume-entries": (trading.RESUME_ENTRIES_ACTION, trading.RESUME_ENTRIES_DETAIL),
+    }
 
-    assert gates.TIER1_ACTIONS
-    for action in gates.TIER1_ACTIONS.values():
-        assert action.action in vars(trading).values(), action.action
-        assert action.detail in vars(trading).values(), action.detail
+    assert set(gates.TIER1_ACTIONS) == set(expected), "a row here has no expected wording"
+    for key, action in gates.TIER1_ACTIONS.items():
+        # IDENTITY, per row. `in vars(trading).values()` accepted any module attribute, so
+        # `action=trading.__name__` passed -- the modal would read "You are about to
+        # keel.commands.trading" -- and swapping the copy between rows passed too, which shows
+        # the operator rail 16's ceremony while disengaging the kill switch (#791 review).
+        assert action.action is expected[key][0], key
+        assert action.detail is expected[key][1], key

@@ -59,7 +59,7 @@ first version of this module paraphrased, and the drift was immediate.
 from __future__ import annotations
 
 import secrets
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from types import MappingProxyType
 
@@ -68,20 +68,30 @@ from keel.commands.trading import (
     RESUME_DETAIL,
     RESUME_ENTRIES_ACTION,
     RESUME_ENTRIES_DETAIL,
+    clear_consecutive_loss_halt,
+    disengage_kill_switch,
 )
+from keel.data.repository import Repository
 
 
 @dataclass(frozen=True)
 class Tier1Action:
     """One action the browser may release, and the sentence that releases it."""
 
-    #: The OPERATION, module-qualified -- the state service in `keel.commands.trading`, never the
-    #: `click.Command` of the same name. `getattr(keel.cli, "resume")()` would enter Click
-    #: standalone mode, re-parse the SERVER's `sys.argv`, run the TTY gate with no terminal and
-    #: `sys.exit` inside a request thread. Qualified because `resume` alone is ambiguous between
-    #: the Command and its callback, and because the effect scan in `tests/web/test_server.py`
-    #: reasons about exactly these names.
-    operation: str
+    #: The OPERATION ITSELF -- the state service from `keel.commands.trading`, imported and held
+    #: as a reference. Never the `click.Command` of the same name: `getattr(keel.cli, "resume")()`
+    #: would enter Click standalone mode, re-parse the SERVER's `sys.argv`, run the TTY gate with
+    #: no terminal and `sys.exit` inside a request thread.
+    #:
+    #: **A reference and not a dotted string, and that is a safety property rather than taste.**
+    #: The first spelling was `"keel.commands.trading.disengage_kill_switch"` -- exactly the one
+    #: form no AST scan can see. A stage 2b dispatch resolving it through
+    #: `getattr(import_module(...), name)` left all three of `keel/web/__init__.py`'s scans green
+    #: while releasing the kill switch, and the comment here claimed the opposite as fact (#791
+    #: review). Holding the function makes the import AND the call site visible, so the effect
+    #: scan sees this package reaching two operations and can require they be exactly the two it
+    #: is allowed to reach.
+    operation: Callable[[Repository], None]
     #: The CLI's own words for what is about to happen. Imported, never restated.
     action: str
     #: The CLI's own consequence line, shown under it.
@@ -97,13 +107,13 @@ class Tier1Action:
 TIER1_ACTIONS: Mapping[str, Tier1Action] = MappingProxyType(
     {
         "resume": Tier1Action(
-            operation="keel.commands.trading.disengage_kill_switch",
+            operation=disengage_kill_switch,
             action=RESUME_ACTION,
             detail=RESUME_DETAIL,
             phrase="RESUME TRADING",
         ),
         "resume-entries": Tier1Action(
-            operation="keel.commands.trading.clear_consecutive_loss_halt",
+            operation=clear_consecutive_loss_halt,
             action=RESUME_ENTRIES_ACTION,
             detail=RESUME_ENTRIES_DETAIL,
             phrase="CLEAR STREAK HALT",
@@ -132,8 +142,10 @@ def phrase_matches(action_key: str, presented: object) -> bool:
     **And refuses, never raises.** `secrets.compare_digest` raises `TypeError` on a non-ASCII
     `str` and on a non-`str`, and this argument comes off an operator's keyboard through a JSON
     body -- so a smart quote or a non-breaking space from a phone delivered the correct verdict
-    as a 500. `tokens_match` carries the identical guard for the identical reason; this module
-    repeated the bug one PR after that one was fixed (#790).
+    as a 500. `security.tokens_match` guards the same class of input for the same reason, but its
+    guard is WEAKER -- `not presented or not presented.isascii()`, with no `isinstance` check, so
+    a non-`str` still raises there. This module repeated the ASCII half of that bug one PR after
+    it was fixed (#790) and carries the stronger guard now.
 
     `compare_digest` because it costs one call and removes the timing question. The phrase is
     public -- the modal prints it -- so this is belt-and-braces rather than load-bearing.
