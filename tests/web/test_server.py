@@ -1435,3 +1435,193 @@ def test_a_loopback_session_of_the_same_age_still_answers(deployment) -> None:
         status, _headers, _body = _request(aged, "/", cookie=f"{SESSION_COOKIE}={aged.token}")
 
     assert status == 200
+
+
+def _web_sources() -> list[str]:
+    """Every module in `keel/web/`, recursively -- the package the invariant is about."""
+    import glob
+    import os
+
+    root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    found = sorted(glob.glob(os.path.join(root, "keel", "web", "**", "*.py"), recursive=True))
+    assert found, "the scan found no web modules, which would make every test below vacuous"
+    return found
+
+
+# -- the invariant, by EFFECT rather than by command name (#788) ----------------------------------
+#
+# `test_no_capability_increasing_action_is_reachable_from_the_web_layer` above forbids this
+# package from naming any `Capability.function`. Those are the CLI COMMANDS -- Click callbacks
+# taking a `ctx` -- and the web layer would never call one. What releases a rail is the operation
+# underneath, and none of those were scanned: an ungated `disengage_kill_switch(repo)` planted in
+# `keel/web/gates.py` passed the whole safety suite. The name check is kept, because it is cheap
+# and it still catches the obvious spelling; these two are what make the guarantee true.
+
+
+def _keel_source_files() -> list[str]:
+    import glob
+    import os
+
+    root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    return sorted(
+        glob.glob(os.path.join(root, "keel", "**", "*.py"), recursive=True)
+        + glob.glob(os.path.join(root, "packages", "**", "*.py"), recursive=True)
+    )
+
+
+#: Helpers a gated command calls that open a database, load config or run the gate itself. They
+#: are not effects, and forbidding them would say nothing. Kept SMALL and explicit: if this list
+#: ever grows to hide a real operation, that is a review question, and its staleness fails
+#: SAFE -- an un-filtered name only means the web layer is forbidden something harmless, which
+#: shows up as a test failure to be read rather than as a silent hole.
+_PLUMBING = frozenset(
+    {"_open_repo", "_load_cfg", "_bound_venue_or_default", "_require_interactive_confirmation"}
+)
+
+
+def _effects_of_gated_actions() -> dict[str, str]:
+    """Every function a gated CLI command calls, derived from the source.
+
+    DERIVED, never a hand-written map from command to operation. `keel/capabilities.py` exists
+    because "a hand-written list would go stale", and a table saying "`keel resume` really means
+    `disengage_kill_switch`" would be exactly that list, one level down.
+
+    Returns `{function name: the invocation that reaches it}`, so a failure can say which action
+    the web layer just became able to perform.
+    """
+    import ast
+    import importlib
+
+    from keel.capabilities import CAPABILITIES
+
+    defined_here = set()
+    for path in _keel_source_files():
+        for node in ast.walk(ast.parse(open(path, encoding="utf-8").read())):
+            if isinstance(node, ast.FunctionDef):
+                defined_here.add(node.name)
+
+    effects: dict[str, str] = {}
+    for cap in CAPABILITIES:
+        module = importlib.import_module(cap.module)
+        tree = ast.parse(open(module.__file__, encoding="utf-8").read())
+        target = next(
+            (
+                node
+                for node in ast.walk(tree)
+                if isinstance(node, ast.FunctionDef) and node.name == cap.function
+            ),
+            None,
+        )
+        assert target is not None, f"{cap.key} names a function that does not exist"
+        for node in ast.walk(target):
+            if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Name):
+                continue
+            name = node.func.id
+            if name in defined_here and name not in _PLUMBING:
+                effects.setdefault(name, cap.invocation)
+    return effects
+
+
+def test_the_web_layer_cannot_reach_the_OPERATION_behind_any_gated_action() -> None:
+    """**The guarantee `keel/web/__init__.py` claims, asserted for the first time (#788).**
+
+    The command-name scan above is satisfied by a web module that imports
+    `keel.commands.trading.disengage_kill_switch` and calls it with no gate at all -- which is
+    the entire effect of `keel resume`. Verified by planting exactly that and watching the suite
+    stay green.
+
+    So this scans for the OPERATIONS, derived from what each gated command actually calls."""
+    import ast
+    import os
+
+    effects = _effects_of_gated_actions()
+    assert len(effects) >= 6, f"the derivation found too few operations to be believable: {effects}"
+
+    offences: list[str] = []
+    for path in _web_sources():
+        tree = ast.parse(open(path, encoding="utf-8").read())
+        for node in ast.walk(tree):
+            name = None
+            if isinstance(node, ast.ImportFrom):
+                for alias in node.names:
+                    if alias.name in effects:
+                        offences.append(
+                            f"{os.path.basename(path)} imports {alias.name} "
+                            f"-- the operation behind `{effects[alias.name]}`"
+                        )
+            elif isinstance(node, ast.Call):
+                callee = node.func
+                name = (
+                    callee.id
+                    if isinstance(callee, ast.Name)
+                    else callee.attr
+                    if isinstance(callee, ast.Attribute)
+                    else None
+                )
+            if name in effects:
+                offences.append(
+                    f"{os.path.basename(path)} calls {name} "
+                    f"-- the operation behind `{effects[name]}`"
+                )
+
+    assert not offences, "the web layer can perform a gated action: " + "; ".join(offences)
+
+
+def test_the_effect_scan_can_fail() -> None:
+    """The derivation and the scan, both proved capable of matching -- a scan that silently found
+    nothing would make the test above vacuous in the same way the name scan turned out to be."""
+    import ast
+
+    effects = _effects_of_gated_actions()
+    assert "disengage_kill_switch" in effects, sorted(effects)
+    assert effects["disengage_kill_switch"] == "keel resume"
+
+    planted = ast.parse("from keel.commands.trading import disengage_kill_switch\n")
+    imported = {
+        alias.name
+        for node in ast.walk(planted)
+        if isinstance(node, ast.ImportFrom)
+        for alias in node.names
+    }
+    assert imported & set(effects), "the scan cannot see a planted import"
+
+
+def test_the_web_layer_writes_to_no_database_at_all() -> None:
+    """**The same guarantee from the other side, and the one that covers what derivation cannot.**
+
+    Four of the nine do their work through `repo.set_state(...)` and similar -- a method call on
+    a generic mutator, which no name-derivation can distinguish from any other write. This says
+    the web package calls NONE of the repository's writers, so those four are unreachable
+    whatever they are spelled.
+
+    It is also the more honest statement of the whole posture: `keel serve` reads. Everything it
+    can change goes through `keel.commands.setup.ACTIONS`, which lives outside this package and
+    contains only idempotent, non-destructive steps.
+    """
+    import ast
+    import os
+
+    root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    repository = os.path.join(root, "keel", "data", "repository.py")
+    writers = set()
+    for node in ast.walk(ast.parse(open(repository, encoding="utf-8").read())):
+        if isinstance(node, ast.ClassDef):
+            for member in node.body:
+                if isinstance(member, ast.FunctionDef) and any(
+                    verb in ast.dump(member)
+                    for verb in ("INSERT", "UPDATE", "DELETE", "REPLACE", "commit")
+                ):
+                    writers.add(member.name)
+    assert len(writers) > 20, f"the writer scan found only {len(writers)}, which is not credible"
+
+    offences = []
+    for path in _web_sources():
+        for node in ast.walk(ast.parse(open(path, encoding="utf-8").read())):
+            if (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr in writers
+            ):
+                offences.append(f"{os.path.basename(path)} calls repository.{node.func.attr}")
+
+    assert not offences, "the web layer writes to the database: " + "; ".join(offences)
