@@ -23,7 +23,15 @@ from typing import Any
 
 import pytest
 
-from keel.capabilities import CAPABILITIES, GATES, TTY, Capability, gate_named, render_lines
+from keel.capabilities import (
+    BROWSER,
+    CAPABILITIES,
+    GATES,
+    TTY,
+    Capability,
+    gate_named,
+    render_lines,
+)
 
 _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -86,6 +94,12 @@ def _scan() -> set[tuple[str, str]]:
 def test_the_inventory_matches_every_gate_call_site_exactly() -> None:
     scanned = _scan()
     declared = {cap.key for cap in CAPABILITIES}
+
+    # TTY rows only. `_scan` finds `_require_interactive_confirmation` call sites, which is the
+    # TTY gate's implementation and nothing else -- a browser row declares a different gate with
+    # a different implementation, so comparing it against this scan would report every one of
+    # them as stale (#781).
+    declared = {cap.key for cap in CAPABILITIES if cap.gate == TTY.name}
 
     undeclared = scanned - declared
     assert not undeclared, (
@@ -150,7 +164,8 @@ def test_a_mirror_is_never_a_cli_row() -> None:
 
 
 def test_the_surfaces_are_a_closed_vocabulary() -> None:
-    assert {cap.surface for cap in CAPABILITIES} <= {"cli", "console", "tui"}
+    """`web` joined at #781, when the browser gained a gate of its own."""
+    assert {cap.surface for cap in CAPABILITIES} <= {"cli", "console", "tui", "web"}
 
 
 # -- what the gate itself must remain --------------------------------------------------------
@@ -231,11 +246,41 @@ def test_every_gate_and_every_action_appears_in_the_rendered_inventory() -> None
         assert f"{cap.module}.{cap.function}" in text
 
 
-def test_the_only_gate_today_is_the_tty_one() -> None:
-    """#436's browser gate becomes a second `Gate` here, and this test is where that change
-    announces itself -- so adding one cannot be a quiet edit."""
-    assert GATES == (TTY,)
-    assert {cap.gate for cap in CAPABILITIES} == {"tty"}
+def test_the_gate_vocabulary_is_stated_and_bounded() -> None:
+    """**Two gates, and this test is where a third would have to announce itself.**
+
+    It read `GATES == (TTY,)` until #781 and said "#436's browser gate becomes a second `Gate`
+    here, and this test is where that change announces itself -- so adding one cannot be a quiet
+    edit". That happened; the assertion moved rather than being deleted, which is the point of
+    having written it that way.
+
+    The BROWSER gate is a second kind of evidence, never a seam in the first: `_is_interactive`
+    is untouched and every CLI path still needs a real terminal. `test_the_tty_predicate_has_no_
+    environment_seam` below is what keeps that true, and it did not change."""
+    assert GATES == (TTY, BROWSER)
+    assert {cap.gate for cap in CAPABILITIES} == {"tty", "browser"}
+
+
+def test_only_the_two_halt_releases_are_reachable_from_the_browser() -> None:
+    """**Which actions the second gate covers, named, so widening it is an edit here.**
+
+    Seven of the nine remain CLI-only. The two that are not are the halt releases, and each
+    appears twice in the inventory -- once as its CLI row, once as the `web` row mirroring it."""
+    web = {cap.mirrors for cap in CAPABILITIES if cap.gate == BROWSER.name}
+
+    assert web == {("keel.cli", "resume"), ("keel.cli", "resume_entries")}
+    assert all(cap.surface == "web" for cap in CAPABILITIES if cap.gate == BROWSER.name)
+
+
+def test_every_browser_row_mirrors_a_tty_row_of_the_same_action() -> None:
+    """A `web` row whose mirror was itself browser-gated would mean the inventory had lost track
+    of which front-end is the original."""
+    by_key = {cap.key: cap for cap in CAPABILITIES}
+    for cap in CAPABILITIES:
+        if cap.gate != BROWSER.name:
+            continue
+        assert cap.mirrors is not None, cap.key
+        assert by_key[cap.mirrors].gate == TTY.name, cap.key
 
 
 @pytest.mark.parametrize("cap", CAPABILITIES, ids=lambda cap: f"{cap.module}.{cap.function}")

@@ -62,14 +62,19 @@ import secrets
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from types import MappingProxyType
+from typing import Any
 
 from keel.commands.trading import (
+    KILL_ENGAGED_LINE,
     RESUME_ACTION,
     RESUME_DETAIL,
+    RESUME_DISENGAGED_LINE,
     RESUME_ENTRIES_ACTION,
+    RESUME_ENTRIES_CLEARED_LINE,
     RESUME_ENTRIES_DETAIL,
     clear_consecutive_loss_halt,
     disengage_kill_switch,
+    engage_kill_switch,
 )
 from keel.data.repository import Repository
 
@@ -99,6 +104,9 @@ class Tier1Action:
     #: The exact sentence the operator types. Never derivable from the key: a phrase a script can
     #: build from the URL is evidence of nothing.
     phrase: str
+    #: The line the CLI prints when this succeeds. Reported back verbatim, for the same reason
+    #: `action` and `detail` are imported: one ceremony, one set of words, three front-ends.
+    done: str
 
 
 #: The two, and only these two (#781, #790). A read-only mapping, because the closure is the
@@ -111,12 +119,14 @@ TIER1_ACTIONS: Mapping[str, Tier1Action] = MappingProxyType(
             action=RESUME_ACTION,
             detail=RESUME_DETAIL,
             phrase="RESUME TRADING",
+            done=RESUME_DISENGAGED_LINE,
         ),
         "resume-entries": Tier1Action(
             operation=clear_consecutive_loss_halt,
             action=RESUME_ENTRIES_ACTION,
             detail=RESUME_ENTRIES_DETAIL,
             phrase="CLEAR STREAK HALT",
+            done=RESUME_ENTRIES_CLEARED_LINE,
         ),
     }
 )
@@ -156,3 +166,71 @@ def phrase_matches(action_key: str, presented: object) -> bool:
     if not isinstance(presented, str) or not presented or not presented.isascii():
         return False
     return secrets.compare_digest(presented, action.phrase)
+
+
+@dataclass(frozen=True)
+class UngatedAction:
+    """An action with no ceremony at all, because adding one would be the wrong direction."""
+
+    #: The operation itself, as a reference -- same reason as `Tier1Action.operation`.
+    operation: Callable[[Repository], None]
+    #: The CLI's own line on success.
+    done: str
+
+
+#: The halt. **Deliberately not a `Tier1Action`, and deliberately carrying no phrase.**
+#:
+#: `keel kill` is ungated -- its docstring is "Always allowed (safe action)" and it is absent
+#: from `CAPABILITIES` -- because a ceremony in front of the stop makes the stop slower than the
+#: start. The browser inherits that exactly: one click, no typed phrase, no modal.
+#:
+#: It ships in the same change as the first release route. A release route landing first would
+#: mean an operator could start trading from a phone and not stop from it, which is the inversion
+#: this tier is ordered to avoid (#790).
+HALT = UngatedAction(operation=engage_kill_switch, done=KILL_ENGAGED_LINE)
+
+
+def run_gated_action(cfg: Any, action_key: str, presented: object) -> str | None:
+    """Perform a Tier 1 action if the typed phrase releases it, else `None`.
+
+    **`None` is the only refusal, and it is indistinguishable between causes.** An unknown key
+    and a wrong phrase come back the same way, so a caller cannot use this to enumerate which
+    actions exist -- the table is public in the page that renders it, but that is a decision made
+    once, in the view, rather than leaked by every refusal here.
+
+    **Nothing is opened before the phrase is checked.** The database connection happens after
+    `phrase_matches`, so a wrong answer costs the deployment nothing -- not a write, not a read,
+    not a file handle. `tests/web/test_gates_tier1.py` points `db_path` at a path that does not
+    exist and asserts the refusal still returns rather than raising, which is what pins the
+    ordering rather than merely describing it.
+
+    This is the LAST of four checks, not the only one. `server.do_POST` runs the admission gate,
+    the client-header gate, `security.gated_action_permitted` (loopback peer, loopback bind, no
+    declared remote origin) and `security.gates_token` before anything reaches here. The phrase
+    proves intent; those prove locality and provenance.
+    """
+    action = TIER1_ACTIONS.get(action_key) if isinstance(action_key, str) else None
+    if action is None or not phrase_matches(action_key, presented):
+        return None
+    return _perform(cfg, action.operation, action.done)
+
+
+def run_halt(cfg: Any) -> str:
+    """Engage the kill-switch. No phrase, no key, no refusal path -- see `HALT`."""
+    return _perform(cfg, HALT.operation, HALT.done)
+
+
+def _perform(cfg: Any, operation: Callable[[Repository], None], done: str) -> str:
+    """Open, act, close. The one place this package writes.
+
+    A `finally`, because every reader in `keel/web/` closes in one and a writer that leaked a
+    connection would hold a write lock on the deployment database until refcounting noticed.
+    """
+    from keel.web.api import close_repo, open_repo
+
+    repo = open_repo(cfg.db_path)
+    try:
+        operation(repo)
+    finally:
+        close_repo(repo)
+    return done

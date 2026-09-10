@@ -101,7 +101,11 @@ def test_tools_call_dispatches_the_capabilities_tool_without_a_database() -> Non
     assert result.get("isError") is None or result["isError"] is False
     rows = json.loads(_text_of(response))["rows"]
     assert len(rows) == len(CAPABILITIES)
-    assert {row["gate"] for row in rows} == {"tty"}
+    # Two gates since #781: the TTY one, and the browser one covering the two halt releases.
+    # Derived from the inventory rather than spelled, so this reports what keel declares rather
+    # than what this test last remembered -- the tool's job is to hand an auditor the real thing.
+    assert {row["gate"] for row in rows} == {cap.gate for cap in CAPABILITIES}
+    assert {row["gate"] for row in rows} == {"tty", "browser"}
 
 
 def test_an_unknown_tool_is_an_error_result_not_a_dead_loop() -> None:
