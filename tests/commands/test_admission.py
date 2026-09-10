@@ -503,7 +503,8 @@ def test_build_propose_view_explicit_path_skips_the_newest_file_search(repo: Rep
     older = _write_shortlist(directory, [_SOL_CANDIDATE], name="older.json")
     os.utime(older, (NOW_TS, NOW_TS))
     newer = _write_shortlist(
-        directory, [{"asset": "btc", "rationale": "r", "sources": ["https://x.invalid"]}],
+        directory,
+        [{"asset": "btc", "rationale": "r", "sources": ["https://x.invalid"]}],
         name="newer.json",
     )
     os.utime(newer, (NOW_TS + 100, NOW_TS + 100))
@@ -678,9 +679,7 @@ def test_build_discover_report_applies_default_volume_floor_matching_assets_disc
     name, not position, so a decorator reorder cannot silently break this pin) and compare it
     against `DEFAULT_MIN_QUOTE_24H_VOLUME` rather than a hardcoded literal, so a future change
     to either constant fails this test instead of silently drifting the two apart."""
-    cli_option = next(
-        p for p in cli_module.assets_discover.params if p.name == "min_volume_24h"
-    )
+    cli_option = next(p for p in cli_module.assets_discover.params if p.name == "min_volume_24h")
     default_floor = Decimal(cli_option.default)
     assert default_floor == DEFAULT_MIN_QUOTE_24H_VOLUME
 
@@ -707,9 +706,7 @@ def test_build_discover_report_custom_volume_floor(repo: Repository):
 
 def test_build_discover_report_limit_respected(repo: Repository):
     config = _config(allowlist=[])
-    products = [
-        _venue_product(f"COIN{i}", volume=str(10_000_000 + i)) for i in range(10)
-    ]
+    products = [_venue_product(f"COIN{i}", volume=str(10_000_000 + i)) for i in range(10)]
 
     report = build_discover_report(products, config, limit=3)
 

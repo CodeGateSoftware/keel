@@ -73,10 +73,7 @@ def _daily(repo: Repository, product_id: str, *, volume_usd: str, bars: int = 5)
     repo.upsert_candles(
         product_id,
         Granularity.ONE_DAY,
-        [
-            _candle(SLIP_NOW_TS - (86_400 * (bars - index)), close, volume)
-            for index in range(bars)
-        ],
+        [_candle(SLIP_NOW_TS - (86_400 * (bars - index)), close, volume) for index in range(bars)],
     )
 
 
@@ -95,8 +92,9 @@ def _daily_varying(repo: Repository, product_id: str, *volumes_usd: str) -> None
         product_id,
         Granularity.ONE_DAY,
         [
-            _candle(SLIP_NOW_TS - (86_400 * (len(volumes_usd) - index)), close,
-                    Decimal(volume) / close)
+            _candle(
+                SLIP_NOW_TS - (86_400 * (len(volumes_usd) - index)), close, Decimal(volume) / close
+            )
             for index, volume in enumerate(volumes_usd)
         ],
     )
@@ -106,8 +104,6 @@ def _candle(ts: int, close: Decimal, volume: Decimal) -> Any:
     from keel_core.types import Candle
 
     return Candle(ts=ts, open=close, high=close, low=close, close=close, volume=volume)
-
-
 
 
 def _row(report: Any, product_id: str) -> Any:
@@ -251,7 +247,7 @@ def test_a_fallback_row_is_not_counted_as_reaching_the_floor(tmp_path: Path) -> 
 
 
 def test_the_model_parameters_are_reported_beside_the_rows(tmp_path: Path) -> None:
-    """"A number whose assumptions cannot be recovered is not evidence" -- the model's own
+    """ "A number whose assumptions cannot be recovered is not evidence" -- the model's own
     words. Floor, cap and anchor travel with the table so a reader can recompute any row."""
     report = gather_slippage(_repo(tmp_path), _config(tmp_path), now_ts=SLIP_NOW_TS)
 

@@ -105,9 +105,9 @@ def test_fees_can_turn_a_gross_winner_into_a_counted_loss() -> None:
             "entry_fill": Decimal("100"),
             "qty": Decimal("1"),
         },
-        exit_fill=Decimal("100.10"),   # +0.10 gross
+        exit_fill=Decimal("100.10"),  # +0.10 gross
         exit_qty=Decimal("1"),
-        fees=Decimal("0.25"),          # -0.15 net
+        fees=Decimal("0.25"),  # -0.15 net
         is_dca=False,
         now_ts=NOW,
     )
@@ -138,9 +138,9 @@ def test_a_dca_loss_records_an_outcome_but_never_moves_the_streak() -> None:
     repo = _repo()
     config = _config(max_consecutive_losses=1)
     _close(repo, config, pnl="-5", is_dca=True)
-    assert len(repo.get_trade_outcomes()) == 1        # recorded
-    assert repo.get_state("consecutive_losses", default=0) == 0   # but not counted
-    assert repo.get_state("streak_halt_until", default=0) == 0    # and never halts
+    assert len(repo.get_trade_outcomes()) == 1  # recorded
+    assert repo.get_state("consecutive_losses", default=0) == 0  # but not counted
+    assert repo.get_state("streak_halt_until", default=0) == 0  # and never halts
 
 
 def test_the_rail_is_inert_when_disabled() -> None:
@@ -160,8 +160,12 @@ def test_a_position_with_no_entry_context_is_skipped_not_guessed() -> None:
         repo,
         _config(),
         product_id="BTC-USD",
-        position={"rule_name": "turtle_breakout", "opened_at": None,
-                  "entry_fill": None, "qty": None},
+        position={
+            "rule_name": "turtle_breakout",
+            "opened_at": None,
+            "entry_fill": None,
+            "qty": None,
+        },
         exit_fill=Decimal("100"),
         exit_qty=Decimal("1"),
         fees=Decimal("0"),
@@ -192,9 +196,9 @@ def test_pnl_net_subtracts_the_entry_fee_as_well_as_the_exit_fee() -> None:
             "qty": Decimal("1"),
             "entry_fee": Decimal("0.30"),
         },
-        exit_fill=Decimal("100.50"),   # +0.50 gross
+        exit_fill=Decimal("100.50"),  # +0.50 gross
         exit_qty=Decimal("1"),
-        fees=Decimal("0.30"),          # -0.10 net once BOTH legs are counted
+        fees=Decimal("0.30"),  # -0.10 net once BOTH legs are counted
         is_dca=False,
         now_ts=NOW,
     )
@@ -212,8 +216,12 @@ def test_a_position_without_entry_fee_context_still_records() -> None:
         repo,
         _config(),
         product_id="BTC-USD",
-        position={"rule_name": "turtle_breakout", "opened_at": NOW - DAY,
-                  "entry_fill": Decimal("100"), "qty": Decimal("1")},
+        position={
+            "rule_name": "turtle_breakout",
+            "opened_at": NOW - DAY,
+            "entry_fill": Decimal("100"),
+            "qty": Decimal("1"),
+        },
         exit_fill=Decimal("99"),
         exit_qty=Decimal("1"),
         fees=Decimal("0"),

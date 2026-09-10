@@ -217,7 +217,6 @@ def test_explored_against_declared_is_reported_without_the_refusing_helper(
     assert exploration[0].declared_cells > 0, "the rule's own declaration, from `declared_cells`"
 
 
-
 def test_the_ledger_is_read_once_and_the_verdict_covers_those_rows(
     tmp_path: Path, monkeypatch: Any
 ) -> None:
@@ -250,6 +249,7 @@ def test_the_ledger_is_read_once_and_the_verdict_covers_those_rows(
     # And the verdict is about the rows that came back, not about a second look at the file.
     assert report.chain_intact is True
     assert report.shown_count == 2
+
 
 # -- the rail, scanned mechanically ---------------------------------------------------------------
 

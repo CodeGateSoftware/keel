@@ -68,9 +68,7 @@ def test_the_stream_opens_with_a_retry_directive_and_a_tick(tmp_path: Any) -> No
     anything moved while it was away.
     """
     clock = _Clock()
-    frames = list(
-        events.stream(_cfg(tmp_path), now=clock.time, sleep=clock.sleep, max_sec=0)
-    )
+    frames = list(events.stream(_cfg(tmp_path), now=clock.time, sleep=clock.sleep, max_sec=0))
 
     assert frames[0] == f"retry: {events.RETRY_MS}\n\n"
     assert frames[1].startswith(f"event: {events.TICK_EVENT}\ndata: ")

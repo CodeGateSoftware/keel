@@ -206,7 +206,7 @@ def _retry_after_seconds(value: str | None) -> float | None:
         return None
     try:
         seconds = float(value.strip())
-    except (ValueError, AttributeError):
+    except ValueError, AttributeError:
         return None
     if seconds < 0 or seconds != seconds:  # negative, or NaN
         return None

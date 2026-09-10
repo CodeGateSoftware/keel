@@ -200,7 +200,6 @@ CAPABILITIES: tuple[Capability, ...] = (
 )
 
 
-
 def gate_named(name: str) -> Gate:
     for gate in GATES:
         if gate.name == name:

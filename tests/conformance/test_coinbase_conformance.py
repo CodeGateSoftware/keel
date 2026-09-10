@@ -46,9 +46,7 @@ class TestCoinbaseConformance(BrokerConformanceTests):
         (see `tests/broker_alpaca/test_adapter.py::TestTradeScopeIsDeliberatelyUnmapped`).
         """
         exc = _HTTPError("403 Client Error", _Response(403, _MISSING_SCOPES_BODY))
-        adapter = CoinbaseAdapter(
-            _RaisingTransport(exc, products=load_fixture("cb_product.json"))
-        )
+        adapter = CoinbaseAdapter(_RaisingTransport(exc, products=load_fixture("cb_product.json")))
 
         with pytest.raises(TradeScopeDenied):
             adapter.place_order(self._scope_spec())
@@ -61,15 +59,11 @@ class TestCoinbaseConformance(BrokerConformanceTests):
         scopes text, so an implementation that matched on the body without gating on the status
         fails here."""
         exc = _HTTPError("503 Server Error", _Response(503, _MISSING_SCOPES_BODY))
-        adapter = CoinbaseAdapter(
-            _RaisingTransport(exc, products=load_fixture("cb_product.json"))
-        )
+        adapter = CoinbaseAdapter(_RaisingTransport(exc, products=load_fixture("cb_product.json")))
 
         with pytest.raises(_HTTPError):
             adapter.place_order(self._scope_spec())
 
     @staticmethod
     def _scope_spec() -> MarketIOCByQuote:
-        return MarketIOCByQuote(
-            product_id="BTC-USD", side=Side.BUY, quote_size=Decimal("100")
-        )
+        return MarketIOCByQuote(product_id="BTC-USD", side=Side.BUY, quote_size=Decimal("100"))

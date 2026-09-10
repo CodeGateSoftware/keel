@@ -136,9 +136,7 @@ def _svg_line(
         f'role="img" aria-label="{_esc(title)}">'
     ]
     if title:
-        parts.append(
-            f'<text x="{pad}" y="{pad / 2:.2f}" class="chart-title">{_esc(title)}</text>'
-        )
+        parts.append(f'<text x="{pad}" y="{pad / 2:.2f}" class="chart-title">{_esc(title)}</text>')
     # axes
     parts.append(
         f'<line x1="{pad}" y1="{height - pad:.2f}" x2="{width - pad}" y2="{height - pad:.2f}" '
@@ -350,7 +348,7 @@ def _render_verdict_box(verdict: Verdict, in_sample: bool) -> str:
         f'<span class="sample-badge">{_esc(label)}</span></p>',
     ]
     if verdict.reasons:
-        parts.append("<ul class=\"reasons\">")
+        parts.append('<ul class="reasons">')
         parts.extend(f"<li>{_esc(reason)}</li>" for reason in verdict.reasons)
         parts.append("</ul>")
     else:

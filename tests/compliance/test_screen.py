@@ -152,9 +152,7 @@ def test_no_known_wrapper_other_than_spot_admits(wrapper):
 
 def test_an_unknown_wrapper_must_be_classified_not_assumed():
     """Mirrors the unknown-backing branch: an unrecognised name is not a pass."""
-    result = screen_asset(
-        _facts(), _attestation(), instrument=_instrument(wrapper="probably spot")
-    )
+    result = screen_asset(_facts(), _attestation(), instrument=_instrument(wrapper="probably spot"))
     assert result.admitted is False
     assert any("instrument_wrapper" in f and "not one of" in f for f in result.failures)
 
@@ -436,9 +434,7 @@ def test_a_documented_history_waiver_admits_and_warns_loudly():
     )
     assert result.admitted is True
     assert not any("history" in f for f in result.failures)
-    assert any(
-        "WAIVED" in w and "PAXG: 441 bars, human-reviewed" in w for w in result.warnings
-    )
+    assert any("WAIVED" in w and "PAXG: 441 bars, human-reviewed" in w for w in result.warnings)
 
 
 @pytest.mark.parametrize("blank", ["", "   ", "\t\n"])
@@ -454,7 +450,9 @@ def test_a_blank_rationale_waiver_does_not_admit_undocumented_is_not_documented(
 def test_a_waiver_is_self_retiring_once_history_clears_the_floor():
     """No leftover warning once the underlying condition it was granted for no longer holds."""
     result = screen_asset(
-        _facts(bars=2000), _attestation(), waived={"history": "stale reason"},
+        _facts(bars=2000),
+        _attestation(),
+        waived={"history": "stale reason"},
         instrument=_instrument(),
     )
     assert result.admitted is True
@@ -503,9 +501,7 @@ def test_a_stray_non_waivable_key_alongside_a_real_waiver_is_dropped_not_honored
 
 def test_a_history_waiver_does_not_rescue_a_different_real_failure():
     """The waiver is scoped to history alone -- it must not paper over an unrelated rejection."""
-    result = screen_asset(
-        _facts(bars=400), None, waived={"history": "reason"}
-    )
+    result = screen_asset(_facts(bars=400), None, waived={"history": "reason"})
     assert result.admitted is False
     assert any("attestation: MISSING" in f for f in result.failures)
 
@@ -641,9 +637,9 @@ def test_discovery_matches_the_quote_currency_case_insensitively():
     from keel.compliance.screen import DiscoveryPolicy, discover_candidates
 
     lowercase_venue = _product(pid="SOL-USD", quote="usd")
-    assert discover_candidates(
-        [lowercase_venue]
-    ).candidates, "lowercase venue quote id dropped everything"
+    assert discover_candidates([lowercase_venue]).candidates, (
+        "lowercase venue quote id dropped everything"
+    )
     assert discover_candidates(
         [_product(pid="SOL-USD", quote="USD")], DiscoveryPolicy(quote_currency="usd")
     ).candidates, "lowercase configured quote currency dropped everything"

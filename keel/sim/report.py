@@ -796,7 +796,7 @@ _TIER_MODE_LABELS: dict[str, str] = {WITHIN_CAP: "Within cap", OVER_CAP: "Over c
 
 
 def _render_tier_section(tier_results: list[TierFeeResult]) -> list[str]:
-    """"Subscription tier & fee analysis" (Issue #86) -- one row per (tier, mode) in
+    """ "Subscription tier & fee analysis" (Issue #86) -- one row per (tier, mode) in
     `tier_results`: does staying WITHIN a Coinbase One tier's fee-free monthly trading-volume
     allowance, or trading freely and paying the taker fee OVER it, net out ahead once the tier's
     own subscription cost is subtracted too? See `sim.tiers`' module docstring for the
@@ -806,7 +806,7 @@ def _render_tier_section(tier_results: list[TierFeeResult]) -> list[str]:
         "",
         "For each Coinbase One tier: staying WITHIN the fee-free monthly trading-volume "
         "allowance (a throttled run, 0 trading fees, subscription still due) vs trading freely "
-        "and paying the taker fee on volume EXCEEDING it (\"over cap\"). Premium's allowance is "
+        'and paying the taker fee on volume EXCEEDING it ("over cap"). Premium\'s allowance is '
         "unlimited, so its within-cap and over-cap rows are identical.",
         "",
     ]

@@ -464,11 +464,22 @@ _REFUSAL_ARGS: dict[str, tuple[str, ...]] = {
     "pbo": ("--ledger", "{tmp}/empty-trials.jsonl"),
     "deflate": ("--ledger", "{tmp}/empty-trials.jsonl", "--sharpe", "1.0"),
     "monte-carlo": (
-        "--rule", "1", "--seed", "1", "--ledger", "{tmp}/mc-trials.jsonl",
+        "--rule",
+        "1",
+        "--seed",
+        "1",
+        "--ledger",
+        "{tmp}/mc-trials.jsonl",
     ),
     "walk-forward": (
-        "--rule", "3", "--train-bars", "1000", "--test-bars", "1000",
-        "--ledger", "{tmp}/wf-trials.jsonl",
+        "--rule",
+        "3",
+        "--train-bars",
+        "1000",
+        "--test-bars",
+        "1000",
+        "--ledger",
+        "{tmp}/wf-trials.jsonl",
     ),
 }
 

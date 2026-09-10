@@ -99,8 +99,14 @@ def load(product_id: str) -> list[Candle]:
     finally:
         con.close()
     return [
-        Candle(ts=r[0], open=Decimal(r[1]), high=Decimal(r[2]), low=Decimal(r[3]),
-               close=Decimal(r[4]), volume=Decimal(r[5]))
+        Candle(
+            ts=r[0],
+            open=Decimal(r[1]),
+            high=Decimal(r[2]),
+            low=Decimal(r[3]),
+            close=Decimal(r[4]),
+            volume=Decimal(r[5]),
+        )
         for r in rows
     ]
 
@@ -186,13 +192,17 @@ def main() -> None:
         print(f"\n=== {arm} ===")
         print(f"{'ticker':<12}{'buys':>6}{'slip bp':>9}{'deployed':>13}{'value':>13}{'gain %':>10}")
         for r in sub:
-            print(f"{r['product_id']:<12}{r['buys']:>6}{r['slippage_bp']:>9}{r['deployed']:>13}"
-                  f"{r['market_value']:>13}{r['gain_pct']:>10}")
+            print(
+                f"{r['product_id']:<12}{r['buys']:>6}{r['slippage_bp']:>9}{r['deployed']:>13}"
+                f"{r['market_value']:>13}{r['gain_pct']:>10}"
+            )
         dep = sum(Decimal(r["deployed"]) for r in sub)
         val = sum(Decimal(r["market_value"]) for r in sub)
         pooled = ((val / dep - 1) * 100) if dep > 0 else Decimal("0")
-        print(f"{'POOLED':<12}{'':>6}{'':>9}{dep.quantize(Decimal('0.01')):>13}"
-              f"{val.quantize(Decimal('0.01')):>13}{pooled.quantize(Decimal('0.01')):>10}")
+        print(
+            f"{'POOLED':<12}{'':>6}{'':>9}{dep.quantize(Decimal('0.01')):>13}"
+            f"{val.quantize(Decimal('0.01')):>13}{pooled.quantize(Decimal('0.01')):>10}"
+        )
     print(f"\nwrote {JSONL_PATH}")
 
 

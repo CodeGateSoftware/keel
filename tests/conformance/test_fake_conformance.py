@@ -37,6 +37,10 @@ class TestFakeConformance(BrokerConformanceTests):
     def test_the_default_venue_places_and_refuses_nothing(self) -> None:
         """The knob is opt-in. Every existing construction site passes no arguments, and the
         conformance run above is one of them."""
-        assert FakeAdapter().place_order(
-            MarketIOCByBase(product_id="BTC-USD", side=Side.BUY, base_size=Decimal("0.1"))
-        ).success
+        assert (
+            FakeAdapter()
+            .place_order(
+                MarketIOCByBase(product_id="BTC-USD", side=Side.BUY, base_size=Decimal("0.1"))
+            )
+            .success
+        )

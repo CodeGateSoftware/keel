@@ -145,7 +145,7 @@ def serve(reader: IO[str], writer: IO[str], db_path: str, config_path: str, log_
             continue
         try:
             message = json.loads(stripped)
-        except (json.JSONDecodeError, ValueError):
+        except json.JSONDecodeError, ValueError:
             _error(writer, None, _PARSE_ERROR, "Parse error")
             continue
         if not isinstance(message, dict):

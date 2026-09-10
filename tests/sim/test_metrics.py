@@ -201,9 +201,7 @@ def test_anticorrelated_sleeves_cancel_toward_zero():
     """Correlation is absorbed by construction -- no covariance matrix is ever formed."""
     up = [Decimal("0.02"), Decimal("-0.02"), Decimal("0.02"), Decimal("-0.02")]
     down = [-r for r in up]
-    hedged = portfolio_volatility(
-        {"A": up, "B": down}, {"A": Decimal("0.5"), "B": Decimal("0.5")}
-    )
+    hedged = portfolio_volatility({"A": up, "B": down}, {"A": Decimal("0.5"), "B": Decimal("0.5")})
     solo = portfolio_volatility({"A": up}, {"A": Decimal("1")})
     assert hedged < solo / 10
 
@@ -211,8 +209,14 @@ def test_anticorrelated_sleeves_cancel_toward_zero():
 def test_exposed_mask_drops_flat_days_and_raises_the_measured_risk():
     """§54.22's GASP objection: zero days on an intermittent book understate volatility."""
     returns = [
-        Decimal("0.05"), Decimal("0"), Decimal("0"), Decimal("0"),
-        Decimal("-0.05"), Decimal("0"), Decimal("0"), Decimal("0"),
+        Decimal("0.05"),
+        Decimal("0"),
+        Decimal("0"),
+        Decimal("0"),
+        Decimal("-0.05"),
+        Decimal("0"),
+        Decimal("0"),
+        Decimal("0"),
     ]
     whole = portfolio_volatility({"BTC": returns}, {"BTC": Decimal("1")})
     exposed_only = portfolio_volatility(

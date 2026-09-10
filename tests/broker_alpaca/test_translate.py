@@ -180,9 +180,7 @@ def test_side_renders_lowercase() -> None:
         ("suspended", "FAILED"),
     ],
 )
-def test_alpaca_statuses_map_onto_the_port_vocabulary(
-    venue_status: str, port_status: str
-) -> None:
+def test_alpaca_statuses_map_onto_the_port_vocabulary(venue_status: str, port_status: str) -> None:
     """Alpaca's order-status enum (docs.alpaca.markets, "Order" schema) meets the port's
     vocabulary in exactly one place. `canceled` is the venue's single-`l` spelling; the
     port's is `CANCELLED` -- they must never be compared directly downstream."""

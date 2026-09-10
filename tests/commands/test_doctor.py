@@ -764,18 +764,14 @@ def test_a_partially_exited_tranche_does_not_warn() -> None:
     """A deliberate scale-out (`executor.scale_out`) and #446's short market exit BOTH leave a
     tranche legitimately open behind a filled SELL, and both record the leg on the tranche.
     Flagging them would fire on correct behaviour every time a position was de-risked."""
-    (finding,) = unbooked_exit_findings(
-        [_tranche(realized_qty=Decimal("0.004"))], [_sell()]
-    )
+    (finding,) = unbooked_exit_findings([_tranche(realized_qty=Decimal("0.004"))], [_sell()])
     assert finding.status == "ok"
 
 
 def test_a_sale_that_predates_the_tranche_does_not_warn() -> None:
     """The ledger is FIFO: a sale that closed an EARLIER tranche says nothing about one opened
     after it, so a long-running product would otherwise warn forever on its own history."""
-    (finding,) = unbooked_exit_findings(
-        [_tranche(opened_at=NOW)], [_sell(created_at=NOW - DAY)]
-    )
+    (finding,) = unbooked_exit_findings([_tranche(opened_at=NOW)], [_sell(created_at=NOW - DAY)])
     assert finding.status == "ok"
 
 

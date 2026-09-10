@@ -243,7 +243,6 @@ def _journal_report(**overrides: Any) -> JournalReport:
     return JournalReport(**base)
 
 
-
 def _empty_notes():
     """An empty discretionary journal (#705), for the callers that are testing the closed-trade
     half. A REQUIRED keyword on `journal_payload`, like `curve`: a default would let every one of
@@ -415,9 +414,7 @@ def _every_payload() -> dict[str, Any]:
         "status": payload.status_payload(_status_report()),
         "insights": payload.insights_payload(
             _insights_report(),
-            series=build_equity_series(
-                _equity_readings(), max_total_dd_pct=Decimal("0.20")
-            ),
+            series=build_equity_series(_equity_readings(), max_total_dd_pct=Decimal("0.20")),
         ),
         "journal": _journal_json(),
         "activity": payload.activity_payload(_activity_feed()),
@@ -1160,8 +1157,7 @@ def test_a_nested_log_field_crosses_as_json_never_as_a_python_repr() -> None:
 
     assert fields["symbols"] == '["BTC-USD", "ETH-USD"]'
     assert fields["limits"] == (
-        '{"max": "100000000000000000000000000000000000000000000000000",'
-        ' "min": "", "on": "false"}'
+        '{"max": "100000000000000000000000000000000000000000000000000", "min": "", "on": "false"}'
     )
     assert "1e+50" not in fields["limits"]
     assert "'" not in fields["limits"] and "None" not in fields["limits"]

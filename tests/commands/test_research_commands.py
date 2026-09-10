@@ -51,9 +51,7 @@ def _invoke(runner: CliRunner, db: Path, tmp_path: Path, *args: str):
     `_invoke_mc`): a real `--db`, and a `--config` pointing at a path that does not exist so
     the fee degrades to the library default instead of loading whatever deployment config
     happens to surround the test run."""
-    return runner.invoke(
-        cli, ["--db", str(db), "--config", str(_missing_config(tmp_path)), *args]
-    )
+    return runner.invoke(cli, ["--db", str(db), "--config", str(_missing_config(tmp_path)), *args])
 
 
 # -- shared candle fixtures -------------------------------------------------------------------
@@ -164,8 +162,15 @@ def test_significance_from_rule_renders_both_fee_regimes_with_n_eff(tmp_path):
     must both be printed, side by side, never n_eff alone and never raw n alone (#427)."""
     db = _turtle_db(tmp_path)
     result = _invoke(
-        CliRunner(), db, tmp_path,
-        "research", "significance", "--from", "rule", "--rule", "1",
+        CliRunner(),
+        db,
+        tmp_path,
+        "research",
+        "significance",
+        "--from",
+        "rule",
+        "--rule",
+        "1",
     )
     assert result.exit_code == 0, result.output
     assert "outside_allowance_taker" in result.output
@@ -184,22 +189,40 @@ def test_significance_from_deployment_renders_both_fee_regimes(tmp_path):
     repo = Repository(conn)
     rows = [
         dict(
-            product_id="BTC-USD", rule_name="turtle_breakout", is_dca=False,
-            opened_at=1000, closed_at=2000, qty=Decimal("1"),
-            entry_fill=Decimal("100"), exit_fill=Decimal("110"),
-            fees=Decimal("1"), pnl_net=Decimal("8"),
+            product_id="BTC-USD",
+            rule_name="turtle_breakout",
+            is_dca=False,
+            opened_at=1000,
+            closed_at=2000,
+            qty=Decimal("1"),
+            entry_fill=Decimal("100"),
+            exit_fill=Decimal("110"),
+            fees=Decimal("1"),
+            pnl_net=Decimal("8"),
         ),
         dict(
-            product_id="ETH-USD", rule_name="turtle_breakout", is_dca=False,
-            opened_at=3000, closed_at=4000, qty=Decimal("1"),
-            entry_fill=Decimal("200"), exit_fill=Decimal("190"),
-            fees=Decimal("1"), pnl_net=Decimal("-11"),
+            product_id="ETH-USD",
+            rule_name="turtle_breakout",
+            is_dca=False,
+            opened_at=3000,
+            closed_at=4000,
+            qty=Decimal("1"),
+            entry_fill=Decimal("200"),
+            exit_fill=Decimal("190"),
+            fees=Decimal("1"),
+            pnl_net=Decimal("-11"),
         ),
         dict(
-            product_id="SOL-USD", rule_name="turtle_breakout", is_dca=False,
-            opened_at=5000, closed_at=6000, qty=Decimal("2"),
-            entry_fill=Decimal("50"), exit_fill=Decimal("55"),
-            fees=Decimal("1"), pnl_net=Decimal("9"),
+            product_id="SOL-USD",
+            rule_name="turtle_breakout",
+            is_dca=False,
+            opened_at=5000,
+            closed_at=6000,
+            qty=Decimal("2"),
+            entry_fill=Decimal("50"),
+            exit_fill=Decimal("55"),
+            fees=Decimal("1"),
+            pnl_net=Decimal("9"),
         ),
     ]
     for row in rows:
@@ -233,36 +256,70 @@ def _pooled_review_dbs(tmp_path: Path) -> tuple[Path, Path]:
     )
     repo.insert_order(
         dict(
-            mode="paper", product_id="BTC-USD", side="BUY", order_type="market",
-            qty=Decimal("1"), limit_price=None, status="filled", fee=Decimal("1"),
-            expected_fill=Decimal("100"), actual_fill=Decimal("100"),
-            filled_quantity=Decimal("1"), raw_response=None, confirmation="auto",
-            rule_id=1, created_at=1000, updated_at=1000,
+            mode="paper",
+            product_id="BTC-USD",
+            side="BUY",
+            order_type="market",
+            qty=Decimal("1"),
+            limit_price=None,
+            status="filled",
+            fee=Decimal("1"),
+            expected_fill=Decimal("100"),
+            actual_fill=Decimal("100"),
+            filled_quantity=Decimal("1"),
+            raw_response=None,
+            confirmation="auto",
+            rule_id=1,
+            created_at=1000,
+            updated_at=1000,
         )
     )
     repo.insert_order(
         dict(
-            mode="paper", product_id="BTC-USD", side="SELL", order_type="market",
-            qty=Decimal("1"), limit_price=None, status="filled", fee=Decimal("1"),
-            expected_fill=Decimal("110"), actual_fill=Decimal("110"),
-            filled_quantity=Decimal("1"), raw_response=None, confirmation="auto",
-            rule_id=1, created_at=2000, updated_at=2000,
+            mode="paper",
+            product_id="BTC-USD",
+            side="SELL",
+            order_type="market",
+            qty=Decimal("1"),
+            limit_price=None,
+            status="filled",
+            fee=Decimal("1"),
+            expected_fill=Decimal("110"),
+            actual_fill=Decimal("110"),
+            filled_quantity=Decimal("1"),
+            raw_response=None,
+            confirmation="auto",
+            rule_id=1,
+            created_at=2000,
+            updated_at=2000,
         )
     )
     repo.insert_trade_outcome(
         dict(
-            product_id="BTC-USD", rule_name="turtle_breakout", is_dca=False,
-            opened_at=1000, closed_at=2000, qty=Decimal("1"),
-            entry_fill=Decimal("100"), exit_fill=Decimal("110"),
-            fees=Decimal("1"), pnl_net=Decimal("8"),
+            product_id="BTC-USD",
+            rule_name="turtle_breakout",
+            is_dca=False,
+            opened_at=1000,
+            closed_at=2000,
+            qty=Decimal("1"),
+            entry_fill=Decimal("100"),
+            exit_fill=Decimal("110"),
+            fees=Decimal("1"),
+            pnl_net=Decimal("8"),
         )
     )
     repo.insert_trade_outcome(
         dict(
-            product_id="ETH-USD", rule_name="turtle_breakout", is_dca=False,
-            opened_at=3000, closed_at=4000, qty=Decimal("1"),
-            entry_fill=Decimal("200"), exit_fill=Decimal("190"),
-            fees=Decimal("1"), pnl_net=Decimal("-11"),
+            product_id="ETH-USD",
+            rule_name="turtle_breakout",
+            is_dca=False,
+            opened_at=3000,
+            closed_at=4000,
+            qty=Decimal("1"),
+            entry_fill=Decimal("200"),
+            exit_fill=Decimal("190"),
+            fees=Decimal("1"),
+            pnl_net=Decimal("-11"),
         )
     )
     conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
@@ -279,10 +336,16 @@ def _pooled_review_dbs(tmp_path: Path) -> tuple[Path, Path]:
     ):
         repo.insert_trade_outcome(
             dict(
-                product_id="SOL-USD", rule_name="turtle_breakout", is_dca=False,
-                opened_at=opened, closed_at=closed, qty=Decimal("2"),
-                entry_fill=Decimal(entry), exit_fill=Decimal(exit_),
-                fees=Decimal("1"), pnl_net=Decimal(pnl),
+                product_id="SOL-USD",
+                rule_name="turtle_breakout",
+                is_dca=False,
+                opened_at=opened,
+                closed_at=closed,
+                qty=Decimal("2"),
+                entry_fill=Decimal(entry),
+                exit_fill=Decimal(exit_),
+                fees=Decimal("1"),
+                pnl_net=Decimal(pnl),
             )
         )
     conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
@@ -295,9 +358,14 @@ def test_pooled_review_pools_across_profiles_dedups_and_states_the_power_sentenc
     result = CliRunner().invoke(
         cli,
         [
-            "research", "pooled-review",
-            "--db", str(db1), "--db", str(db2),
-            "--run-date", "2026-08-28",
+            "research",
+            "pooled-review",
+            "--db",
+            str(db1),
+            "--db",
+            str(db2),
+            "--run-date",
+            "2026-08-28",
         ],
     )
     assert result.exit_code == 0, result.output
@@ -322,11 +390,18 @@ def test_pooled_review_out_and_jsonl_write_the_files_asked_for(tmp_path):
     result = CliRunner().invoke(
         cli,
         [
-            "research", "pooled-review",
-            "--db", str(db1), "--db", str(db2),
-            "--run-date", "2026-08-28",
-            "--out", str(out_path),
-            "--jsonl", str(jsonl_path),
+            "research",
+            "pooled-review",
+            "--db",
+            str(db1),
+            "--db",
+            str(db2),
+            "--run-date",
+            "2026-08-28",
+            "--out",
+            str(out_path),
+            "--jsonl",
+            str(jsonl_path),
         ],
     )
     assert result.exit_code == 0, result.output
@@ -354,11 +429,18 @@ def test_pooled_review_never_writes_to_the_profile_dbs(tmp_path):
     result = CliRunner().invoke(
         cli,
         [
-            "research", "pooled-review",
-            "--db", str(db1), "--db", str(db2),
-            "--run-date", "2026-08-28",
-            "--out", str(tmp_path / "report.md"),
-            "--jsonl", str(tmp_path / "report.jsonl"),
+            "research",
+            "pooled-review",
+            "--db",
+            str(db1),
+            "--db",
+            str(db2),
+            "--run-date",
+            "2026-08-28",
+            "--out",
+            str(tmp_path / "report.md"),
+            "--jsonl",
+            str(tmp_path / "report.jsonl"),
         ],
     )
     assert result.exit_code == 0, result.output
@@ -392,10 +474,16 @@ def test_significance_factors_independence_never_write_to_the_database(tmp_path)
     repo = Repository(conn)
     repo.insert_trade_outcome(
         dict(
-            product_id="BTC-USD", rule_name="turtle_breakout", is_dca=False,
-            opened_at=1000, closed_at=2000, qty=Decimal("1"),
-            entry_fill=Decimal("100"), exit_fill=Decimal("110"),
-            fees=Decimal("1"), pnl_net=Decimal("8"),
+            product_id="BTC-USD",
+            rule_name="turtle_breakout",
+            is_dca=False,
+            opened_at=1000,
+            closed_at=2000,
+            qty=Decimal("1"),
+            entry_fill=Decimal("100"),
+            exit_fill=Decimal("110"),
+            fees=Decimal("1"),
+            pnl_net=Decimal("8"),
         )
     )
     conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
@@ -416,8 +504,15 @@ def test_significance_factors_independence_never_write_to_the_database(tmp_path)
     conn.close()
     before_fac = _file_hash(fac_db)
     result = _invoke(
-        CliRunner(), fac_db, tmp_path,
-        "research", "factors", "--product", "BTC-USD", "--granularity", "ONE_DAY",
+        CliRunner(),
+        fac_db,
+        tmp_path,
+        "research",
+        "factors",
+        "--product",
+        "BTC-USD",
+        "--granularity",
+        "ONE_DAY",
     )
     assert result.exit_code == 0, result.output
     assert _file_hash(fac_db) == before_fac, "factors wrote to the db"
@@ -433,8 +528,15 @@ def test_significance_factors_independence_never_write_to_the_database(tmp_path)
     conn.close()
     before_indep = _file_hash(indep_db)
     result = _invoke(
-        CliRunner(), indep_db, tmp_path,
-        "research", "independence", "--rule-a", "1", "--rule-b", "2",
+        CliRunner(),
+        indep_db,
+        tmp_path,
+        "research",
+        "independence",
+        "--rule-a",
+        "1",
+        "--rule-b",
+        "2",
     )
     assert result.exit_code == 0, result.output
     assert _file_hash(indep_db) == before_indep, "independence wrote to the db"
@@ -516,10 +618,14 @@ def test_throughput_allocates_within_allowance_and_never_exceeds_it(tmp_path):
     result = CliRunner().invoke(
         cli,
         [
-            "research", "throughput",
-            "--venues-json", json.dumps(venues),
-            "--products-json", json.dumps(products),
-            "--allowances-json", json.dumps(allowances),
+            "research",
+            "throughput",
+            "--venues-json",
+            json.dumps(venues),
+            "--products-json",
+            json.dumps(products),
+            "--allowances-json",
+            json.dumps(allowances),
         ],
     )
     assert result.exit_code == 0, result.output
@@ -555,9 +661,12 @@ def test_tuning_explored_within_declared_bounds_reports_as_explored_not_refused(
     result = CliRunner().invoke(
         cli,
         [
-            "research", "tuning",
-            "--rule-kind", "turtle_breakout",
-            "--explored-json", json.dumps(explored),
+            "research",
+            "tuning",
+            "--rule-kind",
+            "turtle_breakout",
+            "--explored-json",
+            json.dumps(explored),
         ],
     )
     assert result.exit_code == 0, result.output
@@ -567,8 +676,7 @@ def test_tuning_explored_within_declared_bounds_reports_as_explored_not_refused(
         "turtle_breakout",
     )
     assert (
-        f"explored {check.explored_cells} of {check.declared_cells} declared cells"
-        in result.output
+        f"explored {check.explored_cells} of {check.declared_cells} declared cells" in result.output
     )
 
 
@@ -584,8 +692,15 @@ def test_factors_renders_pairwise_cluster_and_variance_sections(tmp_path):
     conn.close()
 
     result = _invoke(
-        CliRunner(), db, tmp_path,
-        "research", "factors", "--product", "BTC-USD", "--granularity", "ONE_DAY",
+        CliRunner(),
+        db,
+        tmp_path,
+        "research",
+        "factors",
+        "--product",
+        "BTC-USD",
+        "--granularity",
+        "ONE_DAY",
     )
     assert result.exit_code == 0, result.output
     assert "CTS factor collinearity -- BTC-USD" in result.output
@@ -609,8 +724,15 @@ def test_independence_renders_overlap_and_correlation_figures(tmp_path):
     conn.close()
 
     result = _invoke(
-        CliRunner(), db, tmp_path,
-        "research", "independence", "--rule-a", "1", "--rule-b", "2",
+        CliRunner(),
+        db,
+        tmp_path,
+        "research",
+        "independence",
+        "--rule-a",
+        "1",
+        "--rule-b",
+        "2",
     )
     assert result.exit_code == 0, result.output
     assert "independence -- rule 1 vs rule 2 over 96 common bars (§80.16)" in result.output
@@ -646,12 +768,16 @@ def test_independence_does_not_stretch_a_trade_past_the_shared_history(tmp_path)
     migrate(conn)
     repo = Repository(conn)
     repo.insert_rule(
-        "turtle_breakout", {**_TURTLE_A_PARAMS, "product_id": "BTC-USD"},
-        status="candidate", now_ts=1_800_000_000,
+        "turtle_breakout",
+        {**_TURTLE_A_PARAMS, "product_id": "BTC-USD"},
+        status="candidate",
+        now_ts=1_800_000_000,
     )
     repo.insert_rule(
-        "turtle_breakout", {**_TURTLE_A_PARAMS, "product_id": "ETH-USD"},
-        status="candidate", now_ts=1_800_000_000,
+        "turtle_breakout",
+        {**_TURTLE_A_PARAMS, "product_id": "ETH-USD"},
+        status="candidate",
+        now_ts=1_800_000_000,
     )
     btc = _sawtooth_candles(192)
     repo.upsert_candles("BTC-USD", Granularity.ONE_DAY, btc)
@@ -665,8 +791,15 @@ def test_independence_does_not_stretch_a_trade_past_the_shared_history(tmp_path)
     conn.close()
 
     result = _invoke(
-        CliRunner(), db, tmp_path,
-        "research", "independence", "--rule-a", "1", "--rule-b", "2",
+        CliRunner(),
+        db,
+        tmp_path,
+        "research",
+        "independence",
+        "--rule-a",
+        "1",
+        "--rule-b",
+        "2",
     )
     assert result.exit_code == 0, result.output
     assert "over 96 common bars" in result.output, result.output
@@ -772,9 +905,16 @@ def test_no_evidence_subcommand_names_a_winner(tmp_path):
     deflate_result = runner.invoke(
         cli,
         [
-            "research", "deflate",
-            "--ledger", str(deflate_ledger), "--sharpe", "0.4",
-            "--rho", "0.5", "--trial-sharpe-variance", "0.05",
+            "research",
+            "deflate",
+            "--ledger",
+            str(deflate_ledger),
+            "--sharpe",
+            "0.4",
+            "--rho",
+            "0.5",
+            "--trial-sharpe-variance",
+            "0.05",
         ],
     )
     assert deflate_result.exit_code == 0, deflate_result.output
@@ -784,10 +924,19 @@ def test_no_evidence_subcommand_names_a_winner(tmp_path):
     wf_db = _turtle_db(tmp_path, name="wf.db")
     wf_ledger = tmp_path / "wf-trials.jsonl"
     wf_result = _invoke(
-        runner, wf_db, tmp_path,
-        "research", "walk-forward",
-        "--rule", "1", "--train-bars", "40", "--test-bars", "20",
-        "--ledger", str(wf_ledger),
+        runner,
+        wf_db,
+        tmp_path,
+        "research",
+        "walk-forward",
+        "--rule",
+        "1",
+        "--train-bars",
+        "40",
+        "--test-bars",
+        "20",
+        "--ledger",
+        str(wf_ledger),
     )
     assert wf_result.exit_code == 0, wf_result.output
     assert "walk-forward:" in wf_result.output
@@ -803,12 +952,19 @@ def test_no_evidence_subcommand_names_a_winner(tmp_path):
     thr_result = runner.invoke(
         cli,
         [
-            "research", "throughput",
+            "research",
+            "throughput",
             "--venues-json",
-            json.dumps([{
-                "venue": "coinbase", "monthly_allowance": "5000",
-                "mean_trade_notional": "100", "expected_signals_per_month": "10",
-            }]),
+            json.dumps(
+                [
+                    {
+                        "venue": "coinbase",
+                        "monthly_allowance": "5000",
+                        "mean_trade_notional": "100",
+                        "expected_signals_per_month": "10",
+                    }
+                ]
+            ),
         ],
     )
     assert thr_result.exit_code == 0, thr_result.output
@@ -826,15 +982,29 @@ def test_no_evidence_subcommand_names_a_winner(tmp_path):
     )
     fac_conn.close()
     fac_result = _invoke(
-        runner, fac_db, tmp_path,
-        "research", "factors", "--product", "BTC-USD", "--granularity", "ONE_DAY",
+        runner,
+        fac_db,
+        tmp_path,
+        "research",
+        "factors",
+        "--product",
+        "BTC-USD",
+        "--granularity",
+        "ONE_DAY",
     )
     assert fac_result.exit_code == 0, fac_result.output
     outputs["factors"] = fac_result.output
 
     banned = (
-        "best", "winner", "optimal", "top-ranked", "top ranked",
-        "highest", "lowest", "strongest", "ranked #",
+        "best",
+        "winner",
+        "optimal",
+        "top-ranked",
+        "top ranked",
+        "highest",
+        "lowest",
+        "strongest",
+        "ranked #",
     )
     for name, output in outputs.items():
         lowered = output.lower()
@@ -876,10 +1046,19 @@ def test_backtest_failure_during_a_fold_is_not_a_refusal(tmp_path, monkeypatch):
     monkeypatch.setattr(wf_mod.backtest_mod, "backtest", _boom)
 
     result = _invoke(
-        runner, db, tmp_path,
-        "research", "walk-forward",
-        "--rule", "1", "--train-bars", "40", "--test-bars", "20",
-        "--ledger", str(tmp_path / "wf-bug-trials.jsonl"),
+        runner,
+        db,
+        tmp_path,
+        "research",
+        "walk-forward",
+        "--rule",
+        "1",
+        "--train-bars",
+        "40",
+        "--test-bars",
+        "20",
+        "--ledger",
+        str(tmp_path / "wf-bug-trials.jsonl"),
     )
 
     assert result.exit_code != 0, (
@@ -923,14 +1102,19 @@ def test_operator_mistakes_in_throughput_are_not_refusals(tmp_path):
     typo = runner.invoke(
         cli,
         [
-            "research", "throughput",
+            "research",
+            "throughput",
             "--venues-json",
-            json.dumps([{
-                "venue": "coinbase",
-                "monthly_allowance": "500",
-                "mean_trade_notional": "0",
-                "expected_signals_per_month": "1",
-            }]),
+            json.dumps(
+                [
+                    {
+                        "venue": "coinbase",
+                        "monthly_allowance": "500",
+                        "mean_trade_notional": "0",
+                        "expected_signals_per_month": "1",
+                    }
+                ]
+            ),
         ],
     )
     assert typo.exit_code != 0, (
@@ -942,22 +1126,32 @@ def test_operator_mistakes_in_throughput_are_not_refusals(tmp_path):
     ineligible = runner.invoke(
         cli,
         [
-            "research", "throughput",
+            "research",
+            "throughput",
             "--venues-json",
-            json.dumps([{
-                "venue": "coinbase",
-                "monthly_allowance": "5000",
-                "mean_trade_notional": "100",
-                "expected_signals_per_month": "10",
-            }]),
+            json.dumps(
+                [
+                    {
+                        "venue": "coinbase",
+                        "monthly_allowance": "5000",
+                        "mean_trade_notional": "100",
+                        "expected_signals_per_month": "10",
+                    }
+                ]
+            ),
             "--products-json",
-            json.dumps([{
-                "symbol": "AAPL",
-                "venues": ["alpaca"],
-                "mean_trade_notional": "100",
-                "expected_signals_per_month": "5",
-            }]),
-            "--allowances-json", json.dumps({"coinbase": "5000"}),
+            json.dumps(
+                [
+                    {
+                        "symbol": "AAPL",
+                        "venues": ["alpaca"],
+                        "mean_trade_notional": "100",
+                        "expected_signals_per_month": "5",
+                    }
+                ]
+            ),
+            "--allowances-json",
+            json.dumps({"coinbase": "5000"}),
         ],
     )
     assert ineligible.exit_code != 0, (

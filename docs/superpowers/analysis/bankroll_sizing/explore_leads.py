@@ -620,7 +620,7 @@ def build_report(exp3_results: dict, exp4_results: dict) -> str:
         "2. **Merton share / CRRA sizing (KB §84.6):** `f = mu / (gamma * sigma^2)`, the "
         "continuous-time analogue of Kelly for an investor with constant relative risk aversion "
         "`gamma` (`gamma = 1` approximately recovers full Kelly; higher `gamma` sizes smaller). "
-        "Explored as a principled, defensible way to express \"how sub-Kelly\" instead of an "
+        'Explored as a principled, defensible way to express "how sub-Kelly" instead of an '
         "ad-hoc fractional-Kelly `lambda`."
     )
     lines.append("")
@@ -652,7 +652,7 @@ def build_report(exp3_results: dict, exp4_results: dict) -> str:
         "untapered and (ii) tapered at ceilings D in {0.15, 0.25, 0.35}. EVERY combination also "
         "runs under keel's hard drawdown breaker, modeled as a hard halt (no further trades for "
         "the rest of the sequence) once a path's current drawdown from peak reaches 20% -- "
-        "mirroring rail 11. \"Risk-adj\" is a crude ratio: median terminal multiple / median max "
+        'mirroring rail 11. "Risk-adj" is a crude ratio: median terminal multiple / median max '
         "DD (higher is better: more growth per unit of typical pain)."
     )
     lines.append("")
@@ -684,8 +684,8 @@ def build_report(exp3_results: dict, exp4_results: dict) -> str:
     lines.append("### Headline read: does taper-on-Quarter-Kelly dominate?")
     lines.append("")
     lines.append(
-        "Checked systematically across all 4 profile x world combos (A/B x \"p correct\"/"
-        "\"p over-estimated\"): for each (base fraction, taper ceiling D), does the tapered "
+        'Checked systematically across all 4 profile x world combos (A/B x "p correct"/'
+        '"p over-estimated"): for each (base fraction, taper ceiling D), does the tapered '
         "version reach a median terminal multiple >= flat-1%'s (growth-dominates), AND does it "
         "reach a median max DD and hard-breaker trip rate both <= its own untapered version's "
         "(safety-dominates)?"
@@ -725,7 +725,7 @@ def build_report(exp3_results: dict, exp4_results: dict) -> str:
         "versus untapered, regardless of D), but growth-dominance over flat-1% mostly fails, "
         "because once D exceeds the hard-breaker threshold the taper no longer prevents the "
         "breaker from tripping -- and a tripped, frozen bankroll forfeits the same growth "
-        "untapered Quarter-Kelly forfeits. Concretely, profile A / \"p correct\": flat-1% reaches "
+        'untapered Quarter-Kelly forfeits. Concretely, profile A / "p correct": flat-1% reaches '
         f"{flat1_row['median_multiple']:.3f}x; untapered Quarter-Kelly reaches "
         f"{qk_flat_row['median_multiple']:.3f}x but trips the breaker on "
         f"{fmt_pct(qk_flat_row['breaker_trip_rate'])} of paths (median max DD "
@@ -739,7 +739,7 @@ def build_report(exp3_results: dict, exp4_results: dict) -> str:
         f"**Does the taper help AT ALL on the 1% base?** Barely, and the hypothesis holds: on "
         f"keel-1%, drawdown almost never reaches even the tightest taper ceiling (D=0.15) -- "
         f"untapered keel-1% breaker-trips on {fmt_pct(flat1_row['breaker_trip_rate'])} of paths "
-        f"(profile A, \"p correct\"), and tapering at D=0.15 changes that to "
+        f'(profile A, "p correct"), and tapering at D=0.15 changes that to '
         f"{fmt_pct(keel_taper_row['breaker_trip_rate'])} while giving up some growth "
         f"({keel_taper_row['median_multiple']:.3f}x vs {flat1_row['median_multiple']:.3f}x, "
         "because the taper starts shaving size any time drawdown is nonzero, not just near the "
@@ -837,8 +837,8 @@ def build_report(exp3_results: dict, exp4_results: dict) -> str:
     lines.append(
         "Merton-at-a-fixed-gamma is mathematically a form of fractional Kelly: dividing the "
         "Merton fraction by that profile's own full-Kelly fraction gives an effective lambda "
-        "(`lambda = f_merton / f_kelly`) -- \"what fraction of full Kelly is this gamma "
-        "equivalent to, at this specific edge?\""
+        '(`lambda = f_merton / f_kelly`) -- "what fraction of full Kelly is this gamma '
+        'equivalent to, at this specific edge?"'
     )
     lines.append("")
     lines.append("| Profile | gamma | f_merton | Full Kelly | Effective lambda |")
@@ -860,7 +860,7 @@ def build_report(exp3_results: dict, exp4_results: dict) -> str:
         "`merton_fraction` (a mean/variance formula) and `kelly_fraction` (the discrete binary "
         "formula) are two different approximations of the same growth-optimal bet size, not "
         "algebraically identical. Both worlds tables above show `Merton (gamma=A-implied)` "
-        "keeping ruin at 0.0% under \"p over-estimated by 0.05\" at both profiles -- degrading "
+        'keeping ruin at 0.0% under "p over-estimated by 0.05" at both profiles -- degrading '
         "gracefully, the same qualitative behavior fractional Kelly showed in the original "
         "`simulate.py` study."
     )
@@ -911,13 +911,13 @@ def build_report(exp3_results: dict, exp4_results: dict) -> str:
         f"keel's implied risk-aversion is gamma~{gamma_a:.0f} at profile A and gamma~{gamma_b:.0f} "
         "at profile B -- both far above the textbook gamma~2 human-risk-aversion estimate and far "
         "above the gamma=1 Kelly-equivalent, i.e. keel is a mathematically extreme (not merely "
-        "\"conservative\") point on this spectrum. A single fixed gamma automatically scales risk "
+        '"conservative") point on this spectrum. A single fixed gamma automatically scales risk '
         "up on the stronger/lower-variance edge (B) and down on the floor edge (A) with zero "
         "re-tuning, which flat-1% cannot do by construction; and Merton-at-a-fixed-gamma degrades "
         "gracefully under the p-over-estimated stress test (ruin stays 0.0% at both profiles), "
         "matching fractional Kelly's known robustness. The formula is a legitimate, more "
         "principled way to express the SAME sub-Kelly choice keel already makes -- worth adopting "
-        "as vocabulary/diagnostic (\"keel runs at effectively gamma~24-34\") even without changing "
+        'as vocabulary/diagnostic ("keel runs at effectively gamma~24-34") even without changing '
         "risk_pct itself."
     )
     lines.append("")
@@ -937,14 +937,14 @@ def build_report(exp3_results: dict, exp4_results: dict) -> str:
         "slippage, and spread are not modeled."
     )
     lines.append(
-        "- **A single, fixed estimation-error magnitude.** The \"p over-estimated by 0.05\" "
+        '- **A single, fixed estimation-error magnitude.** The "p over-estimated by 0.05" '
         "world tests one specific misestimation size, not a distribution over possible errors. "
         "It illustrates a direction, not a calibrated probability."
     )
     lines.append(
         "- **Merton is a mean/variance approximation, not an exact rederivation of Kelly.** "
-        "`merton_fraction` and `kelly_fraction` are two different formulas for \"how much to "
-        "risk\"; gamma=1 approximately, not exactly, recovers full Kelly, and the effective-"
+        '`merton_fraction` and `kelly_fraction` are two different formulas for "how much to '
+        'risk"; gamma=1 approximately, not exactly, recovers full Kelly, and the effective-'
         "lambda numbers in (c) above reflect that approximation gap, not an algebraic identity."
     )
     lines.append(
@@ -988,7 +988,7 @@ def build_report(exp3_results: dict, exp4_results: dict) -> str:
         f"{dominance['Quarter-Kelly'][0.35]['n_combos']} -- safety-dominance (lower DD, fewer "
         "breaker trips than untapered) persists at every D tested, but growth-dominance over "
         "flat-1% requires the ceiling to sit below the hard breaker. Concretely at D=0.15, "
-        f"profile A / \"p correct\": {qk_taper_row['median_multiple']:.3f}x median terminal "
+        f'profile A / "p correct": {qk_taper_row["median_multiple"]:.3f}x median terminal '
         f"multiple (vs flat-1%'s {flat1_row['median_multiple']:.3f}x), median max DD "
         f"{fmt_pct(qk_taper_row['median_max_dd'])} and breaker trip rate "
         f"{fmt_pct(qk_taper_row['breaker_trip_rate'])} (vs untapered Quarter-Kelly's "
@@ -996,7 +996,7 @@ def build_report(exp3_results: dict, exp4_results: dict) -> str:
         f"{fmt_pct(qk_flat_row['breaker_trip_rate'])} breaker trip rate)."
     )
     lines.append(
-        f"- **§84.4 -- breaker-trip-rate deltas (profile A, \"p correct\"):** keel-1% untapered "
+        f'- **§84.4 -- breaker-trip-rate deltas (profile A, "p correct"):** keel-1% untapered '
         f"{fmt_pct(flat1_row['breaker_trip_rate'])} -> keel-1% taper D=0.15 "
         f"{fmt_pct(keel_taper_row['breaker_trip_rate'])} (taper barely engages on the 1% base); "
         f"Quarter-Kelly untapered {fmt_pct(qk_flat_row['breaker_trip_rate'])} -> Quarter-Kelly "

@@ -64,9 +64,7 @@ def test_an_unrecorded_series_is_reported_separately_from_a_partial_one() -> Non
 
 
 def test_a_mixed_series_is_reported_as_partial() -> None:
-    (finding,) = feed_scope_findings(
-        {("MSFT-USD", "ONE_DAY"): ("alpaca:iex", "alpaca:sip")}
-    )
+    (finding,) = feed_scope_findings({("MSFT-USD", "ONE_DAY"): ("alpaca:iex", "alpaca:sip")})
     assert finding.status == WARN
     assert "alpaca:iex" in finding.detail
 

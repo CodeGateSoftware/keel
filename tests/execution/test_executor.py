@@ -3920,9 +3920,7 @@ def test_a_refusal_on_an_EXIT_writes_a_row_where_there_was_none(repo):
     `doctor` run from "nobody has attested" into "the venue refused this credential, saying X".
     """
     _seed_open_position(repo, "BTC-USD", Decimal("0.1"), Decimal("50000"))
-    attest_subscription(
-        repo, now_ts=NOW_TS, free_volume_usd=Decimal("10000000"), venue="someplace"
-    )
+    attest_subscription(repo, now_ts=NOW_TS, free_volume_usd=Decimal("10000000"), venue="someplace")
     signal = Signal(
         rule_name="target_harvest",
         product_id="BTC-USD",
@@ -4650,9 +4648,7 @@ class TestProvenanceCannotBlockAPlacement:
             def est_base_size(self):  # type: ignore[no-untyped-def]
                 raise RuntimeError("this venue's preview object is broken")
 
-        intent = executor_mod._build_intent(
-            _enter_signal(), None, repo, _config(), now_ts=NOW_TS
-        )
+        intent = executor_mod._build_intent(_enter_signal(), None, repo, _config(), now_ts=NOW_TS)
         assert intent is not None
 
         row = executor_mod._order_row(intent, "autonomous", NOW_TS, preview=_Exploding())
@@ -4713,8 +4709,14 @@ class TestTheTwoBalanceReadersCannotDrift:
 
         two, raising, empty = self._brokers()
         cases = [
-            (two, "USD"), (two, "usd"), (two, "EUR"), (two, "GBP"),
-            (raising, "USD"), (empty, "USD"), (None, "USD"), (two, ""),
+            (two, "USD"),
+            (two, "usd"),
+            (two, "EUR"),
+            (two, "GBP"),
+            (raising, "USD"),
+            (empty, "USD"),
+            (None, "USD"),
+            (two, ""),
         ]
 
         for broker, currency in cases:
@@ -4744,4 +4746,3 @@ def test_a_balance_object_without_a_total_leg_does_not_raise() -> None:
 
     assert executor._fetch_quote_balance_pair(_Broker(), "USD") == (Decimal("250.10"), None)
     assert executor._fetch_available_quote(_Broker(), "USD") == Decimal("250.10")
-

@@ -78,7 +78,7 @@ def provenance_of(preview: Any) -> str:
         return UNREADABLE
     try:
         unpriced = quote_size <= 0 or base_size <= 0
-    except (ArithmeticError, TypeError):
+    except ArithmeticError, TypeError:
         # A size that cannot be COMPARED to zero cannot be interpreted, which is what
         # `UNREADABLE` means. `Decimal("NaN") <= 0` raises `InvalidOperation` -- and this
         # function is called from `executor._order_row`, which runs BEFORE `place_order`, so

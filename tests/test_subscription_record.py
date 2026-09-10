@@ -42,9 +42,7 @@ def test_active_and_unlimited_returns_none() -> None:
     assert _record(free_volume_usd=None).allowance_usd(NOW, UNSUBSCRIBED) is None
 
 
-@pytest.mark.parametrize(
-    "status", [SubscriptionStatus.SUSPECT, SubscriptionStatus.LAPSED]
-)
+@pytest.mark.parametrize("status", [SubscriptionStatus.SUSPECT, SubscriptionStatus.LAPSED])
 def test_suspect_and_lapsed_fall_back_to_the_unsubscribed_allowance(
     status: SubscriptionStatus,
 ) -> None:

@@ -45,9 +45,7 @@ _ATTESTED_NEVER_INFERRED = "ATTESTED, never inferred"
 _UNKNOWN_IS_A_REJECTION = "unknown is a rejection"
 
 #: The riba screen's failure wording, from `screen_asset`'s `pays_yield` branch. Two-sided.
-_RIBA_WORDING = (
-    "the asset carries a guaranteed/expected return for holding it, which is riba-like"
-)
+_RIBA_WORDING = "the asset carries a guaranteed/expected return for holding it, which is riba-like"
 
 #: The bare-holder semantics of `pays_yield`, established by fetching the staking docs. Pinned
 #: two-sided with the experiment record that did the fetching, so the document's account of
@@ -193,8 +191,7 @@ def test_the_bare_holder_semantics_are_pinned_to_the_experiment_record():
     still show it.
     """
     assert _BARE_HOLDER in _unwrapped(_doc()), (
-        f"{_DOC} must state the bare-holder semantics in the record's own words: "
-        f"{_BARE_HOLDER!r}"
+        f"{_DOC} must state the bare-holder semantics in the record's own words: {_BARE_HOLDER!r}"
     )
     record = "docs/experiments/2026-08-07-unvalidated-skip-set-reassessment.md"
     assert _BARE_HOLDER in _rel(record), (
@@ -357,9 +354,7 @@ def test_the_disagreement_section_names_the_local_attestation_route():
     assert "## What keel deliberately does not decide" in text, (
         f"{_DOC} must have a section naming what keel deliberately does not decide"
     )
-    assert "## How to disagree" in text, (
-        f"{_DOC} must have a 'How to disagree' section"
-    )
+    assert "## How to disagree" in text, f"{_DOC} must have a 'How to disagree' section"
     disagreement = text.split("## How to disagree", 1)[1]
     assert "keel assets attest" in disagreement, (
         f"{_DOC}'s disagreement section must name the local route (`keel assets attest`) "
@@ -417,7 +412,7 @@ def test_the_long_only_ruling_is_pinned_two_sided_to_the_code_that_enforces_it()
     )
     base = (_ROOT / "keel/strategy/rules/base.py").read_text()
     assert re.search(r'(?m)^\s+direction: Literal\["long"\]\s*$', base), (
-        "keel/strategy/rules/base.py must still DECLARE the field as `Literal[\"long\"]`. "
+        'keel/strategy/rules/base.py must still DECLARE the field as `Literal["long"]`. '
         "Matched on the field line, not anywhere in the file: the `__post_init__` docstring "
         f"quotes the annotation too, and a prose mention is not a contract {_DOC} can cite"
     )
@@ -446,9 +441,7 @@ def test_the_long_only_doctrine_is_quoted_from_the_knowledge_base():
             f"{_DOC} must quote §65.11 verbatim ({quoted!r}) -- long-only is a fiqh "
             "derivation here, not a charter, so it must carry its citation"
         )
-        assert quoted in text, (
-            f"{source} must still carry the passage the doc quotes ({quoted!r})"
-        )
+        assert quoted in text, f"{source} must still carry the passage the doc quotes ({quoted!r})"
 
 
 def test_the_hadith_reference_is_marked_as_outside_the_knowledge_base():

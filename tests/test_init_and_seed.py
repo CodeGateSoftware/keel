@@ -90,8 +90,19 @@ def test_init_writes_config_and_seeds_candidates(tmp_path):
 def test_seed_defaults_to_candidate(tmp_path, valid_config_path):
     repo = _repo(tmp_path)
     CliRunner().invoke(
-        cli, ["--db", str(tmp_path / "t.db"), "--config", str(valid_config_path),
-              "rules", "seed", "--kinds", "dca", "--products", "BTC-USD"]
+        cli,
+        [
+            "--db",
+            str(tmp_path / "t.db"),
+            "--config",
+            str(valid_config_path),
+            "rules",
+            "seed",
+            "--kinds",
+            "dca",
+            "--products",
+            "BTC-USD",
+        ],
     )
     rules = repo.get_rules()
     assert rules and all(r["status"] == "candidate" for r in rules)
@@ -100,8 +111,21 @@ def test_seed_defaults_to_candidate(tmp_path, valid_config_path):
 def test_seed_status_live_bypasses_the_gate_and_warns(tmp_path, valid_config_path):
     repo = _repo(tmp_path)
     result = CliRunner().invoke(
-        cli, ["--db", str(tmp_path / "t.db"), "--config", str(valid_config_path),
-              "rules", "seed", "--kinds", "dca", "--products", "BTC-USD", "--status", "live"]
+        cli,
+        [
+            "--db",
+            str(tmp_path / "t.db"),
+            "--config",
+            str(valid_config_path),
+            "rules",
+            "seed",
+            "--kinds",
+            "dca",
+            "--products",
+            "BTC-USD",
+            "--status",
+            "live",
+        ],
     )
     assert result.exit_code == 0, result.output
     assert "LIVE status" in result.output
@@ -121,9 +145,21 @@ def test_seed_status_live_bypasses_the_gate_and_warns(tmp_path, valid_config_pat
 def test_seed_refuses_a_futures_contract_and_names_it(tmp_path, valid_config_path):
     repo = _repo(tmp_path)
     result = CliRunner().invoke(
-        cli, ["--db", str(tmp_path / "t.db"), "--config", str(valid_config_path),
-              "rules", "seed", "--kinds", "dca",
-              "--products", "XLM-28AUG26-CDE", "--status", "live"]
+        cli,
+        [
+            "--db",
+            str(tmp_path / "t.db"),
+            "--config",
+            str(valid_config_path),
+            "rules",
+            "seed",
+            "--kinds",
+            "dca",
+            "--products",
+            "XLM-28AUG26-CDE",
+            "--status",
+            "live",
+        ],
     )
 
     assert result.exit_code != 0
@@ -134,8 +170,19 @@ def test_seed_refuses_a_futures_contract_and_names_it(tmp_path, valid_config_pat
 def test_seed_refuses_a_derivative_shaped_id_that_settles_in_usd(tmp_path, valid_config_path):
     """The R2 residual at the keyboard: rail 18 alone would pass `BTC-PERP-USD`."""
     result = CliRunner().invoke(
-        cli, ["--db", str(tmp_path / "t.db"), "--config", str(valid_config_path),
-              "rules", "seed", "--kinds", "dca", "--products", "BTC-PERP-USD"]
+        cli,
+        [
+            "--db",
+            str(tmp_path / "t.db"),
+            "--config",
+            str(valid_config_path),
+            "rules",
+            "seed",
+            "--kinds",
+            "dca",
+            "--products",
+            "BTC-PERP-USD",
+        ],
     )
     assert result.exit_code != 0
     assert "BTC-PERP-USD" in result.output
@@ -144,21 +191,41 @@ def test_seed_refuses_a_derivative_shaped_id_that_settles_in_usd(tmp_path, valid
 def test_seed_refuses_an_unsettleable_but_well_formed_pair(tmp_path, valid_config_path):
     """`BTC-EUR` is a real spot pair; it fails on settlement membership, not on shape."""
     result = CliRunner().invoke(
-        cli, ["--db", str(tmp_path / "t.db"), "--config", str(valid_config_path),
-              "rules", "seed", "--kinds", "dca", "--products", "BTC-EUR"]
+        cli,
+        [
+            "--db",
+            str(tmp_path / "t.db"),
+            "--config",
+            str(valid_config_path),
+            "rules",
+            "seed",
+            "--kinds",
+            "dca",
+            "--products",
+            "BTC-EUR",
+        ],
     )
     assert result.exit_code != 0
     assert "BTC-EUR" in result.output
     assert "settles in EUR" in result.output
 
 
-def test_seed_refuses_a_lowercase_id_with_a_hint_rather_than_fixing_it(
-    tmp_path, valid_config_path
-):
+def test_seed_refuses_a_lowercase_id_with_a_hint_rather_than_fixing_it(tmp_path, valid_config_path):
     repo = _repo(tmp_path)
     result = CliRunner().invoke(
-        cli, ["--db", str(tmp_path / "t.db"), "--config", str(valid_config_path),
-              "rules", "seed", "--kinds", "dca", "--products", "btc-USD"]
+        cli,
+        [
+            "--db",
+            str(tmp_path / "t.db"),
+            "--config",
+            str(valid_config_path),
+            "rules",
+            "seed",
+            "--kinds",
+            "dca",
+            "--products",
+            "btc-USD",
+        ],
     )
 
     assert result.exit_code != 0
@@ -171,8 +238,17 @@ def test_seed_with_no_products_still_seeds_the_allowlist(tmp_path, valid_config_
     settlement set to validate against), where before it loaded config only on this branch."""
     repo = _repo(tmp_path)
     result = CliRunner().invoke(
-        cli, ["--db", str(tmp_path / "t.db"), "--config", str(valid_config_path),
-              "rules", "seed", "--kinds", "dca"]
+        cli,
+        [
+            "--db",
+            str(tmp_path / "t.db"),
+            "--config",
+            str(valid_config_path),
+            "rules",
+            "seed",
+            "--kinds",
+            "dca",
+        ],
     )
 
     assert result.exit_code == 0, result.output

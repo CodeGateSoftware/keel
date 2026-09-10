@@ -79,8 +79,7 @@ def test_services_import_without_the_cli() -> None:
         "import sys\n"
         + "".join(f"import {name}\n" for name in SERVICE_MODULES)
         + "loaded = sorted(m for m in sys.modules if m == 'keel.cli' or m.startswith('keel.cli.'))"
-        "\n"
-        + "assert not loaded, f'keel.cli was imported by the service layer: {loaded}'\n"
+        "\n" + "assert not loaded, f'keel.cli was imported by the service layer: {loaded}'\n"
     )
     completed = subprocess.run(
         [sys.executable, "-c", program], capture_output=True, text=True, check=False

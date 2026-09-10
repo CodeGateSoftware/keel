@@ -64,11 +64,9 @@ def test_an_in_force_spot_cash_attestation_admits(fresh_repo_without_posture) ->
 
 
 def test_an_expired_attestation_vetoes_and_says_it_expired(fresh_repo_without_posture) -> None:
-    """"Expired" and "never attested" call for the same command but tell an operator different
+    """ "Expired" and "never attested" call for the same command but tell an operator different
     things about their own diligence, so the messages differ."""
-    attest_cash_posture(
-        fresh_repo_without_posture, now_ts=NOW_TS, attest_due_ts=NOW_TS - 1
-    )
+    attest_cash_posture(fresh_repo_without_posture, now_ts=NOW_TS, attest_due_ts=NOW_TS - 1)
     (line,) = _cash(_violations(fresh_repo_without_posture))
     assert "expired" in line.lower()
     assert "keel posture attest" in line
@@ -80,9 +78,7 @@ def test_a_margin_attestation_vetoes_and_names_what_was_attested(
     """An operator who attests margin gave an honest answer. The veto has to reflect that rather
     than reading as "you forgot to attest" -- the remedy is a change to the ACCOUNT, not a
     re-run of the command."""
-    attest_cash_posture(
-        fresh_repo_without_posture, now_ts=NOW_TS, attested_posture=MARGIN_ENABLED
-    )
+    attest_cash_posture(fresh_repo_without_posture, now_ts=NOW_TS, attested_posture=MARGIN_ENABLED)
     (line,) = _cash(_violations(fresh_repo_without_posture))
     assert "margin" in line.lower()
 
@@ -106,9 +102,7 @@ def test_a_different_credential_vetoes_with_its_own_message(
 ) -> None:
     """#633. Something WAS attested here, but not for the credential in place now -- and saying
     "never attested" about that would repeat #624."""
-    attest_cash_posture(
-        fresh_repo_without_posture, now_ts=NOW_TS, credential_fingerprint="fp-old"
-    )
+    attest_cash_posture(fresh_repo_without_posture, now_ts=NOW_TS, credential_fingerprint="fp-old")
     monkeypatch.setattr(
         "keel.execution.guards.current_credential_fingerprint", lambda _venue: "fp-new"
     )

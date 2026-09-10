@@ -1263,9 +1263,7 @@ def _view_keys(view: str, root: str) -> list[str]:
     # send, so renaming a client read to camelCase passed this check while the element rendered
     # empty forever. Found by mutating #704's `sessionChip`; the class now covers any identifier
     # JavaScript allows, and a key the payload does not send fails whatever its casing.
-    found = re.findall(
-        rf"\b{root}\.([a-zA-Z_]+(?:\.[a-zA-Z_0-9]+)?)\b(?!\s*\()", source[start:end]
-    )
+    found = re.findall(rf"\b{root}\.([a-zA-Z_]+(?:\.[a-zA-Z_0-9]+)?)\b(?!\s*\()", source[start:end])
     # Neither `.length` nor `.display` is a payload key: the first is a list length in JavaScript,
     # the second is half of a `Field` whose presence is already checked one level up. Two names
     # rather than a general rule, because a THIRD non-payload member appearing here should be
@@ -1565,8 +1563,22 @@ _BROWSER_GLOBALS = frozenset(
 
 #: Keywords that are followed by a parenthesis and are not calls.
 _NOT_CALLS = frozenset(
-    {"await", "catch", "delete", "for", "function", "if", "instanceof", "new", "return",
-     "super", "switch", "typeof", "void", "while"}
+    {
+        "await",
+        "catch",
+        "delete",
+        "for",
+        "function",
+        "if",
+        "instanceof",
+        "new",
+        "return",
+        "super",
+        "switch",
+        "typeof",
+        "void",
+        "while",
+    }
 )
 
 
@@ -1962,11 +1974,7 @@ def test_every_mapped_collection_is_either_checked_or_named() -> None:
     }
     views = {view for view, _root, _endpoint in _VIEW_ENDPOINTS} | {"statusView", "gatesView"}
 
-    mapped = {
-        (view, root, collection)
-        for view in views
-        for (root, collection) in _row_reads(view)
-    }
+    mapped = {(view, root, collection) for view in views for (root, collection) in _row_reads(view)}
 
     unaccounted = mapped - checked - set(_ROW_ENDPOINTS_UNCOVERED)
     assert not unaccounted, f"mapped collections neither checked nor named: {sorted(unaccounted)}"
@@ -2109,7 +2117,7 @@ def test_the_banner_sentence_is_placed_and_never_written_here() -> None:
 
 
 def test_the_chip_and_the_banner_live_outside_the_view_so_they_survive_navigation() -> None:
-    """"Present on all views" is a property of WHERE they are, not of every view remembering to
+    """ "Present on all views" is a property of WHERE they are, not of every view remembering to
     draw them. `#view` is replaced wholesale on each navigation; these sit outside it."""
     html = _INDEX.read_text(encoding="utf-8")
     view_at = html.index('id="view"')

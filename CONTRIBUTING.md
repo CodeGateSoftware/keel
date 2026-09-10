@@ -140,11 +140,16 @@ Then:
 ```bash
 uv sync --all-extras --dev   # everything: the workspace, dev deps, the conformance extra
 uv run ruff check            # lint — must pass clean
+uv run ruff format --check . # formatting — must pass clean, WHOLE TREE
 uv run mypy                  # types — must pass clean
 uv run pytest -q             # the full suite — must pass (CI runs exactly this)
 ```
 
-All four must be green before you ask for review. CI runs the same commands, so anything red
+`ruff format --check .` is whole-tree where `ruff check` is not, and the asymmetry is deliberate:
+lint still carries a debt in `docs/` and `scripts/`, formatting carries none anywhere since #783's
+one-shot pass. Run `uv run ruff format .` to fix what it reports.
+
+All five must be green before you ask for review. CI runs the same commands, so anything red
 locally is red everywhere. The suite is fast (tens of seconds) — run it freely.
 
 ## The documentation standard

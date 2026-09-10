@@ -62,9 +62,7 @@ class SweepBroker:
             raise ConnectionError("simulated balance outage")
         balances = [Balance(currency="USD", available=Decimal("1000"), total=Decimal("1000"))]
         if self._base is not None:
-            balances.append(
-                Balance(currency="BTC", available=self._available, total=self._base)
-            )
+            balances.append(Balance(currency="BTC", available=self._available, total=self._base))
         return balances
 
     def get_instrument(self, product_id: str) -> Instrument | None:

@@ -117,10 +117,30 @@ OUT_PRIMARY = f"{SCRATCH}/rsi_scale_257.jsonl"
 OUT_CONDITIONAL = f"{SCRATCH}/rsi_scale_257_proximity.jsonl"  # separate file, never merged
 
 UNIVERSE = [
-    "BTC-USD", "ETH-USD", "ADA-USD", "LINK-USD", "LTC-USD", "SOL-USD",
-    "XLM-USD", "PAXG-USDT", "BCH-USD", "AAVE-USD", "DOGE-USD", "DOT-USD",
-    "UNI-USD", "ZEC-USD", "ALGO-USD", "FET-USD", "CRV-USD", "ICP-USD",
-    "AVAX-USD", "NEAR-USD", "XRP-USD", "PAXG-USD", "WLD-USD", "TON-USD",
+    "BTC-USD",
+    "ETH-USD",
+    "ADA-USD",
+    "LINK-USD",
+    "LTC-USD",
+    "SOL-USD",
+    "XLM-USD",
+    "PAXG-USDT",
+    "BCH-USD",
+    "AAVE-USD",
+    "DOGE-USD",
+    "DOT-USD",
+    "UNI-USD",
+    "ZEC-USD",
+    "ALGO-USD",
+    "FET-USD",
+    "CRV-USD",
+    "ICP-USD",
+    "AVAX-USD",
+    "NEAR-USD",
+    "XRP-USD",
+    "PAXG-USD",
+    "WLD-USD",
+    "TON-USD",
 ]
 
 FEES = ["0", "0.006", "0.012"]
@@ -148,8 +168,13 @@ def _run(job: tuple[str, float, str]) -> list[dict]:
         candles = Repository(connect(DB)).get_candles(product, Granularity.ONE_HOUR)
     except Exception as exc:
         return [
-            {"product": product, "oversold": oversold, "proximity": proximity, "fee": f,
-             "error": f"{type(exc).__name__}: {exc}"}
+            {
+                "product": product,
+                "oversold": oversold,
+                "proximity": proximity,
+                "fee": f,
+                "error": f"{type(exc).__name__}: {exc}",
+            }
             for f in FEES
         ]
 
@@ -161,16 +186,28 @@ def _run(job: tuple[str, float, str]) -> list[dict]:
                 support_proximity_pct=Decimal(proximity),
             )
             r = bt.backtest(rule, candles, fee_pct=Decimal(fee), slippage_pct=SLIPPAGE)
-            out.append({
-                "product": product, "oversold": oversold, "proximity": proximity, "fee": fee,
-                "n_trades": int(r.n_trades),
-                "win_rate": float(r.win_rate),
-                "profit_factor": float(r.profit_factor),
-                "expectancy": float(r.expectancy),
-            })
+            out.append(
+                {
+                    "product": product,
+                    "oversold": oversold,
+                    "proximity": proximity,
+                    "fee": fee,
+                    "n_trades": int(r.n_trades),
+                    "win_rate": float(r.win_rate),
+                    "profit_factor": float(r.profit_factor),
+                    "expectancy": float(r.expectancy),
+                }
+            )
         except Exception as exc:
-            out.append({"product": product, "oversold": oversold, "proximity": proximity,
-                        "fee": fee, "error": f"{type(exc).__name__}: {exc}"})
+            out.append(
+                {
+                    "product": product,
+                    "oversold": oversold,
+                    "proximity": proximity,
+                    "fee": fee,
+                    "error": f"{type(exc).__name__}: {exc}",
+                }
+            )
     return out
 
 
@@ -220,8 +257,11 @@ def anchor_rows() -> list[dict]:
 
 
 def main() -> None:
-    print(f"PRIMARY ARM: oversold {NEW_LEVELS} x {len(UNIVERSE)} assets "
-          f"(+ {ANCHOR_OVERSOLD} reused as anchor)", flush=True)
+    print(
+        f"PRIMARY ARM: oversold {NEW_LEVELS} x {len(UNIVERSE)} assets "
+        f"(+ {ANCHOR_OVERSOLD} reused as anchor)",
+        flush=True,
+    )
     jobs = [(a, o, "0.005") for o in NEW_LEVELS for a in UNIVERSE]
     _execute(jobs, OUT_PRIMARY, "primary")
 
@@ -231,16 +271,23 @@ def main() -> None:
     at_max = {
         r["product"]
         for r in rows
-        if "error" not in r and r["oversold"] == TRIGGER_AT_OVERSOLD
-        and r["fee"] == "0" and r["n_trades"] >= 100
+        if "error" not in r
+        and r["oversold"] == TRIGGER_AT_OVERSOLD
+        and r["fee"] == "0"
+        and r["n_trades"] >= 100
     }
-    print(f"\nTRIGGER CHECK: {len(at_max)}/{len(UNIVERSE)} assets reach n>=100 at "
-          f"oversold={TRIGGER_AT_OVERSOLD} (threshold: fewer than {TRIGGER_MIN_ASSETS} fires it)",
-          flush=True)
+    print(
+        f"\nTRIGGER CHECK: {len(at_max)}/{len(UNIVERSE)} assets reach n>=100 at "
+        f"oversold={TRIGGER_AT_OVERSOLD} (threshold: fewer than {TRIGGER_MIN_ASSETS} fires it)",
+        flush=True,
+    )
 
     if len(at_max) < TRIGGER_MIN_ASSETS:
-        print("TRIGGERED -> running the pre-declared conditional proximity arm, "
-              "to its own file, reported as a separate curve.", flush=True)
+        print(
+            "TRIGGERED -> running the pre-declared conditional proximity arm, "
+            "to its own file, reported as a separate curve.",
+            flush=True,
+        )
         cond = [
             (a, o, p)
             for o, p in itertools.product(NEW_LEVELS, PROXIMITY_LEVELS)

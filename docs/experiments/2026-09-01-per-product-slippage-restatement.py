@@ -40,10 +40,30 @@ Path(OUT_DIR).mkdir(parents=True, exist_ok=True)
 JSONL_PATH = f"{OUT_DIR}/per_product_slippage.jsonl"
 
 UNIVERSE = [
-    "BTC-USD", "ETH-USD", "ADA-USD", "LINK-USD", "LTC-USD", "SOL-USD",
-    "XLM-USD", "PAXG-USDT", "BCH-USD", "AAVE-USD", "DOGE-USD", "DOT-USD",
-    "UNI-USD", "ZEC-USD", "ALGO-USD", "FET-USD", "CRV-USD", "ICP-USD",
-    "AVAX-USD", "NEAR-USD", "XRP-USD", "PAXG-USD", "WLD-USD", "TON-USD",
+    "BTC-USD",
+    "ETH-USD",
+    "ADA-USD",
+    "LINK-USD",
+    "LTC-USD",
+    "SOL-USD",
+    "XLM-USD",
+    "PAXG-USDT",
+    "BCH-USD",
+    "AAVE-USD",
+    "DOGE-USD",
+    "DOT-USD",
+    "UNI-USD",
+    "ZEC-USD",
+    "ALGO-USD",
+    "FET-USD",
+    "CRV-USD",
+    "ICP-USD",
+    "AVAX-USD",
+    "NEAR-USD",
+    "XRP-USD",
+    "PAXG-USD",
+    "WLD-USD",
+    "TON-USD",
 ]
 RULES = ["turtle_breakout", "rsi_meanrev", "pullback_continuation", "cusum_event", "triple_barrier"]
 TAKER = Decimal("0.012")
@@ -93,23 +113,29 @@ def run_job(job):
             result = bt.backtest(
                 make_rule(kind, asset), candles, fee_pct=TAKER, slippage_pct=slippage
             )
-            rows.append({
-                "rule": kind,
-                "product": asset,
-                "regime": regime,
-                "slippage_pct": str(slippage),
-                "floor_multiple": float(per_product / bt.SLIPPAGE_FLOOR_PCT),
-                "daily_quote_volume": float(daily_volume),
-                "n_trades": int(result.n_trades),
-                "profit_factor": float(result.profit_factor),
-                "win_rate": float(result.win_rate),
-                "expectancy": float(result.expectancy),
-            })
+            rows.append(
+                {
+                    "rule": kind,
+                    "product": asset,
+                    "regime": regime,
+                    "slippage_pct": str(slippage),
+                    "floor_multiple": float(per_product / bt.SLIPPAGE_FLOOR_PCT),
+                    "daily_quote_volume": float(daily_volume),
+                    "n_trades": int(result.n_trades),
+                    "profit_factor": float(result.profit_factor),
+                    "win_rate": float(result.win_rate),
+                    "expectancy": float(result.expectancy),
+                }
+            )
         except Exception as exc:
-            rows.append({
-                "rule": kind, "product": asset, "regime": regime,
-                "error": f"{type(exc).__name__}: {exc}",
-            })
+            rows.append(
+                {
+                    "rule": kind,
+                    "product": asset,
+                    "regime": regime,
+                    "error": f"{type(exc).__name__}: {exc}",
+                }
+            )
     return rows
 
 
@@ -131,10 +157,7 @@ def done_combos():
 
 def main():
     jobs = [
-        (kind, asset)
-        for kind in RULES
-        for asset in UNIVERSE
-        if (kind, asset) not in done_combos()
+        (kind, asset) for kind in RULES for asset in UNIVERSE if (kind, asset) not in done_combos()
     ]
     print(f"{len(jobs)} combos ({len(jobs) * 2} trials) -> {JSONL_PATH}", flush=True)
     started = time.time()

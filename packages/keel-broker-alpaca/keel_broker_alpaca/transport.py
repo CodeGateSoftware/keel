@@ -206,7 +206,7 @@ class AlpacaTransport:
             if str(name).lower() == "retry-after":
                 try:
                     return float(str(value))
-                except (TypeError, ValueError):
+                except TypeError, ValueError:
                     break  # a malformed hint falls through to the computed backoff
         backoff: float = _BACKOFF_SECONDS * (2 ** (attempt - 1))
         return backoff
@@ -252,7 +252,7 @@ class AlpacaTransport:
             decoded = json.loads(response.text)
             if isinstance(decoded, dict):
                 message = str(decoded.get("message", ""))
-        except (ValueError, AttributeError):
+        except ValueError, AttributeError:
             pass
         return AlpacaAPIError(status, message or f"HTTP {status} with no error body")
 

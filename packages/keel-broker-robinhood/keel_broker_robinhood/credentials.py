@@ -82,7 +82,7 @@ def raw_key_bytes(value: str) -> bytes | None:
     """
     try:
         raw = base64.b64decode(value, validate=True)
-    except (ValueError, TypeError):
+    except ValueError, TypeError:
         return None
     return raw if len(raw) == KEY_RAW_LEN else None
 

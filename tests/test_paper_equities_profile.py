@@ -496,7 +496,7 @@ def test_runner_script_has_a_notify_seam_shaped_like_keel_live_runs():
     text = RUN_SCRIPT.read_text()
     assert 'OSASCRIPT="/usr/bin/osascript"' in text
     assert "notify() {" in text
-    assert '2>/dev/null || true' in text
+    assert "2>/dev/null || true" in text
 
 
 def test_a_failing_fetch_notifies_and_the_cycle_still_runs(tmp_path):

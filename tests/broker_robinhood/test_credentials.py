@@ -150,9 +150,7 @@ def test_no_summary_ever_carries_the_raw_secret_value() -> None:
         find_credential_defect(None, None),
         find_credential_defect(_VALID_API_KEY, "tooshort"),
         find_credential_defect(_ITS_PUBLIC_KEY_B64, _VALID_SEED_B64),
-        find_credential_defect(
-            base64.b64encode(bytes(range(100, 132))).decode(), _VALID_SEED_B64
-        ),
+        find_credential_defect(base64.b64encode(bytes(range(100, 132))).decode(), _VALID_SEED_B64),
     ):
         assert defect is not None
         assert _VALID_SEED_B64 not in defect.summary

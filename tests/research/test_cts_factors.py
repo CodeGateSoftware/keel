@@ -61,8 +61,7 @@ def _sample(vectors: dict[str, list[int]]) -> FactorSample:
     length = len(next(iter(vectors.values())))
     filled = {name: vectors.get(name, [0] * length) for name in FACTOR_NAMES}
     totals = [
-        sum(DEFAULT_WEIGHTS[name] * filled[name][i] for name in FACTOR_NAMES)
-        for i in range(length)
+        sum(DEFAULT_WEIGHTS[name] * filled[name][i] for name in FACTOR_NAMES) for i in range(length)
     ]
     n = length
     return FactorSample(vectors=filled, totals=totals, labels=[str(i) for i in range(n)])
@@ -173,9 +172,7 @@ def test_holm_charges_the_family_size_actually_tested() -> None:
 
 def test_variance_ratio_is_one_when_factors_are_independent_by_construction() -> None:
     """Two factors crossed on a full 2x2 design have exactly zero covariance."""
-    sample = _sample(
-        {"condition_aligned": [1, 1, 0, 0] * 40, "ema_fan_aligned": [1, 0, 1, 0] * 40}
-    )
+    sample = _sample({"condition_aligned": [1, 1, 0, 0] * 40, "ema_fan_aligned": [1, 0, 1, 0] * 40})
     report = variance_report(sample)
     assert report.ratio == pytest.approx(Decimal(1), abs=Decimal("0.02"))
 
@@ -251,9 +248,7 @@ def test_replay_totals_match_the_shipped_scorer() -> None:
     candles = _candles(230)
     sample = replay_every_bar("BTC-USD", candles, warmup=220)
     for index in range(sample.n):
-        rebuilt = sum(
-            DEFAULT_WEIGHTS[name] * sample.vectors[name][index] for name in FACTOR_NAMES
-        )
+        rebuilt = sum(DEFAULT_WEIGHTS[name] * sample.vectors[name][index] for name in FACTOR_NAMES)
         assert sample.totals[index] == rebuilt
 
 

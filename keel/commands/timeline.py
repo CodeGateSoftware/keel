@@ -181,7 +181,6 @@ class TimelineReport:
     filtered_count: int
     rows: tuple[TimelineRow, ...]
 
-
     #: Every kind present in the SCOPED set, in `TIMELINE_KINDS` order -- what a chip bar is
     #: built from. STORED rather than derived from `rows`, because `rows` is what the chip and
     #: the cap left: derived from those, selecting Flows would delete the Trades chip and leave
@@ -243,7 +242,6 @@ class TimelineReport:
         return self.log_status not in ("ok", "missing")
 
 
-
 #: The cap on one PAGE of the merged feed -- the response slice, not the read.
 #:
 #: Stated precisely because the first version of this note was wrong: the four reads underneath
@@ -257,6 +255,7 @@ class TimelineReport:
 #: show. `export_rows` deliberately does not use it.
 DEFAULT_TIMELINE_LIMIT = 200
 MAX_TIMELINE_LIMIT = 2000
+
 
 class _Chain:
     """The chain state, as the two fields a `TimelineRow` carries.
@@ -320,9 +319,7 @@ def _order_rows(repo: Repository, since_ts: int | None, chain: _Chain) -> list[T
     return rows
 
 
-def _transaction_rows(
-    repo: Repository, since_ts: int | None, chain: _Chain
-) -> list[TimelineRow]:
+def _transaction_rows(repo: Repository, since_ts: int | None, chain: _Chain) -> list[TimelineRow]:
     """`transactions` -> flow rows.
 
     `imported-ledger`, never `venue-reported`: these lines came out of a CSV the operator
@@ -354,9 +351,7 @@ def _transaction_rows(
     return rows
 
 
-def _attestation_rows(
-    repo: Repository, since_ts: int | None, chain: _Chain
-) -> list[TimelineRow]:
+def _attestation_rows(repo: Repository, since_ts: int | None, chain: _Chain) -> list[TimelineRow]:
     """The attestation tables -> attestation rows.
 
     `human-attested`: someone typed this and signed their name to it, which is a different kind
@@ -413,9 +408,7 @@ def _attestation_rows(
     return rows
 
 
-def _journal_rows(
-    repo: Repository, since_ts: int | None, chain: _Chain
-) -> list[TimelineRow]:
+def _journal_rows(repo: Repository, since_ts: int | None, chain: _Chain) -> list[TimelineRow]:
     """`journal` -> attestation rows (#705).
 
     Under the ATTESTATION chip, because that is the kind of thing this is -- something a person

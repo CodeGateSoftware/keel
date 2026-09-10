@@ -71,9 +71,7 @@ def _utc_date(ts: int) -> str:
     return datetime.fromtimestamp(ts, UTC).strftime("%Y-%m-%d")
 
 
-def apply_scope_attest(
-    repo: Repository, *, venue: str | None, trading: bool, now_ts: int
-) -> str:
+def apply_scope_attest(repo: Repository, *, venue: str | None, trading: bool, now_ts: int) -> str:
     """`scope attest`'s write: resolve the venue, upsert the record, return the confirmation
     line.
 
@@ -120,8 +118,7 @@ def apply_scope_attest(
         line += " -- rail 20 will veto live ENTRIES on this credential"
     if existing is not None and existing.refuted_ts is not None:
         line += (
-            " (a prior credential on this venue was refuted on "
-            f"{_utc_date(existing.refuted_ts)})"
+            f" (a prior credential on this venue was refuted on {_utc_date(existing.refuted_ts)})"
         )
     return line
 

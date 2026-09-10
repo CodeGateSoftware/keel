@@ -709,7 +709,7 @@ def discover_candidates(
         raw_volume = product.get("quote_24h_volume")
         try:
             volume = Decimal(str(raw_volume))
-        except (TypeError, ArithmeticError, ValueError):
+        except TypeError, ArithmeticError, ValueError:
             unreadable_volume += 1
             continue
         # `Decimal("NaN")`/`Decimal("sNaN")` PARSE cleanly -- the `try` above does not catch

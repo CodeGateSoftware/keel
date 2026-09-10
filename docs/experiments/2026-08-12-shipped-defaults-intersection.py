@@ -71,10 +71,30 @@ JSONL_PATH = f"{OUT_DIR}/intersection.jsonl"
 JSON_PATH = f"{OUT_DIR}/intersection.json"
 
 UNIVERSE = [
-    "BTC-USD", "ETH-USD", "ADA-USD", "LINK-USD", "LTC-USD", "SOL-USD",
-    "XLM-USD", "PAXG-USDT", "BCH-USD", "AAVE-USD", "DOGE-USD", "DOT-USD",
-    "UNI-USD", "ZEC-USD", "ALGO-USD", "FET-USD", "CRV-USD", "ICP-USD",
-    "AVAX-USD", "NEAR-USD", "XRP-USD", "PAXG-USD", "WLD-USD", "TON-USD",
+    "BTC-USD",
+    "ETH-USD",
+    "ADA-USD",
+    "LINK-USD",
+    "LTC-USD",
+    "SOL-USD",
+    "XLM-USD",
+    "PAXG-USDT",
+    "BCH-USD",
+    "AAVE-USD",
+    "DOGE-USD",
+    "DOT-USD",
+    "UNI-USD",
+    "ZEC-USD",
+    "ALGO-USD",
+    "FET-USD",
+    "CRV-USD",
+    "ICP-USD",
+    "AVAX-USD",
+    "NEAR-USD",
+    "XRP-USD",
+    "PAXG-USD",
+    "WLD-USD",
+    "TON-USD",
 ]
 
 ARM_B_EXCLUDE = {"ZEC-USD", "FET-USD", "SOL-USD", "DOGE-USD", "ETH-USD", "BTC-USD"}
@@ -139,34 +159,44 @@ def run_job(job):
         candles = repo.get_candles(asset, Granularity.ONE_HOUR)
     except Exception as e:
         for fee in FEES:
-            rows.append({
-                "arm": arm, "rule": rule, "product": asset, "fee": fee,
-                "error": f"{type(e).__name__}: {e}",
-            })
+            rows.append(
+                {
+                    "arm": arm,
+                    "rule": rule,
+                    "product": asset,
+                    "fee": fee,
+                    "error": f"{type(e).__name__}: {e}",
+                }
+            )
         return rows
 
     for fee in FEES:
         try:
             rule_obj = make_rule(arm, rule, asset)
-            result = bt.backtest(
-                rule_obj, candles, fee_pct=Decimal(fee), slippage_pct=SLIPPAGE
+            result = bt.backtest(rule_obj, candles, fee_pct=Decimal(fee), slippage_pct=SLIPPAGE)
+            rows.append(
+                {
+                    "arm": arm,
+                    "rule": rule,
+                    "product": asset,
+                    "fee": fee,
+                    "n_trades": int(result.n_trades),
+                    "win_rate": float(result.win_rate),
+                    "profit_factor": float(result.profit_factor),
+                    "expectancy": float(result.expectancy),
+                    "max_drawdown": float(result.max_drawdown),
+                }
             )
-            rows.append({
-                "arm": arm,
-                "rule": rule,
-                "product": asset,
-                "fee": fee,
-                "n_trades": int(result.n_trades),
-                "win_rate": float(result.win_rate),
-                "profit_factor": float(result.profit_factor),
-                "expectancy": float(result.expectancy),
-                "max_drawdown": float(result.max_drawdown),
-            })
         except Exception as e:
-            rows.append({
-                "arm": arm, "rule": rule, "product": asset, "fee": fee,
-                "error": f"{type(e).__name__}: {e}",
-            })
+            rows.append(
+                {
+                    "arm": arm,
+                    "rule": rule,
+                    "product": asset,
+                    "fee": fee,
+                    "error": f"{type(e).__name__}: {e}",
+                }
+            )
     return rows
 
 
@@ -224,10 +254,16 @@ def main():
                     rows = fut.result()
                 except Exception as e:
                     arm, rule, asset = job
-                    rows = [{
-                        "arm": arm, "rule": rule, "product": asset, "fee": fee,
-                        "error": f"{type(e).__name__}: {e}",
-                    } for fee in FEES]
+                    rows = [
+                        {
+                            "arm": arm,
+                            "rule": rule,
+                            "product": asset,
+                            "fee": fee,
+                            "error": f"{type(e).__name__}: {e}",
+                        }
+                        for fee in FEES
+                    ]
 
                 for row in rows:
                     jf.write(json.dumps(row) + "\n")

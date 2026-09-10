@@ -73,7 +73,7 @@ class FakeBroker:
         return PlaceResult(success=True, broker_order_id="fake-order-1")
 
     def cancel_order(self, order_id: str) -> bool:
-        return True        # a CONFIRMED cancel -- see `_cancel_at_exchange`
+        return True  # a CONFIRMED cancel -- see `_cancel_at_exchange`
 
 
 # -- db import ------------------------------------------------------------------------------
@@ -89,7 +89,6 @@ def test_db_import_runs_importer_against_temp_db(tmp_path):
     assert "imported=" in result.output
     repo = _repo_at(db_path)
     assert len(repo.get_transactions()) > 0
-
 
 
 # -- disclaimer -----------------------------------------------------------------------------
@@ -117,9 +116,6 @@ def test_disclaimer_shown_even_when_refused(tmp_path):
 # -- agent --bypass gating --------------------------------------------------------------------
 
 
-
-
-
 def test_agent_confirm_mode_needs_no_passphrase(tmp_path, valid_config_path, monkeypatch):
     monkeypatch.setattr(cli_module, "_build_broker", lambda config, **_kw: FakeBroker())
     db_path = tmp_path / "test.db"
@@ -128,9 +124,11 @@ def test_agent_confirm_mode_needs_no_passphrase(tmp_path, valid_config_path, mon
     result = runner.invoke(
         cli,
         [
-            "--db", str(db_path),
-            "--config", str(valid_config_path),
-                        "agent",
+            "--db",
+            str(db_path),
+            "--config",
+            str(valid_config_path),
+            "agent",
         ],
     )
 
@@ -145,9 +143,16 @@ def test_agent_loop_bounded_by_max_cycles(tmp_path, valid_config_path, monkeypat
     result = runner.invoke(
         cli,
         [
-            "--db", str(db_path),
-            "--config", str(valid_config_path),
-            "agent", "--loop", "--max-cycles", "3", "--interval", "0",
+            "--db",
+            str(db_path),
+            "--config",
+            str(valid_config_path),
+            "agent",
+            "--loop",
+            "--max-cycles",
+            "3",
+            "--interval",
+            "0",
         ],
     )
 
@@ -169,8 +174,10 @@ def test_agent_prints_paper_equity_and_drawdown_line(tmp_path, write_config, mon
     result = runner.invoke(
         cli,
         [
-            "--db", str(db_path),
-            "--config", str(config_path),
+            "--db",
+            str(db_path),
+            "--config",
+            str(config_path),
             "agent",
         ],
     )
@@ -244,9 +251,7 @@ def test_agent_exits_zero_and_reports_blocked_zero_when_nothing_is_blocked(
     _repo_at(db_path).set_state("kill_switch", False)
     runner = CliRunner()
 
-    result = runner.invoke(
-        cli, ["--db", str(db_path), "--config", str(valid_config_path), "agent"]
-    )
+    result = runner.invoke(cli, ["--db", str(db_path), "--config", str(valid_config_path), "agent"])
 
     assert result.exit_code == 0, result.output
     assert "signals=0" in result.output
@@ -276,9 +281,16 @@ def test_agent_loop_does_not_exit_the_process_when_a_cycle_is_blocked(
     result = runner.invoke(
         cli,
         [
-            "--db", str(db_path),
-            "--config", str(config_path),
-            "agent", "--loop", "--max-cycles", "1", "--interval", "0",
+            "--db",
+            str(db_path),
+            "--config",
+            str(config_path),
+            "agent",
+            "--loop",
+            "--max-cycles",
+            "1",
+            "--interval",
+            "0",
         ],
     )
 
@@ -316,48 +328,38 @@ def test_agent_exits_clock_unavailable_when_the_session_clock_cannot_be_read(
     silently loses the trading day to a skip that carried no information. Mirrors
     `DATA_NOT_READY_EXIT`'s contract; see `agent.MARKET_CLOCK_UNAVAILABLE_EXIT`."""
     monkeypatch.setattr(
-        cli_module, "_build_broker", lambda config, **_kw: _SessionClockCLIBroker(
-            SessionState.CLOCK_UNAVAILABLE
-        )
+        cli_module,
+        "_build_broker",
+        lambda config, **_kw: _SessionClockCLIBroker(SessionState.CLOCK_UNAVAILABLE),
     )
     db_path = tmp_path / "test.db"
     _repo_at(db_path).set_state("kill_switch", False)
     runner = CliRunner()
 
-    result = runner.invoke(
-        cli, ["--db", str(db_path), "--config", str(valid_config_path), "agent"]
-    )
+    result = runner.invoke(cli, ["--db", str(db_path), "--config", str(valid_config_path), "agent"])
 
     assert result.exit_code == agent.MARKET_CLOCK_UNAVAILABLE_EXIT, result.output
     assert "skipped: market_clock_unavailable" in result.output
 
 
-def test_agent_still_exits_zero_on_a_market_closed_skip(
-    tmp_path, valid_config_path, monkeypatch
-):
+def test_agent_still_exits_zero_on_a_market_closed_skip(tmp_path, valid_config_path, monkeypatch):
     """The other skip kind, and the reason the two need distinct treatment: a CLOSED venue
     (weekend, holiday) is a fact about the calendar, the skip is correct cadence bookkeeping
     -- nothing more can happen that day -- and stamping it is right. Only the degraded
     clock read must decline to stamp."""
     monkeypatch.setattr(
-        cli_module, "_build_broker", lambda config, **_kw: _SessionClockCLIBroker(
-            SessionState.CLOSED
-        )
+        cli_module,
+        "_build_broker",
+        lambda config, **_kw: _SessionClockCLIBroker(SessionState.CLOSED),
     )
     db_path = tmp_path / "test.db"
     _repo_at(db_path).set_state("kill_switch", False)
     runner = CliRunner()
 
-    result = runner.invoke(
-        cli, ["--db", str(db_path), "--config", str(valid_config_path), "agent"]
-    )
+    result = runner.invoke(cli, ["--db", str(db_path), "--config", str(valid_config_path), "agent"])
 
     assert result.exit_code == 0, result.output
     assert "skipped: market_closed" in result.output
-
-
-
-
 
 
 # -- kill / resume ----------------------------------------------------------------------------
@@ -386,7 +388,6 @@ def test_resume_without_passphrase_is_refused(tmp_path):
     assert repo.get_state("kill_switch", default=True) is True
 
 
-
 def test_resume_disengages_when_confirmed(tmp_path, monkeypatch):
     _at_a_terminal(monkeypatch)
     db_path = tmp_path / "test.db"
@@ -396,8 +397,9 @@ def test_resume_disengages_when_confirmed(tmp_path, monkeypatch):
     result = runner.invoke(
         cli,
         [
-            "--db", str(db_path),
-                        "resume",
+            "--db",
+            str(db_path),
+            "resume",
         ],
         input="yes\n",
     )
@@ -450,9 +452,11 @@ def test_monitor_single_poll_needs_no_passphrase(tmp_path, valid_config_path, mo
     result = runner.invoke(
         cli,
         [
-            "--db", str(db_path),
-            "--config", str(valid_config_path),
-                        "monitor",
+            "--db",
+            str(db_path),
+            "--config",
+            str(valid_config_path),
+            "monitor",
         ],
     )
 
@@ -468,9 +472,16 @@ def test_monitor_loop_bounded_by_max_cycles(tmp_path, valid_config_path, monkeyp
     result = runner.invoke(
         cli,
         [
-            "--db", str(db_path),
-            "--config", str(valid_config_path),
-            "monitor", "--loop", "--max-cycles", "2", "--interval", "0",
+            "--db",
+            str(db_path),
+            "--config",
+            str(valid_config_path),
+            "monitor",
+            "--loop",
+            "--max-cycles",
+            "2",
+            "--interval",
+            "0",
         ],
     )
 
@@ -517,9 +528,16 @@ def test_monitor_skips_polling_while_the_venue_reports_closed(
     result = runner.invoke(
         cli,
         [
-            "--db", str(db_path),
-            "--config", str(valid_config_path),
-            "monitor", "--loop", "--max-cycles", "3", "--interval", "0",
+            "--db",
+            str(db_path),
+            "--config",
+            str(valid_config_path),
+            "monitor",
+            "--loop",
+            "--max-cycles",
+            "3",
+            "--interval",
+            "0",
         ],
     )
 
@@ -535,9 +553,7 @@ def test_monitor_skips_polling_while_the_venue_reports_closed(
 def test_monitor_resumes_polling_when_the_venue_reopens(tmp_path, valid_config_path, monkeypatch):
     """Closed, closed, then open: two skipped cycles produce ONE skip line, and the open
     cycle polls exactly as it always did."""
-    broker = _SessionClockFakeBroker(
-        [SessionState.CLOSED, SessionState.CLOSED, SessionState.OPEN]
-    )
+    broker = _SessionClockFakeBroker([SessionState.CLOSED, SessionState.CLOSED, SessionState.OPEN])
     monkeypatch.setattr(cli_module, "_build_broker", lambda config, **_kw: broker)
     db_path = tmp_path / "test.db"
     runner = CliRunner()
@@ -545,9 +561,16 @@ def test_monitor_resumes_polling_when_the_venue_reopens(tmp_path, valid_config_p
     result = runner.invoke(
         cli,
         [
-            "--db", str(db_path),
-            "--config", str(valid_config_path),
-            "monitor", "--loop", "--max-cycles", "3", "--interval", "0",
+            "--db",
+            str(db_path),
+            "--config",
+            str(valid_config_path),
+            "monitor",
+            "--loop",
+            "--max-cycles",
+            "3",
+            "--interval",
+            "0",
         ],
     )
 
@@ -568,9 +591,16 @@ def test_monitor_polls_as_today_when_the_venue_is_open(tmp_path, valid_config_pa
     result = runner.invoke(
         cli,
         [
-            "--db", str(db_path),
-            "--config", str(valid_config_path),
-            "monitor", "--loop", "--max-cycles", "2", "--interval", "0",
+            "--db",
+            str(db_path),
+            "--config",
+            str(valid_config_path),
+            "monitor",
+            "--loop",
+            "--max-cycles",
+            "2",
+            "--interval",
+            "0",
         ],
     )
 
@@ -635,8 +665,15 @@ def test_rules_backtest_states_the_fee_rate_it_priced_fills_at(tmp_path, valid_c
 
     result = runner.invoke(
         cli,
-        ["--db", str(db_path), "--config", str(valid_config_path), "rules", "backtest",
-         str(rule_id)],
+        [
+            "--db",
+            str(db_path),
+            "--config",
+            str(valid_config_path),
+            "rules",
+            "backtest",
+            str(rule_id),
+        ],
     )
 
     assert result.exit_code == 0, result.output
@@ -686,9 +723,13 @@ def test_rules_promote_stays_when_floor_not_cleared(tmp_path, valid_config_path)
     result = runner.invoke(
         cli,
         [
-            "--db", str(db_path),
-            "--config", str(valid_config_path),
-            "rules", "promote", str(rule_id),
+            "--db",
+            str(db_path),
+            "--config",
+            str(valid_config_path),
+            "rules",
+            "promote",
+            str(rule_id),
         ],
     )
 
@@ -709,9 +750,7 @@ def test_rules_promote_force_advances_candidate_to_paper_without_a_passing_backt
     rule_id = repo.insert_rule("pullback_continuation", {"product_id": "BTC-USD"})
     runner = CliRunner()
 
-    result = runner.invoke(
-        cli, ["--db", str(db_path), "rules", "promote", str(rule_id), "--force"]
-    )
+    result = runner.invoke(cli, ["--db", str(db_path), "rules", "promote", str(rule_id), "--force"])
 
     assert result.exit_code == 0, result.output
     assert "status -> paper" in result.output
@@ -725,9 +764,7 @@ def test_rules_promote_force_advances_paper_to_live(tmp_path):
     rule_id = repo.insert_rule("dca", {"product_id": "BTC-USD"}, status="paper")
     runner = CliRunner()
 
-    result = runner.invoke(
-        cli, ["--db", str(db_path), "rules", "promote", str(rule_id), "--force"]
-    )
+    result = runner.invoke(cli, ["--db", str(db_path), "rules", "promote", str(rule_id), "--force"])
 
     assert result.exit_code == 0, result.output
     assert "status -> live" in result.output
@@ -741,9 +778,7 @@ def test_rules_promote_force_on_live_rule_is_a_noop(tmp_path):
     rule_id = repo.insert_rule("dca", {"product_id": "BTC-USD"}, status="live")
     runner = CliRunner()
 
-    result = runner.invoke(
-        cli, ["--db", str(db_path), "rules", "promote", str(rule_id), "--force"]
-    )
+    result = runner.invoke(cli, ["--db", str(db_path), "rules", "promote", str(rule_id), "--force"])
 
     assert result.exit_code == 0, result.output
     assert "nothing to promote" in result.output.lower()
@@ -757,9 +792,7 @@ def test_rules_promote_force_on_disabled_rule_is_a_noop(tmp_path):
     rule_id = repo.insert_rule("dca", {"product_id": "BTC-USD"}, status="disabled")
     runner = CliRunner()
 
-    result = runner.invoke(
-        cli, ["--db", str(db_path), "rules", "promote", str(rule_id), "--force"]
-    )
+    result = runner.invoke(cli, ["--db", str(db_path), "rules", "promote", str(rule_id), "--force"])
 
     assert result.exit_code == 0, result.output
     assert "nothing to promote" in result.output.lower()
@@ -773,9 +806,7 @@ def test_rules_promote_force_prints_a_loud_bypass_warning(tmp_path):
     rule_id = repo.insert_rule("pullback_continuation", {"product_id": "BTC-USD"})
     runner = CliRunner()
 
-    result = runner.invoke(
-        cli, ["--db", str(db_path), "rules", "promote", str(rule_id), "--force"]
-    )
+    result = runner.invoke(cli, ["--db", str(db_path), "rules", "promote", str(rule_id), "--force"])
 
     assert result.exit_code == 0, result.output
     assert "bypass" in result.output.lower()
@@ -793,9 +824,13 @@ def test_rules_promote_unknown_id_refuses_before_the_config_load(tmp_path):
     result = runner.invoke(
         cli,
         [
-            "--db", str(db_path),
-            "--config", str(tmp_path / "missing.yaml"),
-            "rules", "promote", "999",
+            "--db",
+            str(db_path),
+            "--config",
+            str(tmp_path / "missing.yaml"),
+            "rules",
+            "promote",
+            "999",
         ],
     )
 
@@ -817,9 +852,13 @@ def test_rules_promote_known_id_still_loads_the_config_on_the_gated_path(
     result = runner.invoke(
         cli,
         [
-            "--db", str(db_path),
-            "--config", str(tmp_path / "missing.yaml"),
-            "rules", "promote", str(rule_id),
+            "--db",
+            str(db_path),
+            "--config",
+            str(tmp_path / "missing.yaml"),
+            "rules",
+            "promote",
+            str(rule_id),
         ],
     )
 
@@ -841,9 +880,13 @@ def test_rules_promote_without_force_still_gates_on_the_backtest(tmp_path, valid
     result = runner.invoke(
         cli,
         [
-            "--db", str(db_path),
-            "--config", str(valid_config_path),
-            "rules", "promote", str(rule_id),
+            "--db",
+            str(db_path),
+            "--config",
+            str(valid_config_path),
+            "rules",
+            "promote",
+            str(rule_id),
         ],
     )
 
@@ -853,9 +896,7 @@ def test_rules_promote_without_force_still_gates_on_the_backtest(tmp_path, valid
     assert row["status"] == "candidate"
 
 
-def test_rules_promote_reports_that_the_overfitting_check_did_not_run(
-    tmp_path, valid_config_path
-):
+def test_rules_promote_reports_that_the_overfitting_check_did_not_run(tmp_path, valid_config_path):
     """Without `--pbo-session` the G4 check cannot run, and the output SAYS SO.
 
     The visible half of #247. Before it, `rules promote` printed only `status -> X` and an
@@ -868,8 +909,15 @@ def test_rules_promote_reports_that_the_overfitting_check_did_not_run(
 
     result = CliRunner().invoke(
         cli,
-        ["--db", str(db_path), "--config", str(valid_config_path),
-         "rules", "promote", str(rule_id)],
+        [
+            "--db",
+            str(db_path),
+            "--config",
+            str(valid_config_path),
+            "rules",
+            "promote",
+            str(rule_id),
+        ],
     )
 
     assert result.exit_code == 0, result.output
@@ -894,8 +942,17 @@ def test_rules_promote_errors_rather_than_downgrading_an_unusable_pbo_session(
 
     result = CliRunner().invoke(
         cli,
-        ["--db", str(db_path), "--config", str(valid_config_path),
-         "rules", "promote", str(rule_id), "--pbo-session", "no-such-session"],
+        [
+            "--db",
+            str(db_path),
+            "--config",
+            str(valid_config_path),
+            "rules",
+            "promote",
+            str(rule_id),
+            "--pbo-session",
+            "no-such-session",
+        ],
     )
 
     assert result.exit_code != 0
@@ -971,8 +1028,15 @@ def test_rules_promote_reports_both_readings_and_promotes_via_the_pooled_path(
 
     result = CliRunner().invoke(
         cli,
-        ["--db", str(db_path), "--config", str(valid_config_path),
-         "rules", "promote", str(rule_id)],
+        [
+            "--db",
+            str(db_path),
+            "--config",
+            str(valid_config_path),
+            "rules",
+            "promote",
+            str(rule_id),
+        ],
     )
 
     assert result.exit_code == 0, result.output
@@ -1020,8 +1084,15 @@ def test_rules_promote_names_the_diversity_failure_when_the_pool_is_too_narrow(
 
     result = CliRunner().invoke(
         cli,
-        ["--db", str(db_path), "--config", str(valid_config_path),
-         "rules", "promote", str(rule_id)],
+        [
+            "--db",
+            str(db_path),
+            "--config",
+            str(valid_config_path),
+            "rules",
+            "promote",
+            str(rule_id),
+        ],
     )
 
     assert result.exit_code == 0, result.output
@@ -1030,9 +1101,7 @@ def test_rules_promote_names_the_diversity_failure_when_the_pool_is_too_narrow(
     assert "status -> candidate" in result.output
 
 
-def test_rules_promote_with_no_siblings_prints_no_pooled_reading(
-    tmp_path, valid_config_path
-):
+def test_rules_promote_with_no_siblings_prints_no_pooled_reading(tmp_path, valid_config_path):
     """Default behavior for a single-product promotion is unchanged: no siblings in the
     table means no pooled reading in the output -- the per-rule decision, alone, exactly
     as before #338."""
@@ -1042,8 +1111,15 @@ def test_rules_promote_with_no_siblings_prints_no_pooled_reading(
 
     result = CliRunner().invoke(
         cli,
-        ["--db", str(db_path), "--config", str(valid_config_path),
-         "rules", "promote", str(rule_id)],
+        [
+            "--db",
+            str(db_path),
+            "--config",
+            str(valid_config_path),
+            "rules",
+            "promote",
+            str(rule_id),
+        ],
     )
 
     assert result.exit_code == 0, result.output
@@ -1213,11 +1289,16 @@ def test_rules_seed_respects_products_and_kinds_options(tmp_path, valid_config_p
     result = runner.invoke(
         cli,
         [
-            "--db", str(db_path),
-            "--config", str(valid_config_path),
-            "rules", "seed",
-            "--products", "BTC-USD",
-            "--kinds", "dca",
+            "--db",
+            str(db_path),
+            "--config",
+            str(valid_config_path),
+            "rules",
+            "seed",
+            "--products",
+            "BTC-USD",
+            "--kinds",
+            "dca",
         ],
     )
 
@@ -1235,10 +1316,14 @@ def test_rules_seed_unknown_kind_errors(tmp_path):
     result = runner.invoke(
         cli,
         [
-            "--db", str(db_path),
-            "rules", "seed",
-            "--products", "BTC-USD",
-            "--kinds", "not_a_real_kind",
+            "--db",
+            str(db_path),
+            "rules",
+            "seed",
+            "--products",
+            "BTC-USD",
+            "--kinds",
+            "not_a_real_kind",
         ],
     )
 
@@ -1269,11 +1354,16 @@ def test_rules_seed_needs_no_passphrase(tmp_path, valid_config_path):
     result = runner.invoke(
         cli,
         [
-            "--db", str(db_path),
-            "--config", str(valid_config_path),
-            "rules", "seed",
-            "--products", "BTC-USD",
-            "--kinds", "dca",
+            "--db",
+            str(db_path),
+            "--config",
+            str(valid_config_path),
+            "rules",
+            "seed",
+            "--products",
+            "BTC-USD",
+            "--kinds",
+            "dca",
         ],
     )
 
@@ -1764,9 +1854,7 @@ def test_loading_config_binds_the_venue_for_telemetry(tmp_path: Path) -> None:
 
     assert telemetry.current_venue() is None
 
-    result = CliRunner().invoke(
-        cli, ["--db", str(tmp_path / "keel.db"), "subscription", "show"]
-    )
+    result = CliRunner().invoke(cli, ["--db", str(tmp_path / "keel.db"), "subscription", "show"])
 
     assert result.exit_code == 0, result.output
     assert telemetry.current_venue() == DEFAULT_VENUE
@@ -1798,13 +1886,12 @@ def test_resume_entries_clears_an_armed_streak_halt(tmp_path, monkeypatch):
 
     result = runner.invoke(
         cli,
-        ["--db", str(db_path),          "resume-entries"],
+        ["--db", str(db_path), "resume-entries"],
         input="yes\n",
     )
 
     assert result.exit_code == 0, result.output
     assert _repo_at(db_path).get_state("streak_halt_until") == 0
-
 
 
 def test_reset_hwm_clears_the_equity_high_water_mark(tmp_path, monkeypatch):
@@ -1820,7 +1907,7 @@ def test_reset_hwm_clears_the_equity_high_water_mark(tmp_path, monkeypatch):
 
     result = runner.invoke(
         cli,
-        ["--db", str(db_path),          "reset-hwm"],
+        ["--db", str(db_path), "reset-hwm"],
         input="yes\n",
     )
 
@@ -1841,7 +1928,7 @@ def test_record_flow_rebases_the_high_water_mark(tmp_path, monkeypatch):
 
     result = runner.invoke(
         cli,
-        ["--db", str(db_path),          "record-flow", "--amount", "5000"],
+        ["--db", str(db_path), "record-flow", "--amount", "5000"],
         input="yes\n",
     )
 
@@ -1858,13 +1945,12 @@ def test_record_flow_accepts_a_negative_amount_for_a_withdrawal(tmp_path, monkey
 
     result = runner.invoke(
         cli,
-        ["--db", str(db_path),          "record-flow", "--amount", "-5000"],
+        ["--db", str(db_path), "record-flow", "--amount", "-5000"],
         input="yes\n",
     )
 
     assert result.exit_code == 0, result.output
     assert _repo_at(db_path).get_state("equity_high_water_mark") == Decimal("10000")
-
 
 
 def test_record_flow_rejects_a_non_finite_amount(tmp_path, monkeypatch):
@@ -1878,7 +1964,7 @@ def test_record_flow_rejects_a_non_finite_amount(tmp_path, monkeypatch):
 
     result = runner.invoke(
         cli,
-        ["--db", str(db_path),          "record-flow", "--amount", "nan"],
+        ["--db", str(db_path), "record-flow", "--amount", "nan"],
         input="yes\n",
     )
 
@@ -2166,11 +2252,17 @@ def test_autonomy_on_rejects_a_nonsensical_for_hours(tmp_path, monkeypatch, vali
         _repo_at(db)
         result = CliRunner().invoke(
             cli,
-            ["--db", str(db), "--config", str(valid_config_path),
-             "autonomy", "on", "--for-hours", bad],
+            [
+                "--db",
+                str(db),
+                "--config",
+                str(valid_config_path),
+                "autonomy",
+                "on",
+                "--for-hours",
+                bad,
+            ],
             input="yes\n",
         )
         assert result.exit_code != 0, f"--for-hours {bad} should be rejected: {result.output}"
         assert _repo_at(db).get_profile().autonomous is False
-
-

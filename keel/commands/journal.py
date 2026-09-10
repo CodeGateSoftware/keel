@@ -166,9 +166,7 @@ def gather_journal(repo: Repository, *, now_ts: int, limit: int | None = None) -
         )
         for row in repo.get_journal_entries(limit=limit)
     )
-    return JournalReport(
-        now_ts=now_ts, entries=entries, total_count=repo.count_journal_entries()
-    )
+    return JournalReport(now_ts=now_ts, entries=entries, total_count=repo.count_journal_entries())
 
 
 def _optional_text(value: object) -> str | None:
@@ -325,9 +323,7 @@ def journal_add(ctx: click.Context) -> None:
     click.echo("Every question may be skipped; a blank answer records that you did not say.")
 
     emotion = parse_emotion(
-        click.prompt(
-            f"emotion ({EMOTION_MIN}-{EMOTION_MAX})", default="", show_default=False
-        )
+        click.prompt(f"emotion ({EMOTION_MIN}-{EMOTION_MAX})", default="", show_default=False)
     )
     rules = parse_rules_followed(
         click.prompt("did you follow your rules? (y/n)", default="", show_default=False)

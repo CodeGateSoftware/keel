@@ -191,14 +191,10 @@ class _TrivialRule(Rule):
     name = "trivial"
     params: dict = {}
 
-    def detect(
-        self, candles_by_tf: dict[Granularity, list[Candle]]
-    ) -> Setup | None:
+    def detect(self, candles_by_tf: dict[Granularity, list[Candle]]) -> Setup | None:
         return None
 
-    def exit_signal(
-        self, held: Setup, candles_by_tf: dict[Granularity, list[Candle]]
-    ) -> bool:
+    def exit_signal(self, held: Setup, candles_by_tf: dict[Granularity, list[Candle]]) -> bool:
         return False
 
     def describe(self) -> dict:

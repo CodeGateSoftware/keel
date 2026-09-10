@@ -225,7 +225,7 @@ def scope_start_ts(scope: str, now_ts: float) -> float | None:
             days=days - 1
         )
         return datetime.datetime.combine(day, datetime.time.min, datetime.UTC).timestamp()
-    except (OSError, OverflowError, ValueError):
+    except OSError, OverflowError, ValueError:
         return None
 
 
@@ -516,7 +516,7 @@ def _as_int(value: Any) -> int:
     if isinstance(value, str):
         try:
             return int(float(value))
-        except (ValueError, OverflowError):
+        except ValueError, OverflowError:
             # `float("inf")` PARSES -- it is `int()` that then raises `OverflowError`, which is
             # not a `ValueError`. Letting that escape would abort the whole grouping pass over a
             # single garbled `signal_count`, discarding every other, perfectly good cycle in the
@@ -963,7 +963,7 @@ def _safe_strftime(fmt: str, ts: float, width: int) -> str:
     so the guard is unchanged."""
     try:
         return time.strftime(fmt, time.gmtime(ts))
-    except (OSError, OverflowError, ValueError):
+    except OSError, OverflowError, ValueError:
         return _UNRENDERABLE_TS * (width // len(_UNRENDERABLE_TS))
 
 
@@ -1020,7 +1020,7 @@ def _age(then_ts: float, now_ts: float | None) -> str:
         if hours < 48:
             return f"{hours}h"
         return f"{min(hours // 24, 999)}d"
-    except (OverflowError, ValueError):
+    except OverflowError, ValueError:
         return "--"
 
 
@@ -1184,13 +1184,10 @@ def render_event_detail(ev: ActivityEvent) -> str:
         )
     elif name == "engine.setup_rejected":
         detail = (
-            f"{f.get('product', '?')} {f.get('rule', '?')}: REJECTED by gate "
-            f"'{f.get('gate', '?')}'"
+            f"{f.get('product', '?')} {f.get('rule', '?')}: REJECTED by gate '{f.get('gate', '?')}'"
         )
     elif name == "guards.check_failed":
-        detail = (
-            f"{f.get('product', '?')} {f.get('side', '?')} VETOED -- {f.get('violation', '?')}"
-        )
+        detail = f"{f.get('product', '?')} {f.get('side', '?')} VETOED -- {f.get('violation', '?')}"
     elif name == "agent.enter_evaluated":
         verdict = "PLACED" if _as_bool(f.get("placed")) else "NOT PLACED"
         detail = (
@@ -1200,8 +1197,7 @@ def render_event_detail(ev: ActivityEvent) -> str:
     elif name == "agent.exit_evaluated":
         verdict = "PLACED" if _as_bool(f.get("placed")) else "not placed"
         detail = (
-            f"{f.get('product', '?')} exit -> {verdict} -- "
-            f"{f.get('reason', 'no reason given')}"
+            f"{f.get('product', '?')} exit -> {verdict} -- {f.get('reason', 'no reason given')}"
         )
     elif name == "agent.entry_bar_not_ready":
         detail = (
@@ -1365,7 +1361,7 @@ def _day_phrase(then_ts: float, now_ts: float) -> str:
             datetime.datetime.fromtimestamp(now_ts, datetime.UTC).date()
             - datetime.datetime.fromtimestamp(then_ts, datetime.UTC).date()
         ).days
-    except (OSError, OverflowError, ValueError):
+    except OSError, OverflowError, ValueError:
         return "at an unreadable time"
     if delta <= 0:
         return "earlier today"
@@ -1390,7 +1386,7 @@ def _next_due_lines(last_ts: float, now_ts: float) -> list[str]:
         due = datetime.datetime.combine(
             today, datetime.time(last.hour, last.minute), datetime.UTC
         ).timestamp()
-    except (OSError, OverflowError, ValueError):
+    except OSError, OverflowError, ValueError:
         return []
     clock = f"{last.hour:02d}:{last.minute:02d}"
     if due > now_ts:

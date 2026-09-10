@@ -45,7 +45,7 @@ def test_drawdown_is_measured_from_the_peak_not_from_deposits() -> None:
     equity.update_drawdown(repo, equity=Decimal("10000"), now_ts=NOW)
     equity.update_drawdown(repo, equity=Decimal("12000"), now_ts=NOW + DAY)
     equity.update_drawdown(repo, equity=Decimal("9000"), now_ts=NOW + 2 * DAY)
-    assert repo.get_state("drawdown_total_pct") == Decimal("0.25")   # 3000/12000
+    assert repo.get_state("drawdown_total_pct") == Decimal("0.25")  # 3000/12000
 
 
 def test_the_high_water_mark_never_falls() -> None:
@@ -81,7 +81,7 @@ def test_rail11_actually_trips_once_the_producer_runs() -> None:
     repo.set_state("kill_switch", False)
     repo.set_state("last_feed_ts", NOW)
     equity.update_drawdown(repo, equity=Decimal("10000"), now_ts=NOW)
-    equity.update_drawdown(repo, equity=Decimal("7000"), now_ts=NOW + DAY)   # 30% > 20% cap
+    equity.update_drawdown(repo, equity=Decimal("7000"), now_ts=NOW + DAY)  # 30% > 20% cap
 
     from tests.execution.test_guards import _config, _intent, _keys
 
@@ -102,11 +102,11 @@ def test_a_withdrawal_lowers_the_high_water_mark_by_the_same_amount() -> None:
     """
     repo = _repo()
     equity.update_drawdown(repo, equity=Decimal("10000"), now_ts=NOW)
-    equity.record_external_flow(repo, amount=Decimal("5000"))          # deposit
+    equity.record_external_flow(repo, amount=Decimal("5000"))  # deposit
     equity.update_drawdown(repo, equity=Decimal("15000"), now_ts=NOW + DAY)
     assert repo.get_state("equity_high_water_mark") == Decimal("15000")
 
-    equity.record_external_flow(repo, amount=Decimal("-5000"))         # withdraw it again
+    equity.record_external_flow(repo, amount=Decimal("-5000"))  # withdraw it again
     equity.update_drawdown(repo, equity=Decimal("10000"), now_ts=NOW + 2 * DAY)
 
     assert repo.get_state("equity_high_water_mark") == Decimal("10000")
@@ -436,7 +436,6 @@ def test_a_failing_balance_write_does_not_take_the_cycle_down() -> None:
     )
 
     assert repo.get_equity_points(mode="live", limit=1), "the equity point still landed"
-
 
 
 def test_a_swallowed_balance_write_leaves_the_connection_clean(tmp_path) -> None:

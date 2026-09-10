@@ -76,7 +76,7 @@ def test_the_arabic_readme_exists_and_declares_rtl():
     """
     text = _read(_AR)
     assert '<div dir="rtl">\n\n' in text and "\n\n</div>" in text, (
-        f"{_AR} must wrap its content in <div dir=\"rtl\"> -- with blank lines after the "
+        f'{_AR} must wrap its content in <div dir="rtl"> -- with blank lines after the '
         "opening tag and before the closing one, or GitHub's HTML-block rule stops "
         "rendering the markdown inside it -- so the page renders right-to-left"
     )
@@ -112,8 +112,7 @@ def test_the_boundary_is_stated_in_arabic_with_its_english_original():
         f"{_AR} must state the boundary in Arabic, pinned verbatim: {_BOUNDARY_AR!r}"
     )
     assert (
-        "keel is not a fatwa engine. It is an enforcement engine for a ruling you supply."
-        in text
+        "keel is not a fatwa engine. It is an enforcement engine for a ruling you supply." in text
     ), (
         f"{_AR} must quote the boundary's English original alongside its translation, so "
         "the two languages' statements are checkable against each other"
@@ -201,9 +200,7 @@ def test_the_scope_is_stated_entry_point_not_translation_promise():
     between an entry point and an implied commitment the project cannot keep.
     """
     text = _unwrapped(_read(_AR))
-    assert _SCOPE_AR in text, (
-        f"{_AR} must state its scope: the entry point, {_SCOPE_AR!r}"
-    )
+    assert _SCOPE_AR in text, f"{_AR} must state its scope: the entry point, {_SCOPE_AR!r}"
     assert "بالإنجليزية" in text, (
         f"{_AR} must say plainly that the full documentation remains in English"
     )

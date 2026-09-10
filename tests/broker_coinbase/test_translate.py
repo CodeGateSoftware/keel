@@ -113,5 +113,3 @@ def test_bracket_gtc_carries_no_stop_direction() -> None:
 # three keys and the deliberate absence of `stop_direction`, and
 # `tests/data/test_cb_client.py::test_place_order_renders_a_bracket_through_the_one_renderer`
 # proves the live client sends exactly what this function returns.
-
-

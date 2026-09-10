@@ -29,9 +29,7 @@ import click
 from keel.version import BuildInfo, InstallReport, build_info, check_install
 
 
-def render_versions_lines(
-    info: BuildInfo, report: InstallReport
-) -> list[tuple[str, bool]]:
+def render_versions_lines(info: BuildInfo, report: InstallReport) -> list[tuple[str, bool]]:
     """The EXACT `keel versions` lines as `(text, to_stderr)` pairs, in issuance order --
     ONE renderer for both front-ends (issue #392 C6, the C1 rule): the CLI echoes them
     (`err=` carrying the flag, byte-identical to the pre-extraction output) and the

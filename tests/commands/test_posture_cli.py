@@ -126,9 +126,7 @@ def test_the_fingerprint_is_stamped_fresh_not_carried_forward(
             credential_fingerprint="fp-old",
         )
     )
-    monkeypatch.setattr(
-        "keel.commands.posture.current_credential_fingerprint", lambda _v: "fp-new"
-    )
+    monkeypatch.setattr("keel.commands.posture.current_credential_fingerprint", lambda _v: "fp-new")
     apply_posture_attest(repo, venue="coinbase", spot_cash=True, now_ts=NOW)
     assert repo.get_venue_cash_posture("coinbase").credential_fingerprint == "fp-new"
 

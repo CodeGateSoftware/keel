@@ -247,9 +247,7 @@ def test_the_settled_split_reads_only_the_settlement_currency(
     repo.record_cycle_balance(
         _cycle_balance(NOW_TS - 60, "live", "USD", available="250.10", total="300")
     )
-    repo.record_cycle_balance(
-        _cycle_balance(NOW_TS - 60, "live", "USDC", available="7", total="9")
-    )
+    repo.record_cycle_balance(_cycle_balance(NOW_TS - 60, "live", "USDC", available="7", total="9"))
 
     report = gather_balances(repo, _config(tmp_path), now_ts=NOW_TS)
 
@@ -550,7 +548,6 @@ def test_the_recorded_split_carries_the_instant_it_was_observed(
     report = gather_balances(repo, _config(tmp_path), now_ts=NOW_TS)
 
     assert report.settled_as_of == NOW_TS - 3600
-
 
 
 # -- staleness, judged in Python (#702) ------------------------------------------------------------

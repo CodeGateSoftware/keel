@@ -1331,9 +1331,7 @@ def acknowledge_venue_interest_off(
     acknowledged_by = values.get("acknowledged_by", "").strip()
     did_it = values.get("did_it", "").strip().lower()
     if not acknowledged_by:
-        return ActionResult(
-            "venue_interest_off", False, "nothing recorded -- your name was blank"
-        )
+        return ActionResult("venue_interest_off", False, "nothing recorded -- your name was blank")
     if did_it != "yes":
         return ActionResult(
             "venue_interest_off",

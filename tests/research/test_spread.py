@@ -221,9 +221,7 @@ def test_a_floored_block_still_counts_toward_the_average() -> None:
     assert mixed is not None and quiet_only is not None
     assert mixed.blocks == 2 and quiet_only.blocks == 1
     # The trending block floored, so the mixed series reports HALF the quiet block's figure.
-    assert math.isclose(
-        float(mixed.spread_pct), float(quiet_only.spread_pct) / 2, rel_tol=1e-6
-    )
+    assert math.isclose(float(mixed.spread_pct), float(quiet_only.spread_pct) / 2, rel_tol=1e-6)
 
 
 def test_a_block_size_that_cannot_form_a_block_is_refused() -> None:

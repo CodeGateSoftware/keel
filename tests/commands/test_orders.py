@@ -821,6 +821,7 @@ def test_the_filtered_count_reflects_the_cap_being_a_cap(tmp_path: Path) -> None
     assert report.filtered_count == 4
     assert report.shown_count == 2
 
+
 # -- the rule that placed it (#700) -----------------------------------------------------------
 #
 # `orders.rule_id` is a foreign key, and a foreign key on a page is a number a reader cannot act
@@ -892,9 +893,10 @@ def test_a_rule_that_is_no_longer_in_the_book_is_named_as_missing() -> None:
 
     assert row.rule_name == ""
     assert "7" in row.rule_name_detail
-    assert row.rule_name_detail != orders_service._row_from_dict(
-        _order(id=2, rule_id=None), {}
-    ).rule_name_detail
+    assert (
+        row.rule_name_detail
+        != orders_service._row_from_dict(_order(id=2, rule_id=None), {}).rule_name_detail
+    )
 
 
 def test_naming_the_rules_costs_one_read_however_many_orders(tmp_path: Path) -> None:

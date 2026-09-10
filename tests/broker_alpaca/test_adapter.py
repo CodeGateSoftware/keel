@@ -764,9 +764,8 @@ class TestPlaceOrder:
 
     def test_a_venue_rejection_maps_to_a_failed_place_result(self) -> None:
         transport = _RejectingCreateTransport(
-            AlpacaAPIError(422, "notional is out of range"), placed=load_fixture(
-                "alpaca_order_placed.json"
-            )
+            AlpacaAPIError(422, "notional is out of range"),
+            placed=load_fixture("alpaca_order_placed.json"),
         )
         result = AlpacaAdapter(transport).place_order(
             MarketIOCByQuote(product_id=_PRODUCT, side=Side.BUY, quote_size=Decimal("100"))
@@ -777,9 +776,8 @@ class TestPlaceOrder:
 
     def test_a_buying_power_refusal_maps_to_a_failed_place_result(self) -> None:
         transport = _RejectingCreateTransport(
-            AlpacaAPIError(403, "insufficient buying power"), placed=load_fixture(
-                "alpaca_order_placed.json"
-            )
+            AlpacaAPIError(403, "insufficient buying power"),
+            placed=load_fixture("alpaca_order_placed.json"),
         )
         result = AlpacaAdapter(transport).place_order(
             MarketIOCByQuote(product_id=_PRODUCT, side=Side.BUY, quote_size=Decimal("100"))
@@ -1167,6 +1165,8 @@ class TestTradeScopeIsDeliberatelyUnmapped:
             )
         except AlpacaAPIError:
             pass
+
+
 # -- credential declaration (#233 PR4) ------------------------------------------------------------
 
 

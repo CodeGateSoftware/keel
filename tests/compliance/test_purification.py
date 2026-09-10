@@ -147,12 +147,36 @@ def test_purification_cli_reports_owed_and_flags_unknowns(tmp_path):
     migrate(conn)
     repo = Repository(conn)
     for tx in (
-        {"coinbase_id": "a", "source": "t", "type": "Buy", "asset": "BTC",
-         "ts": 1, "qty": Decimal("1"), "price": Decimal("100"), "total": Decimal("100")},
-        {"coinbase_id": "b", "source": "t", "type": "Reward Income", "asset": "USDC",
-         "ts": 2, "qty": Decimal("0.5"), "price": Decimal("1"), "total": Decimal("0.5")},
-        {"coinbase_id": "c", "source": "t", "type": "Mystery", "asset": "ETH",
-         "ts": 3, "qty": Decimal("1"), "price": Decimal("9"), "total": Decimal("9")},
+        {
+            "coinbase_id": "a",
+            "source": "t",
+            "type": "Buy",
+            "asset": "BTC",
+            "ts": 1,
+            "qty": Decimal("1"),
+            "price": Decimal("100"),
+            "total": Decimal("100"),
+        },
+        {
+            "coinbase_id": "b",
+            "source": "t",
+            "type": "Reward Income",
+            "asset": "USDC",
+            "ts": 2,
+            "qty": Decimal("0.5"),
+            "price": Decimal("1"),
+            "total": Decimal("0.5"),
+        },
+        {
+            "coinbase_id": "c",
+            "source": "t",
+            "type": "Mystery",
+            "asset": "ETH",
+            "ts": 3,
+            "qty": Decimal("1"),
+            "price": Decimal("9"),
+            "total": Decimal("9"),
+        },
     ):
         repo.upsert_transaction(tx)
 
@@ -174,8 +198,16 @@ def test_purification_cli_on_a_clean_ledger_says_so(tmp_path):
     conn = connect(str(db_path))
     migrate(conn)
     Repository(conn).upsert_transaction(
-        {"coinbase_id": "a", "source": "t", "type": "Buy", "asset": "BTC",
-         "ts": 1, "qty": Decimal("1"), "price": Decimal("100"), "total": Decimal("100")}
+        {
+            "coinbase_id": "a",
+            "source": "t",
+            "type": "Buy",
+            "asset": "BTC",
+            "ts": 1,
+            "qty": Decimal("1"),
+            "price": Decimal("100"),
+            "total": Decimal("100"),
+        }
     )
     result = CliRunner().invoke(cli, ["--db", str(db_path), "purification"])
     assert result.exit_code == 0, result.output

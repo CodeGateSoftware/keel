@@ -133,7 +133,9 @@ def test_every_field_derives_from_the_adapters_own_declarations() -> None:
         assert row.preview == (
             "native"
             if cap.supports_native_preview
-            else "synthesized" if cap.synthesizes_preview else "none"
+            else "synthesized"
+            if cap.synthesizes_preview
+            else "none"
         )
 
 
@@ -171,8 +173,10 @@ def test_the_classification_constant_names_exactly_the_wired_venues() -> None:
     section) and alpaca (config.paper-equities.yaml), nothing else."""
     assert brokers.WIRED_FOR_DEPLOYMENT == frozenset({"coinbase", "alpaca"})
     for info in brokers.list_installed_brokers():
-        expected = "wired-for-deployment" if info.name in brokers.WIRED_FOR_DEPLOYMENT else (
-            "optional-dev-venue"
+        expected = (
+            "wired-for-deployment"
+            if info.name in brokers.WIRED_FOR_DEPLOYMENT
+            else ("optional-dev-venue")
         )
         assert info.deployment == expected, info.name
 

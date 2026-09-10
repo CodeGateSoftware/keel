@@ -228,9 +228,7 @@ class SimAccount:
 
         if self.equity_high_water_mark is not None:
             self.equity_high_water_mark += amount
-            self._equity_history = [
-                (ts, equity + amount) for ts, equity in self._equity_history
-            ]
+            self._equity_history = [(ts, equity + amount) for ts, equity in self._equity_history]
 
     # -- combined (rule + DCA) notional, for cap purposes --------------------------------------
 
@@ -526,9 +524,7 @@ class SimAccount:
     def positions_for(self, asset: str) -> list[OpenPosition]:
         """Every concurrent RULE position open in `asset`."""
         return [
-            position
-            for (slot_asset, _), position in self.positions.items()
-            if slot_asset == asset
+            position for (slot_asset, _), position in self.positions.items() if slot_asset == asset
         ]
 
     # -- rail 16: the streak producer -----------------------------------------------------------

@@ -89,11 +89,7 @@ def autonomy_show(ctx: click.Context) -> None:
         )
     now_ts = int(time.time())
     live = profile.is_autonomous(now_ts)
-    state = (
-        "ON -- orders are placed WITHOUT asking"
-        if live
-        else "off -- every order asks first"
-    )
+    state = "ON -- orders are placed WITHOUT asking" if live else "off -- every order asks first"
     click.echo(f"autonomy: {state}")
     if profile.autonomous and not live:
         click.echo(f"  (was ON but LAPSED at {profile.autonomous_until})")

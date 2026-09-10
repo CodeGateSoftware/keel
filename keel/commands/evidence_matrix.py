@@ -156,18 +156,14 @@ def _candidate_sessions(trials: list[Any]) -> tuple[str, ...]:
         if trial.series_missing or not trial.per_bar_pnl:
             continue
         usable[trial.session] = usable.get(trial.session, 0) + 1
-    return tuple(
-        session for session, count in usable.items() if count >= MIN_COLUMNS_FOR_A_RUN
-    )
+    return tuple(session for session, count in usable.items() if count >= MIN_COLUMNS_FOR_A_RUN)
 
 
 def gather_matrix(path: Path | str, *, now_ts: int) -> MatrixReport:
     """Every recorded CSCV run in the ledger at `path`, oldest first. No computation."""
     ledger = Path(path)
     if not ledger.exists():
-        return MatrixReport(
-            now_ts=now_ts, ledger_present=False, rows=(), candidate_sessions=()
-        )
+        return MatrixReport(now_ts=now_ts, ledger_present=False, rows=(), candidate_sessions=())
 
     trials = list(read_trials(ledger))
     rows = tuple(

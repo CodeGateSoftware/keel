@@ -81,6 +81,12 @@ jobs:
       - name: Lint
         run: uv run ruff check keel tests packages
 
+      # Re-gated here for the reason the note below gives about the type-check: this workflow is
+      # dispatched against whatever `main` is at the time, which need not be the commit CI went
+      # green on. A gate that only exists in `ci.yml` is not a gate on what actually ships.
+      - name: Format
+        run: uv run ruff format --check .
+
       # Re-run here rather than trusting CI's: this workflow is dispatched against whatever
       # `main` is at the time, which need not be the commit any CI run went green on.
       - name: Type-check

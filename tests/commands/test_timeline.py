@@ -546,7 +546,12 @@ def test_an_engine_log_row_is_never_chained_and_says_so(db_conn) -> None:
     module attesting to something it only read."""
     repo = _chained_repo(db_conn)
     cycle = SimpleNamespace(
-        started_ts=1_500, cycle_id="c-1", products=("BTC-USD",), signals=1, entered=1, exited=0,
+        started_ts=1_500,
+        cycle_id="c-1",
+        products=("BTC-USD",),
+        signals=1,
+        entered=1,
+        exited=0,
         errors=0,
     )
     report = timeline.gather_timeline(repo, now_ts=2_000, cycles=[cycle])
@@ -681,7 +686,8 @@ def test_a_broken_rule_is_said_and_a_skipped_question_is_not(repo: Repository) -
     _journal(repo, ts=NOW_TS - 100, rules_followed=True, chart_note="by the book")
 
     summaries = {
-        r.reference: r.summary for r in gather_timeline(repo, now_ts=NOW_TS).rows
+        r.reference: r.summary
+        for r in gather_timeline(repo, now_ts=NOW_TS).rows
         if r.source == "journal"
     }
     broke = [s for s in summaries.values() if "BROKE RULES" in s]
@@ -708,10 +714,26 @@ def test_a_journal_entry_carries_its_chain_hash_like_every_other_record(repo: Re
 def test_the_journal_respects_the_scope_window(repo: Repository) -> None:
     _journal(repo, ts=NOW_TS - 100)
     _journal(repo, ts=NOW_TS - (40 * 86_400))
-    assert len([r for r in gather_timeline(repo, now_ts=NOW_TS, scope="7d").rows
-                if r.source == "journal"]) == 1
-    assert len([r for r in gather_timeline(repo, now_ts=NOW_TS, scope="all").rows
-                if r.source == "journal"]) == 2
+    assert (
+        len(
+            [
+                r
+                for r in gather_timeline(repo, now_ts=NOW_TS, scope="7d").rows
+                if r.source == "journal"
+            ]
+        )
+        == 1
+    )
+    assert (
+        len(
+            [
+                r
+                for r in gather_timeline(repo, now_ts=NOW_TS, scope="all").rows
+                if r.source == "journal"
+            ]
+        )
+        == 2
+    )
 
 
 def test_the_export_row_carries_every_sentence_the_operator_wrote(repo: Repository) -> None:

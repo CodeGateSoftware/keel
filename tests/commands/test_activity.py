@@ -1211,7 +1211,7 @@ def test_an_error_events_detail_is_the_exception_line_not_the_whole_traceback() 
 
     assert "401 Unauthorized" in detail
     assert "Traceback" not in detail
-    assert "File \"" not in detail
+    assert 'File "' not in detail
 
 
 def test_an_unknown_event_renders_its_own_fields_rather_than_nothing() -> None:
@@ -1719,8 +1719,9 @@ def test_apply_scope_does_not_read_the_clock_when_now_is_given(
 
 
 def test_apply_scope_on_an_unrecognised_scope_shows_today_rather_than_nothing() -> None:
-    feed = _scoped(_cycle_at(_utc_midnight(_SCOPE_NOW) + 9 * 3600, "t"), "since tuesday",
-                   _SCOPE_NOW)
+    feed = _scoped(
+        _cycle_at(_utc_midnight(_SCOPE_NOW) + 9 * 3600, "t"), "since tuesday", _SCOPE_NOW
+    )
 
     assert feed.scope == "today"
     assert len(feed.cycles) == 1
@@ -1810,9 +1811,7 @@ def test_the_empty_state_is_never_blank_for_any_scope(scope: str) -> None:
 def test_describe_empty_scope_under_all_keeps_the_original_no_cycles_wording() -> None:
     """`all` is not a day filter, so the answer there is about the LOG holding nothing groupable
     -- the pre-scoping wording, unchanged."""
-    feed = apply_scope(
-        ActivityFeed(status="ok", source="/tmp/keel.log"), "all", now_ts=_SCOPE_NOW
-    )
+    feed = apply_scope(ActivityFeed(status="ok", source="/tmp/keel.log"), "all", now_ts=_SCOPE_NOW)
 
     assert "No cycles in the window" in describe_empty_scope(feed)[0]
 
@@ -1892,7 +1891,9 @@ def test_an_empty_today_in_an_unproven_window_says_so_instead_of_implying_a_quie
 def test_all_scope_never_reports_coverage_doubt() -> None:
     """There is no boundary to fall short of, so the caveat would be meaningless noise."""
     feed = _scoped(
-        _cycle_at(_utc_midnight(_SCOPE_NOW) + 9 * 3600, "today"), "all", _SCOPE_NOW,
+        _cycle_at(_utc_midnight(_SCOPE_NOW) + 9 * 3600, "today"),
+        "all",
+        _SCOPE_NOW,
         truncated=True,
     )
 

@@ -2236,9 +2236,7 @@ def _scope_adapter(exc: Exception) -> RobinhoodAdapter:
     )
 
 
-_SCOPE_SELL = MarketIOCByBase(
-    product_id="BTC-USD", side=Side.SELL, base_size=Decimal("0.001")
-)
+_SCOPE_SELL = MarketIOCByBase(product_id="BTC-USD", side=Side.SELL, base_size=Decimal("0.001"))
 
 
 def test_the_observed_403_is_a_trade_scope_refusal_carrying_the_venues_own_words() -> None:
@@ -2306,6 +2304,8 @@ def test_a_401_does_NOT_refute_the_scope() -> None:
 
     with pytest.raises(_ScopeHTTPError):
         _scope_adapter(exc).place_order(_SCOPE_SELL)
+
+
 # -- credential declaration and defect detection (#233 PR4) --------------------------------------
 
 

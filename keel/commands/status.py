@@ -175,7 +175,7 @@ def _rail11_status(
     max_total: Decimal,
     max_weekly: Decimal,
 ) -> str:
-    """"HALTED" if either drawdown is at/over its ceiling (matches `execution.guards` rail 11's
+    """ "HALTED" if either drawdown is at/over its ceiling (matches `execution.guards` rail 11's
     own `>=` comparison), "unknown" if either scalar was never written, else "ok".
 
     Guarding on `None` matters here in a way it does not in `guards.py`: the guard reads
@@ -316,7 +316,7 @@ def _withdrawal_attestation(repo: Repository, now_ts: int) -> WithdrawalAttestat
     resolved = executor._withdrawals_enabled(repo, now_ts)
     try:
         attested_at = int(repo.get_state("withdrawals_attested_at", default=0) or 0)
-    except (TypeError, ValueError):
+    except TypeError, ValueError:
         attested_at = 0
 
     if not attested_at:
@@ -435,10 +435,7 @@ def _rail17_line(w: WithdrawalAttestationStatus, rail_evaluated: bool) -> str:
         return f"{prefix}: UNKNOWN (state unreadable); re-attest with keel withdrawals attest"
     halt = " -- entries halted" if rail_evaluated else " (rail 17 not evaluated in paper)"
     if w.state == "suspended":
-        return (
-            f"{prefix}: SUSPENDED{halt}; "
-            "re-attest with keel withdrawals attest --enabled"
-        )
+        return f"{prefix}: SUSPENDED{halt}; re-attest with keel withdrawals attest --enabled"
     if w.state == "expired":
         return (
             f"{prefix}: EXPIRED {_human_age(w.expired_for_sec or 0)}{halt}; "
@@ -564,9 +561,7 @@ def render_human(report: StatusReport) -> list[str]:
         lines.append("subscriptions:")
         for s in report.subscriptions:
             cap = "unlimited" if s.effective_cap is None else str(s.effective_cap)
-            lines.append(
-                f"  {s.venue}: tier={s.tier_name} status={s.effective_status} cap={cap}"
-            )
+            lines.append(f"  {s.venue}: tier={s.tier_name} status={s.effective_status} cap={cap}")
 
     return lines
 

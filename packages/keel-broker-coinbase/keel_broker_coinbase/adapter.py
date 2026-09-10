@@ -172,6 +172,7 @@ class CoinbaseAdapter:
         default it used to be.
         """
         return "coinbase"
+
     def __init__(self, transport: Transport | None = None) -> None:
         self._transport = transport
 

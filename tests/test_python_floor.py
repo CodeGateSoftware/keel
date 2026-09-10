@@ -226,7 +226,7 @@ def _latest_release_floor() -> str | None:
     try:
         data = tomllib.loads(show.stdout)
         requires = data["project"]["requires-python"]
-    except (tomllib.TOMLDecodeError, KeyError):
+    except tomllib.TOMLDecodeError, KeyError:
         return None
     match = re.match(r">=\s*(\d+)\.(\d+)", requires)
     return f"{match.group(1)}.{match.group(2)}" if match else None
@@ -316,3 +316,61 @@ def test_the_wheels_floor_stated_in_release_facing_docs_matches_requires_python(
         "DOES compare against main's requires-python, on purpose: the template generates "
         "the next release from whatever main says at tag time."
     )
+
+
+# -- the formatting gate (#783) -------------------------------------------------------------------
+
+
+def _workflow(name: str) -> str:
+    return (Path(__file__).resolve().parents[1] / ".github" / "workflows" / name).read_text(
+        encoding="utf-8"
+    )
+
+
+def test_ci_and_release_both_gate_on_the_formatter():
+    """**A gate nothing pins is a gate that can be deleted in silence.**
+
+    #783 reformatted 197 of 496 files and turned the formatter on. Before it, `ruff format`
+    was configured and intended -- `ruff.toml` reasons carefully about one of its rewrites --
+    and ran nowhere, which is how the tree drifted 40% out of the format it declares.
+
+    Pinned in BOTH workflows for the reason `release.yml` already gives about re-running mypy:
+    that workflow is dispatched against whatever `main` is at the time, which need not be the
+    commit CI went green on. A gate that exists only in `ci.yml` is not a gate on what ships.
+
+    Asserted as the runnable command, like the floor pin above and like
+    `tests/test_contributing.py`'s gate list: a check spelled differently in the two files is a
+    check that can drift into scoping one of them and not the other.
+    """
+    command = "ruff format --check ."
+    for name in ("ci.yml", "release.yml"):
+        assert command in _workflow(name), f"{name} must gate on `{command}`"
+
+
+def test_the_release_workflow_formats_before_it_stamps_the_build():
+    """The step ORDER, not merely its presence.
+
+    `Stamp build info` writes `keel/_build_info.py`, which is generated and gitignored. Running
+    the formatter after it would put the gate downstream of a file the gate is not meant to
+    judge -- and `test_desktop_packaging.py` pins this workflow's ordering elsewhere for the
+    same class of reason.
+    """
+    text = _workflow("release.yml")
+    assert text.index("ruff format --check .") < text.index("Stamp build info"), (
+        "release.yml must run the format gate before it stamps the build"
+    )
+
+
+def test_the_format_gate_is_whole_tree_where_the_lint_gate_is_not():
+    """The asymmetry, stated so it is not "tidied" into agreement.
+
+    `ruff check` is scoped to `keel tests packages` because lint still carries a debt in `docs/`
+    and `scripts/`. Formatting carries none anywhere after #783, so scoping the format check
+    would re-open exactly the drift that pass closed.
+    """
+    for name in ("ci.yml", "release.yml"):
+        text = _workflow(name)
+        assert "ruff format --check ." in text, name
+        assert "ruff format --check keel" not in text, (
+            f"{name}'s format gate must stay whole-tree, not scoped like `ruff check`"
+        )

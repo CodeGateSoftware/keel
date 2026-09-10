@@ -163,8 +163,10 @@ def record_external_flow(repo: Repository, *, amount: Decimal) -> None:
     if history:
         repo.set_state(
             "equity_history",
-            [{"ts": point["ts"], "equity": Decimal(str(point["equity"])) + amount}
-             for point in history],
+            [
+                {"ts": point["ts"], "equity": Decimal(str(point["equity"])) + amount}
+                for point in history
+            ],
         )
 
     log_event(

@@ -112,7 +112,7 @@ def _git(*args: str) -> str | None:
             timeout=_GIT_TIMEOUT_SEC,
             check=False,
         )
-    except (OSError, subprocess.SubprocessError):
+    except OSError, subprocess.SubprocessError:
         return None
     if result.returncode != 0:
         return None

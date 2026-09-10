@@ -53,6 +53,10 @@ def test_the_gates_a_pr_must_pass_are_stated():
     for command in (
         "uv sync --all-extras --dev",
         "uv run ruff check",
+        # #783 added the format gate to CI. This list is what a contributor pastes, so a gate
+        # missing from it is a gate they discover from a red CI run instead -- and this test
+        # would otherwise go on certifying the incomplete list as complete.
+        "uv run ruff format --check .",
         "uv run mypy",
         "uv run pytest -q",
     ):

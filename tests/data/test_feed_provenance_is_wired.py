@@ -84,9 +84,7 @@ def test_the_coinbase_adapter_declares_its_venue() -> None:
 def test_ensure_history_records_the_feed_it_fetched_under() -> None:
     repo = _repo()
     client = _FeedClient("alpaca:iex", [[_candle(0), _candle(86400)]])
-    history.ensure_history(
-        client, repo, ["MSFT-USD"], [Granularity.ONE_DAY], years=1, now_ts=86400
-    )
+    history.ensure_history(client, repo, ["MSFT-USD"], [Granularity.ONE_DAY], years=1, now_ts=86400)
     assert repo.get_series_feeds("MSFT-USD", Granularity.ONE_DAY) == ("alpaca:iex",)
 
 
@@ -95,9 +93,7 @@ def test_a_client_that_declares_nothing_records_nothing() -> None:
     invent one, or every crypto series silently acquires a provenance nobody established."""
     repo = _repo()
     client = _SilentClient([[_candle(0), _candle(86400)]])
-    history.ensure_history(
-        client, repo, ["BTC-USD"], [Granularity.ONE_DAY], years=1, now_ts=86400
-    )
+    history.ensure_history(client, repo, ["BTC-USD"], [Granularity.ONE_DAY], years=1, now_ts=86400)
     assert repo.get_candles("BTC-USD", Granularity.ONE_DAY)
     assert repo.get_series_feeds("BTC-USD", Granularity.ONE_DAY) == ()
 
@@ -123,9 +119,7 @@ def test_the_live_poll_path_records_the_feed() -> None:
     whether provenance exists in a real database at all."""
     repo = _repo()
     client = _PollClient("alpaca:iex", [[_candle(0), _candle(86400)]])
-    market_feed.poll_once(
-        client, repo, ["MSFT-USD"], [Granularity.ONE_DAY], now_ts=86400 * 3
-    )
+    market_feed.poll_once(client, repo, ["MSFT-USD"], [Granularity.ONE_DAY], now_ts=86400 * 3)
     assert repo.get_series_feeds("MSFT-USD", Granularity.ONE_DAY) == ("alpaca:iex",)
 
 

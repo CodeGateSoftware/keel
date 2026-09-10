@@ -908,8 +908,7 @@ def research_tuning(rule_kind: str | None, explored_json: str | None, run: bool)
     for kind in kinds:
         if kind not in tuning_mod.SEARCH_SPACES:
             raise click.ClickException(
-                f"unknown rule kind {kind!r}; declared families: "
-                f"{sorted(tuning_mod.SEARCH_SPACES)}"
+                f"unknown rule kind {kind!r}; declared families: {sorted(tuning_mod.SEARCH_SPACES)}"
             )
         space = tuning_mod.SEARCH_SPACES[kind]
         cells = tuning_mod.declared_cells(kind)
@@ -921,8 +920,7 @@ def research_tuning(rule_kind: str | None, explored_json: str | None, run: bool)
         assert rule_kind is not None  # guarded above
         try:
             explored = {
-                name: (bounds[0], bounds[1])
-                for name, bounds in json.loads(explored_json).items()
+                name: (bounds[0], bounds[1]) for name, bounds in json.loads(explored_json).items()
             }
         except (json.JSONDecodeError, AttributeError, KeyError, TypeError, IndexError) as exc:
             # Same treatment the sibling --venues-json/--products-json options already get: a
@@ -932,7 +930,7 @@ def research_tuning(rule_kind: str | None, explored_json: str | None, run: bool)
             # through to the user as a stack trace.
             raise click.ClickException(
                 f"--explored-json is malformed: {exc} -- expected an object mapping a "
-                'parameter name to a [low, high] pair, e.g. \'{"entry": [20, 40]}\''
+                "parameter name to a [low, high] pair, e.g. '{\"entry\": [20, 40]}'"
             ) from exc
         try:
             check = tuning_mod.explored_vs_declared(explored, rule_kind)
@@ -942,9 +940,7 @@ def research_tuning(rule_kind: str | None, explored_json: str | None, run: bool)
             # data fails, not an operator typo. Print it, exit 0.
             click.echo(f"refused: {exc}")
             return
-        click.echo(
-            f"  explored {check.explored_cells} of {check.declared_cells} declared cells"
-        )
+        click.echo(f"  explored {check.explored_cells} of {check.declared_cells} declared cells")
 
 
 # -- factors: do the 11 CTS confluence factors carry independent evidence? -----------------------

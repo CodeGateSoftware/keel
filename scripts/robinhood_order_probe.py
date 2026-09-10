@@ -294,7 +294,6 @@ def plan_order(
     }
 
 
-
 #: Statuses on a placement POST that mean the venue certainly did NOT create an order. Everything
 #: else -- a 5xx, a timeout, a dropped connection -- is an UNKNOWN outcome, which is a different
 #: and far more dangerous thing to report.
@@ -360,6 +359,7 @@ def _classify_placement_error(exc: Exception, client_order_id: str) -> dict[str,
             "history before re-running, and do NOT assume nothing happened."
         ),
     }
+
 
 def record(out_dir: Path, name: str, payload: Any) -> Path:
     """Write one raw response, ready to become a fixture. Returns the path written."""

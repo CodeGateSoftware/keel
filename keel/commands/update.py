@@ -246,6 +246,7 @@ def _http_get(url: str) -> bytes:
         url,
         headers={"Accept": "application/vnd.github+json", "User-Agent": "keel-self-update"},
     )
+
     def attempt() -> bytes:
         with urllib.request.urlopen(request, timeout=_HTTP_TIMEOUT_SEC) as response:
             return bytes(response.read())
@@ -366,7 +367,7 @@ def _running_package_file() -> Path | None:
         if not file:
             return None
         return Path(file).resolve()
-    except (ImportError, OSError):
+    except ImportError, OSError:
         return None
 
 
@@ -437,7 +438,7 @@ def _wheel_origin_refusal(package_file: Path) -> str | None:
         return None  # an index install: no direct URL, and indexes ship wheels
     try:
         doc = json.loads(direct.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
+    except OSError, ValueError:
         return f"cannot read {direct} -- refusing rather than guessing the install origin"
     url = doc.get("url") if isinstance(doc, dict) else None
     if isinstance(url, str) and url.endswith(".whl"):
@@ -632,6 +633,7 @@ _MAX_DOWNLOAD_BYTES = 200 * 1024 * 1024
 def _download_file(url: str, dest: Path) -> None:
     """Download a public asset URL to `dest`, with the read BOUNDED at
     `_MAX_DOWNLOAD_BYTES`. The production seam; tests inject."""
+
     def attempt() -> bytes:
         with urllib.request.urlopen(url, timeout=_HTTP_TIMEOUT_SEC) as response:
             return bytes(response.read(_MAX_DOWNLOAD_BYTES + 1))

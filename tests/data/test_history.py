@@ -40,7 +40,11 @@ class FakeClient:
 
 def _mk(ts: int) -> Candle:
     return Candle(
-        ts=ts, open=Decimal(1), high=Decimal(1), low=Decimal(1), close=Decimal(1),
+        ts=ts,
+        open=Decimal(1),
+        high=Decimal(1),
+        low=Decimal(1),
+        close=Decimal(1),
         volume=Decimal(1),
     )
 
@@ -131,8 +135,15 @@ def test_fill_forward_never_requests_more_than_the_cap_per_call(repo):
     client = FakeClient({"BTC-USD": full})
 
     _fill_forward(
-        client, repo, "BTC-USD", Granularity.ONE_HOUR, step, latest_cached, now,
-        sleep_fn=lambda s: None, sleep_sec=0,
+        client,
+        repo,
+        "BTC-USD",
+        Granularity.ONE_HOUR,
+        step,
+        latest_cached,
+        now,
+        sleep_fn=lambda s: None,
+        sleep_sec=0,
     )
 
     sizes = [(end - start) // step + 1 for (_, _, start, end) in client.calls]
@@ -149,8 +160,15 @@ def test_fill_backward_never_requests_more_than_the_cap_per_call(repo):
     client = FakeClient({"BTC-USD": full})
 
     _fill_backward(
-        client, repo, "BTC-USD", Granularity.ONE_HOUR, step, window_end, start_floor,
-        sleep_fn=lambda s: None, sleep_sec=0,
+        client,
+        repo,
+        "BTC-USD",
+        Granularity.ONE_HOUR,
+        step,
+        window_end,
+        start_floor,
+        sleep_fn=lambda s: None,
+        sleep_sec=0,
     )
 
     sizes = [(end - start) // step + 1 for (_, _, start, end) in client.calls]
@@ -173,8 +191,15 @@ def test_window_sizing_tracks_the_cap_constant_so_raising_it_toward_350_stays_sa
     client = FakeClient({"BTC-USD": full})
 
     history_mod._fill_forward(
-        client, repo, "BTC-USD", Granularity.ONE_HOUR, step, latest_cached, now,
-        sleep_fn=lambda s: None, sleep_sec=0,
+        client,
+        repo,
+        "BTC-USD",
+        Granularity.ONE_HOUR,
+        step,
+        latest_cached,
+        now,
+        sleep_fn=lambda s: None,
+        sleep_sec=0,
     )
 
     sizes = [(end - start) // step + 1 for (_, _, start, end) in client.calls]

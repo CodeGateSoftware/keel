@@ -38,9 +38,12 @@ def _add(tmp_path, valid_config_path, *args):
     return CliRunner().invoke(
         cli,
         [
-            "--db", str(tmp_path / "t.db"),
-            "--config", str(valid_config_path),
-            "rules", "add",
+            "--db",
+            str(tmp_path / "t.db"),
+            "--config",
+            str(valid_config_path),
+            "rules",
+            "add",
             *args,
         ],
     )
@@ -56,10 +59,14 @@ def test_add_inserts_one_candidate_rule_and_prints_its_id(tmp_path, valid_config
     repo = _repo(tmp_path)
 
     result = _add(
-        tmp_path, valid_config_path,
-        "--kind", "turtle_breakout",
-        "--product", "BTC-USD",
-        "--params", '{"entry_lookback": 55}',
+        tmp_path,
+        valid_config_path,
+        "--kind",
+        "turtle_breakout",
+        "--product",
+        "BTC-USD",
+        "--params",
+        '{"entry_lookback": 55}',
     )
 
     assert result.exit_code == 0, result.output
@@ -84,9 +91,16 @@ def test_status_is_candidate_and_no_option_can_override_it(tmp_path, valid_confi
 
     repo = _repo(tmp_path)
     refused = _add(
-        tmp_path, valid_config_path,
-        "--kind", "dca", "--product", "BTC-USD", "--params", "{}",
-        "--status", "live",
+        tmp_path,
+        valid_config_path,
+        "--kind",
+        "dca",
+        "--product",
+        "BTC-USD",
+        "--params",
+        "{}",
+        "--status",
+        "live",
     )
 
     assert refused.exit_code != 0
@@ -101,9 +115,7 @@ def test_status_is_candidate_and_no_option_can_override_it(tmp_path, valid_confi
 # -- the round trip: a stored row must rebuild into a working rule -------------------------
 
 
-def test_the_stored_row_rebuilds_into_a_rule_with_the_params_asked_for(
-    tmp_path, valid_config_path
-):
+def test_the_stored_row_rebuilds_into_a_rule_with_the_params_asked_for(tmp_path, valid_config_path):
     """A row that stores but cannot rebuild fails later, inside a backtest or an agent cycle.
 
     `_build_rule` is the reconstruction every consumer performs (`rules backtest`,
@@ -113,10 +125,14 @@ def test_the_stored_row_rebuilds_into_a_rule_with_the_params_asked_for(
     repo = _repo(tmp_path)
 
     result = _add(
-        tmp_path, valid_config_path,
-        "--kind", "turtle_breakout",
-        "--product", "ETH-USD",
-        "--params", '{"entry_lookback": 55, "exit_lookback": 20}',
+        tmp_path,
+        valid_config_path,
+        "--kind",
+        "turtle_breakout",
+        "--product",
+        "ETH-USD",
+        "--params",
+        '{"entry_lookback": 55, "exit_lookback": 20}',
     )
     assert result.exit_code == 0, result.output
 
@@ -142,10 +158,14 @@ def test_json_numbers_land_as_the_decimals_the_rule_expects(tmp_path, valid_conf
     repo = _repo(tmp_path)
 
     result = _add(
-        tmp_path, valid_config_path,
-        "--kind", "turtle_breakout",
-        "--product", "BTC-USD",
-        "--params", '{"atr_stop_mult": 2.5, "target_rr": 4}',
+        tmp_path,
+        valid_config_path,
+        "--kind",
+        "turtle_breakout",
+        "--product",
+        "BTC-USD",
+        "--params",
+        '{"atr_stop_mult": 2.5, "target_rr": 4}',
     )
     assert result.exit_code == 0, result.output
 
@@ -169,8 +189,14 @@ def test_a_rules_own_defaults_fill_in_the_params_not_given(tmp_path, valid_confi
     repo = _repo(tmp_path)
 
     result = _add(
-        tmp_path, valid_config_path,
-        "--kind", "dca", "--product", "BTC-USD", "--params", '{"cadence_days": 14}',
+        tmp_path,
+        valid_config_path,
+        "--kind",
+        "dca",
+        "--product",
+        "BTC-USD",
+        "--params",
+        '{"cadence_days": 14}',
     )
     assert result.exit_code == 0, result.output
 
@@ -204,8 +230,14 @@ def test_an_unknown_param_is_refused_and_nothing_is_written(tmp_path, valid_conf
     repo = _repo(tmp_path)
 
     result = _add(
-        tmp_path, valid_config_path,
-        "--kind", "dca", "--product", "BTC-USD", "--params", '{"cadance_days": 7}',
+        tmp_path,
+        valid_config_path,
+        "--kind",
+        "dca",
+        "--product",
+        "BTC-USD",
+        "--params",
+        '{"cadance_days": 7}',
     )
 
     assert result.exit_code != 0
@@ -213,17 +245,21 @@ def test_an_unknown_param_is_refused_and_nothing_is_written(tmp_path, valid_conf
     assert repo.get_rules() == []
 
 
-def test_an_out_of_range_param_is_refused_by_the_rules_own_validation(
-    tmp_path, valid_config_path
-):
+def test_an_out_of_range_param_is_refused_by_the_rules_own_validation(tmp_path, valid_config_path):
     """`Dca.__init__` raises `ValueError` on `cadence_days <= 0`. Constructing the rule BEFORE
     writing is what turns that into a refusal instead of a row that explodes at backtest time.
     """
     repo = _repo(tmp_path)
 
     result = _add(
-        tmp_path, valid_config_path,
-        "--kind", "dca", "--product", "BTC-USD", "--params", '{"cadence_days": 0}',
+        tmp_path,
+        valid_config_path,
+        "--kind",
+        "dca",
+        "--product",
+        "BTC-USD",
+        "--params",
+        '{"cadence_days": 0}',
     )
 
     assert result.exit_code != 0
@@ -231,9 +267,7 @@ def test_an_out_of_range_param_is_refused_by_the_rules_own_validation(
     assert repo.get_rules() == []
 
 
-def test_a_quoted_number_is_refused_for_a_param_that_is_not_a_decimal(
-    tmp_path, valid_config_path
-):
+def test_a_quoted_number_is_refused_for_a_param_that_is_not_a_decimal(tmp_path, valid_config_path):
     """Construction alone does NOT catch this, and the row it would write crashes a backtest.
 
     `RsiMeanReversion` is a plain dataclass: `oversold="10.0"` constructs happily, stores
@@ -246,9 +280,14 @@ def test_a_quoted_number_is_refused_for_a_param_that_is_not_a_decimal(
     repo = _repo(tmp_path)
 
     result = _add(
-        tmp_path, valid_config_path,
-        "--kind", "rsi_meanrev", "--product", "BTC-USD",
-        "--params", '{"oversold": "10.0", "rsi_period": "2"}',
+        tmp_path,
+        valid_config_path,
+        "--kind",
+        "rsi_meanrev",
+        "--product",
+        "BTC-USD",
+        "--params",
+        '{"oversold": "10.0", "rsi_period": "2"}',
     )
 
     assert result.exit_code != 0
@@ -265,8 +304,14 @@ def test_the_quotable_hint_names_the_granularity_param(tmp_path, valid_config_pa
     operator the exact opposite of the truth about it, in the same breath as correcting them.
     """
     result = _add(
-        tmp_path, valid_config_path,
-        "--kind", "rsi_meanrev", "--product", "BTC-USD", "--params", '{"oversold": "10.0"}',
+        tmp_path,
+        valid_config_path,
+        "--kind",
+        "rsi_meanrev",
+        "--product",
+        "BTC-USD",
+        "--params",
+        '{"oversold": "10.0"}',
     )
 
     assert result.exit_code != 0
@@ -287,18 +332,21 @@ def test_a_fractional_number_is_refused_where_the_rule_counts_bars(tmp_path, val
 
     for value in ("90.5", "1e400"):
         result = _add(
-            tmp_path, valid_config_path,
-            "--kind", "dca", "--product", "BTC-USD",
-            "--params", f'{{"lookback_days": {value}}}',
+            tmp_path,
+            valid_config_path,
+            "--kind",
+            "dca",
+            "--product",
+            "BTC-USD",
+            "--params",
+            f'{{"lookback_days": {value}}}',
         )
         assert result.exit_code != 0, value
         assert "lookback_days" in result.output
     assert repo.get_rules() == []
 
 
-def test_a_list_param_is_refused_when_its_elements_are_the_wrong_type(
-    tmp_path, valid_config_path
-):
+def test_a_list_param_is_refused_when_its_elements_are_the_wrong_type(tmp_path, valid_config_path):
     """`build_rule_from_params` does a blind `tuple(value)` for `ema_periods`. Quoted numbers
     survive it as strings, and `ema()` then computes `2.0 / (period + 1)` on a `str`:
     `TypeError: can only concatenate str (not "int") to str`, inside a backtest. Quoting the
@@ -307,9 +355,14 @@ def test_a_list_param_is_refused_when_its_elements_are_the_wrong_type(
     repo = _repo(tmp_path)
 
     result = _add(
-        tmp_path, valid_config_path,
-        "--kind", "pullback_continuation", "--product", "BTC-USD",
-        "--params", '{"ema_periods": ["8", "20", "50"]}',
+        tmp_path,
+        valid_config_path,
+        "--kind",
+        "pullback_continuation",
+        "--product",
+        "BTC-USD",
+        "--params",
+        '{"ema_periods": ["8", "20", "50"]}',
     )
 
     assert result.exit_code != 0
@@ -324,9 +377,14 @@ def test_a_string_is_refused_where_a_list_param_is_expected(tmp_path, valid_conf
     repo = _repo(tmp_path)
 
     result = _add(
-        tmp_path, valid_config_path,
-        "--kind", "pullback_continuation", "--product", "BTC-USD",
-        "--params", '{"ema_periods": "abc"}',
+        tmp_path,
+        valid_config_path,
+        "--kind",
+        "pullback_continuation",
+        "--product",
+        "BTC-USD",
+        "--params",
+        '{"ema_periods": "abc"}',
     )
 
     assert result.exit_code != 0
@@ -343,17 +401,34 @@ def test_a_non_finite_number_is_refused(tmp_path, valid_config_path):
     repo = _repo(tmp_path)
 
     budget = _add(
-        tmp_path, valid_config_path,
-        "--kind", "dca", "--product", "BTC-USD", "--params", '{"budget_usd": Infinity}',
+        tmp_path,
+        valid_config_path,
+        "--kind",
+        "dca",
+        "--product",
+        "BTC-USD",
+        "--params",
+        '{"budget_usd": Infinity}',
     )
     target = _add(
-        tmp_path, valid_config_path,
-        "--kind", "turtle_breakout", "--product", "BTC-USD",
-        "--params", '{"target_rr": Infinity}',
+        tmp_path,
+        valid_config_path,
+        "--kind",
+        "turtle_breakout",
+        "--product",
+        "BTC-USD",
+        "--params",
+        '{"target_rr": Infinity}',
     )
     lookback = _add(
-        tmp_path, valid_config_path,
-        "--kind", "dca", "--product", "BTC-USD", "--params", '{"lookback_days": 1e400}',
+        tmp_path,
+        valid_config_path,
+        "--kind",
+        "dca",
+        "--product",
+        "BTC-USD",
+        "--params",
+        '{"lookback_days": 1e400}',
     )
 
     assert budget.exit_code != 0
@@ -380,17 +455,28 @@ def test_the_non_finite_refusal_states_the_reason_that_is_true_for_that_param(
     json.loads(json.dumps({"budget_usd": str(Decimal("Infinity"))}))  # valid JSON, no raise
 
     decimal_param = _add(
-        tmp_path, valid_config_path,
-        "--kind", "dca", "--product", "BTC-USD", "--params", '{"budget_usd": Infinity}',
+        tmp_path,
+        valid_config_path,
+        "--kind",
+        "dca",
+        "--product",
+        "BTC-USD",
+        "--params",
+        '{"budget_usd": Infinity}',
     )
     float_param = _add(
-        tmp_path, valid_config_path,
-        "--kind", "turtle_breakout", "--product", "BTC-USD",
-        "--params", '{"volume_mult": 1e400}',
+        tmp_path,
+        valid_config_path,
+        "--kind",
+        "turtle_breakout",
+        "--product",
+        "BTC-USD",
+        "--params",
+        '{"volume_mult": 1e400}',
     )
 
     assert "IS valid JSON" in decimal_param.output, (
-        "the stored value is the string \"Infinity\", which IS valid JSON -- claiming otherwise "
+        'the stored value is the string "Infinity", which IS valid JSON -- claiming otherwise '
         "for the very example the refusal cites is simply false"
     )
     assert '"Infinity"' in decimal_param.output, "the quoted, stored form is what it becomes"
@@ -401,9 +487,7 @@ def test_the_non_finite_refusal_states_the_reason_that_is_true_for_that_param(
     assert "`Infinity`" in float_param.output, "the bare token, unquoted"
 
 
-def test_a_null_is_refused_rather_than_constructing_a_rule_around_it(
-    tmp_path, valid_config_path
-):
+def test_a_null_is_refused_rather_than_constructing_a_rule_around_it(tmp_path, valid_config_path):
     """No rule param has a `None` default, and the coercion boundary deliberately passes `None`
     through untouched -- so `{"oversold": null}` reaches a validation-free dataclass intact and
     dies comparing a float to `None`, at backtest time.
@@ -411,8 +495,14 @@ def test_a_null_is_refused_rather_than_constructing_a_rule_around_it(
     repo = _repo(tmp_path)
 
     result = _add(
-        tmp_path, valid_config_path,
-        "--kind", "rsi_meanrev", "--product", "BTC-USD", "--params", '{"oversold": null}',
+        tmp_path,
+        valid_config_path,
+        "--kind",
+        "rsi_meanrev",
+        "--product",
+        "BTC-USD",
+        "--params",
+        '{"oversold": null}',
     )
 
     assert result.exit_code != 0
@@ -440,8 +530,14 @@ def test_a_json_container_is_refused_where_the_rule_wants_a_single_value(
     ]
     for kind, params, name in cases:
         result = _add(
-            tmp_path, valid_config_path, "--kind", kind, "--product", "BTC-USD",
-            "--params", params,
+            tmp_path,
+            valid_config_path,
+            "--kind",
+            kind,
+            "--product",
+            "BTC-USD",
+            "--params",
+            params,
         )
         assert result.exit_code != 0, (kind, params, result.output)
         assert name in result.output, params
@@ -458,13 +554,24 @@ def test_a_value_outside_a_params_declared_choices_is_refused(tmp_path, valid_co
     repo = _repo(tmp_path)
 
     stop = _add(
-        tmp_path, valid_config_path,
-        "--kind", "rsi_meanrev", "--product", "BTC-USD", "--params", '{"stop_method": "banana"}',
+        tmp_path,
+        valid_config_path,
+        "--kind",
+        "rsi_meanrev",
+        "--product",
+        "BTC-USD",
+        "--params",
+        '{"stop_method": "banana"}',
     )
     target = _add(
-        tmp_path, valid_config_path,
-        "--kind", "rsi_meanrev", "--product", "BTC-USD",
-        "--params", '{"target_method": "banana"}',
+        tmp_path,
+        valid_config_path,
+        "--kind",
+        "rsi_meanrev",
+        "--product",
+        "BTC-USD",
+        "--params",
+        '{"target_method": "banana"}',
     )
 
     assert stop.exit_code != 0
@@ -488,14 +595,24 @@ def test_a_typod_choice_is_refused_rather_than_backtesting_a_different_branch(
     repo = _repo(tmp_path)
 
     zone = _add(
-        tmp_path, valid_config_path,
-        "--kind", "pullback_continuation", "--product", "BTC-USD",
-        "--params", '{"entry_zone": "banana"}',
+        tmp_path,
+        valid_config_path,
+        "--kind",
+        "pullback_continuation",
+        "--product",
+        "BTC-USD",
+        "--params",
+        '{"entry_zone": "banana"}',
     )
     stop = _add(
-        tmp_path, valid_config_path,
-        "--kind", "pullback_continuation", "--product", "BTC-USD",
-        "--params", '{"stop_method": "banana"}',
+        tmp_path,
+        valid_config_path,
+        "--kind",
+        "pullback_continuation",
+        "--product",
+        "BTC-USD",
+        "--params",
+        '{"stop_method": "banana"}',
     )
 
     assert zone.exit_code != 0
@@ -521,8 +638,14 @@ def test_every_choice_a_rule_declares_is_accepted(tmp_path, valid_config_path):
             is_sequence = isinstance(signature[param].default, tuple)
             for choice in choices:
                 result = _add(
-                    tmp_path, valid_config_path, "--kind", kind, "--product", "BTC-USD",
-                    "--params", json.dumps({param: [choice] if is_sequence else choice}),
+                    tmp_path,
+                    valid_config_path,
+                    "--kind",
+                    kind,
+                    "--product",
+                    "BTC-USD",
+                    "--params",
+                    json.dumps({param: [choice] if is_sequence else choice}),
                 )
                 assert result.exit_code == 0, (kind, param, choice, result.output)
                 checked += 1
@@ -543,14 +666,24 @@ def test_an_unknown_signal_pattern_is_refused_like_an_empty_pattern_list(
     repo = _repo(tmp_path)
 
     empty = _add(
-        tmp_path, valid_config_path,
-        "--kind", "pullback_continuation", "--product", "BTC-USD",
-        "--params", '{"signal_patterns": []}',
+        tmp_path,
+        valid_config_path,
+        "--kind",
+        "pullback_continuation",
+        "--product",
+        "BTC-USD",
+        "--params",
+        '{"signal_patterns": []}',
     )
     unknown = _add(
-        tmp_path, valid_config_path,
-        "--kind", "pullback_continuation", "--product", "BTC-USD",
-        "--params", '{"signal_patterns": ["pin_bar", "nonexistent"]}',
+        tmp_path,
+        valid_config_path,
+        "--kind",
+        "pullback_continuation",
+        "--product",
+        "BTC-USD",
+        "--params",
+        '{"signal_patterns": ["pin_bar", "nonexistent"]}',
     )
 
     assert empty.exit_code != 0
@@ -569,23 +702,32 @@ def test_a_whole_number_is_still_fine_for_a_param_whose_default_is_a_float(
     repo = _repo(tmp_path)
 
     result = _add(
-        tmp_path, valid_config_path,
-        "--kind", "turtle_breakout", "--product", "BTC-USD",
-        "--params", '{"adx_threshold": 30, "volume_mult": 2}',
+        tmp_path,
+        valid_config_path,
+        "--kind",
+        "turtle_breakout",
+        "--product",
+        "BTC-USD",
+        "--params",
+        '{"adx_threshold": 30, "volume_mult": 2}',
     )
 
     assert result.exit_code == 0, result.output
     assert _build_rule(repo.get_rules()[0]).params["adx_threshold"] == 30
 
 
-def test_a_number_is_refused_for_a_param_the_rule_declares_as_a_string(
-    tmp_path, valid_config_path
-):
+def test_a_number_is_refused_for_a_param_the_rule_declares_as_a_string(tmp_path, valid_config_path):
     repo = _repo(tmp_path)
 
     result = _add(
-        tmp_path, valid_config_path,
-        "--kind", "rsi_meanrev", "--product", "BTC-USD", "--params", '{"stop_method": 5}',
+        tmp_path,
+        valid_config_path,
+        "--kind",
+        "rsi_meanrev",
+        "--product",
+        "BTC-USD",
+        "--params",
+        '{"stop_method": 5}',
     )
 
     assert result.exit_code != 0
@@ -600,9 +742,14 @@ def test_the_params_that_legitimately_take_strings_are_not_refused(tmp_path, val
     repo = _repo(tmp_path)
 
     result = _add(
-        tmp_path, valid_config_path,
-        "--kind", "rsi_meanrev", "--product", "BTC-USD",
-        "--params", '{"atr_mult": "2.5", "timeframe": "ONE_DAY", "stop_method": "fixed"}',
+        tmp_path,
+        valid_config_path,
+        "--kind",
+        "rsi_meanrev",
+        "--product",
+        "BTC-USD",
+        "--params",
+        '{"atr_mult": "2.5", "timeframe": "ONE_DAY", "stop_method": "fixed"}',
     )
 
     assert result.exit_code == 0, result.output
@@ -622,9 +769,14 @@ def test_a_param_the_row_cannot_carry_is_refused_rather_than_silently_dropped(
     repo = _repo(tmp_path)
 
     result = _add(
-        tmp_path, valid_config_path,
-        "--kind", "pullback_continuation", "--product", "BTC-USD",
-        "--params", '{"granularity": "ONE_DAY"}',
+        tmp_path,
+        valid_config_path,
+        "--kind",
+        "pullback_continuation",
+        "--product",
+        "BTC-USD",
+        "--params",
+        '{"granularity": "ONE_DAY"}',
     )
 
     assert result.exit_code != 0
@@ -639,9 +791,14 @@ def test_a_param_that_the_row_does_carry_is_still_accepted(tmp_path, valid_confi
     repo = _repo(tmp_path)
 
     result = _add(
-        tmp_path, valid_config_path,
-        "--kind", "pullback_continuation", "--product", "BTC-USD",
-        "--params", '{"ema_periods": [10, 20, 50], "buffer_ticks": "0.05"}',
+        tmp_path,
+        valid_config_path,
+        "--kind",
+        "pullback_continuation",
+        "--product",
+        "BTC-USD",
+        "--params",
+        '{"ema_periods": [10, 20, 50], "buffer_ticks": "0.05"}',
     )
 
     assert result.exit_code == 0, result.output
@@ -654,8 +811,14 @@ def test_an_unknown_kind_is_refused_naming_the_kinds_that_exist(tmp_path, valid_
     repo = _repo(tmp_path)
 
     result = _add(
-        tmp_path, valid_config_path,
-        "--kind", "turtle_breakouts", "--product", "BTC-USD", "--params", "{}",
+        tmp_path,
+        valid_config_path,
+        "--kind",
+        "turtle_breakouts",
+        "--product",
+        "BTC-USD",
+        "--params",
+        "{}",
     )
 
     assert result.exit_code != 0
@@ -668,8 +831,14 @@ def test_malformed_params_json_is_refused(tmp_path, valid_config_path):
     repo = _repo(tmp_path)
 
     result = _add(
-        tmp_path, valid_config_path,
-        "--kind", "dca", "--product", "BTC-USD", "--params", "cadence_days=7",
+        tmp_path,
+        valid_config_path,
+        "--kind",
+        "dca",
+        "--product",
+        "BTC-USD",
+        "--params",
+        "cadence_days=7",
     )
 
     assert result.exit_code != 0
@@ -680,7 +849,7 @@ def test_malformed_params_json_is_refused(tmp_path, valid_config_path):
 def test_an_explicitly_empty_params_is_refused_not_read_as_the_defaults(
     tmp_path, valid_config_path
 ):
-    """"Flag absent" and "flag given but empty" are different intentions and must not collapse
+    """ "Flag absent" and "flag given but empty" are different intentions and must not collapse
     into the same defaults row. The empty string is what a shell hands over when the proposal
     plumbing misfires -- `--params "$(jq -c .params proposal.json)"` yields `""` when the key
     is missing or jq errors -- and the silent-default outcome is the worst one available: `added
@@ -691,8 +860,14 @@ def test_an_explicitly_empty_params_is_refused_not_read_as_the_defaults(
 
     for empty in ("", "   "):
         result = _add(
-            tmp_path, valid_config_path,
-            "--kind", "dca", "--product", "BTC-USD", "--params", empty,
+            tmp_path,
+            valid_config_path,
+            "--kind",
+            "dca",
+            "--product",
+            "BTC-USD",
+            "--params",
+            empty,
         )
         assert result.exit_code != 0, repr(empty)
         assert repo.get_rules() == [], "an empty --params must never write a defaults row"
@@ -702,8 +877,14 @@ def test_an_explicitly_empty_params_is_refused_not_read_as_the_defaults(
         )
 
     explicit = _add(
-        tmp_path, valid_config_path,
-        "--kind", "dca", "--product", "BTC-USD", "--params", "{}",
+        tmp_path,
+        valid_config_path,
+        "--kind",
+        "dca",
+        "--product",
+        "BTC-USD",
+        "--params",
+        "{}",
     )
     omitted = _add(tmp_path, valid_config_path, "--kind", "dca", "--product", "ETH-USD")
 
@@ -716,8 +897,14 @@ def test_params_that_are_not_a_json_object_are_refused(tmp_path, valid_config_pa
     repo = _repo(tmp_path)
 
     result = _add(
-        tmp_path, valid_config_path,
-        "--kind", "dca", "--product", "BTC-USD", "--params", "[7]",
+        tmp_path,
+        valid_config_path,
+        "--kind",
+        "dca",
+        "--product",
+        "BTC-USD",
+        "--params",
+        "[7]",
     )
 
     assert result.exit_code != 0
@@ -733,8 +920,14 @@ def test_a_product_id_inside_params_that_disagrees_with_product_is_refused(
     repo = _repo(tmp_path)
 
     result = _add(
-        tmp_path, valid_config_path,
-        "--kind", "dca", "--product", "BTC-USD", "--params", '{"product_id": "ETH-USD"}',
+        tmp_path,
+        valid_config_path,
+        "--kind",
+        "dca",
+        "--product",
+        "BTC-USD",
+        "--params",
+        '{"product_id": "ETH-USD"}',
     )
 
     assert result.exit_code != 0
@@ -749,8 +942,14 @@ def test_a_futures_contract_is_refused_and_named(tmp_path, valid_config_path):
     repo = _repo(tmp_path)
 
     result = _add(
-        tmp_path, valid_config_path,
-        "--kind", "dca", "--product", "XLM-28AUG26-CDE", "--params", "{}",
+        tmp_path,
+        valid_config_path,
+        "--kind",
+        "dca",
+        "--product",
+        "XLM-28AUG26-CDE",
+        "--params",
+        "{}",
     )
 
     assert result.exit_code != 0
@@ -758,14 +957,18 @@ def test_a_futures_contract_is_refused_and_named(tmp_path, valid_config_path):
     assert repo.get_rules() == []
 
 
-def test_a_pair_settling_outside_the_settlement_currencies_is_refused(
-    tmp_path, valid_config_path
-):
+def test_a_pair_settling_outside_the_settlement_currencies_is_refused(tmp_path, valid_config_path):
     repo = _repo(tmp_path)
 
     result = _add(
-        tmp_path, valid_config_path,
-        "--kind", "dca", "--product", "BTC-EUR", "--params", "{}",
+        tmp_path,
+        valid_config_path,
+        "--kind",
+        "dca",
+        "--product",
+        "BTC-EUR",
+        "--params",
+        "{}",
     )
 
     assert result.exit_code != 0
@@ -773,14 +976,18 @@ def test_a_pair_settling_outside_the_settlement_currencies_is_refused(
     assert repo.get_rules() == []
 
 
-def test_a_lowercase_id_gets_a_hint_and_is_never_silently_uppercased(
-    tmp_path, valid_config_path
-):
+def test_a_lowercase_id_gets_a_hint_and_is_never_silently_uppercased(tmp_path, valid_config_path):
     repo = _repo(tmp_path)
 
     result = _add(
-        tmp_path, valid_config_path,
-        "--kind", "dca", "--product", "btc-USD", "--params", "{}",
+        tmp_path,
+        valid_config_path,
+        "--kind",
+        "dca",
+        "--product",
+        "btc-USD",
+        "--params",
+        "{}",
     )
 
     assert result.exit_code != 0
@@ -793,8 +1000,14 @@ def test_more_than_one_product_is_refused(tmp_path, valid_config_path):
     repo = _repo(tmp_path)
 
     result = _add(
-        tmp_path, valid_config_path,
-        "--kind", "dca", "--product", "BTC-USD,ETH-USD", "--params", "{}",
+        tmp_path,
+        valid_config_path,
+        "--kind",
+        "dca",
+        "--product",
+        "BTC-USD,ETH-USD",
+        "--params",
+        "{}",
     )
 
     assert result.exit_code != 0
@@ -814,17 +1027,27 @@ def test_a_second_rule_for_the_same_kind_and_product_is_allowed_and_reported(
     repo = _repo(tmp_path)
 
     first = _add(
-        tmp_path, valid_config_path,
-        "--kind", "turtle_breakout", "--product", "BTC-USD",
-        "--params", '{"entry_lookback": 20}',
+        tmp_path,
+        valid_config_path,
+        "--kind",
+        "turtle_breakout",
+        "--product",
+        "BTC-USD",
+        "--params",
+        '{"entry_lookback": 20}',
     )
     assert first.exit_code == 0, first.output
     first_id = repo.get_rules()[0]["id"]
 
     second = _add(
-        tmp_path, valid_config_path,
-        "--kind", "turtle_breakout", "--product", "BTC-USD",
-        "--params", '{"entry_lookback": 55}',
+        tmp_path,
+        valid_config_path,
+        "--kind",
+        "turtle_breakout",
+        "--product",
+        "BTC-USD",
+        "--params",
+        '{"entry_lookback": 55}',
     )
 
     assert second.exit_code == 0, second.output
@@ -845,17 +1068,27 @@ def test_the_report_shows_how_an_existing_rule_DIFFERS_not_its_whole_params(
     """
     repo = _repo(tmp_path)
     first = _add(
-        tmp_path, valid_config_path,
-        "--kind", "turtle_breakout", "--product", "BTC-USD",
-        "--params", '{"entry_lookback": 20}',
+        tmp_path,
+        valid_config_path,
+        "--kind",
+        "turtle_breakout",
+        "--product",
+        "BTC-USD",
+        "--params",
+        '{"entry_lookback": 20}',
     )
     assert first.exit_code == 0, first.output
     first_id = repo.get_rules()[0]["id"]
 
     second = _add(
-        tmp_path, valid_config_path,
-        "--kind", "turtle_breakout", "--product", "BTC-USD",
-        "--params", '{"entry_lookback": 55}',
+        tmp_path,
+        valid_config_path,
+        "--kind",
+        "turtle_breakout",
+        "--product",
+        "BTC-USD",
+        "--params",
+        '{"entry_lookback": 55}',
     )
 
     assert second.exit_code == 0, second.output
@@ -897,9 +1130,14 @@ def test_a_param_the_older_row_predates_is_not_reported_as_a_parameter_differenc
     )
 
     result = _add(
-        tmp_path, valid_config_path,
-        "--kind", "turtle_breakout", "--product", "BTC-USD",
-        "--params", '{"entry_lookback": 55}',
+        tmp_path,
+        valid_config_path,
+        "--kind",
+        "turtle_breakout",
+        "--product",
+        "BTC-USD",
+        "--params",
+        '{"entry_lookback": 55}',
     )
 
     assert result.exit_code == 0, result.output
@@ -936,9 +1174,7 @@ def test_an_existing_rule_with_identical_params_is_reported_as_identical(
     assert "identical params" in report[0]
 
 
-def test_existing_rules_are_reported_with_their_status_whatever_it_is(
-    tmp_path, valid_config_path
-):
+def test_existing_rules_are_reported_with_their_status_whatever_it_is(tmp_path, valid_config_path):
     """A `live` sibling is the one an operator most needs to hear about before backtesting."""
     repo = _repo(tmp_path)
     live_id = repo.insert_rule("dca", {"product_id": "BTC-USD"}, status="live")
@@ -959,8 +1195,14 @@ def test_a_product_outside_the_allowlist_is_added_and_flagged_not_refused(
     repo = _repo(tmp_path)
 
     result = _add(
-        tmp_path, valid_config_path,
-        "--kind", "dca", "--product", "SOL-USD", "--params", '{"cadence_days": 7}',
+        tmp_path,
+        valid_config_path,
+        "--kind",
+        "dca",
+        "--product",
+        "SOL-USD",
+        "--params",
+        '{"cadence_days": 7}',
     )
 
     assert result.exit_code == 0, result.output
@@ -987,8 +1229,14 @@ def test_it_prints_the_exact_next_command(tmp_path, valid_config_path):
     repo = _repo(tmp_path)
 
     result = _add(
-        tmp_path, valid_config_path,
-        "--kind", "dca", "--product", "BTC-USD", "--params", '{"cadence_days": 7}',
+        tmp_path,
+        valid_config_path,
+        "--kind",
+        "dca",
+        "--product",
+        "BTC-USD",
+        "--params",
+        '{"cadence_days": 7}',
     )
 
     assert result.exit_code == 0, result.output
@@ -1001,8 +1249,14 @@ def test_the_added_rule_actually_backtests(tmp_path, valid_config_path):
     here is accepted by `rules backtest`, which rebuilds the rule and runs it over candles.
     """
     add = _add(
-        tmp_path, valid_config_path,
-        "--kind", "dca", "--product", "BTC-USD", "--params", '{"cadence_days": 3}',
+        tmp_path,
+        valid_config_path,
+        "--kind",
+        "dca",
+        "--product",
+        "BTC-USD",
+        "--params",
+        '{"cadence_days": 3}',
     )
     assert add.exit_code == 0, add.output
     rule_id = _repo(tmp_path).get_rules()[0]["id"]
@@ -1010,10 +1264,15 @@ def test_the_added_rule_actually_backtests(tmp_path, valid_config_path):
     result = CliRunner().invoke(
         cli,
         [
-            "--db", str(tmp_path / "t.db"),
-            "--config", str(valid_config_path),
-            "rules", "backtest", str(rule_id),
-            "--granularity", "ONE_DAY",
+            "--db",
+            str(tmp_path / "t.db"),
+            "--config",
+            str(valid_config_path),
+            "rules",
+            "backtest",
+            str(rule_id),
+            "--granularity",
+            "ONE_DAY",
         ],
     )
 
@@ -1032,8 +1291,14 @@ def test_it_never_constructs_a_broker(tmp_path, valid_config_path, monkeypatch):
     repo = _repo(tmp_path)
 
     result = _add(
-        tmp_path, valid_config_path,
-        "--kind", "dca", "--product", "BTC-USD", "--params", '{"cadence_days": 7}',
+        tmp_path,
+        valid_config_path,
+        "--kind",
+        "dca",
+        "--product",
+        "BTC-USD",
+        "--params",
+        '{"cadence_days": 7}',
     )
 
     assert result.exit_code == 0, result.output
@@ -1045,9 +1310,14 @@ def test_the_printed_params_are_the_stored_params(tmp_path, valid_config_path):
     repo = _repo(tmp_path)
 
     result = _add(
-        tmp_path, valid_config_path,
-        "--kind", "turtle_breakout", "--product", "BTC-USD",
-        "--params", '{"entry_lookback": 55}',
+        tmp_path,
+        valid_config_path,
+        "--kind",
+        "turtle_breakout",
+        "--product",
+        "BTC-USD",
+        "--params",
+        '{"entry_lookback": 55}',
     )
 
     assert result.exit_code == 0, result.output

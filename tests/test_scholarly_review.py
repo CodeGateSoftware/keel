@@ -137,8 +137,10 @@ def test_the_status_section_sits_between_how_to_disagree_and_the_sources_index()
     status must be stated before the citations begin.
     """
     doc = _read(_DOC)
-    assert doc.index("## How to disagree") < doc.index(_SECTION_HEADING) < doc.index(
-        "## Sources index"
+    assert (
+        doc.index("## How to disagree")
+        < doc.index(_SECTION_HEADING)
+        < doc.index("## Sources index")
     ), (
         f"{_DOC} must place {_SECTION_HEADING!r} after '## How to disagree' and before "
         "'## Sources index'"

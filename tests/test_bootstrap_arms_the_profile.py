@@ -32,11 +32,7 @@ _BOOTSTRAP_SECTIONS = (
 def _section(heading: str) -> str:
     text = _RUNBOOK.read_text(encoding="utf-8")
     start = text.index(heading)
-    following = [
-        m.start()
-        for m in re.finditer(r"(?m)^## ", text)
-        if m.start() > start
-    ]
+    following = [m.start() for m in re.finditer(r"(?m)^## ", text) if m.start() > start]
     return text[start : following[0] if following else len(text)]
 
 

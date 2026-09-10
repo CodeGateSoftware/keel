@@ -107,9 +107,7 @@ def test_the_parser_is_TOTAL_and_never_raises(weird):
 
 
 @pytest.mark.parametrize(("product_id", "expected"), _REAL_PRODUCT_IDS)
-def test_any_parsed_quote_leg_is_a_valid_currency_code_by_configs_own_grammar(
-    product_id, expected
-):
+def test_any_parsed_quote_leg_is_a_valid_currency_code_by_configs_own_grammar(product_id, expected):
     """The two grammars cannot be allowed to disagree about what a currency code is.
 
     Rail 18 compares `quote_currency_of`'s output against `config.settlement_currencies`, whose
@@ -135,8 +133,10 @@ def test_the_two_parsers_agree_on_the_quote_leg_of_a_well_formed_spot_id():
 # -- is_spot_base_code (the base-leg half, which `config.allowlist` is checked against) ---------
 
 
-@pytest.mark.parametrize("code", ["BTC", "ETH", "PAXG", "ADA", "XLM", "SOL", "LTC", "LINK",
-                                  "1INCH", "A", "ABCDEFGHIJKLMNOP"])
+@pytest.mark.parametrize(
+    "code",
+    ["BTC", "ETH", "PAXG", "ADA", "XLM", "SOL", "LTC", "LINK", "1INCH", "A", "ABCDEFGHIJKLMNOP"],
+)
 def test_a_real_ticker_is_a_valid_base_code(code):
     """Every asset the shipped configs list, plus the digit-leading and 16-char edges."""
     assert is_spot_base_code(code) is True

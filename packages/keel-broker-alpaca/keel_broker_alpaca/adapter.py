@@ -776,7 +776,7 @@ def _decimal_or_none(value: Any) -> Decimal | None:
         return None
     try:
         parsed = Decimal(str(value))
-    except (InvalidOperation, ValueError, TypeError):
+    except InvalidOperation, ValueError, TypeError:
         return None
     if not parsed.is_finite():
         return None

@@ -1439,7 +1439,10 @@ def test_a_paper_cycle_records_the_split_off_the_synthetic_account(repo, monkeyp
     repo.set_state("equity_state_mode", "paper")
     trader.on_signal(
         _paper_enter_signal(
-            product_id=PRODUCT, entry=Decimal("100"), stop=Decimal("50"), target=Decimal("200"),
+            product_id=PRODUCT,
+            entry=Decimal("100"),
+            stop=Decimal("50"),
+            target=Decimal("200"),
             ts=0,
         ),
         qty=Decimal("10"),
@@ -1474,9 +1477,7 @@ def test_the_live_split_reconciles_against_the_equity_it_was_read_with(repo: Rep
     _seed_open_position(repo, PRODUCT, Decimal("2"), Decimal("100"), ts=1_000)
     broker = FakeBroker()
 
-    parts = agent._mark_to_market_parts(
-        repo, broker, [PRODUCT], {PRODUCT: Decimal("150")}, "USD"
-    )
+    parts = agent._mark_to_market_parts(repo, broker, [PRODUCT], {PRODUCT: Decimal("150")}, "USD")
 
     assert parts is not None
     cost_basis = Decimal("2") * Decimal("100")
@@ -1559,7 +1560,10 @@ def test_a_paper_cycle_writes_no_cycle_balances(repo, monkeypatch) -> None:
     repo.set_state("equity_state_mode", "paper")
     trader.on_signal(
         _paper_enter_signal(
-            product_id=PRODUCT, entry=Decimal("100"), stop=Decimal("50"), target=Decimal("200"),
+            product_id=PRODUCT,
+            entry=Decimal("100"),
+            stop=Decimal("50"),
+            target=Decimal("200"),
             ts=0,
         ),
         qty=Decimal("10"),
@@ -2772,8 +2776,13 @@ class _EnterOnceRule(_AlwaysEnterRule):
     """Enters on the FIRST bar only, so the round-trip tests can assert `exactly one` outcome
     row without `_AlwaysEnterRule` re-entering on the very cycle the exit books."""
 
-    def __init__(self, product_id: str, name: str = "fake_enter", stop_mult: str = "0.95",
-                 target_mult: str = "1.15") -> None:
+    def __init__(
+        self,
+        product_id: str,
+        name: str = "fake_enter",
+        stop_mult: str = "0.95",
+        target_mult: str = "1.15",
+    ) -> None:
         super().__init__(product_id, name=name, stop_mult=stop_mult)
         self.target_mult = Decimal(target_mult)
 
@@ -2795,7 +2804,11 @@ class _EnterOnceRule(_AlwaysEnterRule):
 
 def _bar(ts: int, o: str, h: str, low: str, c: str) -> Candle:
     return Candle(
-        ts=ts, open=Decimal(o), high=Decimal(h), low=Decimal(low), close=Decimal(c),
+        ts=ts,
+        open=Decimal(o),
+        high=Decimal(h),
+        low=Decimal(low),
+        close=Decimal(c),
         volume=Decimal("1"),
     )
 
@@ -4817,7 +4830,6 @@ def test_run_once_sweeps_orphan_brackets_after_the_rebracket_pass(repo, monkeypa
     )
 
 
-
 def test_the_cycle_sizes_against_available_never_total(repo: Repository) -> None:
     """`_mark_to_market_parts`' `cash` becomes rail 11's cash and feeds `equity`. It must be the
     AVAILABLE leg -- what the account can actually deploy -- never `total`, which includes funds
@@ -4838,4 +4850,3 @@ def test_the_cycle_sizes_against_available_never_total(repo: Repository) -> None
     assert parts.cash == Decimal("100"), "cash is the deployable leg, not the account total"
     by_currency = {c: (a, t) for c, a, t in parts.balances}
     assert by_currency["USDC"] == (Decimal("100"), Decimal("999"))
-

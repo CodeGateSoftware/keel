@@ -60,10 +60,30 @@ JSONL_PATH = OUT_DIR / "equities_cost_fidelity.jsonl"
 
 EQUITIES = ["MSFT-USD", "AAPL-USD", "GOOGL-USD", "NVDA-USD", "COST-USD"]
 CRYPTO = [
-    "BTC-USD", "ETH-USD", "ADA-USD", "LINK-USD", "LTC-USD", "SOL-USD",
-    "XLM-USD", "PAXG-USDT", "BCH-USD", "AAVE-USD", "DOGE-USD", "DOT-USD",
-    "UNI-USD", "ZEC-USD", "ALGO-USD", "FET-USD", "CRV-USD", "ICP-USD",
-    "AVAX-USD", "NEAR-USD", "XRP-USD", "PAXG-USD", "WLD-USD", "TON-USD",
+    "BTC-USD",
+    "ETH-USD",
+    "ADA-USD",
+    "LINK-USD",
+    "LTC-USD",
+    "SOL-USD",
+    "XLM-USD",
+    "PAXG-USDT",
+    "BCH-USD",
+    "AAVE-USD",
+    "DOGE-USD",
+    "DOT-USD",
+    "UNI-USD",
+    "ZEC-USD",
+    "ALGO-USD",
+    "FET-USD",
+    "CRV-USD",
+    "ICP-USD",
+    "AVAX-USD",
+    "NEAR-USD",
+    "XRP-USD",
+    "PAXG-USD",
+    "WLD-USD",
+    "TON-USD",
 ]
 
 #: The order size the regulatory term is expressed at. keel's equities profile caps exposure at
@@ -83,8 +103,14 @@ def load(db: str, product_id: str) -> list[Candle]:
     finally:
         con.close()
     return [
-        Candle(ts=r[0], open=Decimal(r[1]), high=Decimal(r[2]), low=Decimal(r[3]),
-               close=Decimal(r[4]), volume=Decimal(r[5]))
+        Candle(
+            ts=r[0],
+            open=Decimal(r[1]),
+            high=Decimal(r[2]),
+            low=Decimal(r[3]),
+            close=Decimal(r[4]),
+            volume=Decimal(r[5]),
+        )
         for r in rows
     ]
 
@@ -174,8 +200,10 @@ def main() -> None:
         for row in rows:
             fh.write(json.dumps(row) + "\n")
 
-    hdr = (f"{'product':<12}{'bars':>6}{'spread bp':>11}{'naive bp':>10}{'raw bp':>10}"
-           f"{'neg share':>11}{'gaps':>7}{'model rt bp':>13}{'measured rt bp':>16}")
+    hdr = (
+        f"{'product':<12}{'bars':>6}{'spread bp':>11}{'naive bp':>10}{'raw bp':>10}"
+        f"{'neg share':>11}{'gaps':>7}{'model rt bp':>13}{'measured rt bp':>16}"
+    )
     for klass in ("equities", "crypto"):
         sub = [r for r in rows if r["asset_class"] == klass]
         print(f"\n=== {klass} ({len(sub)}) ===")
@@ -197,14 +225,20 @@ def main() -> None:
     eq_med = statistics.median(sorted(Decimal(str(r["measured_roundtrip_bp"])) for r in eq))
     cr_med = statistics.median(sorted(Decimal(str(r["measured_roundtrip_bp"])) for r in cr))
     print(f"\ncrypto / equities measured round-trip ratio: {(cr_med / eq_med):.1f}x")
-    print(f"equities: modelled {statistics.median(sorted(Decimal(str(r['modelled_roundtrip_bp'])) for r in eq))} bp"
-          f" vs measured {eq_med} bp")
+    print(
+        f"equities: modelled {statistics.median(sorted(Decimal(str(r['modelled_roundtrip_bp'])) for r in eq))} bp"
+        f" vs measured {eq_med} bp"
+    )
     print(f"floor reference: SLIPPAGE_FLOOR_PCT = {SLIPPAGE_FLOOR_PCT * 10000} bp one way")
     for klass, sub in (("equities", eq), ("crypto", cr)):
         blocked = statistics.median(sorted(Decimal(str(r["spread_bp"])) for r in sub))
         naive = statistics.median(sorted(Decimal(str(r["naive_spread_bp"])) for r in sub))
-        print(f"aggregation bias, {klass}: naive {naive} bp vs blocked {blocked} bp"
-              f" ({naive / blocked:.1f}x)" if blocked else f"{klass}: blocked is zero")
+        print(
+            f"aggregation bias, {klass}: naive {naive} bp vs blocked {blocked} bp"
+            f" ({naive / blocked:.1f}x)"
+            if blocked
+            else f"{klass}: blocked is zero"
+        )
     print(f"\nwrote {JSONL_PATH}")
 
 

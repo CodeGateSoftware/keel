@@ -63,7 +63,13 @@ def test_trading_requires_a_terminal_and_fails_closed_off_one(
     """SAFETY-CRITICAL: --trading must refuse off a TTY, with nothing written."""
     _at_a_terminal(monkeypatch, yes=False)
     result = _run(
-        db_path, valid_config_path, "scope", "attest", "--trading", "--venue", "coinbase",
+        db_path,
+        valid_config_path,
+        "scope",
+        "attest",
+        "--trading",
+        "--venue",
+        "coinbase",
         input="yes\n",
     )
     assert result.exit_code != 0, result.output
@@ -76,7 +82,13 @@ def test_trading_proceeds_on_a_typed_yes_at_a_terminal(
 ) -> None:
     _at_a_terminal(monkeypatch, yes=True)
     result = _run(
-        db_path, valid_config_path, "scope", "attest", "--trading", "--venue", "coinbase",
+        db_path,
+        valid_config_path,
+        "scope",
+        "attest",
+        "--trading",
+        "--venue",
+        "coinbase",
         input="yes\n",
     )
     assert result.exit_code == 0, result.output
@@ -91,7 +103,13 @@ def test_trading_aborts_on_anything_other_than_a_typed_yes(
 ) -> None:
     _at_a_terminal(monkeypatch, yes=True)
     result = _run(
-        db_path, valid_config_path, "scope", "attest", "--trading", "--venue", "coinbase",
+        db_path,
+        valid_config_path,
+        "scope",
+        "attest",
+        "--trading",
+        "--venue",
+        "coinbase",
         input="y\n",
     )
     assert result.exit_code != 0, result.output
@@ -105,7 +123,13 @@ def test_read_only_works_off_a_tty_with_no_gate(
     """--read-only only ever REDUCES capability, so it must stay usable from cron (no TTY)."""
     _at_a_terminal(monkeypatch, yes=False)
     result = _run(
-        db_path, valid_config_path, "scope", "attest", "--read-only", "--venue", "coinbase",
+        db_path,
+        valid_config_path,
+        "scope",
+        "attest",
+        "--read-only",
+        "--venue",
+        "coinbase",
     )
     assert result.exit_code == 0, result.output
     record = _repo_at(db_path).get_venue_trade_scope("coinbase")
@@ -129,7 +153,13 @@ def test_trading_permits_a_live_entry(
 ) -> None:
     _at_a_terminal(monkeypatch, yes=True)
     _run(
-        db_path, valid_config_path, "scope", "attest", "--trading", "--venue", "coinbase",
+        db_path,
+        valid_config_path,
+        "scope",
+        "attest",
+        "--trading",
+        "--venue",
+        "coinbase",
         input="yes\n",
     )
     record = _repo_at(db_path).get_venue_trade_scope("coinbase")
@@ -168,7 +198,13 @@ def test_reattesting_trading_over_a_refuted_record_keeps_refuted_ts_and_reason(
 
     _at_a_terminal(monkeypatch, yes=True)
     result = _run(
-        db_path, valid_config_path, "scope", "attest", "--trading", "--venue", "coinbase",
+        db_path,
+        valid_config_path,
+        "scope",
+        "attest",
+        "--trading",
+        "--venue",
+        "coinbase",
         input="yes\n",
     )
     assert result.exit_code == 0, result.output
@@ -203,7 +239,13 @@ def test_reattesting_read_only_over_a_refuted_record_also_keeps_the_history(
     )
     _at_a_terminal(monkeypatch, yes=False)
     result = _run(
-        db_path, valid_config_path, "scope", "attest", "--read-only", "--venue", "coinbase",
+        db_path,
+        valid_config_path,
+        "scope",
+        "attest",
+        "--read-only",
+        "--venue",
+        "coinbase",
     )
     assert result.exit_code == 0, result.output
     record = _repo_at(db_path).get_venue_trade_scope("coinbase")
@@ -223,7 +265,13 @@ def test_attest_writes_the_current_credential_fingerprint(
         "keel.commands.scope.current_credential_fingerprint", lambda venue: "f" * 32
     )
     result = _run(
-        db_path, valid_config_path, "scope", "attest", "--trading", "--venue", "coinbase",
+        db_path,
+        valid_config_path,
+        "scope",
+        "attest",
+        "--trading",
+        "--venue",
+        "coinbase",
         input="yes\n",
     )
     assert result.exit_code == 0, result.output
@@ -256,7 +304,13 @@ def test_attest_does_not_carry_an_old_fingerprint_forward(
         "keel.commands.scope.current_credential_fingerprint", lambda venue: "fresh" + "0" * 27
     )
     result = _run(
-        db_path, valid_config_path, "scope", "attest", "--trading", "--venue", "coinbase",
+        db_path,
+        valid_config_path,
+        "scope",
+        "attest",
+        "--trading",
+        "--venue",
+        "coinbase",
         input="yes\n",
     )
     assert result.exit_code == 0, result.output
@@ -275,11 +329,15 @@ def test_attest_writes_none_when_no_current_credential_resolves(
     # in CI, false for any contributor with a configured deployment, where `CDP_API_KEY`
     # resolves from the `.env` and this failed. The behaviour under test is what the command
     # WRITES when nothing resolves, so the "nothing resolves" half belongs in the fixture.
-    monkeypatch.setattr(
-        "keel.commands.scope.current_credential_fingerprint", lambda venue: None
-    )
+    monkeypatch.setattr("keel.commands.scope.current_credential_fingerprint", lambda venue: None)
     result = _run(
-        db_path, valid_config_path, "scope", "attest", "--read-only", "--venue", "coinbase",
+        db_path,
+        valid_config_path,
+        "scope",
+        "attest",
+        "--read-only",
+        "--venue",
+        "coinbase",
     )
     assert result.exit_code == 0, result.output
     record = _repo_at(db_path).get_venue_trade_scope("coinbase")
@@ -296,7 +354,13 @@ def test_attest_writes_the_explicit_venue_not_a_hardcoded_default(
 ) -> None:
     _at_a_terminal(monkeypatch, yes=True)
     result = _run(
-        db_path, valid_config_path, "scope", "attest", "--trading", "--venue", "alpaca",
+        db_path,
+        valid_config_path,
+        "scope",
+        "attest",
+        "--trading",
+        "--venue",
+        "alpaca",
         input="yes\n",
     )
     assert result.exit_code == 0, result.output
@@ -334,9 +398,7 @@ def test_attest_without_venue_defaults_to_coinbase_when_nothing_is_bound(
 # -- show ------------------------------------------------------------------------------------
 
 
-def test_show_reports_no_records_and_names_the_bound_venue(
-    tmp_path: Path, write_config
-) -> None:
+def test_show_reports_no_records_and_names_the_bound_venue(tmp_path: Path, write_config) -> None:
     db_path = tmp_path / "keel.db"
     config_path = write_config(VALID_CONFIG_YAML + ALPACA_BROKER_YAML)
 
@@ -353,7 +415,13 @@ def test_show_reports_trading_and_permitted(
 ) -> None:
     _at_a_terminal(monkeypatch, yes=True)
     _run(
-        db_path, valid_config_path, "scope", "attest", "--trading", "--venue", "coinbase",
+        db_path,
+        valid_config_path,
+        "scope",
+        "attest",
+        "--trading",
+        "--venue",
+        "coinbase",
         input="yes\n",
     )
     result = _run(db_path, valid_config_path, "scope", "show")
@@ -380,7 +448,13 @@ def test_show_surfaces_a_past_refusal_even_after_reattestation(
     )
     _at_a_terminal(monkeypatch, yes=True)
     _run(
-        db_path, valid_config_path, "scope", "attest", "--trading", "--venue", "coinbase",
+        db_path,
+        valid_config_path,
+        "scope",
+        "attest",
+        "--trading",
+        "--venue",
+        "coinbase",
         input="yes\n",
     )
 

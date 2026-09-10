@@ -250,7 +250,7 @@ def build_tools(
                 for line in handle:
                     try:
                         event = json.loads(line)
-                    except (json.JSONDecodeError, ValueError):
+                    except json.JSONDecodeError, ValueError:
                         continue
                     if not isinstance(event, dict) or event.get("event") != "executor.order_vetoed":
                         continue

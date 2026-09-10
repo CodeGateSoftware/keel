@@ -724,7 +724,6 @@ def _migrate_v12_positions_initial_stop(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE positions ADD COLUMN initial_stop TEXT")
 
 
-
 def _migrate_v13_positions_realized_legs(conn: sqlite3.Connection) -> None:
     """v13 adds the partial-exit accumulators to `positions` (#502).
 
@@ -752,6 +751,7 @@ def _migrate_v13_positions_realized_legs(conn: sqlite3.Connection) -> None:
     for column in ("realized_qty", "realized_proceeds", "realized_fees"):
         if column not in columns:
             conn.execute(f"ALTER TABLE positions ADD COLUMN {column} TEXT")
+
 
 def _migrate_v14_venue_trade_scopes(conn: sqlite3.Connection) -> None:
     """v14 adds `venue_trade_scopes` (#233). Table creation is handled by `_SCHEMA_STATEMENTS`;

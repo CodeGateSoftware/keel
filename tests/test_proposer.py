@@ -176,20 +176,14 @@ def test_invalid_entries_pass_through_to_report():
 
 
 def _report(admitted, bars, attested=False, hypothesis=None):
-    parsed = parse_proposal(
-        {"candidates": [_entry(asset="SOL", shariah_hypothesis=hypothesis)]}
-    )
+    parsed = parse_proposal({"candidates": [_entry(asset="SOL", shariah_hypothesis=hypothesis)]})
 
     def screen_fn(repo, product, quote):
         facts = screen_mod.MarketFacts("SOL", bars, Decimal("0"), True, "SOL-USD", "coinbase")
         failures = (
             []
             if admitted
-            else (
-                ["history: too few bars"]
-                if bars
-                else ["liquidity: 0", "attestation: MISSING."]
-            )
+            else (["history: too few bars"] if bars else ["liquidity: 0", "attestation: MISSING."])
         )
         return facts, screen_mod.ScreenResult("SOL", admitted=admitted, failures=failures)
 

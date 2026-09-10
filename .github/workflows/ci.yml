@@ -88,6 +88,16 @@ jobs:
       - name: Lint
         run: uv run --python "${{ matrix.python }}" ruff check keel tests packages
 
+      # WHOLE TREE, unlike `ruff check` above, and that difference is deliberate. `ruff check`
+      # is scoped to the three trees whose lint debt has been paid; formatting has no such debt
+      # after #783's one-shot pass, so scoping this would just re-open the drift in `docs/` and
+      # `scripts/` that the pass exists to close.
+      #
+      # It runs as its own step so a formatting failure reads as one. Folded into the lint step,
+      # `ruff check` would mask it on any run where both are red.
+      - name: Format
+        run: uv run --python "${{ matrix.python }}" ruff format --check .
+
       # A STEP in this job, deliberately not a job of its own. The `main` ruleset requires the
       # status context `test`, which this job produces; a separate `typecheck:` job would report
       # a context nothing requires, so a red mypy would not block a merge -- the same failure

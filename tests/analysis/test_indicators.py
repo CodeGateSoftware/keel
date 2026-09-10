@@ -143,9 +143,7 @@ def test_rsi_divergence_bearish_on_higher_high_lower_rsi_high():
     highs = [10, 11, 12, 11, 10, 11, 13, 12, 11]
     lows = [h - 1 for h in highs]
     closes = [h - Decimal("0.5") for h in [Decimal(x) for x in highs]]
-    candles = [
-        _candle(i, closes[i], highs[i], lows[i], closes[i]) for i in range(len(highs))
-    ]
+    candles = [_candle(i, closes[i], highs[i], lows[i], closes[i]) for i in range(len(highs))]
     rsi_vals = [50.0] * len(highs)
     rsi_vals[2] = 70.0
     rsi_vals[6] = 60.0  # price higher high (13>12) but RSI lower high (60<70)
@@ -157,9 +155,7 @@ def test_rsi_divergence_bullish_on_lower_low_higher_rsi_low():
     lows = [20, 19, 18, 19, 20, 19, 17, 18, 19]
     highs = [low + 1 for low in lows]
     closes = [low + Decimal("0.5") for low in [Decimal(x) for x in lows]]
-    candles = [
-        _candle(i, closes[i], highs[i], lows[i], closes[i]) for i in range(len(lows))
-    ]
+    candles = [_candle(i, closes[i], highs[i], lows[i], closes[i]) for i in range(len(lows))]
     rsi_vals = [50.0] * len(lows)
     rsi_vals[2] = 30.0
     rsi_vals[6] = 35.0  # price lower low (17<18) but RSI higher low (35>30)
@@ -171,9 +167,7 @@ def test_rsi_divergence_none_when_price_and_rsi_converge():
     highs = [10, 11, 12, 11, 10, 11, 13, 12, 11]
     lows = [h - 1 for h in highs]
     closes = [h - Decimal("0.5") for h in [Decimal(x) for x in highs]]
-    candles = [
-        _candle(i, closes[i], highs[i], lows[i], closes[i]) for i in range(len(highs))
-    ]
+    candles = [_candle(i, closes[i], highs[i], lows[i], closes[i]) for i in range(len(highs))]
     rsi_vals = [50.0] * len(highs)
     rsi_vals[2] = 60.0
     rsi_vals[6] = 70.0  # both price and RSI make a higher high -> convergence
@@ -238,9 +232,7 @@ def test_atr_matches_hand_computed_reference():
     highs = [10, 11, 12, 11, 12]
     lows = [9, 10, 11, 10, 11]
     closes = [Decimal("9.5"), Decimal("10.5"), Decimal("11.5"), Decimal("10.5"), Decimal("11.5")]
-    candles = [
-        _candle(i, closes[i], highs[i], lows[i], closes[i]) for i in range(len(highs))
-    ]
+    candles = [_candle(i, closes[i], highs[i], lows[i], closes[i]) for i in range(len(highs))]
 
     result = atr(candles, period=3)
     expected = [
@@ -453,9 +445,7 @@ def test_the_overnight_term_degenerates_on_a_continuous_series():
         base = 100 + i
         continuous.append(_ohlc(i * 86400, str(base), str(base + 1), str(base - 1), str(base + 1)))
         # Same bar shape, but each open jumps away from the prior close.
-        gapping.append(
-            _ohlc(i * 86400, str(base + 3), str(base + 4), str(base + 2), str(base + 1))
-        )
+        gapping.append(_ohlc(i * 86400, str(base + 3), str(base + 4), str(base + 2), str(base + 1)))
 
     assert yang_zhang_volatility(gapping, 60) > yang_zhang_volatility(continuous, 60)
 

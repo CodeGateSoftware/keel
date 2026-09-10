@@ -62,8 +62,12 @@ def test_refuted_ts_survives_a_reattestation_upsert() -> None:
     write whatever the caller passes, including a kept-around refuted_ts."""
     repo = _repo()
     repo.upsert_venue_trade_scope(
-        _record(state=TradeScopeState.REFUTED, attested_scope=None, refuted_ts=1_750_000_000,
-                refuted_reason="insufficient permissions")
+        _record(
+            state=TradeScopeState.REFUTED,
+            attested_scope=None,
+            refuted_ts=1_750_000_000,
+            refuted_reason="insufficient permissions",
+        )
     )
     reattested = _record(
         state=TradeScopeState.ATTESTED,
@@ -95,8 +99,9 @@ def test_upsert_replaces_in_place_keyed_on_venue() -> None:
 def test_venues_are_independent() -> None:
     repo = _repo()
     repo.upsert_venue_trade_scope(_record(venue="coinbase"))
-    repo.upsert_venue_trade_scope(_record(venue="kraken", state=TradeScopeState.UNVERIFIED,
-                                           attested_scope=None))
+    repo.upsert_venue_trade_scope(
+        _record(venue="kraken", state=TradeScopeState.UNVERIFIED, attested_scope=None)
+    )
 
     coinbase = repo.get_venue_trade_scope("coinbase")
     kraken = repo.get_venue_trade_scope("kraken")

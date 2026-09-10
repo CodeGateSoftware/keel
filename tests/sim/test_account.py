@@ -267,9 +267,7 @@ def test_monthly_allowance_caps_cumulative_buys(sim_config):
 def test_monthly_allowance_ignores_spend_from_a_prior_month(sim_config):
     acc = SimAccount(Decimal("0"), Decimal("0"))
     acc.deposit(Decimal("100000"), DAY0)
-    acc.open(
-        _intent(notional=Decimal("450")), fill_price=Decimal("10"), now_ts=DAY0 - 40 * 86400
-    )
+    acc.open(_intent(notional=Decimal("450")), fill_price=Decimal("10"), now_ts=DAY0 - 40 * 86400)
 
     ok, reasons = acc.can_open(_intent(notional=Decimal("100")), sim_config, DAY0)
 
@@ -377,8 +375,13 @@ def test_sim_diverges_from_guards_on_monthly_allowance_once_a_sell_has_occurred(
     account.deposit(Decimal("500"), now_ts=now_ts - 60)
     account.open(
         OpenIntent(
-            asset="BTC", qty=Decimal("1.5"), entry=Decimal("100"), stop=None,
-            notional=Decimal("150"), is_dca=True, rule_kind="dca",
+            asset="BTC",
+            qty=Decimal("1.5"),
+            entry=Decimal("100"),
+            stop=None,
+            notional=Decimal("150"),
+            is_dca=True,
+            rule_kind="dca",
         ),
         fill_price=Decimal("100"),
         now_ts=now_ts - 60,
@@ -394,15 +397,27 @@ def test_sim_diverges_from_guards_on_monthly_allowance_once_a_sell_has_occurred(
         now_ts=now_ts,
     )
     order_intent = OrderIntent(
-        product_id="BTC-USD", side=Side.BUY, qty=Decimal("0.5"), entry=Decimal("100"), stop=None,
-        notional=Decimal("50"), is_dca=True, rule_kind="dca", available_quote=account.cash_usdc,
+        product_id="BTC-USD",
+        side=Side.BUY,
+        qty=Decimal("0.5"),
+        entry=Decimal("100"),
+        stop=None,
+        notional=Decimal("50"),
+        is_dca=True,
+        rule_kind="dca",
+        available_quote=account.cash_usdc,
         # Rail 17 is a COMPLIANCE rail (§65.4), not a spend cap, so `SimAccount` deliberately
         # does not model it. Supplied so the spend-cap parity under test is what diverges.
         withdrawals_enabled=True,
     )
     sim_intent = OpenIntent(
-        asset="BTC", qty=Decimal("0.5"), entry=Decimal("100"), stop=None,
-        notional=Decimal("50"), is_dca=True, rule_kind="dca",
+        asset="BTC",
+        qty=Decimal("0.5"),
+        entry=Decimal("100"),
+        stop=None,
+        notional=Decimal("50"),
+        is_dca=True,
+        rule_kind="dca",
     )
 
     guard_result = guards.check(order_intent, repo, config, now_ts)
@@ -672,7 +687,9 @@ def test_dca_position_and_rule_position_coexist_on_the_same_asset():
     acc.deposit(Decimal("10000"), DAY0)
 
     acc.open(
-        _intent(asset="BTC", qty=Decimal("1"), notional=Decimal("100")), Decimal("100"), DAY0,
+        _intent(asset="BTC", qty=Decimal("1"), notional=Decimal("100")),
+        Decimal("100"),
+        DAY0,
         dca=True,
     )
     acc.open(
@@ -719,8 +736,13 @@ def test_exposure_usd_includes_dca_positions():
         dca=True,
     )
     acc.open(
-        _intent(asset="ETH", qty=Decimal("2"), entry=Decimal("100"), notional=Decimal("200"),
-                is_dca=False),
+        _intent(
+            asset="ETH",
+            qty=Decimal("2"),
+            entry=Decimal("100"),
+            notional=Decimal("200"),
+            is_dca=False,
+        ),
         Decimal("100"),
         DAY0,
     )
@@ -769,9 +791,7 @@ def _attest(
     """Attest a coinbase subscription -- rail 14 (`guards.check`) now derives its cap from this
     record rather than from `config.subscription`, so a guards/sim parity comparison must attest
     a record matching whatever `config.subscription` the sim side reads."""
-    attest_subscription(
-        repo, now_ts=now_ts, free_volume_usd=free_volume_usd, pacing=pacing
-    )
+    attest_subscription(repo, now_ts=now_ts, free_volume_usd=free_volume_usd, pacing=pacing)
 
 
 def _seed_filled_buy(
@@ -857,11 +877,17 @@ def _parity_scenario(now_ts: int) -> tuple[Repository, SimAccount]:
     # them to agree, as an explicit setup step rather than an ambient coincidence.
 
     _seed_filled_buy(
-        repo, product_id="BTC-USD", qty=Decimal("2"), price=Decimal("100"),
+        repo,
+        product_id="BTC-USD",
+        qty=Decimal("2"),
+        price=Decimal("100"),
         created_at=month_start + 3600,
     )
     _seed_filled_buy(
-        repo, product_id="PAXG-USD", qty=Decimal("1.5"), price=Decimal("100"),
+        repo,
+        product_id="PAXG-USD",
+        qty=Decimal("1.5"),
+        price=Decimal("100"),
         created_at=now_ts - 60,
     )
 
@@ -869,16 +895,26 @@ def _parity_scenario(now_ts: int) -> tuple[Repository, SimAccount]:
     account.deposit(Decimal("500"), now_ts=month_start + 3600)
     account.open(
         OpenIntent(
-            asset="BTC", qty=Decimal("2"), entry=Decimal("100"), stop=None,
-            notional=Decimal("200"), is_dca=True, rule_kind="dca",
+            asset="BTC",
+            qty=Decimal("2"),
+            entry=Decimal("100"),
+            stop=None,
+            notional=Decimal("200"),
+            is_dca=True,
+            rule_kind="dca",
         ),
         fill_price=Decimal("100"),
         now_ts=month_start + 3600,
     )
     account.open(
         OpenIntent(
-            asset="PAXG", qty=Decimal("1.5"), entry=Decimal("100"), stop=None,
-            notional=Decimal("150"), is_dca=True, rule_kind="dca",
+            asset="PAXG",
+            qty=Decimal("1.5"),
+            entry=Decimal("100"),
+            stop=None,
+            notional=Decimal("150"),
+            is_dca=True,
+            rule_kind="dca",
         ),
         fill_price=Decimal("100"),
         now_ts=now_ts - 60,
@@ -992,10 +1028,7 @@ def test_parity_with_guards_check_even_daily_pacing():
     # ETH (150) is left open rather than netted to ~0 in this BUY-only shared scenario.
     boundaries = {120, 130, 150, 350, 650, paced_boundary}
     notionals = sorted(
-        {1}
-        | {b - 1 for b in boundaries}
-        | {b for b in boundaries}
-        | {b + 1 for b in boundaries}
+        {1} | {b - 1 for b in boundaries} | {b for b in boundaries} | {b + 1 for b in boundaries}
     )
 
     _assert_parity(repo, account, config, now_ts, notionals)
@@ -1185,11 +1218,15 @@ def test_two_rules_hold_concurrent_positions_in_the_same_asset():
 
     acc.open(
         _intent(asset="BTC", qty=Decimal("1"), notional=Decimal("1000")),
-        Decimal("1000"), 0, slot="turtle_s1",
+        Decimal("1000"),
+        0,
+        slot="turtle_s1",
     )
     acc.open(
         _intent(asset="BTC", qty=Decimal("2"), notional=Decimal("2000")),
-        Decimal("1000"), 0, slot="turtle_s2",
+        Decimal("1000"),
+        0,
+        slot="turtle_s2",
     )
 
     assert acc.position("BTC", "turtle_s1").qty == Decimal("1")
@@ -1202,11 +1239,15 @@ def test_closing_one_slot_leaves_the_other_open():
     acc.deposit(Decimal("100000"), 0)
     acc.open(
         _intent(asset="BTC", qty=Decimal("1"), notional=Decimal("1000")),
-        Decimal("1000"), 0, slot="a",
+        Decimal("1000"),
+        0,
+        slot="a",
     )
     acc.open(
         _intent(asset="BTC", qty=Decimal("2"), notional=Decimal("2000")),
-        Decimal("1000"), 0, slot="b",
+        Decimal("1000"),
+        0,
+        slot="b",
     )
 
     acc.close("BTC", Decimal("1100"), 100, slot="a")
@@ -1227,11 +1268,15 @@ def test_concurrent_slots_BOTH_count_toward_the_per_asset_cap():
     acc.deposit(Decimal("100000"), 0)
     acc.open(
         _intent(asset="BTC", qty=Decimal("2"), notional=Decimal("2000")),
-        Decimal("1000"), 0, slot="a",
+        Decimal("1000"),
+        0,
+        slot="a",
     )
     acc.open(
         _intent(asset="BTC", qty=Decimal("2"), notional=Decimal("2000")),
-        Decimal("1000"), 0, slot="b",
+        Decimal("1000"),
+        0,
+        slot="b",
     )
 
     assert acc._asset_notional("BTC") == Decimal("4000")
@@ -1252,7 +1297,9 @@ def test_a_second_slot_is_refused_when_it_would_breach_the_per_asset_cap():
     # 30% of 10000 = 3000 of per-asset headroom.
     acc.open(
         _intent(asset="BTC", qty=Decimal("2"), notional=Decimal("2500")),
-        Decimal("1250"), 0, slot="a",
+        Decimal("1250"),
+        0,
+        slot="a",
     )
     headroom = acc.max_affordable_notional("BTC", config, 0)
     assert headroom == Decimal("500")

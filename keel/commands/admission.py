@@ -167,12 +167,9 @@ def list_shortlists(directory: Path) -> tuple[ScoutFile, ...]:
             stat = candidate.stat()
         except OSError:
             continue
-        found.append(
-            ScoutFile(path=candidate, mtime_ts=stat.st_mtime, size_bytes=stat.st_size)
-        )
+        found.append(ScoutFile(path=candidate, mtime_ts=stat.st_mtime, size_bytes=stat.st_size))
     found.sort(key=lambda f: (f.mtime_ts, f.path.name), reverse=True)
     return tuple(found)
-
 
 
 # -- 2b. screen report (offline, DB reads only) --------------------------------------------------
@@ -410,9 +407,7 @@ def build_propose_view(
             report=None,
         )
 
-    report = build_proposal_report(
-        parsed, repo, config.quote_currency, config.allowlist, screen_fn
-    )
+    report = build_proposal_report(parsed, repo, config.quote_currency, config.allowlist, screen_fn)
     return ProposeView(source=source, status="ok", detail=None, report=report)
 
 
@@ -497,9 +492,7 @@ def build_discover_report(
     dataclass needing a redundant field to carry the same number twice.
     """
     floor = (
-        min_quote_24h_volume
-        if min_quote_24h_volume is not None
-        else DEFAULT_MIN_QUOTE_24H_VOLUME
+        min_quote_24h_volume if min_quote_24h_volume is not None else DEFAULT_MIN_QUOTE_24H_VOLUME
     )
     policy = DiscoveryPolicy(quote_currency=config.quote_currency, min_quote_24h_volume=floor)
     result = discover_candidates(

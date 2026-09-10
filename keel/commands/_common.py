@@ -288,9 +288,7 @@ def _refutation_reason() -> str:
     return str(exc) if exc is not None else "venue posture check refused"
 
 
-def _build_broker(
-    config: Config, *, timeout: int | None = None, repo: Any | None = None
-) -> Any:
+def _build_broker(config: Config, *, timeout: int | None = None, repo: Any | None = None) -> Any:
     """Construct the real, network-talking broker for the venue `config.broker` selects.
 
     **Every name resolves through the registry (issue #524).** The `broker:` config section
@@ -355,9 +353,7 @@ def _build_broker(
         # on an unreadable response for that reason: failing closed would refuse a compliant
         # deployment on a network blip while establishing nothing. One `get_portfolios` read
         # per build. See `CoinbaseAdapter.verify_cash_account` for the probe that settled it.
-        record_cash_posture_refutation(
-            broker, repo=repo, venue=venue, now_ts=int(time.time())
-        )
+        record_cash_posture_refutation(broker, repo=repo, venue=venue, now_ts=int(time.time()))
         return broker
 
     if module_root != "keel_broker_alpaca":

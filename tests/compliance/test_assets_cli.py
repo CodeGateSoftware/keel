@@ -188,7 +188,10 @@ def test_attest_records_the_supplied_attest_due_as_epoch_seconds(tmp_path, valid
     runner = CliRunner()
 
     result = _attest(
-        runner, db_path, valid_config_path, "PAXG",
+        runner,
+        db_path,
+        valid_config_path,
+        "PAXG",
         **{"--backing": "ayn", "--attest-due": "2027-01-31"},
     )
     assert result.exit_code == 0, result.output
@@ -1915,7 +1918,10 @@ def test_a_compact_date_is_refused_rather_than_read_as_a_1970_timestamp(
     runner = CliRunner()
 
     result = _attest(
-        runner, db_path, valid_config_path, "PAXG",
+        runner,
+        db_path,
+        valid_config_path,
+        "PAXG",
         **{"--backing": "ayn", "--attest-due": "20270131"},
     )
 
@@ -1932,7 +1938,10 @@ def test_the_recorded_window_is_echoed_back(tmp_path, valid_config_path) -> None
     runner = CliRunner()
 
     result = _attest(
-        runner, db_path, valid_config_path, "PAXG",
+        runner,
+        db_path,
+        valid_config_path,
+        "PAXG",
         **{"--backing": "ayn", "--attest-due": "2027-01-31"},
     )
 
@@ -1951,4 +1960,3 @@ def test_an_attestation_without_a_window_echoes_a_dash(tmp_path, valid_config_pa
 
     assert result.exit_code == 0, result.output
     assert "expires=-" in result.output
-

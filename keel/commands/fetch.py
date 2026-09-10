@@ -75,14 +75,10 @@ def assess_products(
     for product in products:
         for granularity in granularities:
             info = history_mod.coverage(repo, product, granularity, start_ts)
-            unexplained = repair_mod.unexplained_gap_count(
-                repo, product, granularity, start_ts
-            )
+            unexplained = repair_mod.unexplained_gap_count(repo, product, granularity, start_ts)
             out.append(
                 (
-                    freshness_mod.assess(
-                        info, now_ts, tolerance_bars, market_closed=market_closed
-                    ),
+                    freshness_mod.assess(info, now_ts, tolerance_bars, market_closed=market_closed),
                     unexplained,
                 )
             )
@@ -267,9 +263,7 @@ def run_fetch(
         # "all series actionable" wording said the opposite of what it meant).
         closed_explained = market_closed and any(r.stale for r, _ in before)
         summary = (
-            "all series current or closed-explained"
-            if closed_explained
-            else "all series current"
+            "all series current or closed-explained" if closed_explained else "all series current"
         )
         if unexplained:
             echo(
@@ -282,8 +276,10 @@ def run_fetch(
             echo(f"\n{summary}")
         return FetchResult(before=before, market_closed=market_closed)
 
-    if not refresh and not repair_gaps and not freshness_mod.any_needs_fetch(
-        [r for r, _ in before]
+    if (
+        not refresh
+        and not repair_gaps
+        and not freshness_mod.any_needs_fetch([r for r, _ in before])
     ):
         # The no-network skip is deliberate (nothing a fetch does can produce bars a closed
         # venue is not minting) -- but a behind series must not be called "current" to
