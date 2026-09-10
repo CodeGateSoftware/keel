@@ -6,6 +6,9 @@ would pass just as well against a server with no checks at all.
 
 from __future__ import annotations
 
+import hashlib
+import hmac
+
 import pytest
 
 from keel.web import security
@@ -19,6 +22,9 @@ from keel.web.security import (
     split_host_header,
     tokens_match,
 )
+
+#: The bind these tests hold fixed when they are varying something else.
+LOOPBACK = "127.0.0.1"
 
 
 def _cookie_parts(header: str) -> tuple[str, str, dict[str, str]]:
@@ -325,14 +331,21 @@ def test_a_gated_action_recognises_only_a_loopback_peer(peer: tuple, loopback: b
     legitimate local operator. The IPv4-mapped IPv6 forms are there because a dual-stack bind
     presents `::ffff:127.0.0.1` for a v4 client, and reading that as remote would refuse every
     local request on such a bind."""
-    assert security.is_loopback_peer(peer) is loopback
+    assert security._is_loopback_peer(peer) is loopback
 
 
 def test_a_missing_or_malformed_peer_is_not_loopback() -> None:
     """Fails CLOSED. A peer this cannot parse is one it cannot vouch for, and the safe reading of
     "I do not know where this came from" is "not from here"."""
-    for peer in (None, (), ("",), ("not-an-address", 1), ("127.0.0.1",)):
-        assert security.is_loopback_peer(peer) is False, repr(peer)
+    for peer in (None, (), ("",), ("", 51234), ("not-an-address", 1), ("127.0.0.1",)):
+        assert security._is_loopback_peer(peer) is False, repr(peer)
+
+    # A TUPLE, specifically. `client_address` is one, and accepting any sized sequence would let
+    # a caller hand this something shaped like a peer that is not one -- the narrowing the
+    # docstring argues for, asserted rather than described. A list of the right contents is the
+    # case that tells `isinstance` apart from a `__len__` check.
+    assert security._is_loopback_peer(["127.0.0.1", 51234]) is False
+    assert security._is_loopback_peer("127.0.0.1") is False, "a bare string is not a peer"
 
 
 def test_a_tunnelled_request_is_refused_even_though_its_peer_is_loopback() -> None:
@@ -353,15 +366,114 @@ def test_a_tunnelled_request_is_refused_even_though_its_peer_is_loopback() -> No
     remote = ("192.168.1.10", 51234)
     tunnelled = frozenset({"keel.example.com"})
 
-    assert security.gated_action_permitted(local, external_hosts=frozenset()) is True
-    assert security.gated_action_permitted(local, external_hosts=tunnelled) is False, (
-        "a loopback peer on a tunnelled deployment is the cloudflared daemon, not the operator"
+    assert (
+        security.gated_action_permitted(local, external_hosts=frozenset(), bound_host=LOOPBACK)
+        is True
     )
-    assert security.gated_action_permitted(remote, external_hosts=frozenset()) is False
-    assert security.gated_action_permitted(remote, external_hosts=tunnelled) is False
+    assert (
+        security.gated_action_permitted(local, external_hosts=tunnelled, bound_host=LOOPBACK)
+        is False
+    ), "a loopback peer on a tunnelled deployment is the cloudflared daemon, not the operator"
+    assert (
+        security.gated_action_permitted(remote, external_hosts=frozenset(), bound_host=LOOPBACK)
+        is False
+    )
+    assert (
+        security.gated_action_permitted(remote, external_hosts=tunnelled, bound_host=LOOPBACK)
+        is False
+    )
 
 
 def test_the_gate_fails_closed_on_a_peer_it_cannot_read() -> None:
     """Same rule as `is_loopback_peer`, restated at the level that decides: an unparseable peer
     on a loopback-only deployment is still a refusal."""
-    assert security.gated_action_permitted(None, external_hosts=frozenset()) is False
+    assert (
+        security.gated_action_permitted(None, external_hosts=frozenset(), bound_host=LOOPBACK)
+        is False
+    )
+
+
+def test_an_undeclared_local_reverse_proxy_does_not_open_the_gate() -> None:
+    """**`external_hosts` is a DECLARATION, and this is the deployment that never makes it.**
+
+    nginx's documented default is `proxy_set_header Host $proxy_host` -- the UPSTREAM address --
+    so `proxy_pass http://127.0.0.1:8765;` sends `Host: 127.0.0.1:8765`, which `HostPolicy`
+    permits. The proxy runs on this machine, so the peer is loopback too. Both stated conditions
+    passed, and the request came from the internet.
+
+    The operator never types `--external-host` because with that default rewrite everything
+    already works, so nothing in the configuration records the exposure. Reading the BIND address
+    is what closes it: a server reachable from off-box is one an operator had to bind off-box, and
+    that is observable where the declaration is not."""
+    assert (
+        security.gated_action_permitted(
+            ("127.0.0.1", 51234), external_hosts=frozenset(), bound_host="0.0.0.0"
+        )
+        is False
+    )
+
+
+@pytest.mark.parametrize("bound", ["192.168.1.5", "0.0.0.0", "::", "10.0.0.7", "example.internal"])
+def test_only_a_loopback_BIND_is_loopback_only_posture(bound: str) -> None:
+    """`keel serve --host 192.168.1.5` needs no `--external-host` -- only WILDCARD binds are
+    refused at the CLI -- so `external_hosts` stays empty on a server exposed to the whole LAN.
+    The gate survived that only because a LAN client's peer is not loopback, which is luck rather
+    than the rule it states.
+
+    A hostname that is not an address is refused too: this decides a security question, and
+    "I could not tell" is not "yes"."""
+    assert (
+        security.gated_action_permitted(
+            ("127.0.0.1", 51234), external_hosts=frozenset(), bound_host=bound
+        )
+        is False
+    )
+
+
+@pytest.mark.parametrize("bound", ["127.0.0.1", "localhost", "::1", "[::1]", "127.0.0.53"])
+def test_a_loopback_bind_with_a_loopback_peer_is_permitted(bound: str) -> None:
+    """The one configuration Tier 1 runs in, in every spelling `keel serve --host` accepts for
+    it. A rule that refused `localhost` would refuse the default the CLI prints."""
+    assert (
+        security.gated_action_permitted(
+            ("127.0.0.1", 51234), external_hosts=frozenset(), bound_host=bound
+        )
+        is True
+    )
+
+
+def test_the_gates_token_cannot_be_inverted_back_to_the_session_token() -> None:
+    """**The property the docstring claims, asserted.**
+
+    Inequality and determinism are satisfied by `return session_token[::-1]`, which passed the
+    whole module -- and that mutant hands the session token to anything that can read the page,
+    because stage 2 writes this value into the served document exactly as `csrf_token` already
+    is. The cookie is `HttpOnly` precisely so the session token never reaches the DOM.
+
+    So: the construction is pinned, and the token is checked for the one property no reordering
+    or truncation of the input can fake -- that neither the session token nor any rotation of it
+    appears in the derived value."""
+    session = security.new_session_token()
+    derived = security.gates_token(session)
+
+    assert (
+        derived
+        == hmac.new(session.encode("utf-8"), b"keel/web/gates/v1", hashlib.sha256).hexdigest()
+    ), "the derivation is HMAC(session_token, label), not a rearrangement of the input"
+
+    for rotation in (session, session[::-1], session.lower(), session.upper()):
+        assert rotation not in derived, "the session token must not be recoverable from the token"
+    assert len(derived) == 64, "a full sha256 hexdigest, not a truncation"
+
+
+def test_a_non_ascii_credential_is_refused_rather_than_raising() -> None:
+    """`secrets.compare_digest` refuses non-ASCII strings with a `TypeError`, and `http.server`
+    decodes headers as latin-1 -- so `Cookie: keel_session=\\xff\\xfe` reached this comparison and
+    crashed the handler with no response at all, before any authentication.
+
+    Not a bypass, but an unauthenticated crash-per-request, and it made one refusal path
+    distinguishable by HOW it failed rather than by what it said."""
+    assert security.tokens_match("\xff\xfe", security.gates_token("s")) is False
+    assert security.tokens_match("naïve", "naïve") is False, (
+        "even a matching one: refuse, never raise"
+    )
