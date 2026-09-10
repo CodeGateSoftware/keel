@@ -31,7 +31,12 @@ from typing import Any
 
 import pytest
 
-from keel.commands.orders import OrdersReport, gather_orders, render_orders
+from keel.commands.orders import (
+    OrdersReport,
+    gather_orders,
+    render_orders,
+    scope_start_ts,
+)
 from keel.data.db import connect, migrate
 from keel.data.repository import Repository
 from keel.web import api as web_api
@@ -347,6 +352,38 @@ def _bind(db_path: str, config_path: str) -> Iterator[web_server.ServeConfig]:
         thread.join(timeout=5)
 
 
+def _recent_ts(now: int) -> int:
+    """When to place the row that must fall INSIDE `?scope=today`.
+
+    `now - 60` on its own, which is what this was, is wrong for sixty seconds of every day. CI
+    proved it rather than reasoning finding it: run 34419113683 started at 00:00:01 UTC, so the
+    row landed at 23:59:01 the previous UTC day and `scoped_count` came back `0`. `"today"` is a
+    UTC CALENDAR day (`orders.scope_start_ts`), not a rolling window, so a row a minute old is
+    outside it whenever the suite runs in the first minute after midnight.
+
+    Still anchored on the REAL clock, for the reason the fixture below already gave: a fixed
+    future instant would put every row inside every scope and make the scope assertion pass
+    without the scope doing anything. Clamped, not replaced -- the row stays a minute old on all
+    but one run in 1440.
+
+    The bound is inclusive (`created < start_ts` is what skips a row), so landing exactly on the
+    boundary is inside.
+
+    **What this does NOT close, stated rather than left to be rediscovered.** The fixture reads
+    the clock and the server reads it again a moment later. If those two reads straddle midnight
+    -- the fixture at 23:59:59.95, the server at 00:00:00.05 -- the row is placed inside the old
+    UTC day and judged against the new one, and the assertion fails exactly as it did in CI. That
+    window is the setup-to-request gap, on the order of 100ms, against 60s before: roughly one
+    run in ten million rather than one in 1440.
+
+    It is left open deliberately. Closing it needs either a sleep past the boundary in a fixture
+    or a `skip` guarded on the echoed `scope_start_at` -- and a conditional skip is a test that
+    can decide not to run, which is the failure #775 was about: were `scope_start_at` ever wrong,
+    the guard would silently skip forever instead of going red.
+    """
+    return max(now - 60, scope_start_ts("today", now) or 0)
+
+
 @pytest.fixture
 def book(tmp_path: Path) -> Iterator[web_server.ServeConfig]:
     """A deployment whose book holds one live order and one paper order."""
@@ -354,12 +391,10 @@ def book(tmp_path: Path) -> Iterator[web_server.ServeConfig]:
     conn = connect(str(db_path))
     migrate(conn)
     repo = Repository(conn)
-    # Anchored on the REAL clock, because `read_orders` reads `time.time()` -- a fixture
-    # anchored on a fixed future instant would put every row inside every scope and make the
-    # scope assertion below pass without the scope doing anything.
     now = int(time.time())
+    recent = _recent_ts(now)
     repo.insert_order(
-        _order(mode="live", confirmation="autonomous", created_at=now - 60, updated_at=now - 60)
+        _order(mode="live", confirmation="autonomous", created_at=recent, updated_at=recent)
     )
     repo.insert_order(
         _order(
@@ -412,6 +447,49 @@ def test_the_endpoint_offers_no_way_to_filter_by_mode(book: web_server.ServeConf
     code = "\n".join(line for line in body.splitlines() if not line.lstrip().startswith(("#", "*")))
     assert '_first(query, "mode")' not in code
     assert "mode=" not in code.split('"""')[-1]
+
+
+@pytest.mark.parametrize(
+    ("label", "now"),
+    [
+        # 2026-09-10, the UTC day CI ran on. The first two are the window the flake lives in.
+        ("one second past midnight", 1_788_998_401),
+        ("fifty-nine seconds past midnight", 1_788_998_459),
+        ("one minute past midnight", 1_788_998_460),
+        ("midday", 1_789_041_600),
+        ("one second before midnight", 1_789_084_799),
+    ],
+)
+def test_the_books_recent_row_lands_inside_today_whatever_hour_the_suite_runs(
+    label: str, now: int
+) -> None:
+    """**The fixture's own clock, pinned -- because CI found this and reasoning did not.**
+
+    `?scope=today` is a UTC CALENDAR day, so a row placed at `now - 60` is outside it for the
+    first minute of every day. Run 34419113683 started at 00:00:01 UTC and
+    `test_the_scope_is_normalised_and_echoed_rather_than_refused` failed with `scoped_count == 0`
+    -- a test that fails once a day for sixty seconds and passes on every rerun, which is the
+    kind that gets rerun rather than read.
+
+    Asserted over the placement rather than through the server: the boundary is a pure function
+    of `now`, and a test that had to wait for midnight to prove itself would be no better than
+    the flake it replaces.
+    """
+    boundary = scope_start_ts("today", now)
+    assert boundary is not None
+
+    placed = _recent_ts(now)
+    assert placed >= boundary, label + ": the row must be inside today's scope"
+    assert placed <= now, label + ": the row must not be in the future"
+
+
+def test_the_books_old_row_stays_outside_today() -> None:
+    """The other half of the pairing. A clamp that dragged BOTH rows into today would make the
+    scope assertion pass while proving the scope does nothing -- which is the failure the
+    fixture's real-clock anchoring exists to prevent."""
+    now = 1_788_998_401
+
+    assert (now - 90 * DAY) < (scope_start_ts("today", now) or 0)
 
 
 def test_the_scope_is_normalised_and_echoed_rather_than_refused(
@@ -772,8 +850,7 @@ def test_serving_the_orders_page_imports_no_credential_code(tmp_path) -> None:
     )
     assert result.returncode == 0, result.stderr
     assert result.stdout.strip() == "clean", (
-        "serving /api/orders imported keel_core.secrets -- the console is no longer "
-        "credential-free"
+        "serving /api/orders imported keel_core.secrets -- the console is no longer credential-free"
     )
 
 
