@@ -869,9 +869,7 @@ def test_a_report_that_cannot_be_built_is_reported_not_swallowed(
     client's point of view a report that cannot be built and an engine that is not there require
     the SAME behaviour -- show no figures -- and the difference is already carried by the status
     code and `error.detail`."""
-    monkeypatch.setattr(
-        web_api, "_status_report", _raise, raising=True
-    )
+    monkeypatch.setattr(web_api, "_status_report", _raise, raising=True)
 
     status, headers, document = _json(running, "/api/status")
 
@@ -900,9 +898,7 @@ def test_no_api_response_may_be_cached(running: web_server.ServeConfig, path: st
 
 
 @pytest.mark.parametrize("path", API_ROUTES)
-def test_json_is_served_with_nosniff_and_no_csp(
-    running: web_server.ServeConfig, path: str
-) -> None:
+def test_json_is_served_with_nosniff_and_no_csp(running: web_server.ServeConfig, path: str) -> None:
     """`nosniff` matters more here than on the HTML: a JSON body a browser is free to sniff as
     HTML is a stored-XSS primitive wearing a `Content-Type`. CSP is absent for the reason
     `_static_headers` already records -- it is a response header with no defined meaning outside a
@@ -916,9 +912,7 @@ def test_json_is_served_with_nosniff_and_no_csp(
 
 
 def test_head_returns_the_headers_and_no_body(running: web_server.ServeConfig) -> None:
-    status, headers, body = _get(
-        running, "/api/status", method="HEAD", cookie=_session(running)
-    )
+    status, headers, body = _get(running, "/api/status", method="HEAD", cookie=_session(running))
 
     assert status == 200
     assert headers["Content-Type"] == "application/json; charset=utf-8"
@@ -1034,7 +1028,10 @@ def test_the_client_header_gate_still_guards_every_api_post(
     404 -- unchanged by this issue, and asserted here as well as in `test_server.py` because the
     route table under that prefix is no longer empty."""
     status, _headers, _body = _get(
-        running, "/api/status", method="POST", cookie=_session(running),
+        running,
+        "/api/status",
+        method="POST",
+        cookie=_session(running),
         headers={"Content-Length": "0"},
     )
 
@@ -1107,9 +1104,7 @@ def test_the_routing_layer_formats_nothing() -> None:
 
 def _is_format_call(node: ast.AST) -> bool:
     return (
-        isinstance(node, ast.Call)
-        and isinstance(node.func, ast.Name)
-        and node.func.id == "format"
+        isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "format"
     )
 
 
@@ -1297,3 +1292,136 @@ def test_the_trade_limit_does_not_truncate_the_operators_journal(tmp_path: Path)
     assert notes["shown_count"]["value"] == "5", "the trades' limit reached the journal"
     assert notes["total_count"]["value"] == "5"
     assert notes["window"]["value"] == "all"
+
+
+# -- every reader answers on the clock it was handed (#779) ---------------------------------------
+#
+# `respond` reads `time.time()` ONCE per request and threads it to `route.read(...)`. Two readers
+# ignored it and read the clock again for themselves, which is what put a fixture and a handler on
+# opposite sides of UTC midnight in run 34419113683 (#777) and made a monkeypatched `time.time` the
+# only way to test a scope. Injected, the whole read surface is deterministic without one.
+
+
+def _book_at(tmp_path: Path, now_ts: int) -> Any:
+    """A deployment holding one order inside `now_ts`'s UTC day and one two days before it."""
+    from keel.commands.orders import scope_start_ts
+    from keel.data.db import connect, migrate
+    from keel.data.repository import Repository
+
+    boundary = scope_start_ts("today", now_ts)
+    assert boundary is not None
+    db_path = tmp_path / "keel.db"
+    conn = connect(str(db_path))
+    migrate(conn)
+    repo = Repository(conn)
+    for created in (boundary, boundary - 2 * 86_400):
+        repo.insert_order(
+            {
+                "mode": "paper",
+                "product_id": "BTC-USD",
+                "side": "buy",
+                "order_type": "market",
+                "qty": Decimal("0.01"),
+                "limit_price": None,
+                "status": "filled",
+                "fee": Decimal("1"),
+                "expected_fill": Decimal("100000"),
+                "actual_fill": Decimal("100000"),
+                "filled_quantity": Decimal("0.01"),
+                "raw_response": "{}",
+                "created_at": created,
+                "updated_at": created,
+                "rule_id": None,
+                "confirmation": "paper",
+            }
+        )
+    conn.close()
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(VALID_CONFIG_YAML)
+    return _serve_config(str(db_path), str(config_path))
+
+
+@pytest.mark.parametrize(
+    ("label", "now_ts", "scoped"),
+    [
+        # Two instants a decade apart. A reader that ignores its argument and reads the wall
+        # clock answers the same for both, and the second is far enough out that no wall clock
+        # this suite can run on will agree with it.
+        ("the day the rows were written", 1_788_998_400 + 43_200, "1"),
+        ("ten years later", 1_788_998_400 + 3652 * 86_400, "0"),
+    ],
+)
+def test_read_orders_scopes_by_the_clock_it_was_handed(
+    tmp_path: Path, label: str, now_ts: int, scoped: str
+) -> None:
+    """**Kills: `gather_orders(repo, now_ts=int(time.time()), ...)`.**
+
+    `?scope=today` is a UTC calendar day taken from a clock. Taken from the reader's own
+    `time.time()` rather than from the one `respond` already read, the boundary belongs to a
+    different instant than the `generated_at` printed beside it -- and no test can choose it
+    without patching the `time` module process-wide, which is what #778 had to do."""
+    from keel.web.api import read_orders
+
+    cfg = _book_at(tmp_path, 1_788_998_400 + 43_200)
+
+    body = read_orders(cfg, {"scope": ["today"]}, None, now_ts)
+
+    assert body["scope"] == "today"
+    assert body["scoped_count"]["value"] == scoped, label
+    assert body["total_count"]["value"] == "2", label + ": the book itself is unchanged"
+
+
+def test_read_activity_scopes_by_the_clock_it_was_handed(tmp_path: Path) -> None:
+    """**Kills: `apply_scope(feed, scope, now_ts=time.time())`.**
+
+    Same argument as the orders reader, and the same fix. Asserted through `scope_start_at`,
+    which the payload echoes: it is the boundary the report actually applied, so it is the one
+    field that cannot agree with an injected clock by accident."""
+    import datetime
+
+    from keel.commands.activity import scope_start_ts as activity_scope_start_ts
+    from keel.web.api import read_activity
+
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(VALID_CONFIG_YAML)
+    cfg = _serve_config(str(tmp_path / "keel.db"), str(config_path))
+    chosen = 1_788_998_400 + 3652 * 86_400
+
+    body = read_activity(cfg, {"scope": ["today"]}, None, chosen)
+
+    # Derived from the service's own boundary function rather than restated, so this cannot drift
+    # into asserting a literal that agrees with nothing.
+    boundary = activity_scope_start_ts("today", chosen)
+    assert boundary is not None
+    expected = datetime.datetime.fromtimestamp(boundary, datetime.UTC).strftime(
+        "%Y-%m-%dT%H:%M:%SZ"
+    )
+
+    assert body["scope_start_at"]["value"] == expected, (
+        "the boundary must be midnight of the INJECTED day, not of today"
+    )
+    assert expected.startswith("2036-"), "the injected instant is a decade from any wall clock"
+
+
+def test_no_reader_reads_the_clock_a_second_time() -> None:
+    """**The rule, not the two instances of it.**
+
+    `respond` reads `time.time()` once and hands it down; a reader that reads it again puts the
+    envelope's `generated_at` and its own answer on two different instants, which across a UTC
+    midnight is a real divergence and not a theoretical one (#777). Scanned over each function's
+    OWN body, bounded at the next top-level statement -- a bound taken at the next `def read_`
+    instead swept helper functions in and reported five clock reads inside `read_gates`, which
+    has none."""
+    import re
+
+    source = Path(web_api.__file__).read_text(encoding="utf-8").splitlines()
+    tops = [i for i, line in enumerate(source) if re.match(r"^(def |class )", line)]
+    offenders = []
+    for index in tops:
+        end = next((j for j in tops if j > index), len(source))
+        body = "\n".join(source[index:end])
+        name = re.match(r"def ([a-z_]+)\(", source[index])
+        if name and name.group(1).startswith("read_") and "time.time()" in body:
+            offenders.append(name.group(1))
+
+    assert offenders == [], "these readers ignore the clock they were handed: " + repr(offenders)
