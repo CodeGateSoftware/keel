@@ -57,6 +57,7 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import ipaddress
 import secrets
 from dataclasses import dataclass
 
@@ -188,6 +189,93 @@ def csrf_token(session_token: str) -> str:
     value -- which is written into the page, unlike the `HttpOnly` cookie -- does not let anyone
     work backwards to the session token."""
     return hmac.new(session_token.encode("utf-8"), _CSRF_LABEL, hashlib.sha256).hexdigest()
+
+
+#: Domain separation for the GATES derivation (#781). A different label from `_CSRF_LABEL`, and
+#: that difference is the whole security property: the setup write token is written into
+#: `/api/setup`'s document, so anything that can read that page holds it -- and a value that
+#: opened a rail as well as a setup step would make "can create a deployment" and "can release a
+#: halt" the same permission. Same secret, two derivations, neither usable as the other.
+_GATES_LABEL = b"keel/web/gates/v1"
+
+
+def gates_token(session_token: str) -> str:
+    """The write token for a Tier 1 gated action, derived like `csrf_token` and separately.
+
+    Everything `csrf_token`'s docstring says about derivation applies here: no server-side table
+    to keep, expire or leak, and it dies with the session token it comes from, so stopping
+    `keel serve` revokes it.
+
+    What it adds is that the two are not interchangeable. `csrf_token` guards
+    `keel.commands.setup.ACTIONS` -- idempotent, non-destructive, `MECHANICAL` steps. This guards
+    actions that release a rail. Deriving both from one label would mean a single captured value
+    covered both, and the two surfaces could never be revoked independently.
+    """
+    return hmac.new(session_token.encode("utf-8"), _GATES_LABEL, hashlib.sha256).hexdigest()
+
+
+def is_loopback_peer(peer: object) -> bool:
+    """Whether a socket's REMOTE address is this machine.
+
+    **The peer address, never a header.** `Host:` and `X-Forwarded-For:` are claims the client
+    writes, and this check exists for exactly the case where the claim is a lie -- an operator
+    who has put `keel serve` behind a tunnel, where every request arrives carrying whatever the
+    proxy chose to say. `HostPolicy.permits` reads the header and defends a different thing (DNS
+    rebinding); this reads the socket and cannot be talked out of its answer.
+
+    **The whole 127.0.0.0/8 block, not one address.** systemd-resolved answers on 127.0.0.53, and
+    a check spelled `== "127.0.0.1"` would refuse a local operator on such a host -- a
+    false refusal that reads as a broken button. `ipaddress` decides this rather than a string
+    comparison, so the block, the IPv6 `::1`, and the IPv4-mapped `::ffff:127.0.0.1` a dual-stack
+    bind presents for a v4 client are all handled by one rule.
+
+    **Fails closed.** A peer this cannot parse -- absent, empty, a hostname, a malformed tuple --
+    is one it cannot vouch for, and the only safe reading of "I do not know where this came from"
+    is "not from here".
+
+    `object` rather than `Any` for the parameter, deliberately: `Any` would let a caller pass
+    anything and silently skip every check below, where `object` makes the narrowing explicit and
+    mypy enforce it. What arrives here is `BaseHTTPRequestHandler.client_address`, which typeshed
+    declares as a 2-tuple and which is a 4-tuple on an IPv6 socket -- so the validation is real,
+    not defensive decoration.
+    """
+    if not isinstance(peer, tuple) or len(peer) < 2:
+        return False
+    host = peer[0]
+    if not isinstance(host, str) or not host:
+        return False
+    try:
+        address = ipaddress.ip_address(host)
+    except ValueError:
+        return False
+    mapped = getattr(address, "ipv4_mapped", None)
+    return bool((mapped or address).is_loopback)
+
+
+def gated_action_permitted(peer: object, *, external_hosts: frozenset[str]) -> bool:
+    """Whether a Tier 1 gated action may run for this request (#781).
+
+    **Two conditions, and the second is the one that is easy to miss.** The peer must be
+    loopback, AND this deployment must be in loopback-only posture.
+
+    The peer check alone is not enough, and a tunnel is why: `cloudflared` runs on THIS MACHINE
+    and connects to keel over loopback, so a request that began on the public internet arrives
+    with `client_address` of `127.0.0.1`. `is_loopback_peer` answers truthfully and uselessly.
+    Anything reading only the peer would let whoever can reach the tunnel release a rail.
+
+    `external_hosts` is how this module already spells "remote posture" -- `session_expired_at`
+    turns a never-expiring session into a 30-day one on exactly that field, reasoning that a
+    remote origin "changes the population to anyone who can reach the tunnel". The same signal,
+    read for the same reason, one decision further along.
+
+    **This is a floor, not the final policy.** It holds until #648 (the remote-exposure security
+    pass) and #656 (device pairing) land; relaxing it is their job and belongs in their PR, not
+    in a quiet edit here. Until then a tunnelled deployment serves the read surface and refuses
+    every gated action, which is the posture that fails safe.
+    """
+    if external_hosts:
+        return False
+    return is_loopback_peer(peer)
 
 
 def tokens_match(presented: str | None, expected: str) -> bool:

@@ -283,7 +283,7 @@ def test_no_capability_increasing_action_is_reachable_from_the_web_layer() -> No
 
     "No POST" said the server could not write -- and was also satisfied by a server that could
     not set anything up, which is the problem #437 exists to solve. This says the server cannot
-    ARM, RELEASE or SPEND anything: not one of the eight capability-increasing actions in
+    ARM, RELEASE or SPEND anything: not one of the nine capability-increasing actions in
     `keel/capabilities.py` is named anywhere under `keel/web/`, nor is the TTY gate they all pass
     through.
 
