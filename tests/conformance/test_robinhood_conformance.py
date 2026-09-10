@@ -81,6 +81,4 @@ class TestRobinhoodConformance(BrokerConformanceTests):
 
     @staticmethod
     def _scope_spec() -> MarketIOCByBase:
-        return MarketIOCByBase(
-            product_id="BTC-USD", side=Side.SELL, base_size=Decimal("0.001")
-        )
+        return MarketIOCByBase(product_id="BTC-USD", side=Side.SELL, base_size=Decimal("0.001"))

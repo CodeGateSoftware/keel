@@ -26,9 +26,7 @@ def render_purification_report(report: PurificationReport) -> list[str]:
         lines.append(f"\n{'asset':<8} {'units received':>20} {'owed (USD)':>14}")
         qty_by_asset = report.qty_by_asset
         for asset, owed in report.owed_by_asset.items():
-            lines.append(
-                f"{asset:<8} {qty_by_asset.get(asset, Decimal(0)):>20} {owed:>14.2f}"
-            )
+            lines.append(f"{asset:<8} {qty_by_asset.get(asset, Decimal(0)):>20} {owed:>14.2f}")
         lines.append(f"\nTOTAL OWED TO CHARITY: ${report.total_owed_usd:.2f}")
         lines.append(
             "\nThis is excluded from realised P&L and from the equity base sizing computes "
@@ -37,13 +35,9 @@ def render_purification_report(report: PurificationReport) -> list[str]:
         )
 
     if report.needs_review:
-        lines.append(
-            f"\n⚠️  {len(report.needs_review)} credit(s) of UNRECOGNISED type need review:"
-        )
+        lines.append(f"\n⚠️  {len(report.needs_review)} credit(s) of UNRECOGNISED type need review:")
         for entry in report.needs_review[:20]:
-            lines.append(
-                f"    {entry.tx_type!r} {entry.asset} qty={entry.qty} ${entry.amount_usd}"
-            )
+            lines.append(f"    {entry.tx_type!r} {entry.asset} qty={entry.qty} ${entry.amount_usd}")
         lines.append(
             "    Classified neither way on purpose: calling them clean would let riba into "
             "P&L, calling them non-compliant would state an obligation as fact."

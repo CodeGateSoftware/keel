@@ -520,9 +520,7 @@ def variance_report(sample: FactorSample, weights: dict[str, int] | None = None)
         independent += Decimal(weight) ** 2 * rate * (Decimal(1) - rate)
 
     ratio = observed / independent if independent > 0 else Decimal(0)
-    return VarianceReport(
-        observed=observed, independent=independent, ratio=ratio, mean_total=mean
-    )
+    return VarianceReport(observed=observed, independent=independent, ratio=ratio, mean_total=mean)
 
 
 def _mean(values: Iterable[Decimal]) -> Decimal:

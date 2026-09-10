@@ -226,7 +226,7 @@ def _latest_release_floor() -> str | None:
     try:
         data = tomllib.loads(show.stdout)
         requires = data["project"]["requires-python"]
-    except (tomllib.TOMLDecodeError, KeyError):
+    except tomllib.TOMLDecodeError, KeyError:
         return None
     match = re.match(r">=\s*(\d+)\.(\d+)", requires)
     return f"{match.group(1)}.{match.group(2)}" if match else None

@@ -36,9 +36,7 @@ def subscription_group() -> None:
     """
 
 
-def _resolve_pacing(
-    repo: Repository, config: Config, venue: str, pacing: str | None
-) -> str:
+def _resolve_pacing(repo: Repository, config: Config, venue: str, pacing: str | None) -> str:
     """Explicit `--pacing` wins; otherwise keep the venue's existing choice, else config's.
 
     Re-attesting must not silently reset a pacing mode the user set earlier.
@@ -113,18 +111,14 @@ def apply_subscription_set(
     try:
         free_volume_usd = Decimal(free_volume_raw)
     except InvalidOperation:
-        raise ValueError(
-            f"--free-volume-usd must be a number, got {free_volume_raw!r}"
-        ) from None
+        raise ValueError(f"--free-volume-usd must be a number, got {free_volume_raw!r}") from None
     # `Decimal("nan")`/`Decimal("inf")` parse without raising `InvalidOperation` above, so they
     # must be rejected here, before the `< 0` comparison below (a NaN comparison itself raises
     # InvalidOperation, uncaught). `inf` would otherwise become an unbounded live spend cap --
     # "unlimited" has no representation via this command; it is expressed elsewhere in this
     # system as `free_volume_usd is None` (a Premium tier via `subscription attest`), never `inf`.
     if not free_volume_usd.is_finite():
-        raise ValueError(
-            f"--free-volume-usd must be a finite number, got {free_volume_raw!r}"
-        )
+        raise ValueError(f"--free-volume-usd must be a finite number, got {free_volume_raw!r}")
     if free_volume_usd < 0:
         raise ValueError("--free-volume-usd must be non-negative")
 
@@ -173,9 +167,7 @@ def subscription_show_lines(repo: Repository, config: Config, now_ts: int) -> li
     for record in records:
         allowance = record.allowance_usd(now_ts, unsubscribed)
         cap = "unlimited" if allowance is None else str(allowance)
-        volume = (
-            "unlimited" if record.free_volume_usd is None else str(record.free_volume_usd)
-        )
+        volume = "unlimited" if record.free_volume_usd is None else str(record.free_volume_usd)
         lines.append(
             f"{record.venue}: tier={record.tier_name} free_volume_usd={volume} "
             f"pacing={record.pacing} stored_status={record.status.value} "
@@ -212,7 +204,11 @@ def subscription_attest(
 
     try:
         line = apply_subscription_attest(
-            repo, config, venue=venue, tier_name=tier_name, pacing=pacing,
+            repo,
+            config,
+            venue=venue,
+            tier_name=tier_name,
+            pacing=pacing,
             now_ts=int(time.time()),
         )
     except ValueError as exc:
@@ -255,7 +251,11 @@ def subscription_set(
 
     try:
         line = apply_subscription_set(
-            repo, config, venue=venue, free_volume_raw=free_volume_raw, pacing=pacing,
+            repo,
+            config,
+            venue=venue,
+            free_volume_raw=free_volume_raw,
+            pacing=pacing,
             now_ts=int(time.time()),
         )
     except ValueError as exc:

@@ -149,9 +149,10 @@ def print_base_rates(title: str, samples: dict[str, FactorSample], pooled: Facto
         row = f"{name:24} {DEFAULT_WEIGHTS[name]:3d} {_fmt(pooled.base_rate(name)):>8} "
         row += " ".join(f"{_fmt(s.base_rate(name)):>7}" for s in samples.values())
         print(row)
-    print(f"{'N (observations)':24} {'':3} {pooled.n:8d} " + " ".join(
-        f"{s.n:7d}" for s in samples.values()
-    ))
+    print(
+        f"{'N (observations)':24} {'':3} {pooled.n:8d} "
+        + " ".join(f"{s.n:7d}" for s in samples.values())
+    )
 
 
 def print_pairs(title: str, stats: list[PairStat], limit: int | None = None) -> None:
@@ -180,8 +181,10 @@ def print_clusters(title: str, sample: FactorSample, stats: list[PairStat]) -> N
         f"{'mean phi':>9} {'mean J':>7} {'raw pts':>8}"
     )
     print(header)
-    print(f"{'':10} {'':8} {'':6} {'(within)':>9} {'(within)':>9} {'(other)':>9} {'(within)':>7} "
-          f"{'(share)':>8}")
+    print(
+        f"{'':10} {'':8} {'':6} {'(within)':>9} {'(within)':>9} {'(other)':>9} {'(within)':>7} "
+        f"{'(share)':>8}"
+    )
     print("-" * len(header))
     for report in cluster_report(sample, stats):
         print(
@@ -214,8 +217,7 @@ def analyse(title: str, samples: dict[str, FactorSample], pair_limit: int | None
     constant = [n for n in FACTOR_NAMES if n not in varying]
     if constant:
         print(
-            "constant in this sample (untestable, excluded from the family): "
-            + ", ".join(constant)
+            "constant in this sample (untestable, excluded from the family): " + ", ".join(constant)
         )
     print_base_rates(title, samples, pooled)
     print_pairs(title, stats, limit=pair_limit)
@@ -273,8 +275,7 @@ def arm2(db_path: str) -> None:
 
 def arm3(db_path: str) -> None:
     print(f"\n{'=' * 96}")
-    print("ARM 3 -- window sensitivity (BTC-USD ONE_HOUR, every "
-          f"{SENSITIVITY_STEP}th bar)")
+    print(f"ARM 3 -- window sensitivity (BTC-USD ONE_HOUR, every {SENSITIVITY_STEP}th bar)")
     print(f"{'=' * 96}")
     candles = load_candles(db_path, "BTC-USD", HOURLY_GRANULARITY)
     if not candles:
@@ -284,8 +285,10 @@ def arm3(db_path: str) -> None:
         f"{'P(pullback)':>12} {'strongest pair':>44}"
     )
     print(header)
-    print(f"{'(bars)':>7} {'':7} {'(mean phi)':>10} {'(mean phi)':>10} {'':10} {'':12} "
-          f"{'(|phi|, any of the 45)':>44}")
+    print(
+        f"{'(bars)':>7} {'':7} {'(mean phi)':>10} {'(mean phi)':>10} {'':10} {'':12} "
+        f"{'(|phi|, any of the 45)':>44}"
+    )
     print("-" * len(header))
     for window in SENSITIVITY_WINDOWS:
         sample = replay_every_bar("BTC-USD", candles, window=window, step=SENSITIVITY_STEP)

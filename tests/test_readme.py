@@ -108,10 +108,10 @@ def test_the_readme_ends_by_routing_questions_and_contributions():
 def test_operator_content_moved_not_deleted():
     """The runbook sections live on in `docs/operator-runbook.md`, verbatim enough to find.
 
-    Deployment, upgrades, and the paper-vs-live distinctions are operator knowledge the
-project is not losing — #281 moves them, it does not delete them. Both halves are pinned:
-the runbook GAINS the deployment/upgrade content, and the README LOSES it (below), because
-leaving it in both is how the README grows back into a runbook.
+        Deployment, upgrades, and the paper-vs-live distinctions are operator knowledge the
+    project is not losing — #281 moves them, it does not delete them. Both halves are pinned:
+    the runbook GAINS the deployment/upgrade content, and the README LOSES it (below), because
+    leaving it in both is how the README grows back into a runbook.
     """
     runbook = (_ROOT / "docs" / "operator-runbook.md").read_text()
     assert "gh release download" in runbook, (
@@ -176,9 +176,7 @@ def test_mcp_feature_bullet_names_the_handlers_and_the_boundary():
         "trials",
         "reports",
     ):
-        assert f"`{handler}`" in text, (
-            f"the README's MCP section must name the {handler!r} handler"
-        )
+        assert f"`{handler}`" in text, f"the README's MCP section must name the {handler!r} handler"
     assert "keel/mcp/tools.py" in text, "the README must say where the handlers live"
     assert _MCP_DOC in text, f"the feature section must link {_MCP_DOC}"
     lowered = text.lower()

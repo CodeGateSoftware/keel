@@ -919,9 +919,7 @@ def _handle_exits(
         if booked and repo.get_open_positions(product_id):
             stop = repo.get_state(f"open_stop:{product_id}")
             target = repo.get_state(f"open_target:{product_id}")
-            remainder = sum(
-                (p["qty"] for p in repo.get_open_positions(product_id)), Decimal("0")
-            )
+            remainder = sum((p["qty"] for p in repo.get_open_positions(product_id)), Decimal("0"))
             if stop is not None and target is not None:
                 repo.set_state(
                     f"{executor.UNBRACKETED_PREFIX}{product_id}",

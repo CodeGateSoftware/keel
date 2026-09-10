@@ -201,9 +201,7 @@ def test_transition_does_not_promote_without_overfitting_evidence(repo: Reposito
     assert _rule_status(repo, rule_id) == "candidate"
 
     # Same stats, now with a clean CSCV result behind them: promotes.
-    assert (
-        transition(repo, "turtle_breakout", _stats(), PromotionConfig(), pbo=_pbo()) == "paper"
-    )
+    assert transition(repo, "turtle_breakout", _stats(), PromotionConfig(), pbo=_pbo()) == "paper"
     assert _rule_status(repo, rule_id) == "paper"
 
 
@@ -571,9 +569,7 @@ def _seven_paper_siblings() -> list[tuple[str, BacktestResult]]:
     win_rate 0.625 of 16 = 10 wins; pooled with the candidate's 4 wins in 16,
     that is 74/128 = 0.578125 -- above the 0.55 floor the candidate alone fails.
     """
-    return [
-        (f"ASSET-{i}-USD", _stats(n_trades=16, win_rate=0.625)) for i in range(1, 8)
-    ]
+    return [(f"ASSET-{i}-USD", _stats(n_trades=16, win_rate=0.625)) for i in range(1, 8)]
 
 
 def test_pool_stats_field_arithmetic_is_the_documented_weighting() -> None:
@@ -589,12 +585,13 @@ def test_pool_stats_field_arithmetic_is_the_documented_weighting() -> None:
     expectancy (16*-2 + 16*14)/32 = 6 -- the trade-weighted mean, exact.
     """
     own = _stats(
-        n_trades=16, win_rate=0.25, avg_win=Decimal("60"),
-        avg_loss=Decimal("-20"), expectancy=Decimal("-2"),
+        n_trades=16,
+        win_rate=0.25,
+        avg_win=Decimal("60"),
+        avg_loss=Decimal("-20"),
+        expectancy=Decimal("-2"),
     )
-    pooled, reading = pool_stats(
-        _pool("BTC-USD", own, _seven_paper_siblings()[:1])
-    )
+    pooled, reading = pool_stats(_pool("BTC-USD", own, _seven_paper_siblings()[:1]))
     assert reading.n_pooled == 32
     assert dict(reading.per_product) == {"BTC-USD": 16, "ASSET-1-USD": 16}
     assert pooled.n_trades == 32

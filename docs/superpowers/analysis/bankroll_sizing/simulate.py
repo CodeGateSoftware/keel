@@ -272,9 +272,7 @@ def experiment_2() -> dict[str, dict]:
     for profile_idx, (profile_name, params) in enumerate(PROFILES.items()):
         assumed_p, b = params["p"], params["b"]
         levels = kelly_levels_for(assumed_p, b)
-        strategies: dict[str, FractionFn] = {
-            name: strategy_fixed(f) for name, f in levels.items()
-        }
+        strategies: dict[str, FractionFn] = {name: strategy_fixed(f) for name, f in levels.items()}
 
         worlds = {
             "p correct": assumed_p,
@@ -448,7 +446,7 @@ def build_report(exp1_summary: dict, exp2_results: dict) -> str:
         "also the widest dispersion (stdev) and the deepest typical drawdowns -- the classic "
         "Kelly trait of being growth-optimal in expectation while remaining a psychologically "
         "brutal ride. Half- and Quarter-Kelly trade away some terminal wealth for a large cut in "
-        "drawdown depth and variance -- this is the textbook \"why half-Kelly\" lesson the "
+        'drawdown depth and variance -- this is the textbook "why half-Kelly" lesson the '
         "`keeks` library is built to demonstrate. keel's Fixed-1% sits far below all Kelly "
         "variants on terminal wealth because it never lets its risk keep pace with a compounding "
         "bankroll's *edge*, but it also never comes close to the Kelly variants' drawdowns. CPPI "
@@ -494,7 +492,7 @@ def build_report(exp1_summary: dict, exp2_results: dict) -> str:
     lines.append(
         "**Is 1% too timid?** Mathematically, yes, relative to the growth-maximizing Kelly "
         "fraction: at the promotion floor (p=0.55, b=1.5) full Kelly is 25% of equity per trade, "
-        "and keel's 1% is roughly 4% of that. In the \"p correct\" worlds of Experiment 2, every "
+        'and keel\'s 1% is roughly 4% of that. In the "p correct" worlds of Experiment 2, every '
         "Kelly-family fraction (even Quarter-Kelly) compounds to a dramatically larger median "
         "terminal multiple than keel-1% over 200 trades, because 1% barely lets a real edge "
         "compound -- the bankroll grows close to linearly rather than geometrically at that "
@@ -510,13 +508,13 @@ def build_report(exp1_summary: dict, exp2_results: dict) -> str:
     _fk_over_ruin = _pa_worlds[1]["Full-Kelly"]["ruin_rate"]
     lines.append(
         "**Does the estimation-error run defend sub-Kelly?** Yes, and this is the more important "
-        "half of the story. In the \"p over-estimated by 0.05\" worlds, Full-Kelly's edge "
+        'half of the story. In the "p over-estimated by 0.05" worlds, Full-Kelly\'s edge '
         "assumption breaks: at the floor profile (b=1.5, breakeven p=0.40), an assumed p=0.55 "
         "with a true p=0.50 is still a real edge -- full Kelly at the *true* p=0.50 would be "
         "~16.7% (down from the 25% it was sized at), not zero -- but Full-Kelly was sized as if "
         "the edge were 8-plus points thicker than it actually is, and that overbetting shows up "
         f"directly in the numbers: median terminal multiple collapses from {_fk_correct:.0f}x "
-        f"(\"p correct\") to {_fk_over:.0f}x (\"p over-estimated\"), and a ruin rate that was "
+        f'("p correct") to {_fk_over:.0f}x ("p over-estimated"), and a ruin rate that was '
         f"0.0% becomes {fmt_pct(_fk_over_ruin)}. Half- and "
         "Quarter-Kelly degrade far more gracefully under the identical misestimation (their ruin "
         "rates stay at 0.0%), because they were never betting the full assumed edge in the first "
@@ -530,7 +528,7 @@ def build_report(exp1_summary: dict, exp2_results: dict) -> str:
     )
     lines.append("")
     lines.append(
-        "**Net read**: the honest conclusion is that keel's 1% is not \"wrong\" -- it is an "
+        '**Net read**: the honest conclusion is that keel\'s 1% is not "wrong" -- it is an '
         "extreme point on the same sub-Kelly safety spectrum that Half- and Quarter-Kelly occupy, "
         "just pushed much further toward safety than the math alone would require. If keel's "
         "backtested p and b estimates were trustworthy point estimates with no correlation "
@@ -560,7 +558,7 @@ def build_report(exp1_summary: dict, exp2_results: dict) -> str:
         "noisier and typically worse than backtested R:R."
     )
     lines.append(
-        "- **A single, fixed estimation-error stress test.** The \"p over-estimated by 0.05\" "
+        '- **A single, fixed estimation-error stress test.** The "p over-estimated by 0.05" '
         "world tests one specific magnitude of misestimation, not a distribution over possible "
         "estimation errors. It illustrates the *direction* of the Full-Kelly fragility argument, "
         "not a calibrated probability of it occurring."

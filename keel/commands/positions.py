@@ -200,7 +200,7 @@ def _safe_ratio(numerator: Decimal, denominator: Decimal) -> Decimal | None:
         return None
     try:
         ratio = numerator / denominator
-    except (DivisionByZero, InvalidOperation):
+    except DivisionByZero, InvalidOperation:
         return None
     return ratio if ratio.is_finite() else None
 
@@ -375,9 +375,7 @@ def gather_positions(
             attestations.get(_base_asset(product_id)), now_ts=now_ts
         )
         rows.append(
-            _row_from_dict(
-                raw, mark, mark_ts, ready, ready_reason, attestation, attest_due
-            )
+            _row_from_dict(raw, mark, mark_ts, ready, ready_reason, attestation, attest_due)
         )
     return PositionsReport(now_ts=now_ts, rows=tuple(rows))
 

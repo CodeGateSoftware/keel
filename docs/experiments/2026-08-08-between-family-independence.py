@@ -235,9 +235,7 @@ def by_timestamp(
     positionally would silently pair BTC's day 400 with PAXG's day 400, which are years apart.
     """
     positions, mtm, closed, _ = series_for(trades, candles)
-    return {
-        candle.ts: (positions[i], mtm[i], closed[i]) for i, candle in enumerate(candles)
-    }
+    return {candle.ts: (positions[i], mtm[i], closed[i]) for i, candle in enumerate(candles)}
 
 
 def align(
@@ -356,8 +354,10 @@ def main() -> None:
         f"{'both':>5} {'jaccard':>8} {'pos r':>7} {'pnl r':>7} {'pnl r':>7} {'gap':>5}"
     )
     print(header)
-    print(f"{'':10} {'':5} {'':6} {'':6} {'':7} {'':7} {'':5} {'':8} {'':7} {'(mtm)':>7} "
-          f"{'(clsd)':>7} {'(d)':>5}")
+    print(
+        f"{'':10} {'':5} {'':6} {'':6} {'':7} {'':7} {'':5} {'':8} {'':7} {'(mtm)':>7} "
+        f"{'(clsd)':>7} {'(d)':>5}"
+    )
     print("-" * len(header))
 
     jaccards: list[Decimal] = []
@@ -378,9 +378,7 @@ def main() -> None:
         report, closed_report, a, b = measure(turtle, rsi_rule, candles)
 
         if not b.trades:
-            fires, rsi_min = oversold_bounce_count(
-                candles, rsi_rule.rsi_period, rsi_rule.oversold
-            )
+            fires, rsi_min = oversold_bounce_count(candles, rsi_rule.rsi_period, rsi_rule.oversold)
             gate_notes.append(
                 f"{product_id}: RSI({rsi_rule.rsi_period}) min {rsi_min:.2f} over "
                 f"{len(candles)} daily bars; gate 1 (prev<{rsi_rule.oversold:g} and rising) "
@@ -415,12 +413,18 @@ def main() -> None:
     else:
         n = len(pnl_corrs_mtm)
         print(f"\nMEAN across {n} asset(s) with trades on both arms:")
-        print(f"  Jaccard overlap        {_fmt(sum(jaccards, Decimal(0)) / n)}"
-              f"   (cross-horizon: {CROSS_HORIZON_JACCARD})")
-        print(f"  position correlation   {_fmt(sum(position_corrs, Decimal(0)) / n)}"
-              f"   (cross-horizon: {CROSS_HORIZON_POSITION_CORR})")
-        print(f"  P&L correlation (mtm)  {_fmt(sum(pnl_corrs_mtm, Decimal(0)) / n)}"
-              f"   (cross-horizon: {CROSS_HORIZON_PNL_CORR})")
+        print(
+            f"  Jaccard overlap        {_fmt(sum(jaccards, Decimal(0)) / n)}"
+            f"   (cross-horizon: {CROSS_HORIZON_JACCARD})"
+        )
+        print(
+            f"  position correlation   {_fmt(sum(position_corrs, Decimal(0)) / n)}"
+            f"   (cross-horizon: {CROSS_HORIZON_POSITION_CORR})"
+        )
+        print(
+            f"  P&L correlation (mtm)  {_fmt(sum(pnl_corrs_mtm, Decimal(0)) / n)}"
+            f"   (cross-horizon: {CROSS_HORIZON_PNL_CORR})"
+        )
         print(f"  P&L correlation (clsd) {_fmt(sum(pnl_corrs_closed, Decimal(0)) / n)}")
 
     if degenerate:
@@ -483,9 +487,7 @@ def calibrate(db_path: str) -> None:
         )
 
 
-def turtle_series(
-    db_path: str, product_id: str
-) -> dict[int, tuple[int, Decimal, Decimal]] | None:
+def turtle_series(db_path: str, product_id: str) -> dict[int, tuple[int, Decimal, Decimal]] | None:
     """The shipped turtle's ts-keyed series for one product, or None if no candles are cached."""
     candles = load_candles(db_path, product_id, GRANULARITY)
     if not candles:
@@ -530,8 +532,10 @@ def marginal_independence(db_path: str, candidates: list[str]) -> None:
     for candidate in candidates:
         series = turtle_series(db_path, candidate)
         if series is None:
-            print(f"{candidate.removesuffix('-USD'):11} {'—':>5}   no local candles — run "
-                  f"`keel fetch --products {candidate}` first")
+            print(
+                f"{candidate.removesuffix('-USD'):11} {'—':>5}   no local candles — run "
+                f"`keel fetch --products {candidate}` first"
+            )
             continue
 
         jaccards: list[Decimal] = []
@@ -596,9 +600,7 @@ def cross_asset(db_path: str) -> None:
 
     for i, first in enumerate(names):
         for second in names[i + 1 :]:
-            a_pos, a_mtm, a_closed, b_pos, b_mtm, b_closed = align(
-                series[first], series[second]
-            )
+            a_pos, a_mtm, a_closed, b_pos, b_mtm, b_closed = align(series[first], series[second])
             mtm_report = compare(a_pos, b_pos, a_mtm, b_mtm)
             closed_report = compare(a_pos, b_pos, a_closed, b_closed)
             label = f"{first.removesuffix('-USD')} vs {second.removesuffix('-USD')}"
@@ -622,13 +624,18 @@ def cross_asset(db_path: str) -> None:
     mean_mtm = sum(pnl_mtm_corrs, Decimal(0)) / pairs
     mean_closed = sum(pnl_closed_corrs, Decimal(0)) / pairs
     print(f"\nMEAN across {pairs} pairs:")
-    print(f"  Jaccard overlap        {_fmt(sum(jaccards, Decimal(0)) / pairs)}"
-          f"   (cross-horizon: {CROSS_HORIZON_JACCARD})")
-    print(f"  position correlation   {_fmt(mean_position)}"
-          f"   (cross-horizon: {CROSS_HORIZON_POSITION_CORR})")
+    print(
+        f"  Jaccard overlap        {_fmt(sum(jaccards, Decimal(0)) / pairs)}"
+        f"   (cross-horizon: {CROSS_HORIZON_JACCARD})"
+    )
+    print(
+        f"  position correlation   {_fmt(mean_position)}"
+        f"   (cross-horizon: {CROSS_HORIZON_POSITION_CORR})"
+    )
     print(f"  P&L correlation (mtm)  {_fmt(mean_mtm)}")
-    print(f"  P&L correlation (clsd) {_fmt(mean_closed)}"
-          f"   (cross-horizon: {CROSS_HORIZON_PNL_CORR})")
+    print(
+        f"  P&L correlation (clsd) {_fmt(mean_closed)}   (cross-horizon: {CROSS_HORIZON_PNL_CORR})"
+    )
     print(
         f"\n  effective independent streams from {len(names)} assets, "
         f"n/(1+(n-1)ρ̄) on the position-correlation mean: "

@@ -375,8 +375,6 @@ def test_the_view_takes_its_empty_sentence_from_the_payload() -> None:
     assert "no research ledger beside it" not in body
 
 
-
-
 # -- where the ledger is looked for ----------------------------------------------------------------
 #
 # All of these set `DEFAULT_LEDGER_PATH` to a name of their own rather than using the real one, and
@@ -398,9 +396,7 @@ def _relative_default(monkeypatch: Any, name: str = "rec/trials.jsonl") -> Path:
     return relative
 
 
-def test_the_ledger_is_looked_for_beside_the_config_first(
-    tmp_path: Path, monkeypatch: Any
-) -> None:
+def test_the_ledger_is_looked_for_beside_the_config_first(tmp_path: Path, monkeypatch: Any) -> None:
     """A deployment directory (`~/keel`), which is where `keel serve` actually runs. Untested when
     first written, which for two branches and a fallback is how a resolution path ends up
     reporting "no ledger" on every deployment and nobody noticing."""
@@ -456,9 +452,7 @@ def test_neither_root_having_one_names_the_deployment_path(
     assert not resolved.exists()
 
 
-def test_an_absolute_default_is_used_exactly_as_it_stands(
-    tmp_path: Path, monkeypatch: Any
-) -> None:
+def test_an_absolute_default_is_used_exactly_as_it_stands(tmp_path: Path, monkeypatch: Any) -> None:
     """The branch every test in this repo actually runs under, and the one a naive
     `root / DEFAULT_LEDGER_PATH` gets silently wrong -- `Path("/a") / Path("/b")` is `/b`, so the
     join would appear to work while discarding the deployment root it was searching from.
@@ -484,9 +478,7 @@ def test_the_resolved_path_never_reaches_the_browser(tmp_path: Path) -> None:
     report whose source is a file rather than the database everything else reads."""
     document = json.loads(
         json.dumps(
-            web_payload.trials_payload(
-                gather_trials(_ledger(tmp_path), now_ts=RESEARCH_NOW_TS)
-            )
+            web_payload.trials_payload(gather_trials(_ledger(tmp_path), now_ts=RESEARCH_NOW_TS))
         )
     )
 
@@ -515,9 +507,7 @@ def _slippage(tmp_path: Path, **volumes: str) -> Any:
     repo = _repo(tmp_path)
     for asset, volume in volumes.items():
         _daily(repo, ids[asset], volume_usd=volume)
-    return web_payload.slippage_payload(
-        gather_slippage(repo, config, now_ts=RESEARCH_NOW_TS)
-    )
+    return web_payload.slippage_payload(gather_slippage(repo, config, now_ts=RESEARCH_NOW_TS))
 
 
 def test_no_wire_value_in_the_slippage_payload_is_ever_a_json_number(tmp_path: Path) -> None:

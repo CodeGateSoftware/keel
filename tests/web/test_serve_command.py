@@ -154,9 +154,7 @@ def _policy_from_cli(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, *args: str
 def test_external_host_from_the_cli_reaches_the_host_policy(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    result, cfg = _policy_from_cli(
-        monkeypatch, tmp_path, "--external-host", "keel.example.com"
-    )
+    result, cfg = _policy_from_cli(monkeypatch, tmp_path, "--external-host", "keel.example.com")
 
     assert result.exit_code == 0, result.output
     assert cfg is not None
@@ -220,9 +218,7 @@ def test_the_flag_normalises_case_and_whitespace_before_the_policy_sees_it(
     right in `--help`, and every request is refused for a reason nothing reports. Normalising at
     the boundary is what keeps the comparison a plain membership test rather than a loop.
     """
-    result, cfg = _policy_from_cli(
-        monkeypatch, tmp_path, "--external-host", "  KEEL.Example.COM  "
-    )
+    result, cfg = _policy_from_cli(monkeypatch, tmp_path, "--external-host", "  KEEL.Example.COM  ")
 
     assert result.exit_code == 0, result.output
     assert cfg is not None

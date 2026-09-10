@@ -58,9 +58,7 @@ def withdrawals_attest(ctx: click.Context, enabled: bool) -> None:
     """
     repo = _open_repo(ctx)
     if enabled:
-        _require_interactive_confirmation(
-            WITHDRAWALS_ATTEST_ACTION, WITHDRAWALS_ATTEST_DETAIL
-        )
+        _require_interactive_confirmation(WITHDRAWALS_ATTEST_ACTION, WITHDRAWALS_ATTEST_DETAIL)
     now_ts = int(time.time())
     repo.set_state("withdrawals_enabled", bool(enabled))
     repo.set_state("withdrawals_attested_at", now_ts)

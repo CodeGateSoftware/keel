@@ -145,7 +145,7 @@ class PaperTrader:
         for order in orders:
             try:
                 payload = json.loads(order.get("raw_response") or "{}")
-            except (TypeError, ValueError):
+            except TypeError, ValueError:
                 continue
             if self._ledger_start_order_id is not None:
                 if int(order["id"]) <= self._ledger_start_order_id:

@@ -702,6 +702,8 @@ def test_a_venue_rejection_returned_as_a_result_does_NOT_refute_the_scope() -> N
 
     assert result.success is False
     assert result.reason == "Insufficient balance in source account"
+
+
 # -- credential declaration (#233 PR4) ------------------------------------------------------------
 
 
@@ -743,8 +745,7 @@ class _PortfolioTransport(FakeTransport):
             raise self._raises
         return {
             "portfolios": [
-                {"name": f"p{i}", "uuid": f"u{i}", "type": t}
-                for i, t in enumerate(self._types)
+                {"name": f"p{i}", "uuid": f"u{i}", "type": t} for i, t in enumerate(self._types)
             ]
         }
 
@@ -789,6 +790,7 @@ def test_an_unreadable_portfolio_list_PASSES_and_that_is_deliberate() -> None:
 
 def test_a_malformed_portfolio_response_passes() -> None:
     """Same reasoning: a shape keel does not recognise is not evidence of derivatives."""
+
     class _Malformed(FakeTransport):
         def get_portfolios(self, **kwargs: Any) -> Any:
             return {"unexpected": "shape"}
@@ -812,6 +814,7 @@ def test_a_non_null_margin_rate_warns_without_refusing(caplog) -> None:
     against, so the refusal branch would ship untested. It is surfaced as a warning instead,
     on the fee read that ALREADY fetches this response, so it costs no extra request.
     """
+
     class _MarginRate(FakeTransport):
         def get_transaction_summary(self, **kwargs: Any) -> Any:
             base = super().get_transaction_summary(**kwargs) or {}

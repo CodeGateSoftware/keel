@@ -34,9 +34,7 @@ class GapWindow:
         return (self.product, self.granularity.value, self.start_ts, self.end_ts)
 
 
-def detect(
-    candles: Sequence[Candle], product: str, granularity: Granularity
-) -> list[GapWindow]:
+def detect(candles: Sequence[Candle], product: str, granularity: Granularity) -> list[GapWindow]:
     """Find every interior hole in an ascending-by-ts candle series.
 
     Only INTERIOR holes: a series that simply starts late or ends early is not gapped, it is

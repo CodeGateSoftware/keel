@@ -338,7 +338,13 @@ def test_the_ladder_keys_are_flat_and_zero_padded() -> None:
 
     ladder = montecarlo.quantile_ladder([D("1"), D("2")], "final")
     assert sorted(ladder) == [
-        "final_p01", "final_p05", "final_p25", "final_p50", "final_p75", "final_p95", "final_p99"
+        "final_p01",
+        "final_p05",
+        "final_p25",
+        "final_p50",
+        "final_p75",
+        "final_p95",
+        "final_p99",
     ]
     assert all(isinstance(value, D) for value in ladder.values())
 

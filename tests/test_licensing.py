@@ -97,7 +97,7 @@ def test_every_distribution_declares_the_same_spdx_licence(name):
     declared = _pyprojects()[name]["project"].get("license")
     assert declared == "Apache-2.0", (
         f"{name} declares {declared!r}; every distribution cut from this repo must state "
-        "`license = \"Apache-2.0\"` (SPDX string, not the deprecated table form)"
+        '`license = "Apache-2.0"` (SPDX string, not the deprecated table form)'
     )
 
 

@@ -557,7 +557,7 @@ class RobinhoodAdapter:
             return None
         try:
             return Decimal(str(raw))
-        except (InvalidOperation, ValueError):
+        except InvalidOperation, ValueError:
             return None
 
     def _reject_unsupported(self, spec: OrderSpec) -> None:
@@ -594,7 +594,7 @@ class RobinhoodAdapter:
                 return None
             try:
                 value = Decimal(str(size))
-            except (ArithmeticError, TypeError, ValueError):
+            except ArithmeticError, TypeError, ValueError:
                 return None
             return Instrument(product_id=product_id, base_increment=value) if value > 0 else None
         return None
@@ -1422,7 +1422,7 @@ def _decimal_or_none(value: Any) -> Decimal | None:
         return None
     try:
         return Decimal(str(value))
-    except (InvalidOperation, ValueError, TypeError):
+    except InvalidOperation, ValueError, TypeError:
         return None
 
 

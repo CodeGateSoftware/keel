@@ -184,9 +184,7 @@ def test_limit_order_size_and_price_render_positionally(raw: str, expected: str)
 
 
 @pytest.mark.parametrize(("raw", "expected"), _EXPONENT_HAZARDS)
-def test_stop_limit_order_size_price_and_stop_render_positionally(
-    raw: str, expected: str
-) -> None:
+def test_stop_limit_order_size_price_and_stop_render_positionally(raw: str, expected: str) -> None:
     """The protective-stop path, which is the one that must never be malformed.
 
     A stop-limit rejected for a malformed `stop_price` leaves a position with NO protective stop
@@ -210,9 +208,7 @@ def test_stop_limit_order_size_price_and_stop_render_positionally(
 
 
 @pytest.mark.parametrize(("raw", "_expected"), _EXPONENT_HAZARDS)
-def test_no_rendered_order_field_ever_contains_an_exponent_marker(
-    raw: str, _expected: str
-) -> None:
+def test_no_rendered_order_field_ever_contains_an_exponent_marker(raw: str, _expected: str) -> None:
     """The property itself, asserted structurally across all three body shapes.
 
     The tests above pin exact strings, which is what catches a regression precisely. This one
@@ -223,9 +219,7 @@ def test_no_rendered_order_field_ever_contains_an_exponent_marker(
     value = Decimal(raw)
     specs = [
         MarketIOCByBase(product_id="BTC-USD", side=Side.SELL, base_size=value),
-        LimitGTC(
-            product_id="BTC-USD", side=Side.BUY, base_size=value, limit_price=value
-        ),
+        LimitGTC(product_id="BTC-USD", side=Side.BUY, base_size=value, limit_price=value),
         StopLimitGTC(
             product_id="BTC-USD",
             side=Side.SELL,

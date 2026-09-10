@@ -233,9 +233,7 @@ def pbo(
                 is_performance.append(sortino_from_aggregates(count, total, downside))
                 # The complement, for free -- no second pass over the blocks.
                 oos_performance.append(
-                    sortino_from_aggregates(
-                        whole[0] - count, whole[1] - total, whole[2] - downside
-                    )
+                    sortino_from_aggregates(whole[0] - count, whole[1] - total, whole[2] - downside)
                 )
         else:
             # Slow path: rebuild the actual series, joined in ORIGINAL block order.

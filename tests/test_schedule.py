@@ -99,6 +99,7 @@ def _require_macos() -> None:
     if sys.platform != "darwin":
         pytest.skip(_MACOS_ONLY_REASON)
 
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
 PLIST = REPO_ROOT / "com.keel.live.plist"
 RUN_SCRIPT = REPO_ROOT / "keel-live-run.sh"
@@ -214,12 +215,12 @@ def _stored_series(
 @pytest.mark.parametrize(
     ("hour", "minute", "sees_fresh_bar"),
     [
-        (0, 5, False),   # the old "just after midnight" instinct -- still a day behind
+        (0, 5, False),  # the old "just after midnight" instinct -- still a day behind
         (0, 59, False),  # one minute short: the 00:00-01:00 UTC hourly bar has not closed
-        (1, 0, True),    # the boundary itself: that hourly bar closes AT 01:00
-        (1, 20, True),   # the plist's first eligible trigger, with its publication margin
+        (1, 0, True),  # the boundary itself: that hourly bar closes AT 01:00
+        (1, 20, True),  # the plist's first eligible trigger, with its publication margin
         (2, 20, True),
-        (13, 5, True),   # where the OLD schedule sat -- correct, but ~12h late
+        (13, 5, True),  # where the OLD schedule sat -- correct, but ~12h late
     ],
 )
 def test_effective_bar_does_not_advance_until_0100_utc(
@@ -407,9 +408,9 @@ def _run_gate(
 @pytest.mark.parametrize(
     "tz_name",
     [
-        DEPLOYMENT_TZ,      # the one that actually matters
+        DEPLOYMENT_TZ,  # the one that actually matters
         "Pacific/Auckland",  # southern-hemisphere DST, transitions on the other side of the year
-        "Asia/Kolkata",      # a half-hour offset and no DST at all
+        "Asia/Kolkata",  # a half-hour offset and no DST at all
     ],
 )
 def test_exactly_one_run_per_utc_day_over_a_full_year(tz_name: str) -> None:
@@ -615,9 +616,7 @@ def test_stamp_write_uses_atomic_temp_file_then_mv_with_readback() -> None:
          (e.g. `cp -f`), which drops the atomicity while looking superficially similar.
     """
     source = RUN_SCRIPT.read_text()
-    code_only = "\n".join(
-        line for line in source.splitlines() if not line.lstrip().startswith("#")
-    )
+    code_only = "\n".join(line for line in source.splitlines() if not line.lstrip().startswith("#"))
 
     # Mutation 1's signature: no bare truncating redirect onto $STAMP anywhere in the actual code.
     # This is the exact gap `chflags uchg` cannot probe (it fails at open(2), before truncation),
@@ -665,8 +664,8 @@ class Sandbox:
     stamp: Path
     outlog: Path
     pendlog: Path
-    calls_log: Path         # every argument string any "notification" call made, one per line
-    invocations_log: Path   # one line per time the $KEEL stub actually ran, OUTSIDE logs/ on
+    calls_log: Path  # every argument string any "notification" call made, one per line
+    invocations_log: Path  # one line per time the $KEEL stub actually ran, OUTSIDE logs/ on
     #                         purpose -- the pre-flight test makes logs/ unwritable, and "was
     #                         keel invoked at all" must stay observable even then.
     env: dict[str, str]
@@ -681,6 +680,7 @@ _SANDBOX_EXEC = "/usr/bin/sandbox-exec"
 _DENY_OSASCRIPT_PROFILE = (
     '(version 1)(allow default)(deny process-exec (literal "/usr/bin/osascript"))'
 )
+
 
 def _run_script(script: Path, *, env: dict[str, str]) -> subprocess.CompletedProcess[str]:
     """Run `script` the way launchd would, except sandboxed against ever notifying for real.

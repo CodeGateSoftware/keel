@@ -109,9 +109,7 @@ def test_internal_gaps_are_reported_but_are_NOT_actionable_by_fetching():
 
 
 def test_hourly_lag_is_measured_in_hourly_bars():
-    result = assess(
-        _info(_NOW - 10 * _HOUR, granularity=Granularity.ONE_HOUR), _NOW
-    )
+    result = assess(_info(_NOW - 10 * _HOUR, granularity=Granularity.ONE_HOUR), _NOW)
     assert result.bars_behind == 9
     assert result.stale is True
 

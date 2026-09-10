@@ -409,9 +409,9 @@ def test_screen_asset_refuses_a_whitespace_only_source_for_a_stated_reason() -> 
         _passing_market_facts(), attestation, instrument=_passing_instrument()
     )
     assert result.admitted is False
-    assert any(
-        "attestation: no source recorded" in failure for failure in result.failures
-    ), result.failures
+    assert any("attestation: no source recorded" in failure for failure in result.failures), (
+        result.failures
+    )
 
 
 def test_screen_asset_positive_control_a_complete_attestation_is_admitted() -> None:

@@ -125,9 +125,7 @@ def test_migration_does_not_overwrite_an_existing_row() -> None:
     """
     conn = _v1_database()
     db.migrate(conn)
-    conn.execute(
-        "UPDATE broker_subscriptions SET tier_name = 'Preferred', status = 'active'"
-    )
+    conn.execute("UPDATE broker_subscriptions SET tier_name = 'Preferred', status = 'active'")
     conn.commit()
 
     db._migrate_v2_broker_subscriptions(conn)
@@ -183,8 +181,16 @@ def test_migration_to_v4_creates_the_positions_table() -> None:
     db.migrate(conn)
     cols = {r["name"] for r in conn.execute("PRAGMA table_info(positions)")}
     assert cols >= {
-        "id", "product_id", "rule_name", "opened_at", "closed_at",
-        "qty", "entry_fill", "entry_fee", "bracket_order_id", "status",
+        "id",
+        "product_id",
+        "rule_name",
+        "opened_at",
+        "closed_at",
+        "qty",
+        "entry_fill",
+        "entry_fee",
+        "bracket_order_id",
+        "status",
     }
     stamped = conn.execute("SELECT version FROM schema_version").fetchone()["version"]
     assert stamped == db.SCHEMA_VERSION
@@ -482,8 +488,14 @@ def test_v14_creates_the_venue_trade_scopes_table() -> None:
     db.migrate(conn)
     cols = {r["name"] for r in conn.execute("PRAGMA table_info(venue_trade_scopes)")}
     assert cols >= {
-        "venue", "state", "attested_scope", "attested_ts", "confirmed_ts", "refuted_ts",
-        "refuted_reason", "credential_fingerprint",
+        "venue",
+        "state",
+        "attested_scope",
+        "attested_ts",
+        "confirmed_ts",
+        "refuted_ts",
+        "refuted_reason",
+        "credential_fingerprint",
     }
 
 
@@ -1067,9 +1079,7 @@ def test_v19_database_gains_v20_columns_as_NULL_no_backfill() -> None:
 
     db.migrate(conn)
 
-    order_row = conn.execute(
-        "SELECT quote_provenance, client_order_id FROM orders"
-    ).fetchone()
+    order_row = conn.execute("SELECT quote_provenance, client_order_id FROM orders").fetchone()
     assert order_row["quote_provenance"] is None
     assert order_row["client_order_id"] is None
 

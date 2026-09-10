@@ -220,9 +220,7 @@ def test_the_knob_raises_the_venues_words_verbatim() -> None:
     """The one venue in this repo that can be MADE to refuse. Every real adapter needs a live
     credential without trade scope to exercise its refusal path, and the executor's confirm/refute
     write needs something it can drive end to end without one."""
-    adapter = FakeAdapter(
-        trade_scope_denied="You do not have permission to perform this action."
-    )
+    adapter = FakeAdapter(trade_scope_denied="You do not have permission to perform this action.")
 
     with pytest.raises(TradeScopeDenied) as caught:
         adapter.place_order(

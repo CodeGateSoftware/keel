@@ -144,8 +144,7 @@ def test_describe_params_covers_every_kind_and_every_param_minus_identity() -> N
     for kind, rule_cls in agent.RULE_REGISTRY.items():
         params = describe_params(kind)
         persisted = set(
-            agent.build_rule_from_params(kind, {"product_id": "BTC-USD"})
-            .describe()["params"]
+            agent.build_rule_from_params(kind, {"product_id": "BTC-USD"}).describe()["params"]
         )
         accepted = {
             name
@@ -166,9 +165,9 @@ def test_describe_params_offers_only_params_the_kind_persists() -> None:
     assert "granularity" not in pullback
     # Every offered pullback param is one the row persists.
     persisted = set(
-        agent.build_rule_from_params(
-            "pullback_continuation", {"product_id": "BTC-USD"}
-        ).describe()["params"]
+        agent.build_rule_from_params("pullback_continuation", {"product_id": "BTC-USD"}).describe()[
+            "params"
+        ]
     )
     assert set(pullback) <= persisted
 
@@ -396,9 +395,7 @@ def test_attempt_promotion_force_advances_and_warns(repo: Repository) -> None:
 
 
 def test_apply_rule_enable_restores_a_disabled_rule_at_candidate(repo: Repository) -> None:
-    rule_id = repo.insert_rule(
-        "dca", {"product_id": "BTC-USD"}, status="disabled", now_ts=NOW_TS
-    )
+    rule_id = repo.insert_rule("dca", {"product_id": "BTC-USD"}, status="disabled", now_ts=NOW_TS)
     out, err = _collect()
     outcome = apply_rule_enable(repo, rule_id, echo=out.append, echo_err=err.append)
     assert outcome.new_status == "candidate"
@@ -407,9 +404,7 @@ def test_apply_rule_enable_restores_a_disabled_rule_at_candidate(repo: Repositor
 
 
 def test_apply_rule_enable_refuses_a_rule_that_is_not_disabled(repo: Repository) -> None:
-    rule_id = repo.insert_rule(
-        "dca", {"product_id": "BTC-USD"}, status="candidate", now_ts=NOW_TS
-    )
+    rule_id = repo.insert_rule("dca", {"product_id": "BTC-USD"}, status="candidate", now_ts=NOW_TS)
     out, err = _collect()
     with pytest.raises(RulesRefused):
         apply_rule_enable(repo, rule_id, echo=out.append, echo_err=err.append)
@@ -418,9 +413,7 @@ def test_apply_rule_enable_refuses_a_rule_that_is_not_disabled(repo: Repository)
 
 
 def test_apply_rule_disable_and_demote_write_through_the_service(repo: Repository) -> None:
-    live_id = repo.insert_rule(
-        "dca", {"product_id": "BTC-USD"}, status="live", now_ts=NOW_TS
-    )
+    live_id = repo.insert_rule("dca", {"product_id": "BTC-USD"}, status="live", now_ts=NOW_TS)
     out, err = _collect()
     outcome = apply_rule_demote(repo, live_id, echo=out.append, echo_err=err.append)
     assert outcome.new_status == "paper"
@@ -507,7 +500,10 @@ def test_the_statistic_comes_from_daily_bars_not_the_rules_own_granularity(repo)
         [
             Candle(
                 ts=1_700_000_000 + i * 3600,
-                open=price, high=price, low=price, close=price,
+                open=price,
+                high=price,
+                low=price,
+                close=price,
                 volume=Decimal("25000000") / price,
             )
             for i in range(200)

@@ -33,7 +33,7 @@ def test_a_fresh_attestation_is_honoured(tmp_path):
 
 
 def test_a_STALE_attestation_reads_as_UNKNOWN_not_as_suspended(tmp_path):
-    """"Nobody has checked recently" is a different claim from "the broker says suspended".
+    """ "Nobody has checked recently" is a different claim from "the broker says suspended".
 
     Both block entries, but the operator sees a different message and should.
     """
@@ -78,9 +78,12 @@ def test_cli_roundtrip_and_suspension_message(tmp_path, monkeypatch):
     unknown = runner.invoke(cli, ["--db", str(db_path), "withdrawals", "show"])
     assert "UNKNOWN (never attested)" in unknown.output
 
-    assert runner.invoke(
-        cli, ["--db", str(db_path), "withdrawals", "attest", "--enabled"], input="yes\n"
-    ).exit_code == 0
+    assert (
+        runner.invoke(
+            cli, ["--db", str(db_path), "withdrawals", "attest", "--enabled"], input="yes\n"
+        ).exit_code
+        == 0
+    )
     assert "ENABLED" in runner.invoke(cli, ["--db", str(db_path), "withdrawals", "show"]).output
 
     suspended = runner.invoke(cli, ["--db", str(db_path), "withdrawals", "attest", "--suspended"])

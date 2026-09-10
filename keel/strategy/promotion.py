@@ -120,9 +120,7 @@ _CLASS_FLOORS: dict[str, PromotionConfig] = {
 }
 
 
-def floor_for_class(
-    class_name: str, default: PromotionConfig | None = None
-) -> PromotionConfig:
+def floor_for_class(class_name: str, default: PromotionConfig | None = None) -> PromotionConfig:
     """The promotion floor for a rule's `class_name`.
 
     A class with a fixed, code-defined floor (currently only `trend_follow`) returns that
@@ -322,9 +320,7 @@ def pool_stats(samples: Sequence[ProductSample]) -> tuple[BacktestResult, Pooled
     reading = PooledReading(
         n_pooled=n_total,
         per_product=tuple(sorted(counts.items())),
-        products_contributing=sum(
-            1 for n in counts.values() if n >= MIN_TRADES_PER_PRODUCT_POOLED
-        ),
+        products_contributing=sum(1 for n in counts.values() if n >= MIN_TRADES_PER_PRODUCT_POOLED),
         min_contribution=min(counts.values()) if counts else 0,
     )
     return pooled_stats, reading
@@ -374,9 +370,7 @@ def _pooled_floors(
     return (len(reasons) == 0, reasons)
 
 
-def paper_sibling_rows(
-    repo: Repository, kind: str, params: dict[str, Any]
-) -> list[dict[str, Any]]:
+def paper_sibling_rows(repo: Repository, kind: str, params: dict[str, Any]) -> list[dict[str, Any]]:
     """The `rules` rows that count as pooled evidence for the (kind, params) being
     promoted: same `kind`, params IDENTICAL to `params` after dropping `product_id`,
     a DIFFERENT `product_id`, and status `paper`.
@@ -622,9 +616,7 @@ def _fetch_rule(repo: Repository, rule_name: str, rule_id: int | None = None) ->
         for r in repo.get_rules():
             if r["id"] == rule_id:
                 if r["kind"] != rule_name:
-                    raise ValueError(
-                        f"rule id {rule_id} is kind {r['kind']!r}, not {rule_name!r}"
-                    )
+                    raise ValueError(f"rule id {rule_id} is kind {r['kind']!r}, not {rule_name!r}")
                 return r["id"], r["status"]
         raise ValueError(f"no rule found in the rules table with id={rule_id}")
     matches = [r for r in repo.get_rules() if r["kind"] == rule_name]

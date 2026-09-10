@@ -151,9 +151,7 @@ def test_the_plan_states_the_non_goal():
     engine and will help build one.
     """
     text = _unwrapped(_read(_DOC)).lower()
-    assert "stars" in text, (
-        f"{_DOC} must state the non-goal -- announcing is not for stars"
-    )
+    assert "stars" in text, f"{_DOC} must state the non-goal -- announcing is not for stars"
 
 
 def test_the_announcement_draft_leads_with_the_engine_and_the_honest_result():
@@ -209,6 +207,5 @@ def test_contributing_states_the_solo_maintainer_response_commitment():
 def test_the_readme_maps_the_launch_document():
     """The gate is discoverable from the README's documentation map."""
     assert "docs/launch.md" in _read("README.md"), (
-        "README.md's documentation map must link docs/launch.md -- the gate is findable, "
-        "not filed"
+        "README.md's documentation map must link docs/launch.md -- the gate is findable, not filed"
     )

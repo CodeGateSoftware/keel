@@ -446,25 +446,46 @@ def test_held_products_lists_products_with_filled_live_orders(repo: Repository) 
     for product_id in ("BTC-USD", "ETH-USD"):
         repo.insert_order(
             dict(
-                mode="live", product_id=product_id, side=Side.BUY.value, order_type="market",
-                qty=Decimal("1"), limit_price=Decimal("100"), status="filled",
-                fee=Decimal("0"), expected_fill=Decimal("100"), actual_fill=Decimal("100"),
+                mode="live",
+                product_id=product_id,
+                side=Side.BUY.value,
+                order_type="market",
+                qty=Decimal("1"),
+                limit_price=Decimal("100"),
+                status="filled",
+                fee=Decimal("0"),
+                expected_fill=Decimal("100"),
+                actual_fill=Decimal("100"),
             )
         )
     # a paper-mode order must NOT leak into the live equity calculation
     repo.insert_order(
         dict(
-            mode="paper", product_id="SOL-USD", side=Side.BUY.value, order_type="market",
-            qty=Decimal("1"), limit_price=Decimal("100"), status="filled",
-            fee=Decimal("0"), expected_fill=Decimal("100"), actual_fill=Decimal("100"),
+            mode="paper",
+            product_id="SOL-USD",
+            side=Side.BUY.value,
+            order_type="market",
+            qty=Decimal("1"),
+            limit_price=Decimal("100"),
+            status="filled",
+            fee=Decimal("0"),
+            expected_fill=Decimal("100"),
+            actual_fill=Decimal("100"),
         )
     )
     # an unfilled order is not a holding
     repo.insert_order(
         dict(
-            mode="live", product_id="DOGE-USD", side=Side.BUY.value, order_type="market",
-            qty=Decimal("1"), limit_price=Decimal("100"), status="pending",
-            fee=Decimal("0"), expected_fill=Decimal("100"), actual_fill=None,
+            mode="live",
+            product_id="DOGE-USD",
+            side=Side.BUY.value,
+            order_type="market",
+            qty=Decimal("1"),
+            limit_price=Decimal("100"),
+            status="pending",
+            fee=Decimal("0"),
+            expected_fill=Decimal("100"),
+            actual_fill=None,
         )
     )
 
@@ -649,26 +670,43 @@ def test_reattesting_an_instrument_without_a_window_clears_a_previously_recorded
     """The ON CONFLICT trap, instrument side: omitting `attest_due_ts` from `DO UPDATE SET`
     would let a RE-attestation silently carry the previous window forward (#718)."""
     repo.upsert_instrument_attestation(
-        venue="coinbase", product_id="BTC-USD", wrapper="spot", source="s1",
-        attested_by="alice", attested_at=1_000, attest_due_ts=2_000,
+        venue="coinbase",
+        product_id="BTC-USD",
+        wrapper="spot",
+        source="s1",
+        attested_by="alice",
+        attested_at=1_000,
+        attest_due_ts=2_000,
     )
     assert repo.get_instrument_attestation("coinbase", "BTC-USD")["attest_due_ts"] == 2_000
 
     repo.upsert_instrument_attestation(
-        venue="coinbase", product_id="BTC-USD", wrapper="perpetual", source="s2",
-        attested_by="bob", attested_at=3_000,
+        venue="coinbase",
+        product_id="BTC-USD",
+        wrapper="perpetual",
+        source="s2",
+        attested_by="bob",
+        attested_at=3_000,
     )
     assert repo.get_instrument_attestation("coinbase", "BTC-USD")["attest_due_ts"] is None
 
 
 def test_upsert_instrument_attestation_on_conflict_replaces_rather_than_duplicates(repo):
     repo.upsert_instrument_attestation(
-        venue="coinbase", product_id="BTC-USD", wrapper="spot", source="s1",
-        attested_by="alice", attested_at=1_000,
+        venue="coinbase",
+        product_id="BTC-USD",
+        wrapper="spot",
+        source="s1",
+        attested_by="alice",
+        attested_at=1_000,
     )
     repo.upsert_instrument_attestation(
-        venue="coinbase", product_id="BTC-USD", wrapper="perpetual", source="s2",
-        attested_by="bob", attested_at=2_000,
+        venue="coinbase",
+        product_id="BTC-USD",
+        wrapper="perpetual",
+        source="s2",
+        attested_by="bob",
+        attested_at=2_000,
     )
 
     row = repo.get_instrument_attestation("coinbase", "BTC-USD")
@@ -682,12 +720,20 @@ def test_same_product_id_on_two_venues_are_independent_rows(repo):
     """The whole point of the composite key: one venue's BTC-USD spot listing must not collide
     with another venue's BTC-USD listing of a different wrapper."""
     repo.upsert_instrument_attestation(
-        venue="coinbase", product_id="BTC-USD", wrapper="spot", source="s1",
-        attested_by="a", attested_at=1,
+        venue="coinbase",
+        product_id="BTC-USD",
+        wrapper="spot",
+        source="s1",
+        attested_by="a",
+        attested_at=1,
     )
     repo.upsert_instrument_attestation(
-        venue="kraken", product_id="BTC-USD", wrapper="cfd", source="s2",
-        attested_by="a", attested_at=1,
+        venue="kraken",
+        product_id="BTC-USD",
+        wrapper="cfd",
+        source="s2",
+        attested_by="a",
+        attested_at=1,
     )
 
     assert repo.get_instrument_attestation("coinbase", "BTC-USD")["wrapper"] == "spot"
@@ -700,15 +746,27 @@ def test_get_instrument_attestation_returns_none_for_an_unknown_key(repo):
 
 def test_get_instrument_attestations_lists_all_rows_ordered_by_venue_then_product(repo):
     repo.upsert_instrument_attestation(
-        venue="kraken", product_id="BTC-USD", wrapper="cfd", source="s", attested_by="a",
+        venue="kraken",
+        product_id="BTC-USD",
+        wrapper="cfd",
+        source="s",
+        attested_by="a",
         attested_at=1,
     )
     repo.upsert_instrument_attestation(
-        venue="coinbase", product_id="ETH-USD", wrapper="spot", source="s", attested_by="a",
+        venue="coinbase",
+        product_id="ETH-USD",
+        wrapper="spot",
+        source="s",
+        attested_by="a",
         attested_at=1,
     )
     repo.upsert_instrument_attestation(
-        venue="coinbase", product_id="BTC-USD", wrapper="spot", source="s", attested_by="a",
+        venue="coinbase",
+        product_id="BTC-USD",
+        wrapper="spot",
+        source="s",
+        attested_by="a",
         attested_at=1,
     )
 
@@ -742,11 +800,17 @@ def test_get_screen_exceptions_is_empty_for_an_asset_with_none(repo):
 
 def test_upsert_screen_exception_on_conflict_updates_rationale_and_grant_fields(repo):
     repo.upsert_screen_exception(
-        asset="PAXG", criterion="history", rationale="first", granted_by="alice",
+        asset="PAXG",
+        criterion="history",
+        rationale="first",
+        granted_by="alice",
         granted_at=1_000,
     )
     repo.upsert_screen_exception(
-        asset="PAXG", criterion="history", rationale="second", granted_by="bob",
+        asset="PAXG",
+        criterion="history",
+        rationale="second",
+        granted_by="bob",
         granted_at=2_000,
     )
 

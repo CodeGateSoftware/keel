@@ -293,15 +293,16 @@ def print_thresholds(
         moved = sum(1 for a, b in zip(was, now) if a != b)
         n = len(now)
         print(
-            f"{product_id:10} {'before':>7} "
-            + " ".join(f"{was.count(t):14d}" for t in techniques)
+            f"{product_id:10} {'before':>7} " + " ".join(f"{was.count(t):14d}" for t in techniques)
         )
         print(
-            f"{'':10} {'after':>7} " + " ".join(f"{now.count(t):14d}" for t in techniques)
+            f"{'':10} {'after':>7} "
+            + " ".join(f"{now.count(t):14d}" for t in techniques)
             + f" {moved:7d}"
         )
         print(
-            f"{'':10} {'':>7} " + " ".join(
+            f"{'':10} {'':>7} "
+            + " ".join(
                 f"{(Decimal(now.count(t) - was.count(t)) / Decimal(n)):>+13.4f} "
                 for t in techniques
             )
@@ -313,7 +314,8 @@ def print_thresholds(
     print("-" * len(header))
     print(f"{'POOLED':10} {'before':>7} " + " ".join(f"{all_was.count(t):14d}" for t in techniques))
     print(
-        f"{'':10} {'after':>7} " + " ".join(f"{all_now.count(t):14d}" for t in techniques)
+        f"{'':10} {'after':>7} "
+        + " ".join(f"{all_now.count(t):14d}" for t in techniques)
         + f" {moved:7d}"
     )
     print(
@@ -332,9 +334,11 @@ def print_tolerance_ladder(candles_by_asset: dict[str, list[Candle]]) -> None:
     these agree with them at `tolerance=0.02` to within the 200-bar warm-up, which is the check.
     """
     print("\nARM D -- tolerance sensitivity (fraction of handle spacing), over daily closes")
-    header = f"{'tolerance':>10} " + " ".join(
-        f"{a.removesuffix('-USD'):>8}" for a in candles_by_asset
-    ) + f" {'pooled':>8} {'spread':>7} {'64975.78':>9}"
+    header = (
+        f"{'tolerance':>10} "
+        + " ".join(f"{a.removesuffix('-USD'):>8}" for a in candles_by_asset)
+        + f" {'pooled':>8} {'spread':>7} {'64975.78':>9}"
+    )
     print(header)
     print("-" * len(header))
     for tolerance in TOLERANCE_LADDER:
@@ -349,7 +353,8 @@ def print_tolerance_ladder(candles_by_asset: dict[str, list[Candle]]) -> None:
             total += len(closes)
         marker = "*" if tolerance == levels.DEFAULT_HANDLE_TOLERANCE else " "
         print(
-            f"{str(tolerance):>9}{marker} " + " ".join(cells)
+            f"{str(tolerance):>9}{marker} "
+            + " ".join(cells)
             + f" {_fmt(Decimal(hits) / Decimal(total)):>8}"
             + f" {_fmt(max(rates) / min(rates), '0.01'):>7}"
             + f" {str(levels.is_round_number(Decimal('64975.78'), tolerance)):>9}"

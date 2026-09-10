@@ -492,8 +492,7 @@ def cash_posture_findings(
                 "attest.cash_posture",
                 FAIL,
                 "cash posture attestation expired",
-                f"{venue} expired {_days(now_ts - due)} day(s) ago; rail 22 vetoes "
-                "live ENTRIES",
+                f"{venue} expired {_days(now_ts - due)} day(s) ago; rail 22 vetoes live ENTRIES",
                 attest,
             )
         ]
@@ -732,7 +731,7 @@ def veto_findings(lines: Iterable[str], since_ts: float) -> list[Finding]:
     for line in lines:
         try:
             event = json.loads(line)
-        except (json.JSONDecodeError, ValueError):
+        except json.JSONDecodeError, ValueError:
             continue
         if event.get("event") != "executor.order_vetoed":
             continue
@@ -1102,7 +1101,6 @@ def partial_fill_findings(orders: list[dict[str, Any]]) -> list[Finding]:
             "cancel & re-place the bracket at the filled size (automated resize: #502)",
         )
     ]
-
 
 
 def balance_drift_findings(records: dict[str, Any]) -> list[Finding]:
@@ -1919,7 +1917,7 @@ def _loaded_launchd_labels() -> frozenset[str] | None:
         result = subprocess.run(
             ["launchctl", "list"], capture_output=True, text=True, timeout=5, check=False
         )
-    except (OSError, subprocess.SubprocessError):
+    except OSError, subprocess.SubprocessError:
         return None
     if result.returncode != 0:
         return None
@@ -2104,9 +2102,7 @@ def collect_profiles(
         """Drop every line whose first non-whitespace character is `#`. A comment must never
         compete with the script's real invocation for a regex match -- see the docstring
         above for the incident this prevents."""
-        return "\n".join(
-            line for line in text.splitlines() if not line.lstrip().startswith("#")
-        )
+        return "\n".join(line for line in text.splitlines() if not line.lstrip().startswith("#"))
 
     def _resolve_token(token: str, code_text: str) -> str | None:
         """Resolve one captured `--config`/`--db` argument to a plain filename.

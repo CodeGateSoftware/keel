@@ -274,9 +274,7 @@ def test_release_notes_template_names_the_real_per_platform_checksum_files(
     wording under test.
     """
     expected = _expected_checksum_filenames(desktop_job)
-    notes_step = next(
-        s for s in release_job["steps"] if s.get("name") == "Compose release notes"
-    )
+    notes_step = next(s for s in release_job["steps"] if s.get("name") == "Compose release notes")
     notes_section = str(notes_step["run"])
     for filename in expected:
         assert filename in notes_section, (

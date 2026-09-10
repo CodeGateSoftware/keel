@@ -76,9 +76,7 @@ class HeldBroker(FakeBroker):
     def get_balances(self) -> list[Balance]:
         balances = super().get_balances()
         balances.append(
-            Balance(
-                currency=self._base, available=self._base_available, total=self._base_total
-            )
+            Balance(currency=self._base, available=self._base_available, total=self._base_total)
         )
         return balances
 
@@ -279,9 +277,7 @@ def test_rail_21_vetoes_a_sell_when_the_venue_reports_no_holding(repo):  # noqa:
     means the two disagree -- and refusing sells nothing and traps nothing, because there is
     nothing there to trap. On a margin-enabled account, sending it is the short.
     """
-    result = guards.check(
-        _sell_intent(available_base=Decimal("0")), repo, _config(), NOW_TS
-    )
+    result = guards.check(_sell_intent(available_base=Decimal("0")), repo, _config(), NOW_TS)
 
     assert _rail21(result), "a SELL against an affirmatively empty holding must be vetoed"
     assert "keel's ledger expects 0.1" in _rail21(result)[0]
@@ -293,9 +289,7 @@ def test_rail_21_does_not_veto_a_holding_merely_smaller_than_the_order(repo):  #
     This is the boundary between the two mechanisms: below the order but above zero belongs to
     the clamp, and only zero-or-less belongs to the rail.
     """
-    result = guards.check(
-        _sell_intent(available_base=Decimal("0.05")), repo, _config(), NOW_TS
-    )
+    result = guards.check(_sell_intent(available_base=Decimal("0.05")), repo, _config(), NOW_TS)
 
     assert not _rail21(result)
 

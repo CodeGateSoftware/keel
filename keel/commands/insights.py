@@ -650,9 +650,7 @@ def _realized_rr_for_display(stats: Any) -> Decimal | None:
     return stats.avg_win / abs(stats.avg_loss)
 
 
-def build_gate_distance(
-    rule: Rule, stats: Any, default_floor: PromotionConfig
-) -> GateDistance:
+def build_gate_distance(rule: Rule, stats: Any, default_floor: PromotionConfig) -> GateDistance:
     """How far `stats` is from `rule`'s promotion floor (its class's floor, or `default_floor`
     for classes with no code-defined override)."""
     promotion_class = promotion_class_of(rule)
@@ -756,8 +754,7 @@ def build_insights_report(
         rows = [r for r in rows if r["status"] in _PAPER_PIPELINE_STATUSES]
 
     rules = [
-        build_rule_track_record(row, track_record(repo, row["kind"]), default_floor)
-        for row in rows
+        build_rule_track_record(row, track_record(repo, row["kind"]), default_floor) for row in rows
     ]
 
     return InsightsReport(

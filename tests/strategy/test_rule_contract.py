@@ -97,9 +97,7 @@ def test_a_rules_own_declaration_is_what_coerces_its_decimal_param(foreign_kind:
     string `"2.75"`, the rule stored it unconverted, and the first symptom was a
     `Decimal`/`float` `TypeError` from inside the rule's own arithmetic, cycles later.
     """
-    rule = build_rule_from_params(
-        foreign_kind, {"product_id": "BTC-USD", "threshold": "2.75"}
-    )
+    rule = build_rule_from_params(foreign_kind, {"product_id": "BTC-USD", "threshold": "2.75"})
 
     assert isinstance(rule.threshold, Decimal)
     assert rule.threshold == Decimal("2.75")
@@ -115,9 +113,7 @@ def test_an_undeclared_decimal_param_still_arrives_as_the_raw_string(foreign_kin
     stored as, which is exactly the failure the declaration exists to prevent, reproduced here
     on purpose.
     """
-    rule = build_rule_from_params(
-        foreign_kind, {"product_id": "BTC-USD", "undeclared": "2.75"}
-    )
+    rule = build_rule_from_params(foreign_kind, {"product_id": "BTC-USD", "undeclared": "2.75"})
 
     assert rule.undeclared == "2.75"
     assert not isinstance(rule.undeclared, Decimal)
@@ -132,9 +128,7 @@ def test_a_rules_own_declaration_is_what_coerces_its_granularity_param(
     identity checks silently -- re-gating the rule on the coarsest configured granularity while
     it keeps deciding on its own candles (#337).
     """
-    rule = build_rule_from_params(
-        foreign_kind, {"product_id": "BTC-USD", "timeframe": "ONE_HOUR"}
-    )
+    rule = build_rule_from_params(foreign_kind, {"product_id": "BTC-USD", "timeframe": "ONE_HOUR"})
 
     assert rule.timeframe is Granularity.ONE_HOUR
 
@@ -143,9 +137,7 @@ def test_a_rules_own_declaration_is_what_coerces_its_tuple_param(foreign_kind: s
     """Until #447 this was not a table but a literal `if kind == "pullback_continuation"` inside
     `build_rule_from_params` -- so no rule but that one could have a tuple param at all.
     """
-    rule = build_rule_from_params(
-        foreign_kind, {"product_id": "BTC-USD", "lookbacks": [5, 20, 55]}
-    )
+    rule = build_rule_from_params(foreign_kind, {"product_id": "BTC-USD", "lookbacks": [5, 20, 55]})
 
     assert rule.lookbacks == (5, 20, 55)
     assert isinstance(rule.lookbacks, tuple)
@@ -204,9 +196,7 @@ def test_every_decimal_constructor_param_is_declared(kind: str) -> None:
     """
     rule_cls = RULE_REGISTRY[kind]
     annotated = {
-        name
-        for name, hint in _annotated_kwargs(rule_cls).items()
-        if _admits(hint, Decimal)
+        name for name, hint in _annotated_kwargs(rule_cls).items() if _admits(hint, Decimal)
     }
 
     assert set(rule_cls.decimal_params) == annotated, (
@@ -226,9 +216,7 @@ def test_every_granularity_constructor_param_is_declared(kind: str) -> None:
     """
     rule_cls = RULE_REGISTRY[kind]
     annotated = sorted(
-        name
-        for name, hint in _annotated_kwargs(rule_cls).items()
-        if _admits(hint, Granularity)
+        name for name, hint in _annotated_kwargs(rule_cls).items() if _admits(hint, Granularity)
     )
 
     assert len(annotated) <= 1, f"{kind}: `granularity_param` cannot express {annotated}"
@@ -247,9 +235,7 @@ def test_every_tuple_constructor_param_is_declared(kind: str) -> None:
     """
     rule_cls = RULE_REGISTRY[kind]
     annotated = {
-        name
-        for name, hint in _annotated_kwargs(rule_cls).items()
-        if get_origin(hint) is tuple
+        name for name, hint in _annotated_kwargs(rule_cls).items() if get_origin(hint) is tuple
     }
 
     assert set(rule_cls.tuple_params) == annotated, (

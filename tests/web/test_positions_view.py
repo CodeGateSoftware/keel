@@ -58,9 +58,7 @@ def test_no_wire_value_in_the_positions_payload_is_ever_a_json_number(tmp_path: 
     """#533's contract, over this payload. Positions carry more money per row than any other
     view -- entry, fee, mark, market value, unrealized, stop, realized -- so it is the one most
     likely to leak a float."""
-    document = json.loads(
-        json.dumps(web_payload.positions_payload(_positions_report(tmp_path)))
-    )
+    document = json.loads(json.dumps(web_payload.positions_payload(_positions_report(tmp_path))))
     numbers = [
         path
         for path, leaf in _walk(document)

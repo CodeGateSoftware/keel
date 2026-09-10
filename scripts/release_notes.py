@@ -226,8 +226,10 @@ def compose_release_notes(
         lines = [f"## {category.title}", ""]
         for pr in bucket:
             body = clean_pr_body(pr.body)
-            body = truncate_body(demote_headings(body), body_limit, pr.number) if body else (
-                NO_DESCRIPTION
+            body = (
+                truncate_body(demote_headings(body), body_limit, pr.number)
+                if body
+                else (NO_DESCRIPTION)
             )
             lines += [f"### {pr.title} (#{pr.number})", "", body, ""]
         sections.append("\n".join(lines).rstrip())

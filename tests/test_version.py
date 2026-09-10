@@ -50,7 +50,7 @@ def test_build_info_never_raises_when_git_is_unavailable(monkeypatch):
 
 
 def test_a_failed_status_call_reads_as_DIRTY_not_clean(monkeypatch):
-    """"We could not tell" must not be reported as a clean tree."""
+    """ "We could not tell" must not be reported as a clean tree."""
     calls = {"n": 0}
 
     def fake_git(*args):

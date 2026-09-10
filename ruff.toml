@@ -11,6 +11,22 @@ line-length = 100
 # hazard is gone rather than merely tolerated, and `py314` is the honest target.
 target-version = "py314"
 
+# ── THE FORMATTER IS GATED, SO IT IS ALSO SETTLED (#783) ──────────────────────────────────────
+#
+# `ruff format --check .` runs in `ci.yml` and `release.yml`. Before #783 it ran nowhere, and 197
+# of 496 files had drifted out of the format this file configures -- so a contributor who ran the
+# formatter on a file they touched reformatted regions they had not, and those hunks landed in
+# PRs whose bodies said "no behaviour change". #780 shipped six of them.
+#
+# The gate is WHOLE-TREE, where `ruff check` in the same workflows is scoped to `keel tests
+# packages`. Lint has a debt in `docs/` and `scripts/`; formatting no longer has one anywhere,
+# and scoping the check would re-open exactly the drift the one-shot pass closed.
+#
+# The PEP 758 note above is the reason this could be turned on at all: the pass rewrote 28
+# `except (A, B):` into `except A, B:`, which is what that note predicted and what the `>=3.14`
+# floor now makes safe. `tests/test_python_floor.py` pins that floor across all eight
+# distributions, so the syntax cannot outlive the interpreter that parses it.
+
 [lint]
 select = ["E", "F", "I", "UP"]
 # UP042: the design spec pins `class X(str, Enum)` explicitly (not `StrEnum`) for these types.

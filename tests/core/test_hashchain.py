@@ -33,9 +33,7 @@ def test_canonical_json_is_insertion_order_blind() -> None:
     A payload assembled by a `dict` literal in one module and by `dict(row)` out of sqlite in
     another would otherwise hash differently while describing the same row.
     """
-    assert hashchain.canonical_json({"b": 1, "a": 2}) == hashchain.canonical_json(
-        {"a": 2, "b": 1}
-    )
+    assert hashchain.canonical_json({"b": 1, "a": 2}) == hashchain.canonical_json({"a": 2, "b": 1})
 
 
 def test_canonical_json_has_no_incidental_whitespace() -> None:

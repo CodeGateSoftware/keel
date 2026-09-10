@@ -201,9 +201,7 @@ def _drive(repo, monkeypatch, rule: Rule, *, product: str = PRODUCT) -> tuple[Fa
     repo.set_autonomous(False, now_ts=0)
     _seed_rule(repo, monkeypatch, rule, status="live")
     broker = FakeBroker(series={(product, Granularity.ONE_DAY): [_candle(0, "100")]})
-    result = run_once(
-        broker, repo, _live_config(), now_ts=90_000, confirm_fn=lambda preview: True
-    )
+    result = run_once(broker, repo, _live_config(), now_ts=90_000, confirm_fn=lambda preview: True)
     return broker, result
 
 
@@ -362,9 +360,7 @@ def test_a_rule_cannot_reach_for_the_sell_side_through_its_context(repo, monkeyp
 # -- layer 4: the rails refuse the instrument, whatever proposed it --------------------------
 
 
-def test_rail_19_refuses_a_non_spot_instrument_shape_whatever_rule_produced_it(
-    repo, monkeypatch
-):
+def test_rail_19_refuses_a_non_spot_instrument_shape_whatever_rule_produced_it(repo, monkeypatch):
     """A foreign rule naming a futures contract. Its BASE is allowlisted, so the product loop
     does not drop it early and the intent genuinely reaches `guards.check`.
 

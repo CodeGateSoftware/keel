@@ -259,9 +259,7 @@ def test_re_importing_a_transaction_appends_rather_than_rewrites(conn: sqlite3.C
     exactly what an auditor wants visible."""
     repo = Repository(conn)
     for total in (Decimal("250.00"), Decimal("260.00")):
-        repo.upsert_transaction(
-            _transaction(coinbase_id="cb-1", total=total)
-        )
+        repo.upsert_transaction(_transaction(coinbase_id="cb-1", total=total))
     events = audit.read_events(conn)
     assert len(events) == 2
     assert events[0].row_hash != events[1].row_hash
@@ -271,12 +269,21 @@ def test_re_importing_a_transaction_appends_rather_than_rewrites(conn: sqlite3.C
 def test_both_attestation_upserts_record_a_human_claim(conn: sqlite3.Connection) -> None:
     repo = Repository(conn)
     repo.upsert_asset_attestation(
-        asset="BTC", sector="tech", backing="none", pays_yield=False,
-        source="prospectus", attested_by="operator", attested_at=100,
+        asset="BTC",
+        sector="tech",
+        backing="none",
+        pays_yield=False,
+        source="prospectus",
+        attested_by="operator",
+        attested_at=100,
     )
     repo.upsert_instrument_attestation(
-        venue="coinbase", product_id="BTC-USD", wrapper="spot",
-        source="venue docs", attested_by="operator", attested_at=101,
+        venue="coinbase",
+        product_id="BTC-USD",
+        wrapper="spot",
+        source="venue docs",
+        attested_by="operator",
+        attested_at=101,
     )
     events = audit.read_events(conn)
     assert [event.event_type for event in events] == ["asset_attested", "instrument_attested"]

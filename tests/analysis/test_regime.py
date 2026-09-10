@@ -33,9 +33,7 @@ class TestDetectCondition:
 
     def test_flat_swings_is_ranging(self):
         # Peaks hover near 110, troughs hover near 100 -- no directional drift in either.
-        candles = make_series(
-            [100, 110.02, 100.02, 109.98, 99.98, 110.03, 100.01, 109.99]
-        )
+        candles = make_series([100, 110.02, 100.02, 109.98, 99.98, 110.03, 100.01, 109.99])
 
         assert detect_condition(candles) == Condition.RANGING
 

@@ -122,7 +122,7 @@ def _decimal(value: Any) -> Decimal:
         return Decimal("0")
     try:
         return Decimal(str(value).replace("$", "").replace(",", "").strip() or "0")
-    except (InvalidOperation, ValueError):
+    except InvalidOperation, ValueError:
         return Decimal("0")
 
 

@@ -106,9 +106,7 @@ def to_symbol(product_id: str) -> str:
     """
     parts = product_id.split("-")
     if len(parts) != 2 or not parts[0] or not parts[1]:
-        raise UnsupportedOrder(
-            f"alpaca requires a BASE-QUOTE product id, got {product_id!r}"
-        )
+        raise UnsupportedOrder(f"alpaca requires a BASE-QUOTE product id, got {product_id!r}")
     base, quote = parts
     if quote.upper() != QUOTE_CURRENCY:
         raise UnsupportedOrder(

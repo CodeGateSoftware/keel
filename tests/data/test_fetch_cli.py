@@ -89,9 +89,7 @@ def _no_network(monkeypatch):
     monkeypatch.setattr(cli_module, "_build_broker", lambda config: _ExplodingBroker())
 
 
-def test_check_reports_current_series_and_exits_zero(
-    tmp_path, valid_config_path, monkeypatch
-):
+def test_check_reports_current_series_and_exits_zero(tmp_path, valid_config_path, monkeypatch):
     _no_network(monkeypatch)
     db_path = tmp_path / "t.db"
     repo = _repo_at(db_path)
@@ -136,9 +134,7 @@ def test_check_reports_missing_series(tmp_path, valid_config_path, monkeypatch):
     assert "MISSING" in result.output
 
 
-def test_check_reports_gaps_without_failing_unless_asked(
-    tmp_path, valid_config_path, monkeypatch
-):
+def test_check_reports_gaps_without_failing_unless_asked(tmp_path, valid_config_path, monkeypatch):
     """Gaps are reported, but do not fail --check by default.
 
     `ensure_history` cannot repair internal holes, so failing on them would leave the alert
@@ -584,11 +580,7 @@ def _seed_sol_field_repro(repo: Repository) -> None:
     old = [_START - i * _DAY for i in range(1, 11) if i not in (5, 6)]
     # (a)+(b): every window bar, minus one hole at +10d and one at +20d.
     n_window_days = (last_day - _START) // _DAY + 1
-    window = [
-        _START + i * _DAY
-        for i in range(n_window_days)
-        if i not in (10, 20)
-    ]
+    window = [_START + i * _DAY for i in range(n_window_days) if i not in (10, 20)]
     _seed(repo, "SOL-USD", day, old + window)
 
     # The venue was asked about the +10d hole and had nothing -- as `repair_series` records.
@@ -598,9 +590,7 @@ def _seed_sol_field_repro(repo: Repository) -> None:
     last_hour = _NOW - _HOUR
     _seed(repo, "SOL-USD", Granularity.ONE_HOUR, [last_hour - i * _HOUR for i in range(48)])
     last_q = _NOW - _FIFTEEN
-    _seed(
-        repo, "SOL-USD", Granularity.FIFTEEN_MINUTE, [last_q - i * _FIFTEEN for i in range(48)]
-    )
+    _seed(repo, "SOL-USD", Granularity.FIFTEEN_MINUTE, [last_q - i * _FIFTEEN for i in range(48)])
 
 
 def test_the_gap_suffix_shares_the_fetch_window_so_it_cannot_go_negative(
@@ -621,8 +611,18 @@ def test_the_gap_suffix_shares_the_fetch_window_so_it_cannot_go_negative(
 
     result = CliRunner().invoke(
         cli,
-        ["--db", str(db_path), "--config", str(valid_config_path),
-         "fetch", "--check", "--years", "1", "--products", "SOL-USD"],
+        [
+            "--db",
+            str(db_path),
+            "--config",
+            str(valid_config_path),
+            "fetch",
+            "--check",
+            "--years",
+            "1",
+            "--products",
+            "SOL-USD",
+        ],
     )
 
     assert (
@@ -682,8 +682,7 @@ def test_fail_on_gaps_still_judges_holes_older_than_the_fetch_window(
         repo,
         "SOL-USD",
         Granularity.ONE_DAY,
-        [_START - 6 * _DAY, _START - _DAY]
-        + [_START + i * _DAY for i in range(n_window_days)],
+        [_START - 6 * _DAY, _START - _DAY] + [_START + i * _DAY for i in range(n_window_days)],
     )
     _seed(repo, "SOL-USD", Granularity.ONE_HOUR, [_NOW - _HOUR - i * _HOUR for i in range(48)])
     _seed(
@@ -693,8 +692,18 @@ def test_fail_on_gaps_still_judges_holes_older_than_the_fetch_window(
         [_NOW - _FIFTEEN - i * _FIFTEEN for i in range(48)],
     )
 
-    args = ["--db", str(db_path), "--config", str(valid_config_path),
-            "fetch", "--check", "--years", "1", "--products", "SOL-USD"]
+    args = [
+        "--db",
+        str(db_path),
+        "--config",
+        str(valid_config_path),
+        "fetch",
+        "--check",
+        "--years",
+        "1",
+        "--products",
+        "SOL-USD",
+    ]
 
     plain = CliRunner().invoke(cli, args)
     assert plain.exit_code == 0, plain.output
@@ -730,8 +739,16 @@ def test_fetch_refuses_a_malformed_product_id_because_that_is_always_a_typo(
 
     result = CliRunner().invoke(
         cli,
-        ["--db", str(db_path), "--config", str(valid_config_path),
-         "fetch", "--check", "--products", "XLM-28AUG26-CDE"],
+        [
+            "--db",
+            str(db_path),
+            "--config",
+            str(valid_config_path),
+            "fetch",
+            "--check",
+            "--products",
+            "XLM-28AUG26-CDE",
+        ],
     )
 
     assert result.exit_code != 0
@@ -739,9 +756,7 @@ def test_fetch_refuses_a_malformed_product_id_because_that_is_always_a_typo(
     assert "not a spot product id" in result.output
 
 
-def test_fetch_WARNS_on_a_cross_settled_pair_and_proceeds(
-    tmp_path, valid_config_path, monkeypatch
-):
+def test_fetch_WARNS_on_a_cross_settled_pair_and_proceeds(tmp_path, valid_config_path, monkeypatch):
     """The history has to be fetchable before the screen can say anything about the asset.
 
     `BTC-EUR` is a real Coinbase spot pair. Rail 18 vetoes an ORDER for it under the shipped
@@ -755,8 +770,16 @@ def test_fetch_WARNS_on_a_cross_settled_pair_and_proceeds(
 
     result = CliRunner().invoke(
         cli,
-        ["--db", str(db_path), "--config", str(valid_config_path),
-         "fetch", "--check", "--products", "BTC-EUR"],
+        [
+            "--db",
+            str(db_path),
+            "--config",
+            str(valid_config_path),
+            "fetch",
+            "--check",
+            "--products",
+            "BTC-EUR",
+        ],
     )
 
     assert "BTC-EUR" in result.output
@@ -777,8 +800,16 @@ def test_fetch_reports_a_shape_error_even_when_a_settlement_warning_rides_along(
 
     result = CliRunner().invoke(
         cli,
-        ["--db", str(db_path), "--config", str(valid_config_path),
-         "fetch", "--check", "--products", "BTC-EUR,XLM-28AUG26-CDE"],
+        [
+            "--db",
+            str(db_path),
+            "--config",
+            str(valid_config_path),
+            "fetch",
+            "--check",
+            "--products",
+            "BTC-EUR,XLM-28AUG26-CDE",
+        ],
     )
 
     assert result.exit_code != 0
@@ -878,8 +909,6 @@ def test_fetch_touches_only_the_configured_granularities(tmp_path, write_config,
     db_path = tmp_path / "t.db"
     _repo_at(db_path)
 
-    result = CliRunner().invoke(
-        cli, ["--db", str(db_path), "--config", str(config_path), "fetch"]
-    )
+    result = CliRunner().invoke(cli, ["--db", str(db_path), "--config", str(config_path), "fetch"])
     assert result.exit_code == 0, result.output
     assert set(client.requests) == {Granularity.ONE_DAY}

@@ -23,8 +23,14 @@ _GUARDS = _ROOT / "keel/execution/guards.py"
 #: current count in both directions: the failure mode is a STALE claim, so the search has to see
 #: the numbers nobody expects to find.
 _WORDS = {
-    15: "fifteen", 16: "sixteen", 17: "seventeen", 18: "eighteen", 19: "nineteen",
-    20: "twenty", 21: "twenty-one", 22: "twenty-two",
+    15: "fifteen",
+    16: "sixteen",
+    17: "seventeen",
+    18: "eighteen",
+    19: "nineteen",
+    20: "twenty",
+    21: "twenty-one",
+    22: "twenty-two",
 }
 
 #: Where a count claim can hide. Experiment records, presentations, specs and research notes are

@@ -490,9 +490,7 @@ def test_a_token_bearing_navigation_never_answers_from_cache() -> None:
     param = re.search(r'query\.get\("([^"]+)"\)', server_source)
     assert param is not None, "the server no longer reads a token out of the query string"
 
-    branch = re.search(
-        r'if \(request\.mode === "navigate"\) \{(.*?)\n  \}', source, re.DOTALL
-    )
+    branch = re.search(r'if \(request\.mode === "navigate"\) \{(.*?)\n  \}', source, re.DOTALL)
     assert branch is not None, "the navigation branch is not in the shape this test understands"
     body = branch.group(1)
 
@@ -519,9 +517,7 @@ def test_a_token_bearing_navigation_never_answers_from_cache() -> None:
         "the token check must come BEFORE the cache lookup; after it, the cached shell has "
         "already been returned and the exchange never happened"
     )
-    assert re.search(
-        r'const SESSION_TOKEN_PARAM = "' + re.escape(param.group(1)) + r'"', source
-    ), (
+    assert re.search(r'const SESSION_TOKEN_PARAM = "' + re.escape(param.group(1)) + r'"', source), (
         f"the worker's session-token parameter does not match the server's {param.group(1)!r} -- "
         "one side was renamed and the other was not"
     )
@@ -727,9 +723,7 @@ def test_a_refusal_is_not_painted_as_an_outage(running: server.ServeConfig) -> N
     """
     connection = http.client.HTTPConnection(running.host, running.port, timeout=10)
     try:
-        connection.request(
-            "GET", "/api/status", headers={"Host": f"{running.host}:{running.port}"}
-        )
+        connection.request("GET", "/api/status", headers={"Host": f"{running.host}:{running.port}"})
         response = connection.getresponse()
         refusal = json.loads(response.read().decode("utf-8"))
     finally:

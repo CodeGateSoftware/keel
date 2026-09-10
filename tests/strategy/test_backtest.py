@@ -441,9 +441,9 @@ class TestLiquidityScaledSlippage:
         fitted near; that is the extrapolation the bound exists to refuse.
         """
         far_below_the_tail = SLIPPAGE_TAIL_QUOTE_VOLUME / Decimal(10)
-        unclamped = SLIPPAGE_FLOOR_PCT * (
-            SLIPPAGE_REFERENCE_QUOTE_VOLUME / far_below_the_tail
-        ).sqrt()
+        unclamped = (
+            SLIPPAGE_FLOOR_PCT * (SLIPPAGE_REFERENCE_QUOTE_VOLUME / far_below_the_tail).sqrt()
+        )
 
         assert unclamped > SLIPPAGE_CAP_PCT  # the clamp is genuinely load-bearing here
         assert slippage_for_quote_volume(far_below_the_tail) == SLIPPAGE_CAP_PCT
@@ -542,9 +542,10 @@ class TestTheCapIsDerivedFromTheCorpusTail:
         """The unclamped curve at the corpus tail, computed from the constants -- the same
         expression `slippage_for_quote_volume` evaluates, written out so the arithmetic is
         visible rather than borrowed from the function under test."""
-        return SLIPPAGE_FLOOR_PCT * (
-            SLIPPAGE_REFERENCE_QUOTE_VOLUME / SLIPPAGE_TAIL_QUOTE_VOLUME
-        ).sqrt()
+        return (
+            SLIPPAGE_FLOOR_PCT
+            * (SLIPPAGE_REFERENCE_QUOTE_VOLUME / SLIPPAGE_TAIL_QUOTE_VOLUME).sqrt()
+        )
 
     def test_the_cap_is_the_curve_read_at_the_tail(self) -> None:
         """floor x sqrt(anchor / tail volume), quantised to the tenth of a basis point every
@@ -640,9 +641,7 @@ class TestControlsAboveTheCapThresholdAreUnaffected:
         ]
 
     def _run_at(self, product_id: str, volume: Decimal, cap: Decimal) -> BacktestResult:
-        rule = _ScriptedRule(
-            60, Decimal(110), Decimal(95), Decimal(130), product_id=product_id
-        )
+        rule = _ScriptedRule(60, Decimal(110), Decimal(95), Decimal(130), product_id=product_id)
         rate = self._rate_under_cap(volume, cap)
         return backtest(rule, self._candles(), slippage_by_product=lambda pid: rate)
 

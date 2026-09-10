@@ -89,9 +89,7 @@ def volatility(returns: list[Decimal]) -> Decimal:
     return variance.sqrt() if variance > 0 else Decimal(0)
 
 
-def ewma_volatility(
-    returns: list[Decimal], lam: Decimal = DEFAULT_EWMA_LAMBDA
-) -> Decimal:
+def ewma_volatility(returns: list[Decimal], lam: Decimal = DEFAULT_EWMA_LAMBDA) -> Decimal:
     """Exponentially-weighted volatility via the iterative RiskMetrics recurrence.
 
     `var_t = lam*var_{t-1} + (1-lam)*r_t**2`, seeded at `var=0`, walked forward over
@@ -183,9 +181,7 @@ def irr(
     """
     if not cashflows:
         return Decimal(0)
-    ranked = [
-        (i, amount) for i, (_, amount) in enumerate(sorted(cashflows, key=lambda cf: cf[0]))
-    ]
+    ranked = [(i, amount) for i, (_, amount) in enumerate(sorted(cashflows, key=lambda cf: cf[0]))]
     ending_period = len(cashflows) + 1
 
     lo, hi = Decimal("-0.9999"), Decimal("10")
@@ -330,9 +326,7 @@ def portfolio_volatility(
         previous_value = value
 
     if exposed is not None:
-        portfolio_returns = [
-            r for r, is_exposed in zip(portfolio_returns, exposed) if is_exposed
-        ]
+        portfolio_returns = [r for r, is_exposed in zip(portfolio_returns, exposed) if is_exposed]
 
     if len(portfolio_returns) < 2:
         return Decimal(0)

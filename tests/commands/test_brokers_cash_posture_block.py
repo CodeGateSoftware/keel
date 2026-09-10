@@ -108,9 +108,7 @@ def test_venues_are_listed_in_a_stable_order() -> None:
     `[coinbase, alpaca]` a mutation replacing `sorted` with `reversed` produced the identical
     output and the pin stayed green.
     """
-    text = _text(
-        [_record(venue="alpaca"), _record(venue="robinhood"), _record(venue="coinbase")]
-    )
+    text = _text([_record(venue="alpaca"), _record(venue="robinhood"), _record(venue="coinbase")])
     assert text.index("alpaca") < text.index("coinbase") < text.index("robinhood")
 
 
@@ -170,7 +168,7 @@ def test_an_unreadable_database_is_reported_as_unknown_not_as_nothing_attested(t
 
 
 def test_no_database_at_all_is_not_unreadable(tmp_path) -> None:
-    """"There is no deployment" is a true statement about this machine, not an admission of
+    """ "There is no deployment" is a true statement about this machine, not an admission of
     ignorance -- the same distinction `_read_only_trade_scope` draws in its first branch."""
     from keel.commands.brokers import _cash_posture_records
 

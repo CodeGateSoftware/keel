@@ -61,9 +61,7 @@ class _Clean:
 
 def test_a_refusal_marks_the_standing_attestation_refuted(repo: Repository) -> None:
     with pytest.raises(RuntimeError):
-        record_cash_posture_refutation(
-            _Refusing(), repo=repo, venue="coinbase", now_ts=NOW + 10
-        )
+        record_cash_posture_refutation(_Refusing(), repo=repo, venue="coinbase", now_ts=NOW + 10)
     record = repo.get_venue_cash_posture("coinbase")
     assert record.state is CashPostureState.REFUTED
     assert "INTX" in record.refuted_reason

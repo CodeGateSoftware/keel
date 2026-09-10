@@ -490,12 +490,12 @@ def test_the_real_shipped_live_wrapper_resolves_without_its_comment_as_the_crutc
 
 
 def test_an_hourly_stamp_format_yields_a_3600_second_cadence() -> None:
-    code_text = 'THIS_HOUR="$(date -u \'+%Y-%m-%dT%H\')"\n'
+    code_text = "THIS_HOUR=\"$(date -u '+%Y-%m-%dT%H')\"\n"
     assert _runner_cadence_sec(code_text, fallback_sec=999) == 3600
 
 
 def test_a_daily_stamp_format_yields_an_86400_second_cadence() -> None:
-    code_text = 'TODAY_RAW="$(date -u \'+%Y-%m-%d\')"\n'
+    code_text = "TODAY_RAW=\"$(date -u '+%Y-%m-%d')\"\n"
     assert _runner_cadence_sec(code_text, fallback_sec=999) == 86_400
 
 
@@ -593,9 +593,7 @@ def test_a_malformed_plist_is_reported_while_its_valid_sibling_still_resolves(
     corrupt = deployment_dir / "com.keel.paper-equities.plist"
     corrupt.write_bytes(b"this is not a plist file at all \x00\x01\x02")
 
-    profiles, failed = collect_profiles(
-        deployment_dir, frozenset({"com.keel.paper-hourly"}), NOW
-    )
+    profiles, failed = collect_profiles(deployment_dir, frozenset({"com.keel.paper-hourly"}), NOW)
     cycled_findings = profile_findings(profiles, NOW)
     unreadable_findings = unreadable_profile_findings(failed)
 

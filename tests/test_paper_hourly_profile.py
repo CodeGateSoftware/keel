@@ -258,9 +258,7 @@ def _sandbox(
 def _run(script: Path, env: dict[str, str], now_utc: datetime) -> subprocess.CompletedProcess[str]:
     run_env = dict(env)
     run_env["KEEL_TEST_NOW"] = str(int(now_utc.timestamp()))
-    return subprocess.run(
-        ["/bin/bash", str(script)], capture_output=True, text=True, env=run_env
-    )
+    return subprocess.run(["/bin/bash", str(script)], capture_output=True, text=True, env=run_env)
 
 
 def _count_lines(path: Path) -> int:
@@ -375,7 +373,7 @@ def test_runner_script_has_a_notify_seam_shaped_like_keel_live_runs(tmp_path):
     text = RUN_SCRIPT.read_text()
     assert 'OSASCRIPT="/usr/bin/osascript"' in text
     assert "notify() {" in text
-    assert '2>/dev/null || true' in text
+    assert "2>/dev/null || true" in text
 
 
 def test_a_failing_fetch_notifies_and_the_cycle_still_runs(tmp_path):
@@ -402,8 +400,7 @@ def test_a_doctor_fail_notifies_and_the_cycle_still_runs_with_no_gate(tmp_path):
         keel_exit_code=0,
         doctor_exit_code=1,
         doctor_stdout=(
-            "[FAIL] data.stale: 3 of 19 series are stale\n"
-            "       BTC-USD ONE_HOUR 5 bars behind\n"
+            "[FAIL] data.stale: 3 of 19 series are stale\n       BTC-USD ONE_HOUR 5 bars behind\n"
         ),
     )
     result = _run(script, env, datetime(2026, 6, 15, 14, 20, tzinfo=UTC))

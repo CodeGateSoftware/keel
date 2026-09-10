@@ -132,9 +132,7 @@ def test_a_since_window_is_bounded_by_epoch_order_not_string_order(repo: Reposit
 
 def test_a_limit_takes_the_MOST_RECENT_readings_still_oldest_first(repo: Repository) -> None:
     for offset in range(5):
-        repo.record_cycle_balance(
-            _balance(ts=NOW + offset * DAY, available=str(1000 + offset))
-        )
+        repo.record_cycle_balance(_balance(ts=NOW + offset * DAY, available=str(1000 + offset)))
 
     got = repo.get_cycle_balances(limit=2)
 

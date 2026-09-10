@@ -912,11 +912,11 @@ CANCEL_NOTES: Mapping[str, str] = {
 }
 
 
-
 # The vocabulary and its tables, checked here rather than hoped about. `CANCEL_KINDS` existed and
 # nothing read it; now a kind added to the set without a headline or a note fails at import.
 assert set(CANCEL_HEADLINES) == set(CANCEL_KINDS), "CANCEL_HEADLINES does not cover CANCEL_KINDS"
 assert set(CANCEL_NOTES) == set(CANCEL_KINDS), "CANCEL_NOTES does not cover CANCEL_KINDS"
+
 
 @dataclass(frozen=True)
 class CancelDecision:
@@ -1277,7 +1277,7 @@ def _clear_orphaned_brackets(
             continue
         try:
             _cancel_at_exchange(broker, repo, row)
-        except (CancelUnavailable, CancelPending):
+        except CancelUnavailable, CancelPending:
             log_exception(logger, "orders.orphan_bracket_cancel_failed", order_id=order_id)
             stranded.append(order_id)
             continue

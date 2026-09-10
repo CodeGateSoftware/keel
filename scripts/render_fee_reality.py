@@ -81,9 +81,7 @@ def _row(ledger_text: str) -> dict:
     """The one ledger row carrying the fee curve, or a loud failure."""
     rows = [json.loads(line) for line in ledger_text.splitlines() if line.strip()]
     curves = [
-        r
-        for r in rows
-        if r.get("session") == _SESSION and "fee_curve" in r.get("params", {})
+        r for r in rows if r.get("session") == _SESSION and "fee_curve" in r.get("params", {})
     ]
     if len(curves) != 1:
         raise SystemExit(
@@ -175,8 +173,7 @@ def render(ledger_text: str) -> str:
         "maximum of 144 draws, not an expectation. The bias runs *against* the finding, which is",
         "why the comparison survives it: it inflates the arm that wins with the fee removed, and",
         "that arm still dies when the fee is charged. Break-even fees were bracketed by real",
-        "cells,"
-        "not interpolated. Slippage is held at 0.0005 in every cell, so the zero column is",
+        "cells,not interpolated. Slippage is held at 0.0005 in every cell, so the zero column is",
         "zero *fee*, not zero cost.",
         "",
         f"Source: [`{document}`]({document}), rendered from the hash-chained trials ledger by",

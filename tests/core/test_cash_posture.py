@@ -132,9 +132,9 @@ def test_a_missing_due_date_refuses() -> None:
 
 def test_a_refuted_record_refuses_even_inside_its_ttl() -> None:
     """The venue found an INTX portfolio. That is evidence, and it outranks the claim."""
-    assert not _posture(
-        state=CashPostureState.REFUTED, refuted_ts=NOW - 10
-    ).may_place_live_entry(NOW, FP)
+    assert not _posture(state=CashPostureState.REFUTED, refuted_ts=NOW - 10).may_place_live_entry(
+        NOW, FP
+    )
 
 
 def test_re_attesting_over_a_refutation_recovers_and_keeps_the_history() -> None:
@@ -164,7 +164,7 @@ def test_an_unfingerprinted_record_still_permits() -> None:
 
 
 def test_an_unreadable_current_credential_still_permits() -> None:
-    """"I could not resolve this" is not "this changed" -- a locked keychain is a fact about the
+    """ "I could not resolve this" is not "this changed" -- a locked keychain is a fact about the
     observer, not the credential."""
     assert _posture().may_place_live_entry(NOW, None)
 

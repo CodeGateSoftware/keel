@@ -60,17 +60,41 @@ JSONL_PATH = f"{OUT_DIR}/restatement_restated.jsonl"
 #: The 24-asset universe of the 08-12/08-13/09-01 documents, unchanged so this run sits
 #: beside the null it restates rather than beside a different population.
 UNIVERSE = [
-    "BTC-USD", "ETH-USD", "ADA-USD", "LINK-USD", "LTC-USD", "SOL-USD",
-    "XLM-USD", "PAXG-USDT", "BCH-USD", "AAVE-USD", "DOGE-USD", "DOT-USD",
-    "UNI-USD", "ZEC-USD", "ALGO-USD", "FET-USD", "CRV-USD", "ICP-USD",
-    "AVAX-USD", "NEAR-USD", "XRP-USD", "PAXG-USD", "WLD-USD", "TON-USD",
+    "BTC-USD",
+    "ETH-USD",
+    "ADA-USD",
+    "LINK-USD",
+    "LTC-USD",
+    "SOL-USD",
+    "XLM-USD",
+    "PAXG-USDT",
+    "BCH-USD",
+    "AAVE-USD",
+    "DOGE-USD",
+    "DOT-USD",
+    "UNI-USD",
+    "ZEC-USD",
+    "ALGO-USD",
+    "FET-USD",
+    "CRV-USD",
+    "ICP-USD",
+    "AVAX-USD",
+    "NEAR-USD",
+    "XRP-USD",
+    "PAXG-USD",
+    "WLD-USD",
+    "TON-USD",
 ]
 #: 08-13 sec.3.2's six selection assets. Arm B runs the whole universe and splits on this set,
 #: so the in-sample and out-of-sample halves come from one run at one cost model.
 ARM_B_SELECTION = {"ZEC-USD", "FET-USD", "SOL-USD", "DOGE-USD", "ETH-USD", "BTC-USD"}
 
 SIGNAL_RULES = [
-    "turtle_breakout", "rsi_meanrev", "pullback_continuation", "cusum_event", "triple_barrier"
+    "turtle_breakout",
+    "rsi_meanrev",
+    "pullback_continuation",
+    "cusum_event",
+    "triple_barrier",
 ]
 FEES = ["0", "0.006", "0.012"]
 TAKER = Decimal("0.012")
@@ -144,25 +168,31 @@ def run_job(job):
                     fee_pct=Decimal(fee),
                     slippage_pct=slippage,
                 )
-                rows.append({
-                    **key,
-                    "regime": regime,
-                    "fee": fee,
-                    "slippage_pct": str(slippage),
-                    "floor_multiple": float(per_product / bt.SLIPPAGE_FLOOR_PCT),
-                    "daily_quote_volume": float(daily_volume),
-                    "bars": len(candles),
-                    "n_trades": int(result.n_trades),
-                    "win_rate": float(result.win_rate),
-                    "profit_factor": float(result.profit_factor),
-                    "expectancy": float(result.expectancy),
-                    "max_drawdown": float(result.max_drawdown),
-                })
+                rows.append(
+                    {
+                        **key,
+                        "regime": regime,
+                        "fee": fee,
+                        "slippage_pct": str(slippage),
+                        "floor_multiple": float(per_product / bt.SLIPPAGE_FLOOR_PCT),
+                        "daily_quote_volume": float(daily_volume),
+                        "bars": len(candles),
+                        "n_trades": int(result.n_trades),
+                        "win_rate": float(result.win_rate),
+                        "profit_factor": float(result.profit_factor),
+                        "expectancy": float(result.expectancy),
+                        "max_drawdown": float(result.max_drawdown),
+                    }
+                )
             except Exception as exc:
-                rows.append({
-                    **key, "regime": regime, "fee": fee,
-                    "error": f"{type(exc).__name__}: {exc}",
-                })
+                rows.append(
+                    {
+                        **key,
+                        "regime": regime,
+                        "fee": fee,
+                        "error": f"{type(exc).__name__}: {exc}",
+                    }
+                )
     return rows
 
 
@@ -219,8 +249,10 @@ def main():
             for row in future.result():
                 sink.write(json.dumps(row) + "\n")
             sink.flush()
-            print(f"  {index}/{len(jobs)} {futures[future]} "
-                  f"[{time.time() - started:.0f}s]", flush=True)
+            print(
+                f"  {index}/{len(jobs)} {futures[future]} [{time.time() - started:.0f}s]",
+                flush=True,
+            )
     print(f"done in {time.time() - started:.0f}s", flush=True)
 
 

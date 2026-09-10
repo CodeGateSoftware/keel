@@ -62,8 +62,21 @@ def main():
     from keel.strategy.rules.turtle_breakout import TurtleBreakout
 
     repo = Repository(connect(DB))
-    header = ("cell", "n 0813", "n cut", "n full", "g 0813", "g cut", "g full",
-              "mk 0813", "mk cut", "mk full", "tk 0813", "tk cut", "tk full")
+    header = (
+        "cell",
+        "n 0813",
+        "n cut",
+        "n full",
+        "g 0813",
+        "g cut",
+        "g full",
+        "mk 0813",
+        "mk cut",
+        "mk full",
+        "tk 0813",
+        "tk cut",
+        "tk full",
+    )
     print(("{:22}" + "{:>8}" * 12).format(*header))
 
     for (kind, product), (n0, gross0, maker0, taker0) in PRINTED.items():
@@ -74,16 +87,29 @@ def main():
         for tag, candles in (("cut", cut), ("full", full)):
             for fee in FEES:
                 result = bt.backtest(
-                    rule_cls(product_id=product), candles,
-                    fee_pct=Decimal(fee), slippage_pct=FLAT_SLIPPAGE,
+                    rule_cls(product_id=product),
+                    candles,
+                    fee_pct=Decimal(fee),
+                    slippage_pct=FLAT_SLIPPAGE,
                 )
                 out[(tag, fee)] = (int(result.n_trades), float(result.profit_factor))
-        print(("{:22}" + "{:8}" * 3 + "{:8.3f}" * 9).format(
-            f"{kind} {product}", n0, out[("cut", "0")][0], out[("full", "0")][0],
-            gross0, out[("cut", "0")][1], out[("full", "0")][1],
-            maker0, out[("cut", "0.006")][1], out[("full", "0.006")][1],
-            taker0, out[("cut", "0.012")][1], out[("full", "0.012")][1],
-        ))
+        print(
+            ("{:22}" + "{:8}" * 3 + "{:8.3f}" * 9).format(
+                f"{kind} {product}",
+                n0,
+                out[("cut", "0")][0],
+                out[("full", "0")][0],
+                gross0,
+                out[("cut", "0")][1],
+                out[("full", "0")][1],
+                maker0,
+                out[("cut", "0.006")][1],
+                out[("full", "0.006")][1],
+                taker0,
+                out[("cut", "0.012")][1],
+                out[("full", "0.012")][1],
+            )
+        )
         print(f"    bars: cut={len(cut)} full={len(full)} (+{len(full) - len(cut)})")
 
 

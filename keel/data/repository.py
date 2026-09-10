@@ -142,7 +142,6 @@ def _trade_scope_from_row(row: sqlite3.Row) -> VenueTradeScope:
     )
 
 
-
 def _cash_posture_from_row(row: Any) -> VenueCashPosture:
     """Map a `venue_cash_postures` row to the domain record.
 

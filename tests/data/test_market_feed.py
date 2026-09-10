@@ -85,9 +85,7 @@ def _stale_series(product_id: str = "BTC-USD") -> dict[tuple[str, Granularity], 
 def test_backfill_writes_all_closed_candles_in_history_window(repo):
     client = FakeClient(_full_series())
 
-    written = backfill(
-        client, repo, ["BTC-USD"], [Granularity.ONE_HOUR], HISTORY_DAYS, now_ts=NOW
-    )
+    written = backfill(client, repo, ["BTC-USD"], [Granularity.ONE_HOUR], HISTORY_DAYS, now_ts=NOW)
 
     assert written == len(EXPECTED_TS)
     stored = repo.get_candles("BTC-USD", Granularity.ONE_HOUR)
@@ -113,14 +111,10 @@ def test_backfill_only_fetches_missing_gaps(repo):
     midpoint = len(EXPECTED_TS) // 2
     already_have = EXPECTED_TS[:midpoint]
     still_missing = EXPECTED_TS[midpoint:]
-    repo.upsert_candles(
-        "BTC-USD", Granularity.ONE_HOUR, [_candle(ts) for ts in already_have]
-    )
+    repo.upsert_candles("BTC-USD", Granularity.ONE_HOUR, [_candle(ts) for ts in already_have])
     client = FakeClient(_full_series())
 
-    written = backfill(
-        client, repo, ["BTC-USD"], [Granularity.ONE_HOUR], HISTORY_DAYS, now_ts=NOW
-    )
+    written = backfill(client, repo, ["BTC-USD"], [Granularity.ONE_HOUR], HISTORY_DAYS, now_ts=NOW)
 
     assert written == len(still_missing)
     stored_ts = {c.ts for c in repo.get_candles("BTC-USD", Granularity.ONE_HOUR)}
@@ -148,9 +142,7 @@ def test_backfill_covers_multiple_products_and_granularities(repo):
 def test_backfill_returns_zero_when_client_has_no_data_for_gap(repo):
     client = FakeClient({("BTC-USD", Granularity.ONE_HOUR): []})
 
-    written = backfill(
-        client, repo, ["BTC-USD"], [Granularity.ONE_HOUR], HISTORY_DAYS, now_ts=NOW
-    )
+    written = backfill(client, repo, ["BTC-USD"], [Granularity.ONE_HOUR], HISTORY_DAYS, now_ts=NOW)
 
     assert written == 0
     assert repo.get_candles("BTC-USD", Granularity.ONE_HOUR) == []
@@ -174,9 +166,7 @@ def test_poll_once_appends_only_new_closed_candles(repo):
 
 
 def test_poll_once_is_a_noop_when_already_up_to_date(repo):
-    repo.upsert_candles(
-        "BTC-USD", Granularity.ONE_HOUR, [_candle(ts) for ts in EXPECTED_TS]
-    )
+    repo.upsert_candles("BTC-USD", Granularity.ONE_HOUR, [_candle(ts) for ts in EXPECTED_TS])
     client = FakeClient(_full_series())
 
     written = poll_once(client, repo, ["BTC-USD"], [Granularity.ONE_HOUR], now_ts=NOW)
@@ -272,9 +262,7 @@ def test_poll_once_keeps_going_past_an_empty_window_so_a_mid_history_hole_cannot
     """
     repo.upsert_candles("BTC-USD", Granularity.ONE_HOUR, [_candle(STALE_LAST_TS)])
     fetch_start = STALE_LAST_TS + GRAN_SEC
-    first_window_end = min(
-        LATEST_CLOSED, fetch_start + (MAX_CANDLES_PER_REQUEST - 1) * GRAN_SEC
-    )
+    first_window_end = min(LATEST_CLOSED, fetch_start + (MAX_CANDLES_PER_REQUEST - 1) * GRAN_SEC)
     assert first_window_end < LATEST_CLOSED, "fixture must span >1 window for this test to hold"
     later_ts = list(range(first_window_end + GRAN_SEC, LATEST_CLOSED + 1, GRAN_SEC))
     client = FakeClient(
@@ -313,9 +301,7 @@ def test_is_fresh_false_when_stale(repo):
 
 
 def test_is_fresh_false_when_no_candles_stored(repo):
-    assert not is_fresh(
-        repo, "BTC-USD", Granularity.ONE_HOUR, now_ts=NOW, max_age_sec=200
-    )
+    assert not is_fresh(repo, "BTC-USD", Granularity.ONE_HOUR, now_ts=NOW, max_age_sec=200)
 
 
 # -- backfill: the same candle-cap defect, on the one windowing site #269/#271 did not reach ----
@@ -345,8 +331,12 @@ def test_backfill_never_requests_more_than_the_candle_cap(repo):
     client = FakeClient(_wide_series())
 
     backfill(
-        client, repo, ["BTC-USD"], [Granularity.ONE_HOUR],
-        history_days=BACKFILL_DAYS, now_ts=NOW,
+        client,
+        repo,
+        ["BTC-USD"],
+        [Granularity.ONE_HOUR],
+        history_days=BACKFILL_DAYS,
+        now_ts=NOW,
     )
 
     assert client.calls
@@ -360,8 +350,12 @@ def test_backfill_chunk_windows_are_contiguous_and_cover_the_gap(repo):
     client = FakeClient(_wide_series())
 
     written = backfill(
-        client, repo, ["BTC-USD"], [Granularity.ONE_HOUR],
-        history_days=BACKFILL_DAYS, now_ts=NOW,
+        client,
+        repo,
+        ["BTC-USD"],
+        [Granularity.ONE_HOUR],
+        history_days=BACKFILL_DAYS,
+        now_ts=NOW,
     )
 
     assert len(client.calls) > 1, "a range this wide can only tile into >1 window under the cap"
@@ -377,8 +371,12 @@ def test_backfill_still_uses_one_request_for_a_gap_within_the_cap(repo):
     client = FakeClient(_full_series())
 
     backfill(
-        client, repo, ["BTC-USD"], [Granularity.ONE_HOUR],
-        history_days=HISTORY_DAYS, now_ts=NOW,
+        client,
+        repo,
+        ["BTC-USD"],
+        [Granularity.ONE_HOUR],
+        history_days=HISTORY_DAYS,
+        now_ts=NOW,
     )
 
     assert len(client.calls) == 1

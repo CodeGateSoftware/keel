@@ -268,7 +268,9 @@ def adapter_error_block(info: BrokerInfo) -> list[str]:
     return [
         f"{info.name} ({info.package_version or 'unknown version'}) -- unavailable",
         *textwrap.wrap(
-            f"construction failed: {info.error}", width=78, initial_indent="  ",
+            f"construction failed: {info.error}",
+            width=78,
+            initial_indent="  ",
             subsequent_indent="  ",
         ),
     ]
@@ -483,9 +485,7 @@ def brokers_group() -> None:
 
 
 @brokers_group.command("list")
-@click.option(
-    "--json", "as_json", is_flag=True, default=False, help="Emit machine-readable JSON."
-)
+@click.option("--json", "as_json", is_flag=True, default=False, help="Emit machine-readable JSON.")
 @click.pass_context
 def brokers_list(ctx: click.Context, as_json: bool) -> None:
     """Every installed adapter with its declared capabilities (read-only, offline), followed by

@@ -274,7 +274,7 @@ def _kill_zone_ok(setup: Setup, rr_floor: Decimal) -> bool:
     """Reject a risk-defined setup whose R:R doesn't clear `rr_floor` (spec §17.2)."""
     try:
         return setup.rr >= rr_floor
-    except (ZeroDivisionError, InvalidOperation):
+    except ZeroDivisionError, InvalidOperation:
         return False
 
 

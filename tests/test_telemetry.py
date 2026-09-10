@@ -95,9 +95,7 @@ def test_non_serialisable_field_falls_back_to_str(caplog) -> None:
 
     payload = _capture(
         caplog,
-        lambda log: telemetry.log_event(
-            log, logging.INFO, "agent.cycle_start", obj=Weird()
-        ),
+        lambda log: telemetry.log_event(log, logging.INFO, "agent.cycle_start", obj=Weird()),
     )
     assert payload["obj"] == "weird-repr"
 
@@ -364,9 +362,7 @@ def test_unreachable_during_a_trade_cycle_stays_an_error(caplog) -> None:
 
 
 def test_caller_fields_survive_on_the_warning_path(caplog) -> None:
-    payload = _capture_raising(
-        caplog, ConnectionErrorLike("unreachable"), quote_currency="USD"
-    )
+    payload = _capture_raising(caplog, ConnectionErrorLike("unreachable"), quote_currency="USD")
 
     assert payload["quote_currency"] == "USD"
 

@@ -140,9 +140,7 @@ def test_the_downward_side_fires_independently() -> None:
 
 def test_a_non_positive_close_is_skipped_rather_than_dividing_by_zero() -> None:
     """A zero or negative close is not a price; it must not take the filter out with it."""
-    reading = cusum_read(
-        [Decimal("0"), Decimal("100"), Decimal("106")], Decimal("0.05")
-    )
+    reading = cusum_read([Decimal("0"), Decimal("100"), Decimal("106")], Decimal("0.05"))
     assert reading.fired_up
 
 
@@ -160,7 +158,7 @@ def test_a_rally_past_the_threshold_produces_a_long_setup() -> None:
     assert setup.context["friction_mult"] == 2.0
 
 
-def test_a_move_smaller_than_the_threshold_declines_and_says_how_far_off(  ) -> None:
+def test_a_move_smaller_than_the_threshold_declines_and_says_how_far_off() -> None:
     """`signals=0` alone cannot distinguish "nothing happened" from "almost fired"."""
     rule = CusumEvent(product_id="BTC-USD")
 

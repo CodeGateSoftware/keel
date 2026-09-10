@@ -56,7 +56,8 @@ def client() -> RESTClient:
         def guarded(url_path, *args, _verb=verb, _original=original, **kwargs):
             if _verb != "post" or url_path != PREVIEW_PATH:
                 raise MutationBlocked(
-                    f"{_verb.upper()} {url_path} blocked: this probe is read-only")
+                    f"{_verb.upper()} {url_path} blocked: this probe is read-only"
+                )
             return _original(url_path, *args, **kwargs)
 
         setattr(c, verb, guarded)
@@ -98,8 +99,10 @@ def census(c: RESTClient) -> dict[str, list[dict]]:
         tradable = sum(1 for p in ps if not p.get("view_only"))
         print(f"{product_type:16} n={len(ps):5} tradable={tradable:4} venues={dict(venues)}")
 
-    print("\nValues the document claims are not enum members at all "
-          "(a 400 here is stronger evidence than a zero count):")
+    print(
+        "\nValues the document claims are not enum members at all "
+        "(a 400 here is stronger evidence than a zero count):"
+    )
     for product_type in INVALID_PRODUCT_TYPES:
         try:
             ps = products(c, product_type)
@@ -114,37 +117,51 @@ def fx_check(c: RESTClient, found: dict[str, list[dict]]) -> None:
     header("FX / FOREX")
     for product_type, ps in found.items():
         by_id = [
-            p["product_id"] for p in ps
-            if any(p["product_id"].endswith(f"-{m}") or p["product_id"].startswith(f"{m}-")
-                   for m in FX_MARKERS)
+            p["product_id"]
+            for p in ps
+            if any(
+                p["product_id"].endswith(f"-{m}") or p["product_id"].startswith(f"{m}-")
+                for m in FX_MARKERS
+            )
         ]
         by_quote = [p["product_id"] for p in ps if p.get("quote_currency_id") in FX_MARKERS]
-        print(f"{product_type:16} fiat-marker ids={len(by_id):4} fiat-quoted={len(by_quote):4} "
-              f"e.g. {by_id[:4]}")
-    print("\nThose are crypto assets QUOTED in a fiat currency, plus stablecoin pairs "
-          "(EURC-USDC, TGBP-USDC). Neither is an FX pair -- no product has two fiat legs.")
+        print(
+            f"{product_type:16} fiat-marker ids={len(by_id):4} fiat-quoted={len(by_quote):4} "
+            f"e.g. {by_id[:4]}"
+        )
+    print(
+        "\nThose are crypto assets QUOTED in a fiat currency, plus stablecoin pairs "
+        "(EURC-USDC, TGBP-USDC). Neither is an FX pair -- no product has two fiat legs."
+    )
     for pair in ["EUR-USD", "GBP-USD", "USD-JPY", "AUD-USD"]:
         try:
             c.get_product(product_id=pair)
             print(f"  {pair}: UNEXPECTEDLY EXISTS")
         except Exception as exc:  # noqa: BLE001
             print(f"  {pair}: {str(exc)[:110]}")
-    print("\nNote a false positive for anyone re-running a currency-code sweep: Nokia's ADR "
-          "ticker is NOK, which is also the ISO code for the Norwegian krone.")
+    print(
+        "\nNote a false positive for anyone re-running a currency-code sweep: Nokia's ADR "
+        "ticker is NOK, which is also the ISO code for the Norwegian krone."
+    )
 
 
 def front_month(futs: list[dict], group_fragment: str) -> dict | None:
     """Pick the nearest-expiry tradable contract for a group, so this survives contract rolls."""
     matches = [
-        p for p in futs
-        if group_fragment.lower() in
-        ((p.get("future_product_details") or {}).get("group_short_description") or "").lower()
+        p
+        for p in futs
+        if group_fragment.lower()
+        in ((p.get("future_product_details") or {}).get("group_short_description") or "").lower()
         and not p.get("view_only")
     ]
-    return min(
-        matches,
-        key=lambda p: (p["future_product_details"].get("contract_expiry") or ""),
-    ) if matches else None
+    return (
+        min(
+            matches,
+            key=lambda p: p["future_product_details"].get("contract_expiry") or "",
+        )
+        if matches
+        else None
+    )
 
 
 def futures_taxonomy(futs: list[dict]) -> None:
@@ -153,8 +170,10 @@ def futures_taxonomy(futs: list[dict]) -> None:
         (p.get("future_product_details") or {}).get("contract_expiry_type") for p in futs
     )
     print(f"contract_expiry_type across {len(futs)} products: {dict(expiry_types)}")
-    print("A PERPETUAL count of zero is the point: the US 'perps' are long-dated EXPIRING "
-          "contracts that carry funding.\n")
+    print(
+        "A PERPETUAL count of zero is the point: the US 'perps' are long-dated EXPIRING "
+        "contracts that carry funding.\n"
+    )
 
     groups: dict[tuple, list[dict]] = collections.defaultdict(list)
     for p in futs:
@@ -163,22 +182,28 @@ def futures_taxonomy(futs: list[dict]) -> None:
     for (group, non_crypto), ps in sorted(groups.items(), key=lambda kv: str(kv[0])):
         d = ps[0].get("future_product_details") or {}
         tradable = sum(1 for q in ps if not q.get("view_only"))
-        print(f"  {str(group):32} non_crypto={str(non_crypto):5} n={len(ps):3} "
-              f"tradable={tradable:2} size={str(d.get('contract_size')):>7} "
-              f"funding={str(d.get('funding_interval')):>6} 24x7={d.get('twenty_four_by_seven')} "
-              f"ids={[q['product_id'] for q in ps[:3]]}")
+        print(
+            f"  {str(group):32} non_crypto={str(non_crypto):5} n={len(ps):3} "
+            f"tradable={tradable:2} size={str(d.get('contract_size')):>7} "
+            f"funding={str(d.get('funding_interval')):>6} 24x7={d.get('twenty_four_by_seven')} "
+            f"ids={[q['product_id'] for q in ps[:3]]}"
+        )
 
-    print("\nPerp-style contracts in full -- note the far-dated expiry alongside a live funding "
-          "rate, and that the settlement leg is USD (the -CDE suffix is a venue tag, which is "
-          "exactly what quote_currency_of's rpartition('-') mistakes for a quote currency):")
+    print(
+        "\nPerp-style contracts in full -- note the far-dated expiry alongside a live funding "
+        "rate, and that the settlement leg is USD (the -CDE suffix is a venue tag, which is "
+        "exactly what quote_currency_of's rpartition('-') mistakes for a quote currency):"
+    )
     for p in futs:
         d = p.get("future_product_details") or {}
         if not d.get("funding_interval"):
             continue
-        print(f"  {p['product_id']:18} expiry={d.get('contract_expiry')} "
-              f"funding_rate={str(d.get('funding_rate')):>12} oi={str(d.get('open_interest')):>8} "
-              f"quote={p.get('quote_currency_id')} base_increment={p.get('base_increment')} "
-              f"risk={d.get('risk_managed_by')}")
+        print(
+            f"  {p['product_id']:18} expiry={d.get('contract_expiry')} "
+            f"funding_rate={str(d.get('funding_rate')):>12} oi={str(d.get('open_interest')):>8} "
+            f"quote={p.get('quote_currency_id')} base_increment={p.get('base_increment')} "
+            f"risk={d.get('risk_managed_by')}"
+        )
 
 
 def market_data(c: RESTClient, product_id: str, label: str) -> None:
@@ -187,8 +212,9 @@ def market_data(c: RESTClient, product_id: str, label: str) -> None:
     now = int(time.time())
     for granularity, span in [("ONE_HOUR", 86400 * 3), ("ONE_DAY", 86400 * 30)]:
         try:
-            candles = c.get_candles(product_id=product_id, start=str(now - span),
-                                    end=str(now), granularity=granularity).to_dict()["candles"]
+            candles = c.get_candles(
+                product_id=product_id, start=str(now - span), end=str(now), granularity=granularity
+            ).to_dict()["candles"]
             newest = candles[0] if candles else None
             print(f"candles {granularity:10} n={len(candles)} newest={newest}")
         except Exception as exc:  # noqa: BLE001
@@ -196,10 +222,13 @@ def market_data(c: RESTClient, product_id: str, label: str) -> None:
     attempt("product_book", lambda: c.get_product_book(product_id=product_id, limit=2))
     attempt("best_bid_ask", lambda: c.get_best_bid_ask(product_ids=[product_id]))
     attempt("market_trades", lambda: c.get_market_trades(product_id=product_id, limit=2))
-    fresh = attempt("price fields on the product itself", lambda: {
-        k: c.get_product(product_id=product_id).to_dict().get(k)
-        for k in ("price", "best_bid_price", "best_ask_price", "mid_market_price", "volume_24h")
-    })
+    fresh = attempt(
+        "price fields on the product itself",
+        lambda: {
+            k: c.get_product(product_id=product_id).to_dict().get(k)
+            for k in ("price", "best_bid_price", "best_ask_price", "mid_market_price", "volume_24h")
+        },
+    )
     if fresh is not None and not any(fresh.values()):
         print("  ^ every price field empty")
 
@@ -224,8 +253,10 @@ def equity_pagination(c: RESTClient, first_page: list[dict]) -> None:
         return {p["product_id"] for p in (page.get("products") or [])}
 
     a, b = window(), window()
-    print(f"\nsame offset=0,limit=500 twice: |A|={len(a)} |B|={len(b)} differ={len(a ^ b) // 2}"
-          "  (even a fixed window is not a stable window)")
+    print(
+        f"\nsame offset=0,limit=500 twice: |A|={len(a)} |B|={len(b)} differ={len(a ^ b) // 2}"
+        "  (even a fixed window is not a stable window)"
+    )
 
     seen: set[str] = set()
     cursor, pages = "", 0
@@ -241,9 +272,11 @@ def equity_pagination(c: RESTClient, first_page: list[dict]) -> None:
         cursor = (page.get("pagination") or {}).get("next_cursor") or ""
         if not cursor:
             break
-    print(f"cursor walk reached {len(seen)} distinct ids across {pages} pages -- well past the "
-          "1000 cap, but repeat walks do not converge on the same total, so there is no "
-          "reproducible snapshot of the equity universe.")
+    print(
+        f"cursor walk reached {len(seen)} distinct ids across {pages} pages -- well past the "
+        "1000 cap, but repeat walks do not converge on the same total, so there is no "
+        "reproducible snapshot of the equity universe."
+    )
 
 
 def equities(c: RESTClient, eqs: list[dict]) -> None:
@@ -258,16 +291,35 @@ def equities(c: RESTClient, eqs: list[dict]) -> None:
     sample = eqs[0]
     details = sample.get("equity_product_details") or {}
     print("\nidentity shape -- product_id is an opaque hash and the ticker hides in a sub-object:")
-    print(json.dumps({k: sample.get(k) for k in
-                      ("product_id", "alias", "base_currency_id", "display_name",
-                       "quote_currency_id", "price", "best_bid_price", "mid_market_price")},
-                     default=str, indent=2))
+    print(
+        json.dumps(
+            {
+                k: sample.get(k)
+                for k in (
+                    "product_id",
+                    "alias",
+                    "base_currency_id",
+                    "display_name",
+                    "quote_currency_id",
+                    "price",
+                    "best_bid_price",
+                    "mid_market_price",
+                )
+            },
+            default=str,
+            indent=2,
+        )
+    )
     day = details.get("trading_day_info") or {}
-    print(f"ticker={details.get('ticker')} fractionable={details.get('fractionable')} "
-          f"cik={details.get('cik')} venue_id={day.get('venue_id')}")
+    print(
+        f"ticker={details.get('ticker')} fractionable={details.get('fractionable')} "
+        f"cik={details.get('cik')} venue_id={day.get('venue_id')}"
+    )
     print("sessions:", [s["session_type"] for s in day.get("trading_sessions", [])])
-    print("A CIK, an equity_subtype and an Apex venue are what distinguish these from the "
-          "non-US tokenized-stock product: they are real US shares.")
+    print(
+        "A CIK, an equity_subtype and an Apex venue are what distinguish these from the "
+        "non-US tokenized-stock product: they are real US shares."
+    )
 
 
 def accounts(c: RESTClient) -> None:
@@ -281,15 +333,26 @@ def accounts(c: RESTClient) -> None:
 def order_paths(c: RESTClient, futures_id: str, equity_id: str) -> None:
     """preview_order binds nothing. The two 403s are the finding."""
     header("ORDER PATH (preview only -- nothing is placed)")
-    attempt("preview futures (expect 403: FCM onboarding)",
-            lambda: c.preview_order(product_id=futures_id, side="BUY",
-                                    order_configuration={"market_market_ioc": {"base_size": "1"}}))
-    attempt("preview equity (expect 403: unsupported for equities)",
-            lambda: c.preview_order(
-                product_id=equity_id, side="BUY",
-                order_configuration={"market_market_ioc": {"quote_size": "10"}}))
-    attempt("cfm balance_summary (null => not onboarded)",
-            lambda: c.get("/api/v3/brokerage/cfm/balance_summary"))
+    attempt(
+        "preview futures (expect 403: FCM onboarding)",
+        lambda: c.preview_order(
+            product_id=futures_id,
+            side="BUY",
+            order_configuration={"market_market_ioc": {"base_size": "1"}},
+        ),
+    )
+    attempt(
+        "preview equity (expect 403: unsupported for equities)",
+        lambda: c.preview_order(
+            product_id=equity_id,
+            side="BUY",
+            order_configuration={"market_market_ioc": {"quote_size": "10"}},
+        ),
+    )
+    attempt(
+        "cfm balance_summary (null => not onboarded)",
+        lambda: c.get("/api/v3/brokerage/cfm/balance_summary"),
+    )
     attempt("cfm positions", lambda: c.list_futures_positions())
     attempt("api key permissions", lambda: c.get_api_key_permissions())
 
@@ -309,9 +372,11 @@ def main() -> None:
     futs = found.get("FUTURE", [])
     if futs:
         futures_taxonomy(futs)
-        picks = [(front_month(futs, "nano BTC"), "dated crypto future"),
-                 (front_month(futs, "nano BTC Perp"), "perp-style future"),
-                 (front_month(futs, "Gold"), "gold future")]
+        picks = [
+            (front_month(futs, "nano BTC"), "dated crypto future"),
+            (front_month(futs, "nano BTC Perp"), "perp-style future"),
+            (front_month(futs, "Gold"), "gold future"),
+        ]
         for product, label in picks:
             if product:
                 market_data(c, product["product_id"], label)

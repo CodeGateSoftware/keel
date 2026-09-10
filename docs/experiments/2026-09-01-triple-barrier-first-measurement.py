@@ -40,10 +40,30 @@ Path(OUT_DIR).mkdir(parents=True, exist_ok=True)
 JSONL_PATH = f"{OUT_DIR}/triple_barrier_first.jsonl"
 
 UNIVERSE = [
-    "BTC-USD", "ETH-USD", "ADA-USD", "LINK-USD", "LTC-USD", "SOL-USD",
-    "XLM-USD", "PAXG-USDT", "BCH-USD", "AAVE-USD", "DOGE-USD", "DOT-USD",
-    "UNI-USD", "ZEC-USD", "ALGO-USD", "FET-USD", "CRV-USD", "ICP-USD",
-    "AVAX-USD", "NEAR-USD", "XRP-USD", "PAXG-USD", "WLD-USD", "TON-USD",
+    "BTC-USD",
+    "ETH-USD",
+    "ADA-USD",
+    "LINK-USD",
+    "LTC-USD",
+    "SOL-USD",
+    "XLM-USD",
+    "PAXG-USDT",
+    "BCH-USD",
+    "AAVE-USD",
+    "DOGE-USD",
+    "DOT-USD",
+    "UNI-USD",
+    "ZEC-USD",
+    "ALGO-USD",
+    "FET-USD",
+    "CRV-USD",
+    "ICP-USD",
+    "AVAX-USD",
+    "NEAR-USD",
+    "XRP-USD",
+    "PAXG-USD",
+    "WLD-USD",
+    "TON-USD",
 ]
 
 FEES = ["0", "0.006", "0.012"]
@@ -73,10 +93,14 @@ def run_job(job):
         repo = Repository(connect(DB))
         candles = repo.get_candles(asset, Granularity.ONE_HOUR)
     except Exception as exc:
-        return [{
-            "arm": arm, "product": asset, "bars": bars,
-            "error": f"{type(exc).__name__}: {exc}",
-        }]
+        return [
+            {
+                "arm": arm,
+                "product": asset,
+                "bars": bars,
+                "error": f"{type(exc).__name__}: {exc}",
+            }
+        ]
     if not candles:
         return [{"arm": arm, "product": asset, "bars": bars, "error": "no hourly candles"}]
 
@@ -84,23 +108,30 @@ def run_job(job):
         try:
             rule = TripleBarrier(product_id=asset, max_holding_bars=int(bars))
             result = bt.backtest(rule, candles, fee_pct=Decimal(fee), slippage_pct=SLIPPAGE)
-            rows.append({
-                "arm": arm,
-                "product": asset,
-                "bars": bars,
-                "fee": fee,
-                "candles": len(candles),
-                "n_trades": int(result.n_trades),
-                "win_rate": float(result.win_rate),
-                "profit_factor": float(result.profit_factor),
-                "expectancy": float(result.expectancy),
-                "max_drawdown": float(result.max_drawdown),
-            })
+            rows.append(
+                {
+                    "arm": arm,
+                    "product": asset,
+                    "bars": bars,
+                    "fee": fee,
+                    "candles": len(candles),
+                    "n_trades": int(result.n_trades),
+                    "win_rate": float(result.win_rate),
+                    "profit_factor": float(result.profit_factor),
+                    "expectancy": float(result.expectancy),
+                    "max_drawdown": float(result.max_drawdown),
+                }
+            )
         except Exception as exc:
-            rows.append({
-                "arm": arm, "product": asset, "bars": bars, "fee": fee,
-                "error": f"{type(exc).__name__}: {exc}",
-            })
+            rows.append(
+                {
+                    "arm": arm,
+                    "product": asset,
+                    "bars": bars,
+                    "fee": fee,
+                    "error": f"{type(exc).__name__}: {exc}",
+                }
+            )
     return rows
 
 

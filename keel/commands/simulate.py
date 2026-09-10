@@ -169,9 +169,7 @@ def build_account_metrics(
         for t in closed_trades
         if t.exit_ts is not None
     ]
-    avg_hold_hours = (
-        sum(hold_spans, Decimal("0")) / len(hold_spans) if hold_spans else Decimal("0")
-    )
+    avg_hold_hours = sum(hold_spans, Decimal("0")) / len(hold_spans) if hold_spans else Decimal("0")
 
     return {
         "contributed": contributed,
@@ -472,9 +470,7 @@ def run_simulation(
     # against its own floor, so a low-win/high-R:R trend-follower isn't rejected by the global
     # 55%-win floor `promo_cfg` carries. Classes without a fixed floor fall back to `promo_cfg`.
     pooled_by_class = report_mod.group_trades_by_class(edge, rules)
-    floors = {
-        cls: promotion_mod.floor_for_class(cls, promo_cfg) for cls in pooled_by_class
-    }
+    floors = {cls: promotion_mod.floor_for_class(cls, promo_cfg) for cls in pooled_by_class}
     verdict = report_mod.build_verdict(
         edge[report_mod.POOLED_KEY],
         account_metrics,

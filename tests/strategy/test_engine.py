@@ -477,9 +477,7 @@ class TestNoSignalDiagnostics:
         with caplog.at_level(logging.INFO):
             assert evaluate(rules=[rule], candles_by_tf={Granularity.ONE_DAY: candles}) == []
 
-        record = next(
-            r for r in caplog.records if r.getMessage() == "engine.no_signal"
-        )
+        record = next(r for r in caplog.records if r.getMessage() == "engine.no_signal")
         fields = record.keel_fields
         assert fields["rule"] == "turtle_breakout"
         assert fields["gate"] == "donchian_high"

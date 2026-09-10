@@ -426,9 +426,7 @@ def test_two_rules_of_one_kind_on_different_timeframes_keep_their_own_verdicts(
     assert by_rule["turtle_daily"].ready_reason != "missing", "gated on the present ONE_DAY"
 
 
-def test_two_rules_sharing_a_name_degrade_to_the_fallback(
-    repo: Repository, tmp_path: Path
-) -> None:
+def test_two_rules_sharing_a_name_degrade_to_the_fallback(repo: Repository, tmp_path: Path) -> None:
     """`name` is not unique in the schema. When two rows answer to one name with DIFFERENT gate
     granularities, which one opened a tranche is genuinely unknowable from `rule_name` alone --
     so the chip takes the fallback rather than picking one and stating it with confidence."""
@@ -474,9 +472,7 @@ def test_each_rule_is_built_once_however_many_tranches_it_opened(
     assert builds["n"] == 1, f"built the rule {builds['n']} times for 6 tranches"
 
 
-def test_the_mark_cache_does_not_leak_between_products(
-    repo: Repository, tmp_path: Path
-) -> None:
+def test_the_mark_cache_does_not_leak_between_products(repo: Repository, tmp_path: Path) -> None:
     """A cache keyed carelessly would hand product B product A's price, and every figure derived
     from it would be confidently wrong with nothing in the row to show it."""
     _open_tranche(repo, product_id="BTC-USD")

@@ -165,7 +165,7 @@ def _decimal_or_none(summary: dict[str, Any], key: str) -> Decimal | None:
         return value
     try:
         return Decimal(str(value))
-    except (ArithmeticError, TypeError, ValueError):
+    except ArithmeticError, TypeError, ValueError:
         return None
 
 
@@ -187,7 +187,7 @@ def _int_or_none(summary: dict[str, Any], key: str) -> int | None:
         return None
     try:
         return int(value)
-    except (ArithmeticError, TypeError, ValueError):
+    except ArithmeticError, TypeError, ValueError:
         # A read-only page must not 500 over one malformed row written by something else.
         return None
 

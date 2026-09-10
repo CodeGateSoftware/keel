@@ -281,9 +281,7 @@ def test_live_position_with_no_bracket_still_renders_no_bracket(repo: Repository
         bracket_order_id=None,
     )
 
-    report = gather_status(
-        repo, _config(auto_trade=AutoTradeConfig(mode="confirm")), now_ts=NOW_TS
-    )
+    report = gather_status(repo, _config(auto_trade=AutoTradeConfig(mode="confirm")), now_ts=NOW_TS)
     lines = render_human(report)
 
     assert any(line.endswith("(NO bracket)") for line in lines)
@@ -581,9 +579,7 @@ def test_rail17_expired_in_paper_names_the_state_not_a_halt(repo: Repository) ->
 def test_rail17_never_attested_is_said_as_such(repo: Repository) -> None:
     """A fresh DB has no attestation at all -- rail 17 fails closed on that too, so status
     must not render the silence as health."""
-    report = gather_status(
-        repo, _config(auto_trade=AutoTradeConfig(mode="confirm")), now_ts=NOW_TS
-    )
+    report = gather_status(repo, _config(auto_trade=AutoTradeConfig(mode="confirm")), now_ts=NOW_TS)
 
     w = report.withdrawal_attestation
     assert w.state == "unattested"
@@ -599,9 +595,7 @@ def test_rail17_suspended_attestation_still_names_the_halt(repo: Repository) -> 
     line must say which, because the release is the same command with `--enabled`."""
     _attest(repo, enabled=False, age_sec=3600)
 
-    report = gather_status(
-        repo, _config(auto_trade=AutoTradeConfig(mode="confirm")), now_ts=NOW_TS
-    )
+    report = gather_status(repo, _config(auto_trade=AutoTradeConfig(mode="confirm")), now_ts=NOW_TS)
 
     w = report.withdrawal_attestation
     assert w.state == "suspended"

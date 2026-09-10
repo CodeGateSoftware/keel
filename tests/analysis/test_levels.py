@@ -116,9 +116,7 @@ def test_find_levels_three_bounces_yields_support_level_with_min_three_touches()
     # These fixtures are stamped at bare indices (ts 0,1,2...), so the shipped 14-day
     # touch separation would collapse every cluster to one touch. They are testing PRICE
     # CLUSTERING, not the separation policy (which has its own tests below), so pin it.
-    levels = find_levels(
-        candles, tolerance=Decimal("0.002"), min_touches=3, min_separation_sec=0
-    )
+    levels = find_levels(candles, tolerance=Decimal("0.002"), min_touches=3, min_separation_sec=0)
 
     support_levels = [lvl for lvl in levels if lvl.kind == "support"]
     assert len(support_levels) == 1
@@ -134,9 +132,7 @@ def test_find_levels_three_bounces_yields_resistance_level_with_min_three_touche
     # These fixtures are stamped at bare indices (ts 0,1,2...), so the shipped 14-day
     # touch separation would collapse every cluster to one touch. They are testing PRICE
     # CLUSTERING, not the separation policy (which has its own tests below), so pin it.
-    levels = find_levels(
-        candles, tolerance=Decimal("0.002"), min_touches=3, min_separation_sec=0
-    )
+    levels = find_levels(candles, tolerance=Decimal("0.002"), min_touches=3, min_separation_sec=0)
 
     resistance_levels = [lvl for lvl in levels if lvl.kind == "resistance"]
     assert len(resistance_levels) == 1
@@ -151,9 +147,7 @@ def test_find_levels_excludes_level_touched_only_twice_at_min_touches_three():
     # These fixtures are stamped at bare indices (ts 0,1,2...), so the shipped 14-day
     # touch separation would collapse every cluster to one touch. They are testing PRICE
     # CLUSTERING, not the separation policy (which has its own tests below), so pin it.
-    levels = find_levels(
-        candles, tolerance=Decimal("0.002"), min_touches=3, min_separation_sec=0
-    )
+    levels = find_levels(candles, tolerance=Decimal("0.002"), min_touches=3, min_separation_sec=0)
 
     prices = [lvl.price for lvl in levels]
     assert Decimal("200") not in prices
@@ -165,9 +159,7 @@ def test_find_levels_includes_level_touched_twice_when_min_touches_two():
     # These fixtures are stamped at bare indices (ts 0,1,2...), so the shipped 14-day
     # touch separation would collapse every cluster to one touch. They are testing PRICE
     # CLUSTERING, not the separation policy (which has its own tests below), so pin it.
-    levels = find_levels(
-        candles, tolerance=Decimal("0.002"), min_touches=2, min_separation_sec=0
-    )
+    levels = find_levels(candles, tolerance=Decimal("0.002"), min_touches=2, min_separation_sec=0)
 
     support_levels = [lvl for lvl in levels if lvl.kind == "support"]
     assert len(support_levels) == 1
@@ -335,8 +327,7 @@ def _pivot_series(pivot_indices: list[int], step_sec: int) -> list[Candle]:
     length = max(pivot_indices) + 3
     marks = set(pivot_indices)
     return [
-        _c(i * step_sec, "105", "106", "100" if i in marks else "104", "105")
-        for i in range(length)
+        _c(i * step_sec, "105", "106", "100" if i in marks else "104", "105") for i in range(length)
     ]
 
 

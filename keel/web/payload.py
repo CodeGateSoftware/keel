@@ -1473,8 +1473,7 @@ def _matrix_state_payload(report: MatrixReport) -> Field:
         return label(
             "recorded",
             display=(
-                "Compiled from recorded gauntlet runs — nothing here was computed "
-                "for this page."
+                "Compiled from recorded gauntlet runs — nothing here was computed for this page."
             ),
             state=NEUTRAL,
         )
@@ -2043,9 +2042,7 @@ def orders_payload(report: OrdersReport) -> dict[str, Any]:
         "empty_note": _EMPTY_NOTES.get(report.empty_reason, ""),
         # The badge the console wears on this page (#707). Written here, not in the client: it is a
         # claim about how this deployment is built, and Rule 2 keeps claims in Python.
-        "write_posture": label(
-            WEB_READ_ONLY_BADGE, display=WEB_READ_ONLY_NOTE, state=NEUTRAL
-        ),
+        "write_posture": label(WEB_READ_ONLY_BADGE, display=WEB_READ_ONLY_NOTE, state=NEUTRAL),
         "rows": [_order_row_payload(row) for row in report.rows],
     }
 
@@ -3168,8 +3165,7 @@ def _session_banner(mode: str, equity_state_mode: str, autonomous: bool) -> str:
     state = equity_state_mode or _EQUITY_STATE_UNRECORDED
     if autonomous and mode == "confirm":
         return (
-            f"{mode.upper()} · AUTONOMOUS — orders place without asking you; "
-            f"equity state {state}"
+            f"{mode.upper()} · AUTONOMOUS — orders place without asking you; equity state {state}"
         )
     return (
         f"{mode.upper()} — every order is previewed and waits for your approval; "

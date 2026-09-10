@@ -22,15 +22,24 @@ def _record(runner, path, trial_id, decision="selected"):
     return runner.invoke(
         cli,
         [
-            "trials", "record",
-            "--ledger", str(path),
-            "--trial-id", trial_id,
-            "--session", "s1",
-            "--rule", "turtle_breakout",
-            "--params", '{"entry": 40}',
-            "--provenance", "fitted",
-            "--kind", "sweep_node",
-            "--decision", decision,
+            "trials",
+            "record",
+            "--ledger",
+            str(path),
+            "--trial-id",
+            trial_id,
+            "--session",
+            "s1",
+            "--rule",
+            "turtle_breakout",
+            "--params",
+            '{"entry": 40}',
+            "--provenance",
+            "fitted",
+            "--kind",
+            "sweep_node",
+            "--decision",
+            decision,
             "--series-missing",
         ],
     )
@@ -75,10 +84,25 @@ def test_record_rejects_bad_enum(tmp_path):
     result = runner.invoke(
         cli,
         [
-            "trials", "record", "--ledger", str(path), "--trial-id", "t1",
-            "--session", "s", "--rule", "r", "--params", "{}",
-            "--provenance", "vibes", "--kind", "sweep_node",
-            "--decision", "selected", "--series-missing",
+            "trials",
+            "record",
+            "--ledger",
+            str(path),
+            "--trial-id",
+            "t1",
+            "--session",
+            "s",
+            "--rule",
+            "r",
+            "--params",
+            "{}",
+            "--provenance",
+            "vibes",
+            "--kind",
+            "sweep_node",
+            "--decision",
+            "selected",
+            "--series-missing",
         ],
     )
     assert result.exit_code != 0
@@ -144,9 +168,7 @@ def test_deflate_reports_a_band_and_refuses_to_invent_DSR(tmp_path):
     for i in range(5):
         _record(runner, path, f"t{i}")
 
-    result = runner.invoke(
-        cli, ["trials", "deflate", "--ledger", str(path), "--sharpe", "0.4"]
-    )
+    result = runner.invoke(cli, ["trials", "deflate", "--ledger", str(path), "--sharpe", "0.4"])
     assert result.exit_code == 0, result.output
     # A band, not a single number, because rho is not measured here.
     assert "0.00" in result.output and "0.90" in result.output
@@ -162,8 +184,18 @@ def test_deflate_computes_dsr_when_the_variance_is_supplied_explicitly(tmp_path)
 
     result = runner.invoke(
         cli,
-        ["trials", "deflate", "--ledger", str(path), "--sharpe", "0.4",
-         "--rho", "0.5", "--trial-sharpe-variance", "0.05"],
+        [
+            "trials",
+            "deflate",
+            "--ledger",
+            str(path),
+            "--sharpe",
+            "0.4",
+            "--rho",
+            "0.5",
+            "--trial-sharpe-variance",
+            "0.05",
+        ],
     )
     assert result.exit_code == 0, result.output
     assert "SR_0" in result.output
@@ -175,9 +207,7 @@ def test_deflate_refuses_on_too_few_decision_trials(tmp_path):
     runner = CliRunner()
     path = tmp_path / "trials.jsonl"
     _record(runner, path, "only-one")
-    result = runner.invoke(
-        cli, ["trials", "deflate", "--ledger", str(path), "--sharpe", "0.4"]
-    )
+    result = runner.invoke(cli, ["trials", "deflate", "--ledger", str(path), "--sharpe", "0.4"])
     # #601: an evidence-shaped refusal is a result, not an error -- exit 0, on stdout.
     assert result.exit_code == 0, result.output
     assert "refused" in result.output
@@ -607,8 +637,16 @@ def test_trials_deflate_records_the_inputs_the_operator_supplied(tmp_path) -> No
     result = CliRunner().invoke(
         cli,
         [
-            "trials", "deflate", "--ledger", str(path),
-            "--sharpe", "1.8", "--trial-sharpe-variance", "0.25", "--rho", "0.5",
+            "trials",
+            "deflate",
+            "--ledger",
+            str(path),
+            "--sharpe",
+            "1.8",
+            "--trial-sharpe-variance",
+            "0.25",
+            "--rho",
+            "0.5",
         ],
     )
     assert result.exit_code == 0, result.output
@@ -650,8 +688,16 @@ def test_every_recorded_gauntlet_row_keeps_the_chain_intact(tmp_path) -> None:
     CliRunner().invoke(cli, ["trials", "pbo", "--ledger", str(path), "--blocks", "4"])
     CliRunner().invoke(
         cli,
-        ["trials", "deflate", "--ledger", str(path), "--sharpe", "1.8",
-         "--trial-sharpe-variance", "0.25"],
+        [
+            "trials",
+            "deflate",
+            "--ledger",
+            str(path),
+            "--sharpe",
+            "1.8",
+            "--trial-sharpe-variance",
+            "0.25",
+        ],
     )
 
     assert ledger.verify_chain(path) == []

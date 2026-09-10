@@ -578,7 +578,8 @@ class TestBacktestMatchesPre352Golden:
         golden = json.loads(_352_GOLDEN_PATH.read_text())
         for window in golden["windows"]:
             rule = PullbackContinuation(
-                product_id="BTC-USD", **window["params"]  # type: ignore[arg-type]
+                product_id="BTC-USD",
+                **window["params"],  # type: ignore[arg-type]
             )
             result = backtest(rule, _synthetic_hourly(window["seed"], window["bars"]))
             assert serialize_result(result) == window["result"], (window["seed"], window["bars"])
@@ -784,12 +785,9 @@ class TestLazyStateAcquisition:
         self, monkeypatch
     ) -> None:
         candles = _synthetic_hourly(99, 400)
-        conditions = [
-            regime.detect_condition(candles[:n]) for n in range(2, len(candles) + 1)
-        ]
+        conditions = [regime.detect_condition(candles[:n]) for n in range(2, len(candles) + 1)]
         bullish_ns = [
-            n for n, cond in enumerate(conditions, start=2)
-            if cond == regime.Condition.BULLISH
+            n for n, cond in enumerate(conditions, start=2) if cond == regime.Condition.BULLISH
         ]
         # A passing bar, then >= 2 declining bars (the gap), then the next passing bar.
         pair = next(

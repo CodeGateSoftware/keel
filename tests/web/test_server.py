@@ -458,7 +458,8 @@ def test_a_write_from_a_rebound_hostname_is_refused(
         "/api/setup/config",
         method="POST",
         cookie=_session(empty_machine),
-        form={}, csrf=_csrf(empty_machine),
+        form={},
+        csrf=_csrf(empty_machine),
         host=f"evil.example:{empty_machine.port}",
     )
     assert status == 403
@@ -502,7 +503,8 @@ def test_a_write_missing_sec_fetch_site_is_accepted(
         "/api/setup/config",
         method="POST",
         cookie=_session(empty_machine),
-        form={}, csrf=_csrf(empty_machine),
+        form={},
+        csrf=_csrf(empty_machine),
         sec_fetch_site=None,
     )
     assert status == 200
@@ -516,7 +518,8 @@ def test_a_write_with_sec_fetch_site_same_origin_is_accepted(
         "/api/setup/config",
         method="POST",
         cookie=_session(empty_machine),
-        form={}, csrf=_csrf(empty_machine),
+        form={},
+        csrf=_csrf(empty_machine),
         sec_fetch_site="same-origin",
     )
     assert status == 200
@@ -533,7 +536,8 @@ def test_a_write_with_a_wrong_sec_fetch_site_is_refused(
         "/api/setup/config",
         method="POST",
         cookie=_session(empty_machine),
-        form={}, csrf=_csrf(empty_machine),
+        form={},
+        csrf=_csrf(empty_machine),
         sec_fetch_site=value,
     )
     assert status == 403, value
@@ -656,7 +660,8 @@ def test_a_first_run_user_can_build_a_paper_deployment_from_the_browser(
             f"/api/setup/{action.key}",
             method="POST",
             cookie=_session(empty_machine),
-            form={}, csrf=_csrf(empty_machine),
+            form={},
+            csrf=_csrf(empty_machine),
         )
         assert status == 200, action.key
         assert json.loads(body)["data"]["step_key"] == action.key
@@ -685,7 +690,8 @@ def test_running_every_action_twice_changes_nothing_the_second_time(
                 f"/api/setup/{action.key}",
                 method="POST",
                 cookie=_session(empty_machine),
-                form={}, csrf=_csrf(empty_machine),
+                form={},
+                csrf=_csrf(empty_machine),
             )
             assert status == 200
 
@@ -710,7 +716,8 @@ def test_an_undeclared_action_key_is_a_404_not_a_lookup_that_falls_through(
             f"/api/setup/{key}",
             method="POST",
             cookie=_session(empty_machine),
-            form={}, csrf=_csrf(empty_machine),
+            form={},
+            csrf=_csrf(empty_machine),
         )
         assert status == 404, key
 
@@ -732,7 +739,8 @@ def test_an_oversized_form_body_is_refused_without_being_read(
         "/api/setup/config",
         method="POST",
         cookie=_session(empty_machine),
-        csrf=_csrf(empty_machine), form={"padding": "x" * 32_000},
+        csrf=_csrf(empty_machine),
+        form={"padding": "x" * 32_000},
     )
     assert status == 400
     assert not Path(empty_machine.config_path).exists()
@@ -1001,9 +1009,7 @@ def test_static_assets_are_behind_the_same_admission_as_every_other_page(
 
 
 def test_a_missing_static_asset_is_a_404(running: web_server.ServeConfig) -> None:
-    status, _headers, body = _request(
-        running, _P("does-not-exist.html"), cookie=_session(running)
-    )
+    status, _headers, body = _request(running, _P("does-not-exist.html"), cookie=_session(running))
     assert status == 404
 
 
@@ -1101,9 +1107,7 @@ def test_an_unrecognised_static_extension_is_refused(
     (tmp_path / "payload.exe").write_bytes(b"MZ")
     monkeypatch.setattr(staticfiles, "STATIC_ROOT", tmp_path)
 
-    status, _headers, body = _request(
-        running, _P("payload.exe"), cookie=_session(running)
-    )
+    status, _headers, body = _request(running, _P("payload.exe"), cookie=_session(running))
     assert status == 404
 
 
@@ -1240,7 +1244,7 @@ def test_a_submitted_secret_never_appears_in_a_response_or_a_redirect(
         method="POST",
         cookie=_session(empty_machine),
         csrf=_csrf(empty_machine),
-            form={
+        form={
             "CDP_API_KEY": "cdp-key-value",
             "CDP_API_SECRET": secret,
         },
@@ -1273,7 +1277,8 @@ def test_a_blank_field_records_nothing(
         "/api/setup/credentials",
         method="POST",
         cookie=_session(empty_machine),
-        csrf=_csrf(empty_machine), form={"CDP_API_KEY": "k", "CDP_API_SECRET": "   "},
+        csrf=_csrf(empty_machine),
+        form={"CDP_API_KEY": "k", "CDP_API_SECRET": "   "},
     )
     assert status == 200
     assert stored == {}
@@ -1308,7 +1313,7 @@ def test_a_field_the_action_did_not_declare_is_dropped(
         method="POST",
         cookie=_session(empty_machine),
         csrf=_csrf(empty_machine),
-            form={
+        form={
             "CDP_API_KEY": "k",
             "CDP_API_SECRET": "s",
             "SOMETHING_ELSE": "should not arrive",
@@ -1351,7 +1356,8 @@ def test_starting_market_data_returns_immediately(
             "/api/setup/market_data",
             method="POST",
             cookie=_session(empty_machine),
-            form={}, csrf=_csrf(empty_machine),
+            form={},
+            csrf=_csrf(empty_machine),
         )
         assert status == 200
         assert json.loads(body)["data"]["step_key"] == "market_data"

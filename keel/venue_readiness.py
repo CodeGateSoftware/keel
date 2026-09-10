@@ -302,9 +302,7 @@ def gather_readiness(
     rows: list[VenueReadinessRow] = []
     for venue in venues:
         record, unreadable = _read_only_trade_scope(db_path, venue)
-        rows.append(
-            venue_readiness(venue, registry, secrets, record, record_unreadable=unreadable)
-        )
+        rows.append(venue_readiness(venue, registry, secrets, record, record_unreadable=unreadable))
     return rows
 
 

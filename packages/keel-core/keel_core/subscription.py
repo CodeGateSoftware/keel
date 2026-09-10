@@ -60,9 +60,7 @@ class BrokerSubscription:
             return SubscriptionStatus.SUSPECT
         return self.status
 
-    def allowance_usd(
-        self, now_ts: int, unsubscribed_allowance_usd: Decimal
-    ) -> Decimal | None:
+    def allowance_usd(self, now_ts: int, unsubscribed_allowance_usd: Decimal) -> Decimal | None:
         """The spend cap rail 14 must enforce. `None` means unlimited (no cap at all).
 
         Anything other than an in-force `ACTIVE` falls back to `unsubscribed_allowance_usd` --

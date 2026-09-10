@@ -53,7 +53,6 @@ def _instrument(
 # -- asset attestations ----------------------------------------------------------------------
 
 
-
 def test_no_attestations_is_ok():
     (finding,) = asset_attestation_window_findings([], now_ts=NOW)
     assert finding.status == OK
@@ -68,9 +67,7 @@ def test_a_null_window_is_not_reported_as_expired_or_approaching():
 
 
 def test_a_passed_window_is_reported():
-    findings = asset_attestation_window_findings(
-        [_asset(attest_due_ts=NOW - 3 * DAY)], now_ts=NOW
-    )
+    findings = asset_attestation_window_findings([_asset(attest_due_ts=NOW - 3 * DAY)], now_ts=NOW)
     (finding,) = [f for f in findings if f.status != OK]
     assert finding.status == WARN
     assert "BTC" in finding.detail
@@ -79,9 +76,7 @@ def test_a_passed_window_is_reported():
 
 
 def test_an_approaching_window_is_reported():
-    findings = asset_attestation_window_findings(
-        [_asset(attest_due_ts=NOW + 2 * DAY)], now_ts=NOW
-    )
+    findings = asset_attestation_window_findings([_asset(attest_due_ts=NOW + 2 * DAY)], now_ts=NOW)
     (finding,) = [f for f in findings if f.status != OK]
     assert finding.status == WARN
     assert "BTC" in finding.detail
@@ -96,9 +91,7 @@ def test_a_window_far_in_the_future_is_ok():
 
 def test_screening_never_vetoes_and_the_finding_says_so():
     """Reporting only -- the hard boundary from #718."""
-    findings = asset_attestation_window_findings(
-        [_asset(attest_due_ts=NOW - DAY)], now_ts=NOW
-    )
+    findings = asset_attestation_window_findings([_asset(attest_due_ts=NOW - DAY)], now_ts=NOW)
     (finding,) = [f for f in findings if f.status != OK]
     assert finding.status == WARN  # never FAIL: nothing is actually blocked
     assert "does not veto" in finding.detail or "reporting only" in finding.detail.lower()
@@ -186,4 +179,3 @@ def test_a_row_from_a_database_that_predates_the_column_is_not_an_error() -> Non
     (finding,) = asset_attestation_window_findings([row], now_ts=NOW)
 
     assert finding.status == OK
-

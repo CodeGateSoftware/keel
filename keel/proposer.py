@@ -18,9 +18,7 @@ from keel.compliance import screen as screen_mod
 from keel.compliance.screen import missing_history_lines, split_failures
 from keel.data.repository import Repository
 
-ScreenFn = Callable[
-    [Repository, str, str], tuple[screen_mod.MarketFacts, screen_mod.ScreenResult]
-]
+ScreenFn = Callable[[Repository, str, str], tuple[screen_mod.MarketFacts, screen_mod.ScreenResult]]
 
 
 class ProposalError(ValueError):
@@ -52,7 +50,7 @@ def _is_http_url(value: Any) -> bool:
         return False
     try:
         parsed = urlparse(value)
-    except (ValueError, TypeError):
+    except ValueError, TypeError:
         return False
     return parsed.scheme in ("http", "https") and bool(parsed.netloc)
 
@@ -179,8 +177,7 @@ def render_proposal_report(report: ProposalReport) -> list[str]:
         attested = "attested" if sc.attested else "UNATTESTED"
         lines.append("")
         lines.append(
-            f"{sc.result.summary:<7} {cand.asset:<8} bars={sc.facts.daily_bars} "
-            f"{allow} {attested}"
+            f"{sc.result.summary:<7} {cand.asset:<8} bars={sc.facts.daily_bars} {allow} {attested}"
         )
         lines.append(f"    rationale: {cand.rationale}")
         for src in cand.sources:

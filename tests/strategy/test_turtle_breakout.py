@@ -35,8 +35,16 @@ _SMALL_PARAMS = {
 
 # A minimal non-empty ONE_HOUR window: its mere presence (not its contents) is the account-sim
 # signal that the last ONE_DAY bar is the current forming day and must be dropped.
-_ANY_HOUR = [Candle(ts=0, open=Decimal("1"), high=Decimal("1"), low=Decimal("1"),
-                    close=Decimal("1"), volume=Decimal("1"))]
+_ANY_HOUR = [
+    Candle(
+        ts=0,
+        open=Decimal("1"),
+        high=Decimal("1"),
+        low=Decimal("1"),
+        close=Decimal("1"),
+        volume=Decimal("1"),
+    )
+]
 
 
 def _candle(ts: int, o: float, h: float, low: float, c: float) -> Candle:
@@ -104,8 +112,26 @@ def _choppy_breakout_candles() -> list[Candle]:
     trend gate rejecting a "breakout" that isn't backed by real trend strength.
     """
     prices = [
-        100, 104, 98, 103, 97, 105, 96, 106, 99, 102,
-        100, 103, 98, 104, 101, 100, 102, 99, 101, 100,
+        100,
+        104,
+        98,
+        103,
+        97,
+        105,
+        96,
+        106,
+        99,
+        102,
+        100,
+        103,
+        98,
+        104,
+        101,
+        100,
+        102,
+        99,
+        101,
+        100,
     ]
     candles = [_candle(i, p - 0.5, p + 1.5, p - 1.5, p) for i, p in enumerate(prices)]
     breakout_price = float(max(c.high for c in candles[-5:])) + 5.0
@@ -462,7 +488,10 @@ class TestCompletedDailyBarIsUsedInTheLiveAgentPath:
         base.append(
             _day_candle(
                 base[-1].ts + _DAY,
-                pullback_price - 0.5, pullback_price + 0.5, pullback_price - 0.5, pullback_price,
+                pullback_price - 0.5,
+                pullback_price + 0.5,
+                pullback_price - 0.5,
+                pullback_price,
             )
         )
         breakout_price = float(base[-2].close) + 20.0
@@ -470,7 +499,10 @@ class TestCompletedDailyBarIsUsedInTheLiveAgentPath:
         base.append(
             _day_candle(
                 breakout_ts,
-                breakout_price - 0.5, breakout_price + 0.5, breakout_price - 0.5, breakout_price,
+                breakout_price - 0.5,
+                breakout_price + 0.5,
+                breakout_price - 0.5,
+                breakout_price,
             )
         )
         # The live agent's newest CLOSED hourly bar sits in the day AFTER the newest daily bar,
@@ -492,7 +524,10 @@ class TestCompletedDailyBarIsUsedInTheLiveAgentPath:
         base.append(
             _day_candle(
                 base[-1].ts + _DAY,
-                pullback_price - 0.5, pullback_price + 0.5, pullback_price - 0.5, pullback_price,
+                pullback_price - 0.5,
+                pullback_price + 0.5,
+                pullback_price - 0.5,
+                pullback_price,
             )
         )
         forming_ts = base[-1].ts + _DAY
@@ -500,7 +535,10 @@ class TestCompletedDailyBarIsUsedInTheLiveAgentPath:
         base.append(
             _day_candle(
                 forming_ts,
-                breakout_price - 0.5, breakout_price + 0.5, breakout_price - 0.5, breakout_price,
+                breakout_price - 0.5,
+                breakout_price + 0.5,
+                breakout_price - 0.5,
+                breakout_price,
             )
         )
         # Mid-day hourly bar, inside the last daily bar's own period = still forming.
@@ -645,8 +683,16 @@ class TestDailyEdgeBacktestProducesTrades:
 # ---------------------------------------------------------------------------
 
 
-def _impulse_pullback_cycle(price: float, ts: int, *, impulse: int = 8, pullback: int = 5,
-                            up: float = 3.0, down: float = 4.0, crash: bool = False):
+def _impulse_pullback_cycle(
+    price: float,
+    ts: int,
+    *,
+    impulse: int = 8,
+    pullback: int = 5,
+    up: float = 3.0,
+    down: float = 4.0,
+    crash: bool = False,
+):
     """One impulse-up (breakout + ADX) then pullback-down (channel exit) cycle, à la
     `_daily_uptrend_with_pullbacks`. `crash=True` makes the first pullback bar gap its LOW far
     below (≈ -40) so the 2N stop is hit -> the cycle's trade is a LOSS rather than a channel-exit
@@ -686,9 +732,7 @@ class TestS1Filter:
     def test_default_off_still_detects_breakout(self) -> None:
         # filter defaults off -> a clean breakout still yields a Setup (behavior unchanged)
         assert _rule().detect({Granularity.ONE_DAY: _breakout_candles()}) is not None
-        assert _rule(s1_filter=False).detect(
-            {Granularity.ONE_DAY: _breakout_candles()}
-        ) is not None
+        assert _rule(s1_filter=False).detect({Granularity.ONE_DAY: _breakout_candles()}) is not None
 
     def test_param_round_trips_through_agent(self) -> None:
         described = _rule(s1_filter=True).describe()
@@ -721,15 +765,19 @@ class TestS1Filter:
         assert on.n_trades < off.n_trades
 
 
-def _with_breakout_volume(candles: list[Candle], breakout_vol: float,
-                          base_vol: float = 100.0) -> list[Candle]:
+def _with_breakout_volume(
+    candles: list[Candle], breakout_vol: float, base_vol: float = 100.0
+) -> list[Candle]:
     """Rebuild `candles` with a flat base volume and a chosen volume on the final (breakout) bar
     (Candle is frozen, so construct new ones)."""
     out: list[Candle] = []
     for i, c in enumerate(candles):
         v = breakout_vol if i == len(candles) - 1 else base_vol
-        out.append(Candle(ts=c.ts, open=c.open, high=c.high, low=c.low, close=c.close,
-                          volume=Decimal(str(v))))
+        out.append(
+            Candle(
+                ts=c.ts, open=c.open, high=c.high, low=c.low, close=c.close, volume=Decimal(str(v))
+            )
+        )
     return out
 
 

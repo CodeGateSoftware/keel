@@ -522,8 +522,7 @@ def test_live_blockers_is_exactly_the_off_venue_step_until_acknowledged() -> Non
     step done except the acknowledgement" through a real deployment is impossible -- exercising
     the property directly is the only way to check it against that precondition."""
     states = tuple(
-        StepState(step=step, done=(step.key != "venue_interest_off"), detail="")
-        for step in STEPS
+        StepState(step=step, done=(step.key != "venue_interest_off"), detail="") for step in STEPS
     )
     deployment = DeploymentState(
         root=Path("."), config_path=Path("config.yaml"), db_path=Path("keel.db"), states=states

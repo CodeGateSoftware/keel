@@ -207,9 +207,7 @@ def posture_attest(ctx: click.Context, venue: str | None, spot_cash: bool) -> No
             "account can fill a sell as a SHORT. Confirm you have checked the account itself.",
         )
     click.echo(
-        apply_posture_attest(
-            repo, venue=venue, spot_cash=spot_cash, now_ts=int(time.time())
-        )
+        apply_posture_attest(repo, venue=venue, spot_cash=spot_cash, now_ts=int(time.time()))
     )
 
 

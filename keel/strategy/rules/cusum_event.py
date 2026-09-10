@@ -107,9 +107,7 @@ def cusum_read(closes: list[Decimal], threshold: Decimal) -> CusumReading:
             # its flag forward would report a stale event on every later bar.
             fired_up = False
             fired_down = False
-    return CusumReading(
-        fired_up=fired_up, fired_down=fired_down, s_plus=s_plus, s_minus=s_minus
-    )
+    return CusumReading(fired_up=fired_up, fired_down=fired_down, s_plus=s_plus, s_minus=s_minus)
 
 
 class CusumEvent(Rule):

@@ -120,9 +120,7 @@ def test_a_refuted_posture_fails_and_names_the_venue_evidence() -> None:
 def test_the_warning_reaches_the_notification_path(due_offset: int) -> None:
     """A doctor finding nobody is told about is only marginally better than the veto. Both the
     WARN and the FAIL have to produce an `attestation.expiring` event."""
-    findings = cash_posture_findings(
-        _record(due_ts=NOW + due_offset), venue="coinbase", now_ts=NOW
-    )
+    findings = cash_posture_findings(_record(due_ts=NOW + due_offset), venue="coinbase", now_ts=NOW)
     assert "attest.cash_posture" in notifications._ATTESTATION_FINDINGS  # noqa: SLF001
     events = notifications.events_from_state(
         attestation_findings=findings,

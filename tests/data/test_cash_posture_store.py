@@ -112,9 +112,7 @@ def test_a_refutation_preserves_the_attestation_history(repo: Repository) -> Non
     """`doctor` has to be able to say what was claimed, when, and when the venue contradicted
     it. An operator asked to re-attest deserves to know what they said last time."""
     repo.upsert_venue_cash_posture(_record())
-    repo.upsert_venue_cash_posture(
-        _record(state=CashPostureState.REFUTED, refuted_ts=NOW + 100)
-    )
+    repo.upsert_venue_cash_posture(_record(state=CashPostureState.REFUTED, refuted_ts=NOW + 100))
     got = repo.get_venue_cash_posture("coinbase")
     assert got.state is CashPostureState.REFUTED
     assert got.attested_ts == NOW

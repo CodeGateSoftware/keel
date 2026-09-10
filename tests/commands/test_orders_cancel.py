@@ -557,9 +557,7 @@ def test_cancelling_an_entry_does_clear_a_bracket_no_position_relies_on(
     assert Repository(conn).get_order(orphan)["status"] == "canceled"
 
 
-def test_a_fill_landing_while_the_operator_answers_stops_the_cancel(
-    tmp_path, monkeypatch
-) -> None:
+def test_a_fill_landing_while_the_operator_answers_stops_the_cancel(tmp_path, monkeypatch) -> None:
     """A typed phrase is 34 characters, and a resting order can fill while it is being typed.
 
     The first cut classified once, before the prompt, and everything downstream read that stale

@@ -53,16 +53,12 @@ def build_pnl_report(
             open_qty=pos.qty,
             avg_cost=pos.avg_cost,
             mark=marks.get(asset),
-            unrealized=(
-                (marks[asset] - pos.avg_cost) * pos.qty if asset in marks else None
-            ),
+            unrealized=((marks[asset] - pos.avg_cost) * pos.qty if asset in marks else None),
         )
         return PnlReport(asset=asset, total_realized=None, rows=(row,))
 
     rows: list[AssetPnl] = []
-    unrealized_by_asset = (
-        pnl_analysis.unrealized_pnl(transactions, marks) if marks else {}
-    )
+    unrealized_by_asset = pnl_analysis.unrealized_pnl(transactions, marks) if marks else {}
     for asset_code in sorted({tx["asset"] for tx in transactions}):
         pos = pnl_analysis.position(transactions, asset_code)
         if not pos.qty:
@@ -89,13 +85,10 @@ def render_pnl_report(report: PnlReport) -> list[str]:
     if report.asset is not None:
         (row,) = report.rows
         lines = [
-            f"{row.asset}: realized={row.realized} open_qty={row.open_qty} "
-            f"avg_cost={row.avg_cost}"
+            f"{row.asset}: realized={row.realized} open_qty={row.open_qty} avg_cost={row.avg_cost}"
         ]
         if row.mark is not None:
-            lines.append(
-                f"{row.asset}: mark={row.mark} unrealized={row.unrealized}"
-            )
+            lines.append(f"{row.asset}: mark={row.mark} unrealized={row.unrealized}")
         return lines
 
     lines = [f"total realized P&L: {report.total_realized}"]

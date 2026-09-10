@@ -115,7 +115,7 @@ def _as_decimal(value: object) -> Decimal | None:
         return value
     try:
         return Decimal(str(value))
-    except (ArithmeticError, ValueError):
+    except ArithmeticError, ValueError:
         return None
 
 
@@ -135,7 +135,7 @@ def policy_for(rule: Rule) -> ExitPolicy:
     raw_period = params.get("atr_period", DEFAULT_TRAIL_ATR_PERIOD)
     try:
         atr_period = int(raw_period)
-    except (TypeError, ValueError):
+    except TypeError, ValueError:
         atr_period = DEFAULT_TRAIL_ATR_PERIOD
     if atr_period <= 0:
         atr_period = DEFAULT_TRAIL_ATR_PERIOD
