@@ -1,4 +1,4 @@
-"""The browser gate: three of the nine capability-increasing actions, and what releases them.
+"""The browser gate: two of the nine capability-increasing actions, and what releases them.
 
 `keel/capabilities.py` has said since it was written that "#436's browser gate would be a second
 `Gate` here and a second value in `Capability.gate` -- which is the point of writing the
@@ -9,91 +9,150 @@ wrong.
 
 ── WHAT THIS IS NOT ──────────────────────────────────────────────────────────────────────────
 
-**Not a bypass, and not a seam in the TTY gate.** `_is_interactive` is untouched, has no
-env-var or flag override, and the CLI path still requires a real terminal. This is a SECOND kind
-of evidence for the same fact -- a human, present, who typed something a script would not. The
-other six are refused here as firmly as they are refused to cron.
+**Not a bypass, and not a seam in the TTY gate.** `_is_interactive` is untouched, has no env-var
+or flag override, and the CLI path still requires a real terminal. This is a SECOND kind of
+evidence for the same fact -- a human, present, who typed something a script would not. The other
+seven are refused here as firmly as they are refused to cron.
 
-**Not the whole gate either.** The typed phrase is one of three checks, and on its own it is the
-weakest: it proves intent, not locality. `security.gated_action_permitted` decides whether this
-request may attempt an action at all (loopback peer, loopback bind, no declared remote origin),
-and `security.gates_token` proves the request came from a page this session served. All three,
-in `server.do_POST`, in that order.
+**Not the whole gate either.** The typed phrase proves intent, not locality, and on its own it is
+the weakest of the three checks a request must pass. `security.gated_action_permitted` decides
+whether a request may attempt an action at all -- loopback peer, loopback bind, no declared
+remote origin -- and `security.gates_token` proves it came from a page this session served.
+Stage 2b wires all three into `server.do_POST`; **until it does, nothing in this package routes
+here, and `keel/web/__init__.py`'s invariant is unchanged.** This module is a declaration.
 
-── WHY THESE THREE, AND NOT THE OTHER SIX ────────────────────────────────────────────────────
+── WHY THESE TWO ─────────────────────────────────────────────────────────────────────────────
 
-Every one of the three RELEASES A BRAKE a rail applied, and that is deliberately not described
-as "risk-reducing": they increase what keel can do. What makes them Tier 1 is that the capability
-is bounded and instantly reversible -- the rail that fired can fire again, and `keel kill` undoes
-all three from anywhere, with no ceremony, because stopping must never be slower than starting.
+Both release a halt an operator has reviewed, and neither is described as risk-reducing: they
+increase what keel can do. What makes them Tier 1 is that the capability is bounded -- the rail
+that fired can fire again on the next cycle -- and that the state they change is a flag rather
+than a measurement. Neither destroys a record.
 
-The other six grant STANDING capability or move a baseline. `autonomy on` converts every later
-prompt into an automatic yes for the window it names. `record-flow` rebases the drawdown
-high-water mark, which `capabilities.py` calls out as "the one direction a circuit breaker must
-not fail in". The three attestations are statements about the world that nothing can check.
-`update` replaces the binary. None is admitted, and the table below cannot be widened to include
-one without deleting a test that says why it is absent.
+`reset-hwm` was here and was dropped to Tier 2 (#790). `reset_high_water_mark` clears the mark,
+zeroes BOTH drawdown scalars and empties `equity_history` -- the rolling window the weekly peak
+is computed from. That is strictly more destructive than `record-flow`, which Tier 2 refuses
+because it "can, with the wrong sign, mask a real trading drawdown". Admitting the action that
+ERASES the evidence while refusing the one that adjusts it was a boundary that argued against
+itself, and the honest resolution was to move it rather than to reword the criterion.
+
+`resume` is the subtler of the two, and its own entry says so: `guards.check` reads
+`repo.get_state("kill_switch", default=True)`, so an unset kill-switch is ENGAGED. On a
+never-resumed deployment this does not release a brake a rail applied -- it moves a fail-closed
+default to permissive. It stays in Tier 1 because `keel kill` re-engages it in one gesture from
+anywhere, which is the property that bounds it.
+
+**Stopping must never be slower than starting.** `keel kill` is ungated by design -- its own
+docstring says "Always allowed (safe action)" and it is absent from `CAPABILITIES`. The browser
+has no halt today, so a release route that shipped before one would mean an operator could start
+from a phone and not stop from it. Stage 2b ships the ungated one-click halt in the same change
+as the first release route, not after it.
+
+── WHAT THE OPERATOR IS TOLD ─────────────────────────────────────────────────────────────────
+
+`action` and `detail` are IMPORTED from `keel.commands.trading`, never restated. That module
+holds this wording because "two front-ends printing one ceremony out of two copies is exactly the
+drift O3 forbids -- the CLI imports and prints these; the console imports and renders these;
+neither re-words them". A browser is a third front-end and the rule does not change for it. The
+first version of this module paraphrased, and the drift was immediate.
 """
 
 from __future__ import annotations
 
 import secrets
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
+from types import MappingProxyType
+
+from keel.commands.trading import (
+    RESUME_ACTION,
+    RESUME_DETAIL,
+    RESUME_ENTRIES_ACTION,
+    RESUME_ENTRIES_DETAIL,
+    clear_consecutive_loss_halt,
+    disengage_kill_switch,
+)
+from keel.data.repository import Repository
 
 
 @dataclass(frozen=True)
 class Tier1Action:
     """One action the browser may release, and the sentence that releases it."""
 
-    #: The `Capability.function` this reaches, in `keel.cli`. Named rather than imported here:
-    #: the dispatch that calls it lives in `server.py`, so this module stays a declaration.
-    function: str
-    #: What the rail was doing, in the operator's terms -- rendered in the modal above the field.
-    releases: str
-    #: The exact sentence the operator types. Never the action's own key: a phrase a script can
-    #: derive from the URL is evidence of nothing.
+    #: The OPERATION ITSELF -- the state service from `keel.commands.trading`, imported and held
+    #: as a reference. Never the `click.Command` of the same name: `getattr(keel.cli, "resume")()`
+    #: would enter Click standalone mode, re-parse the SERVER's `sys.argv`, run the TTY gate with
+    #: no terminal and `sys.exit` inside a request thread.
+    #:
+    #: **A reference and not a dotted string, and that is a safety property rather than taste.**
+    #: The first spelling was `"keel.commands.trading.disengage_kill_switch"` -- exactly the one
+    #: form no AST scan can see. A stage 2b dispatch resolving it through
+    #: `getattr(import_module(...), name)` left all three of `keel/web/__init__.py`'s scans green
+    #: while releasing the kill switch, and the comment here claimed the opposite as fact (#791
+    #: review). Holding the function makes the import AND the call site visible, so the effect
+    #: scan sees this package reaching two operations and can require they be exactly the two it
+    #: is allowed to reach.
+    operation: Callable[[Repository], None]
+    #: The CLI's own words for what is about to happen. Imported, never restated.
+    action: str
+    #: The CLI's own consequence line, shown under it.
+    detail: str
+    #: The exact sentence the operator types. Never derivable from the key: a phrase a script can
+    #: build from the URL is evidence of nothing.
     phrase: str
 
 
-#: The three, and only these three (#781). A closed table: `tests/web/test_gates_tier1.py` names
-#: each Tier 2 action individually and asserts its absence, so admitting one means deleting a
-#: test that states why it was out.
-TIER1_ACTIONS: dict[str, Tier1Action] = {
-    "resume": Tier1Action(
-        function="resume",
-        releases="the kill-switch halt that stopped all trading",
-        phrase="RESUME TRADING",
-    ),
-    "resume-entries": Tier1Action(
-        function="resume_entries",
-        releases="rail 16's consecutive-loss halt on new entries",
-        phrase="CLEAR STREAK HALT",
-    ),
-    "reset-hwm": Tier1Action(
-        function="reset_hwm",
-        releases="rail 11's drawdown veto, by re-seeding the high-water mark",
-        phrase="RESET HIGH WATER MARK",
-    ),
-}
+#: The two, and only these two (#781, #790). A read-only mapping, because the closure is the
+#: safety property and a plain `dict` let any importer add `autonomy-on` in one line -- while
+#: stage 2b's dispatch reads this table at request time.
+TIER1_ACTIONS: Mapping[str, Tier1Action] = MappingProxyType(
+    {
+        "resume": Tier1Action(
+            operation=disengage_kill_switch,
+            action=RESUME_ACTION,
+            detail=RESUME_DETAIL,
+            phrase="RESUME TRADING",
+        ),
+        "resume-entries": Tier1Action(
+            operation=clear_consecutive_loss_halt,
+            action=RESUME_ENTRIES_ACTION,
+            detail=RESUME_ENTRIES_DETAIL,
+            phrase="CLEAR STREAK HALT",
+        ),
+    }
+)
 
 
-def phrase_matches(action_key: str, presented: str | None) -> bool:
+def phrase_matches(action_key: str, presented: object) -> bool:
     """Whether `presented` is EXACTLY the phrase that releases `action_key`.
 
     Exactly is meant literally: not case-folded, not stripped, not prefix-matched. The operator
     is asked to reproduce one specific sentence, and every loosening turns a deliberate act into
     a plausible typo. `RESUME TRADING` and `resume trading` are different answers to "prove you
-    meant this", and only one of them is the answer that was asked for.
+    meant this", and only one is the answer that was asked for.
 
-    Fails closed on the KEY as well as the phrase: an action absent from the table has no phrase,
-    and "no phrase" must never read as "no phrase required" -- which is what a lookup returning
-    an empty default would quietly mean.
+    **Bound to the action, which is the property that was missing.** A version testing the
+    presented phrase against every row passed the whole first suite -- and made any Tier 1 phrase
+    a master key for every Tier 1 action, which is the closure this module calls its safety
+    property, defeated.
 
-    `compare_digest` because it costs one call and removes the timing question entirely. The
-    phrase is public -- the modal prints it -- so this is belt-and-braces rather than
-    load-bearing, and saying so is cheaper than leaving a reader to wonder.
+    Fails closed on the KEY as well: an action absent from the table has no phrase, and "no
+    phrase" must never read as "no phrase required" -- which is what a lookup returning an empty
+    default would quietly mean.
+
+    **And refuses, never raises.** `secrets.compare_digest` raises `TypeError` on a non-ASCII
+    `str` and on a non-`str`, and this argument comes off an operator's keyboard through a JSON
+    body -- so a smart quote or a non-breaking space from a phone delivered the correct verdict
+    as a 500. `security.tokens_match` guards the same class of input for the same reason, but its
+    guard is WEAKER -- `not presented or not presented.isascii()`, with no `isinstance` check, so
+    a non-`str` still raises there. This module repeated the ASCII half of that bug one PR after
+    it was fixed (#790) and carries the stronger guard now.
+
+    `compare_digest` because it costs one call and removes the timing question. The phrase is
+    public -- the modal prints it -- so this is belt-and-braces rather than load-bearing.
     """
-    action = TIER1_ACTIONS.get(action_key)
-    if action is None or not presented:
+    action = TIER1_ACTIONS.get(action_key) if isinstance(action_key, str) else None
+    if action is None:
+        return False
+    if not isinstance(presented, str) or not presented or not presented.isascii():
         return False
     return secrets.compare_digest(presented, action.phrase)

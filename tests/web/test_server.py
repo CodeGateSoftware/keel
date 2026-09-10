@@ -1513,12 +1513,24 @@ def _effects_of_gated_actions() -> dict[str, str]:
             None,
         )
         assert target is not None, f"{cap.key} names a function that does not exist"
+        # `from X import f as g` binds `g` locally while the operation is `f`. `keel/cli.py`
+        # does exactly that for `record_flow as record_declared_flow`, so a scan reading callee
+        # names alone dropped the whole record-flow effect -- and an aliased import of it into
+        # `keel/web/` then passed every scan (#791 review). Both names are recorded: the local
+        # one so the call site resolves, the real one so an import of it anywhere is seen.
+        aliases: dict[str, str] = {}
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ImportFrom):
+                for alias in node.names:
+                    if alias.asname:
+                        aliases[alias.asname] = alias.name
+
         for node in ast.walk(target):
             if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Name):
                 continue
-            name = node.func.id
-            if name in defined_here and name not in _PLUMBING:
-                effects.setdefault(name, cap.invocation)
+            for name in {node.func.id, aliases.get(node.func.id, node.func.id)}:
+                if name in defined_here and name not in _PLUMBING:
+                    effects.setdefault(name, cap.invocation)
     return effects
 
 
@@ -1564,7 +1576,58 @@ def test_the_web_layer_cannot_reach_the_OPERATION_behind_any_gated_action() -> N
                     f"-- the operation behind `{effects[name]}`"
                 )
 
+    # The TWO Tier 1 operations are permitted, in ONE module, as IMPORTS ONLY (#781). Everything
+    # else stays forbidden, and the permission is not a hole punched in the scan -- it is pinned
+    # from both sides by `test_the_only_permitted_effects_are_the_ones_the_gate_table_names`
+    # below, which requires the imported set to equal the table's own.
+    permitted = {"disengage_kill_switch", "clear_consecutive_loss_halt"}
+    offences = [
+        offence
+        for offence in offences
+        if not (offence.startswith("gates.py imports ") and offence.split()[2] in permitted)
+    ]
+
     assert not offences, "the web layer can perform a gated action: " + "; ".join(offences)
+
+
+def test_the_only_permitted_effects_are_the_ones_the_gate_table_names() -> None:
+    """**The exemption above, pinned from the other side.**
+
+    `keel/web/gates.py` imports two operations because its table holds them as references rather
+    than as dotted strings -- a string is the one form no AST scan can see, and a stage 2b
+    dispatch resolving one through `getattr(import_module(...), name)` left every scan green
+    while releasing the kill switch (#791 review).
+
+    So the exemption is not "these two names are fine wherever they appear". It is: the set of
+    gated operations this package imports must be EXACTLY the set its Tier 1 table names, in the
+    one module that declares it, and nowhere else. Adding an import without adding a row fails
+    here; adding a row without the operation being a real gated effect fails the derivation.
+    """
+    import ast
+    import os
+
+    from keel.web.gates import TIER1_ACTIONS
+
+    effects = _effects_of_gated_actions()
+    declared = {action.operation.__name__ for action in TIER1_ACTIONS.values()}
+    assert declared, "an empty table would make this vacuous"
+    assert declared <= set(effects), (
+        "the table names something that is not a gated operation: " + repr(declared - set(effects))
+    )
+
+    imported: dict[str, set[str]] = {}
+    for path in _web_sources():
+        module = os.path.basename(path)
+        for node in ast.walk(ast.parse(open(path, encoding="utf-8").read())):
+            if isinstance(node, ast.ImportFrom):
+                for alias in node.names:
+                    if alias.name in effects:
+                        imported.setdefault(module, set()).add(alias.name)
+
+    assert imported == {"gates.py": declared}, (
+        "gated operations are imported somewhere other than the gate table, or the table and "
+        f"the imports disagree: imported={imported}, table={declared}"
+    )
 
 
 def test_the_effect_scan_can_fail() -> None:

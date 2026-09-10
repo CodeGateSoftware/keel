@@ -18,10 +18,17 @@ now is stronger than the one it replaced, and it is the one anyone actually care
   non-destructive steps -- so a first-run user on a machine with no terminal can create a
   deployment. "No POST at all" was a clean property that was also satisfied by a server which
   could not set anything up.
-* **Not one of the nine capability-increasing actions in `keel/capabilities.py` is reachable
-  from this package**, asserted by tests that scan this source rather than by inspection. The
-  server cannot arm, release or spend. Attesting, promoting, releasing a halt and arming autonomy
-  remain CLI-only, behind the TTY gate; D3 (#436) is where a browser gate for those would go.
+* **Seven of the nine capability-increasing actions in `keel/capabilities.py` are unreachable
+  from this package, and the other two are reachable only as the gate table declares them**,
+  asserted by tests that scan this source rather than by inspection. The server cannot arm or
+  spend, and it can release exactly two halts -- through `gates.TIER1_ACTIONS`, which holds the
+  operations as REFERENCES so that the import and the call site are both visible to the scan. A
+  dotted string would have been the one form no scan can see (#791).
+
+  Attesting, arming autonomy, rebasing the drawdown mark and replacing the binary remain
+  CLI-only, behind the TTY gate. The two halt releases are D3 (#436) arriving: a SECOND gate,
+  never a seam in the first -- `_is_interactive` is untouched and the CLI still needs a real
+  terminal. Nothing routes to the table yet; stage 2b wires `server.do_POST` to it.
 
   **Three scans, because the first one alone was hollow (#788).** It forbade this package from
   naming any `Capability.function` -- and those are the CLI COMMANDS, Click callbacks taking a
