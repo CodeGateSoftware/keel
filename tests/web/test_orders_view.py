@@ -369,46 +369,109 @@ def _recent_ts(now: int) -> int:
     The bound is inclusive (`created < start_ts` is what skips a row), so landing exactly on the
     boundary is inside.
 
-    **What this does NOT close, stated rather than left to be rediscovered.** The fixture reads
-    the clock and the server reads it again a moment later. If those two reads straddle midnight
-    -- the fixture at 23:59:59.95, the server at 00:00:00.05 -- the row is placed inside the old
-    UTC day and judged against the new one, and the assertion fails exactly as it did in CI. That
-    window is the setup-to-request gap, on the order of 100ms, against 60s before: roughly one
-    run in ten million rather than one in 1440.
+    **The clock race this leaves, and where it IS closed.** `book` reads the clock and the
+    server reads it again a moment later, so reads that straddle midnight place the row in the
+    old UTC day and judge it against the new one. Measured end to end -- fixture reading to the
+    handler's first `time.time()`, seeding and socket bind included -- that gap is about 0.4s,
+    so roughly one run in 200,000 against one in 1440 before.
 
-    It is left open deliberately. Closing it needs either a sleep past the boundary in a fixture
-    or a `skip` guarded on the echoed `scope_start_at` -- and a conditional skip is a test that
-    can decide not to run, which is the failure #775 was about: were `scope_start_at` ever wrong,
-    the guard would silently skip forever instead of going red.
+    The first version of this docstring guessed "on the order of 100ms" and derived "one in ten
+    million" from it. Both numbers were wrong, in opposite directions, which is what a guessed
+    figure in a docstring is worth in a repository whose docstrings are its rules. This one was
+    measured.
+
+    It is not left open. `book_at_midnight` below stops the clock half a second past a UTC
+    boundary and gives the fixture and the handler the SAME one, which closes the race entirely
+    and -- with `now - 60` in place of this clamp -- reproduces the CI failure deterministically.
+    The first version of this docstring claimed the only ways out were a sleep in a fixture or a
+    self-skipping guard. Both were wrong: the server runs in-process on a thread, so there is a
+    third way, and it needs three lines.
+
+    **Two mutations of this module are deliberately NOT rejected**, because they are correct code
+    by another route rather than defects: seeding the live row at `now` (always inside today, by
+    construction) and the old row at `now - DAY` (always outside it). A test written to reject
+    those would be pinning this spelling rather than the property, which is over-fitting of the
+    kind #776 was about.
     """
-    return max(now - 60, scope_start_ts("today", now) or 0)
+    boundary = scope_start_ts("today", now)
+    # `assert`, never `or 0`. `scope_start_ts` returns `None` on a clock it cannot read and for
+    # any scope outside `_SCOPE_DAYS` (it does not normalise), and `max(now - 60, 0)` is
+    # `now - 60` -- this function silently becoming the bug it exists to fix, with every test
+    # green. Unreachable from `int(time.time())` today; loud if it ever is not (#778 review).
+    assert boundary is not None, "the today scope always has a boundary"
+    return max(now - 60, boundary)
 
 
-@pytest.fixture
-def book(tmp_path: Path) -> Iterator[web_server.ServeConfig]:
-    """A deployment whose book holds one live order and one paper order."""
+def _old_ts(now: int) -> int:
+    """When to place the row that must fall OUTSIDE `?scope=today`.
+
+    A helper for one expression, because the test that guards it has to read the SAME expression
+    the fixture inserts. Restated in the test instead, it asserted arithmetic over two literals:
+    moving this to `now - DAY` left it green while the row it describes had moved inside the
+    scope (#778 review)."""
+    return now - 90 * DAY
+
+
+def _seed_book(tmp_path: Path, now: int) -> tuple[str, str]:
+    """The two rows every book in this module holds, seeded from ONE clock reading.
+
+    One seeder for both fixtures, so that a defect in the placement has a single place to live
+    and `book_at_midnight` below is exercising the same code `book` does. Two copies is how the
+    first version came to have tests that proved `_recent_ts` correct while proving nothing about
+    whether anything called it -- reverting the fixture to `now - 60` passed 56 of 56 (#778
+    review).
+    """
     db_path = tmp_path / "keel.db"
     conn = connect(str(db_path))
     migrate(conn)
     repo = Repository(conn)
-    now = int(time.time())
     recent = _recent_ts(now)
     repo.insert_order(
         _order(mode="live", confirmation="autonomous", created_at=recent, updated_at=recent)
     )
+    old = _old_ts(now)
     repo.insert_order(
         _order(
             mode="paper",
             confirmation="paper",
-            created_at=now - 90 * DAY,
-            updated_at=now - 90 * DAY,
+            created_at=old,
+            updated_at=old,
             raw_response=json.dumps({"role": "entry"}),
         )
     )
     conn.close()
     config_path = tmp_path / "config.yaml"
     config_path.write_text(VALID_CONFIG_YAML)
-    yield from _bind(str(db_path), str(config_path))
+    return str(db_path), str(config_path)
+
+
+@pytest.fixture
+def book(tmp_path: Path) -> Iterator[web_server.ServeConfig]:
+    """A deployment whose book holds one live order and one paper order."""
+    yield from _bind(*_seed_book(tmp_path, int(time.time())))
+
+
+#: Half a second past 2026-09-10 00:00:00 UTC -- the worst instant in the day for this module,
+#: and the one CI actually ran at (run 34419113683 started at 00:00:01).
+_MIDNIGHT = 1_788_998_400.5
+
+
+@pytest.fixture
+def book_at_midnight(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[Any]:
+    """The same book, with the clock STOPPED half a second into a new UTC day.
+
+    **One clock on both sides, which is the whole trick.** `_bind` runs the server in-process on
+    a thread and `api.read_orders` reads `time.time()` in the handler, so patching it here
+    reaches the request too. The fixture and the endpoint then agree about which UTC day it is,
+    and the race between two readings of a moving clock is gone rather than made rarer.
+
+    It is NOT the "fixed future instant" `book` avoids. That objection is about placing rows at a
+    constant while the boundary moves, which puts every row inside every scope; here the rows are
+    placed RELATIVE to the frozen value, so the 90-day row is still outside and the scope still
+    has to discriminate for the test below to pass.
+    """
+    monkeypatch.setattr(web_api.time, "time", lambda: _MIDNIGHT)
+    yield from _bind(*_seed_book(tmp_path, int(_MIDNIGHT)))
 
 
 def _json_get(cfg: web_server.ServeConfig, path: str) -> tuple[int, Any]:
@@ -481,15 +544,26 @@ def test_the_books_recent_row_lands_inside_today_whatever_hour_the_suite_runs(
     placed = _recent_ts(now)
     assert placed >= boundary, label + ": the row must be inside today's scope"
     assert placed <= now, label + ": the row must not be in the future"
+    # And still RECENT. Without this, `return boundary` (the row pinned at midnight) and
+    # `max(now - 86400, boundary)` (a day old) both passed: the two assertions above are
+    # satisfied by any placement anywhere in the day (#778 review).
+    assert placed >= now - 60, label + ": the row must stay a minute old, not merely in-scope"
 
 
-def test_the_books_old_row_stays_outside_today() -> None:
+@pytest.mark.parametrize("now", [1_788_998_401, 1_789_041_600, 1_789_084_799])
+def test_the_books_old_row_stays_outside_today(now: int) -> None:
     """The other half of the pairing. A clamp that dragged BOTH rows into today would make the
     scope assertion pass while proving the scope does nothing -- which is the failure the
-    fixture's real-clock anchoring exists to prevent."""
-    now = 1_788_998_401
+    fixture's real-clock anchoring exists to prevent.
 
-    assert (now - 90 * DAY) < (scope_start_ts("today", now) or 0)
+    Reads `_old_ts`, which is what the fixture inserts. The first version restated the
+    expression, so it was an arithmetic tautology over two literals: moving the fixture's old row
+    to `now - DAY` passed, and the row this test exists to keep outside the scope was inside it
+    (#778 review)."""
+    boundary = scope_start_ts("today", now)
+    assert boundary is not None
+
+    assert _old_ts(now) < boundary, "the paper row must fall outside today"
 
 
 def test_the_scope_is_normalised_and_echoed_rather_than_refused(
@@ -507,6 +581,46 @@ def test_the_scope_is_normalised_and_echoed_rather_than_refused(
     # The 90-day-old paper row falls outside; the book still says it holds two.
     assert scoped["data"]["scoped_count"]["value"] == "1"
     assert scoped["data"]["total_count"]["value"] == "2"
+
+
+def test_the_scope_holds_the_recent_row_half_a_second_into_a_new_utc_day(
+    book_at_midnight: web_server.ServeConfig,
+) -> None:
+    """**The CI failure, reproduced deterministically instead of waited for.**
+
+    Run 34419113683 started at 00:00:01 UTC and `scoped_count` came back `0`. Every other test of
+    this fix asserts over `_recent_ts` in isolation; this one drives `/api/orders?scope=today`
+    with the clock stopped at the worst instant in the day, so the endpoint itself is what is
+    being checked.
+
+    Reverting `_recent_ts` to `now - 60` turns this red every run rather than one in 1440.
+
+    `total_count` is asserted too: it is what proves the frozen clock has not simply swallowed
+    the whole book into the scope. The 90-day row is still out, so the scope is still doing the
+    work the assertion credits it with."""
+    status, scoped = _json_get(book_at_midnight, "/api/orders?scope=today")
+
+    assert status == 200, scoped
+    assert scoped["data"]["scope"] == "today"
+    assert scoped["data"]["scoped_count"]["value"] == "1"
+    assert scoped["data"]["total_count"]["value"] == "2"
+
+
+def test_a_row_created_exactly_on_the_scope_boundary_is_inside_it(tmp_path: Path) -> None:
+    """**The property `_recent_ts`' clamp leans on, pinned.**
+
+    During the flake window the clamp lands the row EXACTLY on `scope_start_ts`, which is only
+    correct because `gather_orders` skips a row when `created < start_ts` -- strictly less than.
+    Flip that to `<=` and the clamp silently stops working: CI goes red for sixty seconds a day
+    again, with nothing naming why. That mutation survived 1092 tests before this one (#778
+    review)."""
+    # `_report` builds at `NOW_TS`, so the boundary has to be computed from the same instant.
+    boundary = scope_start_ts("today", NOW_TS)
+    assert boundary is not None
+
+    report = _report(tmp_path, _order(created_at=boundary), scope="today")
+
+    assert report.scoped_count == 1, "a row on the boundary is inside the scope, not before it"
 
 
 def test_the_status_filter_reaches_the_service_from_the_query(
