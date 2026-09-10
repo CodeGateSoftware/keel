@@ -21,10 +21,16 @@ as deliberate. #541 deleted the TUI and the console layer that was reachable onl
 and those four rows went with their call sites. `mirrors` stays on the dataclass: it describes a
 shape this registry must be able to express the moment a second front-end gates anything again.
 
-**What that leaves is worth stating plainly: every capability increase in this build is a CLI
-command run by a person at a terminal.** The browser can perform none of them. That is not a
-property of what the client draws -- "a client that hides a button is not a gate" -- it is a
-property of the server, which implements no verb that would reach one.
+**Seven of the nine capability increases in this build are a CLI command run by a person at a
+terminal, and the browser can perform none of those.** That is not a property of what the client
+draws -- "a client that hides a button is not a gate" -- it is a property of the server, which
+implements no verb that would reach one, asserted by scans over `keel/web/`'s own source.
+
+The other two -- releasing the kill-switch halt and clearing rail 16's -- are reachable from the
+browser since #781, behind `BROWSER` below. They appear TWICE here: once as the CLI row that has
+always existed, and once as a `web` row carrying `mirrors` back to it. That is the shape
+`mirrors` was kept for -- "it describes a shape this registry must be able to express the moment
+a second front-end gates anything again" -- and this is that moment.
 
 **And one bypass is deliberately absent, as it always was.** `keel rules promote --force` skips
 the backtest and every gate check, and it is not here, because this registry is an inventory of
@@ -68,8 +74,28 @@ TTY = Gate(
     implementation="keel.commands._common._require_interactive_confirmation",
 )
 
-#: Every gate kind keel knows about. #436 adds the browser gate here, not beside it.
-GATES: tuple[Gate, ...] = (TTY,)
+BROWSER = Gate(
+    name="browser",
+    evidence=(
+        "an exact typed phrase from a human at a loopback session on a loopback bind, carrying "
+        "a write token derived for this surface alone"
+    ),
+    fails_closed_against=(
+        "everything the TTY gate refuses, plus a tunnel, a reverse proxy and a LAN bind -- "
+        "checked on the socket's peer address and on the bind, never on a header, because a "
+        "header is a claim and this gate exists for the case where the claim is a lie"
+    ),
+    implementation="keel.web.gates.run_gated_action",
+)
+
+#: Every gate kind keel knows about. Two since #781, and a third arriving must edit
+#: `tests/test_capabilities.py::test_the_gate_vocabulary_is_stated_and_bounded` to do it.
+#:
+#: **`BROWSER` is a SECOND gate and never a seam in the first.** `_is_interactive` is untouched,
+#: still has no env-var or flag override, and every CLI path still requires a real terminal. Two
+#: kinds of evidence for one fact -- a human, present, who meant this -- and the browser's kind
+#: is admitted for two actions out of nine.
+GATES: tuple[Gate, ...] = (TTY, BROWSER)
 
 
 @dataclass(frozen=True)
@@ -80,7 +106,7 @@ class Capability:
     module: str
     #: Enclosing function of the call site. `(module, function)` is the identity the pin matches.
     function: str
-    #: The front-end an operator reaches this through: `cli`, `console` or `tui`.
+    #: The front-end an operator reaches this through: `cli`, `console`, `tui` or `web`.
     surface: str
     #: What the operator invokes.
     invocation: str
@@ -196,6 +222,35 @@ CAPABILITIES: tuple[Capability, ...] = (
             "the running binary is replaced. Not a trading capability, but it changes every "
             "other one at once, which is why it is gated identically"
         ),
+    ),
+    # -- the browser, since #781 ---------------------------------------------------------------
+    #
+    # One row per CALL SITE, and these are the second call site for two actions that already had
+    # one. `mirrors` names the CLI row each reflects, so the duplication reads as deliberate: the
+    # same action, reached from a second front-end, gated by a second kind of evidence.
+    Capability(
+        module="keel.web.gates",
+        function="run_gated_action",
+        surface="web",
+        invocation="the Resume trading button, with its typed phrase",
+        increases=(
+            "trading resumes after the kill-switch halted it -- the same increase `keel resume` "
+            "grants, reached from a browser on a loopback session instead of from a terminal"
+        ),
+        gate=BROWSER.name,
+        mirrors=("keel.cli", "resume"),
+    ),
+    Capability(
+        module="keel.web.gates",
+        function="run_gated_action",
+        surface="web",
+        invocation="the Clear streak halt button, with its typed phrase",
+        increases=(
+            "new entries resume after rail 16's consecutive-loss halt -- the same increase "
+            "`keel resume-entries` grants, reached from a browser on a loopback session"
+        ),
+        gate=BROWSER.name,
+        mirrors=("keel.cli", "resume_entries"),
     ),
 )
 

@@ -371,3 +371,115 @@ def test_the_operator_sees_the_cli_s_own_words_and_not_a_paraphrase() -> None:
         # the operator rail 16's ceremony while disengaging the kill switch (#791 review).
         assert action.action is expected[key][0], key
         assert action.detail is expected[key][1], key
+
+
+# -- the dispatch, and the halt beside it (stage 2b, #781) ---------------------------------------
+
+
+def test_the_halt_is_declared_ungated_and_carries_no_phrase() -> None:
+    """**Stopping must never be slower than starting.**
+
+    `keel kill` is ungated by design -- its docstring is "Always allowed (safe action)" and it is
+    absent from `CAPABILITIES`, because a ceremony in front of the stop makes the stop slower
+    than the start. The browser's halt inherits that: one click, no phrase, no confirmation.
+
+    It ships in the SAME change as the first release route. A release route landing first would
+    mean an operator could start from a phone and not stop from it, which is the inversion this
+    whole tier is ordered to avoid."""
+    from keel.commands import trading
+
+    assert gates.HALT.operation is trading.engage_kill_switch
+    assert not hasattr(gates.HALT, "phrase"), "a phrase in front of the stop is the wrong shape"
+    assert gates.HALT.done is trading.KILL_ENGAGED_LINE
+
+
+def test_the_halt_is_not_in_the_tier_one_table() -> None:
+    """It is not a gated action and must not be reachable through the gated dispatch: a caller
+    naming `halt` there would be asking for a phrase check on something that has none."""
+    assert "halt" not in gates.TIER1_ACTIONS
+    assert gates.run_gated_action(_cfg_stub(), "halt", "") is None
+
+
+def _cfg_stub() -> object:
+    """A config whose `db_path` no dispatch should ever reach -- every test below that uses it
+    expects a refusal BEFORE the database is opened."""
+
+    class _Cfg:
+        db_path = "/nonexistent/keel.db"
+
+    return _Cfg()
+
+
+@pytest.mark.parametrize("key", ["resume", "resume-entries"])
+def test_a_gated_action_refuses_a_wrong_phrase_without_opening_the_database(key: str) -> None:
+    """**The refusal comes first, and that ordering is the test.**
+
+    `db_path` points at nothing. If the dispatch opened the repository before checking the
+    phrase, this would raise rather than return `None` -- so this pins that a wrong phrase costs
+    the deployment nothing at all, not even a connection."""
+    assert gates.run_gated_action(_cfg_stub(), key, "NOPE") is None
+    assert gates.run_gated_action(_cfg_stub(), key, "") is None
+    assert gates.run_gated_action(_cfg_stub(), key, None) is None
+
+
+def test_an_unknown_action_is_refused_before_anything_else() -> None:
+    """Same ordering, on the key. `autonomy-on` is a real capability and not a Tier 1 one; it
+    must not reach a database either."""
+    for key in ("autonomy-on", "reset-hwm", "", "../resume", "RESUME"):
+        assert gates.run_gated_action(_cfg_stub(), key, "RESUME TRADING") is None, key
+
+
+def test_a_correct_phrase_performs_the_operation_and_reports_the_cli_s_line(tmp_path) -> None:
+    """The whole path, against a real database: the phrase matches, the operation runs, and what
+    comes back is the line the CLI prints for it -- not a sentence this layer invented."""
+    from keel.commands import trading
+    from keel.data.db import connect, migrate
+    from keel.data.repository import Repository
+
+    db_path = tmp_path / "keel.db"
+    conn = connect(str(db_path))
+    migrate(conn)
+    Repository(conn).set_state("kill_switch", True)
+    conn.close()
+
+    class _Cfg:
+        pass
+
+    cfg = _Cfg()
+    cfg.db_path = str(db_path)  # type: ignore[attr-defined]
+
+    assert gates.run_gated_action(cfg, "resume", "RESUME TRADING") == trading.RESUME_DISENGAGED_LINE
+
+    conn = connect(str(db_path))
+    try:
+        assert Repository(conn).get_state("kill_switch", default=True) is False
+    finally:
+        conn.close()
+
+
+def test_the_halt_engages_the_kill_switch(tmp_path) -> None:
+    """And the halt, which takes no phrase: one call, and the rail's fail-closed default is back
+    in force."""
+    from keel.commands import trading
+    from keel.data.db import connect, migrate
+    from keel.data.repository import Repository
+
+    db_path = tmp_path / "keel.db"
+    conn = connect(str(db_path))
+    migrate(conn)
+    Repository(conn).set_state("kill_switch", False)
+    conn.close()
+
+    class _Cfg:
+        pass
+
+    cfg = _Cfg()
+    cfg.db_path = str(db_path)  # type: ignore[attr-defined]
+
+    assert gates.run_halt(cfg) == trading.KILL_ENGAGED_LINE
+
+    conn = connect(str(db_path))
+    try:
+        assert Repository(conn).get_state("kill_switch", default=True) is True
+    finally:
+        conn.close()

@@ -61,6 +61,7 @@ def _request(
     form: dict[str, str] | None = None,
     raw_body: str | None = None,
     csrf: str | None = None,
+    gate: str | None = None,
     client_header: str | None = "1",
     sec_fetch_site: str | None = None,
     origin: str | None = None,
@@ -87,6 +88,8 @@ def _request(
         headers["Cookie"] = cookie
     if method == "POST" and client_header is not None:
         headers["X-Keel-Client"] = client_header
+    if gate is not None:
+        headers[security.GATES_HEADER] = gate
     if sec_fetch_site is not None:
         headers["Sec-Fetch-Site"] = sec_fetch_site
     if origin is not None:
@@ -295,10 +298,13 @@ def test_no_capability_increasing_action_is_reachable_from_the_web_layer() -> No
 
     from keel.capabilities import CAPABILITIES
 
-    forbidden_functions = {cap.function for cap in CAPABILITIES} | {
-        "_require_interactive_confirmation"
-    }
-    forbidden_modules = {cap.module for cap in CAPABILITIES}
+    # TTY rows only (#781). A `web` row's `function` is the browser gate's own implementation,
+    # which necessarily LIVES in this package -- forbidding it here would forbid the gate from
+    # existing. What this scan is about is the CLI surface being unreachable from the browser,
+    # and that is exactly the TTY-gated set.
+    tty = [cap for cap in CAPABILITIES if cap.gate == "tty"]
+    forbidden_functions = {cap.function for cap in tty} | {"_require_interactive_confirmation"}
+    forbidden_modules = {cap.module for cap in tty}
 
     web_dir = os.path.join(
         os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
@@ -410,11 +416,18 @@ def test_the_disjointness_comments_state_the_actual_capability_count() -> None:
     #: assertions below would pass on an empty list and prove nothing.
     assert stated, "no source under keel/web states the capability count in prose"
 
+    # ACTIONS, not rows (#781). The inventory holds one row per CALL SITE, and since the browser
+    # gained a gate two actions have two rows each -- a CLI row and a `web` row that `mirrors`
+    # it. The prose counts what an operator would count: distinct capability increases, which is
+    # the rows that mirror nothing.
+    actions = [cap for cap in CAPABILITIES if cap.mirrors is None]
+    assert len(actions) < len(CAPABILITIES), "no mirrored rows -- has the browser gate gone?"
+
     for rel, word in stated:
         assert word in number_words, f"{rel} states an unrecognised count word: {word!r}"
-        assert number_words[word] == len(CAPABILITIES), (
+        assert number_words[word] == len(actions), (
             f"{rel} says {word!r} ({number_words[word]}) capability-increasing actions, but "
-            f"keel/capabilities.py's CAPABILITIES has {len(CAPABILITIES)} rows -- prose is stale"
+            f"keel/capabilities.py declares {len(actions)} distinct ones -- prose is stale"
         )
 
 
@@ -1502,6 +1515,13 @@ def _effects_of_gated_actions() -> dict[str, str]:
 
     effects: dict[str, str] = {}
     for cap in CAPABILITIES:
+        if cap.gate != "tty":
+            # A browser row's function is the gate itself, whose body calls this package's own
+            # helpers. Deriving "effects" from it would forbid `keel/web/` from calling code that
+            # lives in `keel/web/`. What a browser row reaches is its `Tier1Action.operation`,
+            # and `test_the_only_permitted_effects_are_the_ones_the_gate_table_names` is what
+            # pins that -- from both sides, which a derivation could not.
+            continue
         module = importlib.import_module(cap.module)
         tree = ast.parse(open(module.__file__, encoding="utf-8").read())
         target = next(
@@ -1688,3 +1708,162 @@ def test_the_web_layer_writes_to_no_database_at_all() -> None:
                 offences.append(f"{os.path.basename(path)} calls repository.{node.func.attr}")
 
     assert not offences, "the web layer writes to the database: " + "; ".join(offences)
+
+
+# -- the gated write surface (stage 2b, #781) -----------------------------------------------------
+
+
+def _gate_post(running, path, *, phrase=None, gate=None, cookie=None):
+    """A POST to `/api/gates/*` carrying, by default, everything a real browser would."""
+    import json as _json
+
+    return _request(
+        running,
+        path,
+        method="POST",
+        cookie=cookie if cookie is not None else _session(running),
+        gate=security.gates_token(running.token) if gate is None else gate,
+        raw_body=_json.dumps({} if phrase is None else {"phrase": phrase}),
+    )
+
+
+def test_a_gated_action_needs_the_gate_token_and_not_the_setup_one(running) -> None:
+    """**The two write tokens are not interchangeable, which is the whole point of deriving them
+    under different labels (#786).**
+
+    The setup token is written into `/api/setup`'s document, so anything that can read that page
+    holds it. If it also released a rail, "can create a deployment" and "can release a halt"
+    would be one permission."""
+    status, _headers, body = _gate_post(
+        running,
+        "/api/gates/resume",
+        phrase="RESUME TRADING",
+        gate=security.csrf_token(running.token),
+    )
+
+    assert status == 403, body
+    assert "RESUME TRADING" not in body, "a refusal must not echo the phrase back"
+
+
+def test_a_gated_action_needs_a_session(running) -> None:
+    status, _headers, _body = _gate_post(
+        running, "/api/gates/resume", phrase="RESUME TRADING", cookie=""
+    )
+    assert status == 403
+
+
+def test_a_gated_action_is_refused_without_the_api_client_header(running) -> None:
+    """The header a plain HTML form can never set, which is what keeps a cross-origin form from
+    reaching this at all."""
+    import json as _json
+
+    status, _headers, _body = _request(
+        running,
+        "/api/gates/resume",
+        method="POST",
+        cookie=_session(running),
+        gate=security.gates_token(running.token),
+        client_header=None,
+        raw_body=_json.dumps({"phrase": "RESUME TRADING"}),
+    )
+    assert status == 403
+
+
+def test_a_wrong_phrase_is_refused_and_changes_nothing(running) -> None:
+    status, _headers, body = _gate_post(running, "/api/gates/resume", phrase="nope")
+
+    assert status == 403, body
+    assert "nope" not in body
+
+
+def test_a_tier_two_action_has_no_route_at_all(running) -> None:
+    """`autonomy-on` is a real capability and is not admitted. It must 404 rather than 403: there
+    is no such action here, and saying so is both true and less informative than a refusal."""
+    for key in ("autonomy-on", "reset-hwm", "record-flow", "update"):
+        status, _headers, _body = _gate_post(running, f"/api/gates/{key}", phrase="X")
+        assert status == 404, key
+
+
+def test_the_gated_route_answers_no_GET(running) -> None:
+    """A capability increase behind a GET would be reachable from an `<img src>`."""
+    status, _headers, _body = _request(running, "/api/gates/resume", cookie=_session(running))
+    assert status == 404
+
+
+def test_a_release_is_refused_on_a_deployment_configured_for_remote_access(deployment) -> None:
+    """**The guard the whole tier rests on, at the route.**
+
+    Every other test here runs against a loopback-only server, so the locality check always
+    passes and deleting it entirely was invisible -- it passed the full suite. This is the test
+    that makes it visible: a deployment with `--external-host` set is one whose requests may have
+    come through a tunnel, and `cloudflared` connects over loopback, so the peer address alone
+    says nothing.
+
+    The refusal names the CLI, because an operator on a tunnel has not lost the ability to do
+    this -- they have lost the ability to do it from here."""
+    import json as _json
+
+    remote = frozenset({"keel.example.com"})
+    with _serving(deployment, external_hosts=remote) as tunnelled:
+        status, _headers, body = _request(
+            tunnelled,
+            "/api/gates/resume",
+            method="POST",
+            cookie=f"{SESSION_COOKIE}={tunnelled.token}",
+            gate=security.gates_token(tunnelled.token),
+            raw_body=_json.dumps({"phrase": "RESUME TRADING"}),
+        )
+
+    assert status == 403, body
+    assert "terminal" in body, "the refusal must say where the action is still available"
+
+
+def test_the_halt_is_reachable_from_a_remote_deployment_and_engages(deployment) -> None:
+    """**Stopping is never gated on locality, and this is where that is enforced.**
+
+    The release above is refused on a tunnelled deployment. The halt is not: an operator whose
+    keel is behind a tunnel must be able to stop it from the tunnel, and a stop refused for
+    being remote is the one failure this surface must not have. It still needs the session and
+    the gate token, because it is a write.
+
+    Also pins that `halt` has a branch of its own: removed, the key falls through to the Tier 1
+    lookup and 404s -- a halt button that does nothing, which no other test here would see."""
+    import json as _json
+
+    from keel.data.db import connect
+    from keel.data.repository import Repository
+
+    db_path, _config_path = deployment
+    remote = frozenset({"keel.example.com"})
+    with _serving(deployment, external_hosts=remote) as tunnelled:
+        status, _headers, body = _request(
+            tunnelled,
+            "/api/gates/halt",
+            method="POST",
+            cookie=f"{SESSION_COOKIE}={tunnelled.token}",
+            gate=security.gates_token(tunnelled.token),
+            raw_body=_json.dumps({}),
+        )
+
+    assert status == 200, body
+    conn = connect(db_path)
+    try:
+        assert Repository(conn).get_state("kill_switch", default=False) is True
+    finally:
+        conn.close()
+
+
+def test_the_halt_still_needs_the_gate_token(deployment) -> None:
+    """Ungated means no PHRASE and no locality check. It does not mean no authentication."""
+    import json as _json
+
+    with _serving(deployment) as running_local:
+        status, _headers, _body = _request(
+            running_local,
+            "/api/gates/halt",
+            method="POST",
+            cookie=f"{SESSION_COOKIE}={running_local.token}",
+            gate="not-the-token",
+            raw_body=_json.dumps({}),
+        )
+    assert status == 403

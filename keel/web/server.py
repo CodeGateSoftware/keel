@@ -55,10 +55,13 @@ from urllib.parse import parse_qs, urlsplit
 from keel.web import api, events, runtime, staticfiles
 from keel.web.security import (
     CSRF_HEADER,
+    GATES_HEADER,
     REMOTE_SESSION_MAX_AGE_SECONDS,
     SESSION_COOKIE,
     HostPolicy,
     csrf_token,
+    gated_action_permitted,
+    gates_token,
     parse_cookie_header,
     session_cookie,
     tokens_match,
@@ -205,6 +208,20 @@ EVENTS_PATH = "/api/events"
 #: increasing actions in `keel/capabilities.py`. A browser can set a deployment up. It still cannot
 #: arm a rule, attest an asset or enable autonomy.
 API_SETUP_PREFIX = "/api/setup/"
+
+#: The gated write surface (#781). A prefix of its own rather than a key under `/api/setup/`,
+#: because the two carry different tokens, answer to different checks and have different blast
+#: radii -- and `keel.commands.setup.ACTIONS` is asserted disjoint from every gated action, which
+#: a shared prefix would make a confusing thing to state.
+API_GATES_PREFIX = "/api/gates/"
+
+#: The one ungated key under that prefix. Not a `Tier1Action`: it takes no phrase and no locality
+#: check, because refusing a STOP is the one failure this surface must not have.
+HALT_KEY = "halt"
+
+#: One sentence for the missing-gate-token refusal, in one place, because two spellings of one
+#: refusal is how a reader comes to think they are two different failures.
+_NO_GATE_TOKEN = "That request did not carry this session's gate token. Reload the page."
 
 
 def run_setup_action(cfg: ServeConfig, key: str, form: dict[str, str]) -> Any:
@@ -744,6 +761,10 @@ class KeelHandler(BaseHTTPRequestHandler):
         if not self._api_client_header_ok():
             return
 
+        if parsed.path.startswith(API_GATES_PREFIX):
+            self._gated_action(parsed.path[len(API_GATES_PREFIX) :])
+            return
+
         if not parsed.path.startswith(API_SETUP_PREFIX):
             self._refuse(404, "No such action", f"Nothing accepts a POST at {parsed.path}.")
             return
@@ -782,6 +803,76 @@ class KeelHandler(BaseHTTPRequestHandler):
         # reloaded is a client view that re-reads `/api/setup` itself. The actions are idempotent,
         # so a repeated submission is harmless by construction rather than by a redirect.
         self._send_json(200, api.action_document(result))
+
+    def _gated_action(self, key: str) -> None:
+        """One Tier 1 release, or the halt (#781). Four checks, and the order is the contract.
+
+        `_admitted` and `_api_client_header_ok` are already behind us -- this method is reached
+        only from `do_POST`, after them. What it adds:
+
+        1. **The halt is separated first, and takes no locality check.** `keel kill` is ungated
+           because a ceremony in front of the stop makes the stop slower than the start, and the
+           same argument refuses to add a LOCALITY condition to it: an operator whose deployment
+           is behind a tunnel must be able to halt from the tunnel. It still needs the session
+           and the gate token, because it is a write; it needs nothing else, because refusing a
+           stop is the one failure mode this surface must not have.
+
+        2. **Locality, for a release.** `gated_action_permitted` wants a loopback peer, a
+           loopback bind and no declared remote origin -- see its own docstring for why the peer
+           alone is not enough (a tunnel forwards to loopback) and why the bind is read too (a
+           declaration is something an operator types, and two ordinary deployments never do).
+
+        3. **The gate token**, derived apart from the setup one so a value captured from
+           `/api/setup`'s document cannot release a rail.
+
+        4. **The typed phrase**, checked in `gates.run_gated_action`, which opens no database
+           until it matches.
+
+        An unknown key is a 404 and a failed check is a 403, and neither ever echoes the phrase:
+        a refusal that quoted it back would put a credential-shaped string into logs and into
+        whatever the operator pastes while asking for help.
+        """
+        from keel.web import gates
+
+        if key == HALT_KEY:
+            if not tokens_match(self.headers.get(GATES_HEADER), gates_token(self.cfg.token)):
+                self._refuse(403, "Refused", _NO_GATE_TOKEN)
+                return
+            self._send_json(200, api.action_document(gates.run_halt(self.cfg)))
+            return
+
+        if key not in gates.TIER1_ACTIONS:
+            self._refuse(404, "No such action", f"{key!r} is not an action this gate performs.")
+            return
+
+        if not gated_action_permitted(
+            self.client_address,
+            external_hosts=self.cfg.external_hosts,
+            bound_host=self.cfg.host,
+        ):
+            self._refuse(
+                403,
+                "Refused",
+                "Gated actions are restricted to a loopback session on a loopback bind. This "
+                "deployment is reachable from elsewhere, so keel refuses them here and they "
+                "remain available at the terminal.",
+            )
+            return
+
+        if not tokens_match(self.headers.get(GATES_HEADER), gates_token(self.cfg.token)):
+            self._refuse(403, "Refused", _NO_GATE_TOKEN)
+            return
+
+        values = self._read_json_object()
+        if values is None:
+            self._refuse(400, "Unreadable request", "The body was not a JSON object of fields.")
+            return
+
+        done = gates.run_gated_action(self.cfg, key, values.get("phrase"))
+        if done is None:
+            self._refuse(403, "Refused", "That was not the phrase this action asks for.")
+            return
+        self._send_json(200, api.action_document(done))
 
     def _read_json_object(self) -> dict[str, str] | None:
         """The JSON request body as `{field: string}`, or `None` for anything else.

@@ -141,6 +141,11 @@ TOKEN_ENTROPY_BITS = 256
 #: is redundancy rather than duplication: they fail independently.
 CSRF_HEADER = "X-Keel-CSRF"
 
+#: The header carrying `gates_token` (#781). A SECOND header, not a second value in the first:
+#: two surfaces whose tokens are derived apart should not be presented through one field, where a
+#: handler could check the wrong one and still see something that looked right.
+GATES_HEADER = "X-Keel-Gate"
+
 #: Hostnames that mean "this machine" and are therefore acceptable in a `Host:` header when the
 #: server is bound to a loopback address. Anything else -- including a hostname that RESOLVES to
 #: 127.0.0.1 -- is rejected, which is the entire point of checking the header at all.
