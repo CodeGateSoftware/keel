@@ -22,10 +22,16 @@ target-version = "py314"
 # packages`. Lint has a debt in `docs/` and `scripts/`; formatting no longer has one anywhere,
 # and scoping the check would re-open exactly the drift the one-shot pass closed.
 #
-# The PEP 758 note above is the reason this could be turned on at all: the pass rewrote 28
+# The PEP 758 note above is the reason this could be turned on at all: the pass rewrote 38
 # `except (A, B):` into `except A, B:`, which is what that note predicted and what the `>=3.14`
 # floor now makes safe. `tests/test_python_floor.py` pins that floor across all eight
-# distributions, so the syntax cannot outlive the interpreter that parses it.
+# distributions, so the syntax cannot outlive the interpreter that parses it. The rewrite is
+# provably neutral rather than merely believed to be: the two forms parse to a byte-identical
+# AST, and all 197 reformatted files were AST-compared against the commit before the pass.
+#
+# (38, not the 28 this first said. The miscount came from a regex that required the FIRST
+# exception name to end in `Error`, which missed ten. It is the one number justifying the
+# change, so it is the one number that had to be measured rather than estimated.)
 
 [lint]
 select = ["E", "F", "I", "UP"]

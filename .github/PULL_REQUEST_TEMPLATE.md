@@ -19,6 +19,7 @@
 ## Gates (all must pass)
 
 - [ ] `uv run ruff check` clean
+- [ ] `uv run ruff format --check .` clean
 - [ ] `uv run mypy` clean
 - [ ] `uv run pytest -q` green
 
