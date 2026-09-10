@@ -925,6 +925,15 @@ export function setupView(data, section, onSection) {
   fragment.append(el("h1", undefined, "Setup"));
   fragment.append(el("p", "sub", plain(data.root)));
 
+  // ABOVE the switch, and outside every section (#775). `market_data` is a `Stage.PAPER` step,
+  // so the button that starts this job is on the "To run in paper" tab -- and the first spelling
+  // put the panel reporting it inside the "Setup" section, where the operator who pressed it is
+  // not looking. The state line, the elapsed time, the streamed transcript and `job.error` were
+  // all invisible to the one reader they exist for, which defeats `jobPanel`'s own reason for
+  // keeping a failure on screen: "the whole point of running something in the background is that
+  // nobody was watching when it broke."
+  if (data.job) fragment.append(jobPanel(data.job));
+
   fragment.append(sectioned(data, SETUP_SECTIONS, section, onSection, "Setup section"));
   return fragment;
 }
@@ -964,9 +973,12 @@ const SETUP_SECTIONS = [
 /**
  * Where this deployment stands, and the one thing to do next.
  *
- * No heading -- the page's `<h1>` says "Setup" and the tab bar says which section is on. The
- * running job's panel belongs here rather than under a stage: a fetch started from the paper
- * stage keeps reporting its progress to a reader who has since moved on to the live one.
+ * No heading -- the page's `<h1>` says "Setup" and the tab bar says which section is on.
+ *
+ * **The running job's panel is NOT here**, and the first spelling's argument for putting it here
+ * was backwards -- see `setupView`. A panel inside a section reports to whoever is reading that
+ * section, which is never the operator who pressed the button, because every action lives in a
+ * stage section and the panel did not.
  *
  * @param {any} data
  * @returns {DocumentFragment}
@@ -982,8 +994,6 @@ function setupSummary(data) {
       kv("database file", plain(data.db_path)),
     ]),
   );
-
-  if (data.job) fragment.append(jobPanel(data.job));
 
   const steps = data.steps || [];
   const next = steps.find(/** @param {any} step */ (step) => step.key === data.next_step);
@@ -2569,23 +2579,42 @@ const SCOPES = ["today", "7d", "all"];
  * a section renamed while a reader had its tab open -- falls back to the first, which is a page
  * that renders rather than a blank one.
  *
- * @param {any} data  the view's payload, passed through to whichever builder runs.
- * @param {Section[]} table
- * @param {string} [current]  a `table` key, or `""` for the first section.
+ * ── TWO PARAMETER NAMES THAT ARE LOAD-BEARING (#775) ─────────────────────────────────────────
+ *
+ * **`sections`, not `table`.** `table` is this module's own row renderer, three hundred lines
+ * up. Shadowing it here breaks nothing today because neither function calls it -- and
+ * `test_every_call_resolves_to_something_the_module_has` scopes parameters per function, so it
+ * would go on passing while a `table(...)` added inside either one resolved to an array and
+ * shipped a runtime `TypeError`. That test's own docstring records this class of miss from #701.
+ *
+ * **`payload`, not `data` -- HERE, and only here.** These two helpers sit between `activityView`
+ * and `insightsView`, so `_view_keys` counts them inside `activityView`'s region: any
+ * `data.<key>` written here would be checked against `/api/activity`, which is not the endpoint
+ * it came from. Naming the parameter something else makes that mistake unspellable.
+ *
+ * The same rename applied to `setupPaper`/`setupLive` was an own-goal and is reverted (#776
+ * review): those two sit INSIDE `setupView`'s region, where `data.` is exactly what the parity
+ * pin scans for, so `payload` there would hide a wrong key rather than expose one. Proved with a
+ * controlled pair -- `payload.made_up_key` in `setupPaper` escaped the suite; the identical
+ * `data.made_up_key` in `setupSummary` was caught. The rule is regional, not global.
+ *
+ * @param {any} payload  the view's payload, passed through to whichever builder runs.
+ * @param {Section[]} sections
+ * @param {string} [current]  a `sections` key, or `""` for the first section.
  * @param {(key: string) => void} [onSection]
  * @param {string} [label]  how this page's tab bar announces itself.
  * @returns {DocumentFragment}
  */
-function sectioned(data, table, current, onSection, label) {
+function sectioned(payload, sections, current, onSection, label) {
   const fragment = document.createDocumentFragment();
   if (!onSection) {
-    for (const entry of table) fragment.append(entry.build(data, entry));
+    for (const entry of sections) fragment.append(entry.build(payload, entry));
     return fragment;
   }
-  const chosen = table.find(/** @param {Section} entry */ (entry) => entry.key === current);
-  const here = chosen || table[0];
-  fragment.append(sectionSwitch(here.key, table, onSection, label));
-  fragment.append(here.build(data, here));
+  const chosen = sections.find(/** @param {Section} entry */ (entry) => entry.key === current);
+  const here = chosen || sections[0];
+  fragment.append(sectionSwitch(here.key, sections, onSection, label));
+  fragment.append(here.build(payload, here));
   return fragment;
 }
 
@@ -2607,16 +2636,16 @@ function sectioned(data, table, current, onSection, label) {
  * landed in -- the lesson `scopeSwitch` learned at #659 when it grew a second caller.
  *
  * @param {string} current  the resolved section key -- never the raw request.
- * @param {Section[]} table
+ * @param {Section[]} sections
  * @param {(key: string) => void} onSection
  * @param {string} [label]
  * @returns {HTMLElement}
  */
-function sectionSwitch(current, table, onSection, label) {
+function sectionSwitch(current, sections, onSection, label) {
   const wrap = el("nav", "scopes");
   wrap.setAttribute("aria-label", label || "Section");
   wrap.append(el("span", "k", "section"));
-  for (const entry of table) {
+  for (const entry of sections) {
     const button = el("button", "scopekey", entry.label);
     button.setAttribute("type", "button");
     button.setAttribute("data-focus", "section:".concat(entry.key));
