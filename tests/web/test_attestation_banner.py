@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import re
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -284,8 +285,10 @@ def test_the_banner_has_words_for_every_state_the_model_can_be_in() -> None:
         for name in dir(attestations)
         if name.isupper() and isinstance(getattr(attestations, name), str)
     }
-    covered = set(payload._ATTESTATION_WHEN) | {attestations.OK}
-    assert states - covered == set()
+    # BOTH tables. `tones` is indexed first, and for one revision this test pinned only the
+    # wording table -- so the dict whose miss actually raises was the one it could not see.
+    for table in (payload._ATTESTATION_WHEN, payload._ATTESTATION_TONES):
+        assert states - (set(table) | {attestations.OK}) == set(), sorted(table)
 
 
 def test_a_suspended_attestation_reads_as_the_refusal_it_is() -> None:
@@ -305,3 +308,136 @@ def test_a_suspended_attestation_reads_as_the_refusal_it_is() -> None:
     assert alert["state"]["state"] == payload.BAD
     assert alert["when_label"] == "attested"
     assert alert["when"]["value"] == payload.iso(NOW - 86_400)
+
+
+def test_the_banner_reads_the_venue_the_deployment_is_bound_to(deployment: tuple[str, str]) -> None:
+    """`survey` defaults to coinbase and `attestation_alerts` took that default.
+
+    It is read from the CONFIG and not from `current_venue()`: that is a `ContextVar` bound once
+    at process entry, and context variables do not cross into the threads a `ThreadingHTTPServer`
+    answers on -- so reading it here returns `None` on every request and falls back to coinbase,
+    which is the bug rather than the fix."""
+    from keel.config import load_config
+    from keel.web import api as web_api
+
+    _db_path, config_path = deployment
+    config = Path(config_path)
+    config.write_text(config.read_text(encoding="utf-8") + "\nbroker:\n  name: alpaca\n")
+    # The fixture's default is coinbase, so a test that failed to change it would pass against
+    # the very default it is meant to reject.
+    assert load_config(config_path).broker.name == "alpaca"
+
+    asked: list[str] = []
+    original = web_api.open_repo
+
+    def _spy(path: str) -> Any:
+        repo = original(path)
+        inner = repo.get_venue_cash_posture
+
+        def _record(venue: str) -> Any:
+            asked.append(venue)
+            return inner(venue)
+
+        repo.get_venue_cash_posture = _record
+        return repo
+
+    web_api.open_repo = _spy  # type: ignore[assignment]
+    try:
+        web_api.respond(_cfg(deployment), "/api/status", {})
+    finally:
+        web_api.open_repo = original  # type: ignore[assignment]
+
+    assert asked == ["alpaca"], f"read the wrong venue: {asked}"
+
+
+def test_a_read_that_failed_says_so_rather_than_all_clear(
+    deployment: tuple[str, str], monkeypatch: Any
+) -> None:
+    """`[]` is "checked, nothing is wrong" -- `envelope`'s own distinction, and the case this
+    guard exists for (a database locked by the agent mid-cycle) is when the banner matters most.
+
+    Driven at `attestation_alerts` rather than through `respond`, deliberately: an `open_repo`
+    that throws for EVERYONE takes the route down too and the answer is a 500 error envelope,
+    which carries no `attestations` key at all. What is under test here is the banner failing on
+    its own while the page still renders."""
+    from keel import attestations as model
+    from keel.web import api as web_api
+
+    def _explode(*_args: Any, **_kwargs: Any) -> Any:
+        raise OSError("database is locked")
+
+    monkeypatch.setattr(model, "survey", _explode)
+    assert web_api.attestation_alerts(_cfg(deployment), NOW) is None
+
+
+def test_every_reading_the_client_mints_carries_the_whole_envelope() -> None:
+    """**The defect the rest of this file could not see.**
+
+    `api.js`'s `reading()` builds a CLOSED object literal, and `attestations` was not in it -- so
+    `primary.attestations` was `undefined` on every request, `Array.isArray(undefined)` was
+    false, and the banner took its empty branch forever. Every assertion above passed: the server
+    payload was right, the renderer was right, and `paint` did call the renderer. The wire
+    between them did not exist.
+
+    The scan that was supposed to catch it asserted the CALL TEXT appeared inside `paint` -- the
+    exact mistake its own sibling comment names, "a source-text scan passes on a declaration
+    alone". A call to a property nobody produces is still a call.
+
+    So this asserts over the LITERALS: every object the client mints as a `Reading` must carry
+    the same key set, and that set must include every key the server's envelope puts on the
+    wire. Adding a key to `payload.envelope` and forgetting one literal fails here."""
+    from keel.web import payload as server_payload
+
+    source = _code("api.js") + _code("live.js")
+    # Every `{ as_of: ... }` object literal -- the minted readings, and nothing else in either
+    # file starts an object with that key.
+    #
+    # Brace-MATCHED, not regexed. `.*?\}` stops at the first closing brace, and one of these
+    # literals carries a nested `error: {...}`, so the slice ended inside it and the keys after
+    # it -- `sort` and the very key under test -- were reported missing from a literal that had
+    # them. The same mis-bounding cost #775 a test that inspected a neighbour's code.
+    literals = []
+    for start in (index for index in range(len(source)) if source.startswith("{", index)):
+        depth, end = 0, None
+        for index in range(start, len(source)):
+            if source[index] == "{":
+                depth += 1
+            elif source[index] == "}":
+                depth -= 1
+                if depth == 0:
+                    end = index + 1
+                    break
+        if end is None:
+            continue
+        literal = source[start:end]
+        if re.match(r"\{\s*as_of:", literal):
+            literals.append(literal)
+    assert len(literals) >= 5, f"found only {len(literals)} readings; the shape moved"
+
+    envelope_keys = set(server_payload.envelope(0, running=False, data=None))
+
+    # **Presence is not enough, and this half was added after the pin let a mutant through.**
+    # A literal reading `attestations: null` on the SUCCESS path carries the key and still
+    # discards every alert the server sent -- the original defect exactly, one line further on.
+    # Whatever the success literal does for `data` and `sort`, it must do for this.
+    (success,) = [literal for literal in literals if "document_." in literal]
+    forwarded = set(re.findall(r"([a-z_]+): document_\.", success))
+    assert envelope_keys - {"engine"} <= forwarded | {"as_of"}, (
+        f"the success reading invents rather than forwards: {sorted(envelope_keys - forwarded)}"
+    )
+
+    for literal in literals:
+        # After `{` or `,` -- the one-line literals have no key at a line start.
+        keys = set(re.findall(r"[{,]\s*([a-z_]+):", literal))
+        missing = envelope_keys - keys
+        assert not missing, f"a Reading drops {sorted(missing)}: {literal[:90]}"
+
+
+def test_a_refusal_carries_the_key_as_null_like_every_other_answer() -> None:
+    """`error_envelope` is the other document the client reads, and `reading()` mints a `Reading`
+    from it. A key missing there is `undefined` on the client, which reads as "nothing wrong" --
+    the same silence, one document over. It is always `null`: most refusals happen before the
+    session cookie is checked, so filling it in would mean an unauthenticated request reading the
+    deployment database, which is the argument that keeps `engine` out of this document too."""
+    refusal = payload.error_envelope(NOW, status=403, title="No", detail="no")
+    assert "attestations" in refusal and refusal["attestations"] is None

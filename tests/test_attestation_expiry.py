@@ -17,7 +17,9 @@ from a TTL, rail 22 stores a due date -- and about no surface ever computing one
 
 from __future__ import annotations
 
+from dataclasses import replace
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -181,7 +183,10 @@ def test_doctor_reads_rail_17s_TTL_from_the_executor_rather_than_restating_it(
     (rail17,) = [
         f
         for f in doctor.attestation_findings(
-            subscription=None, withdrawals_attested_at=NOW - 4 * 86_400, now_ts=NOW
+            subscription=None,
+            withdrawals_attested_at=NOW - 4 * 86_400,
+            withdrawals_enabled=True,
+            now_ts=NOW,
         )
         if f.name == "attest.withdrawals"
     ]
@@ -209,7 +214,10 @@ def test_doctor_starts_warning_on_rail_17_exactly_when_the_banner_does(
     (rail17,) = [
         f
         for f in doctor.attestation_findings(
-            subscription=None, withdrawals_attested_at=attested_at, now_ts=NOW
+            subscription=None,
+            withdrawals_attested_at=attested_at,
+            withdrawals_enabled=True,
+            now_ts=NOW,
         )
         if f.name == "attest.withdrawals"
     ]
@@ -276,3 +284,184 @@ def test_the_verdict_does_not_outrank_the_clock() -> None:
         satisfied=False,
     )
     assert stale.state(NOW) == attestations.EXPIRED
+
+
+# -- the review of #794 ------------------------------------------------------------------------
+#
+# Every test below was written against a defect the first version of this module actually had.
+# The pattern in all of them is the same: the model answered the CLOCK question correctly and
+# then disagreed with the rail about whether the attestation was any good.
+
+
+def _posture(**overrides: Any) -> Any:
+    from keel_core.cash_posture import CashPostureState, VenueCashPosture
+
+    fields: dict[str, Any] = {
+        "venue": "coinbase",
+        "state": CashPostureState.ATTESTED,
+        "attested_posture": "SPOT_CASH",
+        "attested_ts": NOW - 86_400,
+        "attest_due_ts": NOW + 60 * 86_400,
+        "refuted_ts": None,
+        "refuted_reason": None,
+        "credential_fingerprint": "fp-1",
+    }
+    return VenueCashPosture(**{**fields, **overrides})
+
+
+class _PostureRepo:
+    """Just the read `_posture_dates` makes."""
+
+    def __init__(self, record: Any, *, venue: str = "coinbase") -> None:
+        self._record, self._venue = record, venue
+        self.asked_for: list[str] = []
+
+    def get_state(self, key: str, default: Any = None) -> Any:
+        return default
+
+    def get_venue_cash_posture(self, venue: str) -> Any:
+        self.asked_for.append(venue)
+        return self._record if venue == self._venue else None
+
+
+def test_a_refuted_posture_is_not_a_healthy_one() -> None:
+    """**The worst of the #794 findings, because it made things worse than before.**
+
+    `refute_posture` PRESERVES `attested_ts` and `attest_due_ts` (`posture.py:28-29`), so a
+    refuted record still carries a due date months out. The model read the dates alone, called it
+    `ok`, and the banner stayed blank while rail 22 vetoed every live entry. Worse: `ok:<due_ts>`
+    is a window that does not move, so the `attestation.expiring` alert doctor still FAILs on was
+    delivered once and then suppressed for the rest of the due date -- up to 90 days. Before
+    #793 it fired every cycle.
+    """
+    from keel_core.cash_posture import CashPostureState
+
+    repo = _PostureRepo(_posture(state=CashPostureState.REFUTED, refuted_ts=NOW - 3_600))
+    (_withdrawal, posture) = attestations.survey(repo, NOW)
+    assert posture.state(NOW) == attestations.REFUSED
+
+
+def test_a_margin_enabled_posture_is_not_a_healthy_one() -> None:
+    """Rail 22's other veto. Doctor's own words: "a sell can fill as a short".
+
+    The CONSTANT, not the literal `"MARGIN_ENABLED"` -- `cash_posture.MARGIN_ENABLED` is
+    `"margin_enabled"`, and a test that spells it in the wrong case asserts nothing: the
+    comparison is false for the same reason the defect made it false."""
+    from keel_core.cash_posture import MARGIN_ENABLED
+
+    repo = _PostureRepo(_posture(attested_posture=MARGIN_ENABLED))
+    (_withdrawal, posture) = attestations.survey(repo, NOW)
+    assert posture.state(NOW) == attestations.REFUSED
+
+
+def test_a_posture_attested_with_no_due_date_is_not_reported_as_never_attested() -> None:
+    """`MISSING` names a rail nobody has attested. This record WAS attested; what it lacks is an
+    expiry, which `VenueCashPosture` refuses to invent and rail 22 refuses to treat as "never
+    expires". Doctor words it correctly at `doctor.py:516` and the model did not."""
+    repo = _PostureRepo(_posture(attest_due_ts=None))
+    (_withdrawal, posture) = attestations.survey(repo, NOW)
+    assert posture.state(NOW) == attestations.REFUSED
+    assert posture.attested_at == NOW - 86_400, "the date it WAS attested must survive"
+
+
+def test_a_rail_nobody_has_attested_still_reports_missing() -> None:
+    """The negative control for the three above: `MISSING` must not become unreachable."""
+    repo = _PostureRepo(None)
+    (withdrawal, posture) = attestations.survey(repo, NOW)
+    assert (withdrawal.state(NOW), posture.state(NOW)) == (
+        attestations.MISSING,
+        attestations.MISSING,
+    )
+
+
+def test_survey_covers_every_definition_rather_than_the_first_two(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`survey` indexed `_DEFINITIONS[0]` and `[1]`, which two definitions cannot distinguish
+    from iterating them -- so the test has to ADD a third.
+
+    Append a rail and it reaches `survey_definitions()` but never `survey()`, so it can never
+    reach the banner, doctor or the ledger and nothing fails. REORDER the tuple and withdrawal
+    dates get attached to the posture definition. Both are silent."""
+    third = attestations.Attestation(
+        key="third_rail", rail="99", label="A rail added later", remedy="keel attest --something"
+    )
+    monkeypatch.setattr(attestations, "_DEFINITIONS", (*attestations.survey_definitions(), third))
+    surveyed = attestations.survey(_PostureRepo(None), NOW)
+
+    assert [a.key for a in surveyed] == ["withdrawal", "cash_posture", "third_rail"]
+    assert surveyed[2].state(NOW) == attestations.MISSING, "a rail with no reader is not ok"
+
+
+def test_reordering_the_definitions_does_not_cross_the_wires(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The other half of the index coupling, and the one that is actively wrong rather than
+    merely absent: `replace(_DEFINITIONS[0], **_withdrawal_dates(repo))` on a reordered tuple
+    attaches rail 17's dates to rail 22's definition."""
+    monkeypatch.setattr(
+        attestations, "_DEFINITIONS", tuple(reversed(attestations.survey_definitions()))
+    )
+    repo = _PostureRepo(_posture())
+    surveyed = {a.key: a for a in attestations.survey(repo, NOW)}
+
+    assert surveyed["cash_posture"].attested_at == NOW - 86_400
+    assert surveyed["withdrawal"].attested_at is None
+
+
+def test_the_warning_window_never_outlives_the_attestation_it_guards(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`withdrawal_expiry` reads the TTL at call time and the 48-hour window is flat, so a TTL
+    shortened below 48 hours makes every attestation `EXPIRING` the instant it is made -- a
+    banner lit permanently, which is the same thing as a banner nobody reads."""
+    from keel.execution import executor
+
+    monkeypatch.setattr(executor, "WITHDRAWAL_ATTESTATION_TTL_SEC", 6 * 3_600)
+    fresh = replace(
+        attestations.definition("withdrawal"),
+        attested_at=NOW,
+        expires_at=attestations.withdrawal_expiry(attested_at=NOW),
+    )
+    assert fresh.state(NOW) == attestations.OK
+    assert fresh.state(NOW + 4 * 3_600) == attestations.EXPIRING
+
+
+def test_the_survey_never_raises_even_when_every_read_fails() -> None:
+    """The promise `survey`'s docstring makes, which nothing tested. It matters most at
+    `notify_after_cycle`, whose one broad `except` would swallow the whole cycle's
+    notifications -- `rail.armed` and `setup.unplaced` included -- for a fault in here."""
+
+    class _Broken:
+        def get_state(self, *_args: Any, **_kwargs: Any) -> Any:
+            raise OSError("database is locked")
+
+        def get_venue_cash_posture(self, *_args: Any, **_kwargs: Any) -> Any:
+            raise OSError("database is locked")
+
+    surveyed = attestations.survey(_Broken(), NOW)
+    assert [a.state(NOW) for a in surveyed] == [attestations.MISSING, attestations.MISSING]
+
+
+def test_asking_for_an_attestation_that_does_not_exist_is_an_error_not_a_blank() -> None:
+    """`definition` returning a placeholder would put a rail on the banner that no rail owns."""
+    with pytest.raises(KeyError):
+        attestations.definition("no_such_rail")
+
+
+def test_forgetting_rail_17s_verdict_reports_too_loud_rather_than_too_quiet() -> None:
+    """The DEFAULT, which every caller now passes explicitly -- so nothing else notices it.
+
+    A defaulted `True` is what shipped first, and it means a future caller who forgets the
+    argument gets `ok · N day(s) remain` for an account whose broker has frozen withdrawals.
+    `None` is the rail's own word for "nobody has checked" and routes to the never-attested FAIL,
+    so the same forgetfulness costs a false alarm instead of false silence.
+    `cash_posture.py:91-94` states the rule for exactly this shape."""
+    (rail17,) = [
+        f
+        for f in doctor.attestation_findings(
+            subscription=None, withdrawals_attested_at=NOW - 3_600, now_ts=NOW
+        )
+        if f.name == "attest.withdrawals"
+    ]
+    assert rail17.status == doctor.FAIL

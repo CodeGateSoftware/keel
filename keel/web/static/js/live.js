@@ -142,6 +142,7 @@ export function subscribe(onReading) {
         // the ENGINE field carries the whole sentence instead.
         error: null,
         sort: null,
+        attestations: null,
       },
       "",
     );

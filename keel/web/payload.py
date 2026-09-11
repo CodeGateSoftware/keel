@@ -748,7 +748,7 @@ def attestation_alerts(surveyed: Sequence[Any], now_ts: int) -> list[dict[str, A
     """
     from keel import attestations as model
 
-    tones = {model.EXPIRING: WARN, model.EXPIRED: BAD, model.MISSING: BAD, model.REFUSED: BAD}
+    tones = _ATTESTATION_TONES
     # `MISSING` has no instant at all -- `moment(None)` is `ABSENT` -- so its words carry the
     # whole statement. "never attested" is the true one; "expired" would name a lapse that never
     # happened, and rail 22 on this deployment has never been attested once.
@@ -790,6 +790,13 @@ def attestation_alerts(surveyed: Sequence[Any], now_ts: int) -> list[dict[str, A
         )
     return alerts
 
+
+#: How alarming each state is. Module-level beside the wording table, not a local, because both
+#: are indexed by the same key and a test that pins one and not the other pins nothing: `tones`
+#: is read FIRST, so a state added to the model and missed here is the `KeyError` on every page
+#: that `test_the_banner_has_words_for_every_state_the_model_can_be_in` exists to prevent -- and
+#: for one revision that test could not see this dict at all.
+_ATTESTATION_TONES = {"expiring": WARN, "expired": BAD, "missing": BAD, "refused": BAD}
 
 #: The words that precede the one instant `attestation_alerts` sends, by state. Keyed by the
 #: model's own words and pinned against them by
@@ -3069,11 +3076,15 @@ def error_envelope(
 
     `data` is present and `null` so that a client reading `.data` on any response gets a value
     rather than `undefined` -- the key set stays constant across the two documents for the same
-    reason it stays constant across endpoints.
+    reason it stays constant across endpoints. `attestations` (#793) is here for that reason and
+    is always `null`: most refusals happen before the session cookie is checked, so filling it in
+    would mean an unauthenticated request reading the deployment database -- the same argument
+    that keeps `engine` out of this document.
     """
     return {
         "as_of": iso(now_ts),
         "data": None,
+        "attestations": None,
         "error": {"status": str(status), "title": title, "detail": detail},
     }
 

@@ -280,3 +280,35 @@ def test_an_undelivered_alert_is_retried_on_the_next_cycle(repo: Repository) -> 
     calls: list[Any] = []
     _cycle(repo, calls, NOW + HOUR)
     assert _rail17(calls) == 1
+
+
+def test_the_alert_reads_the_venue_the_cycle_is_bound_to(repo: Repository) -> None:
+    """`survey` defaults to `venue="coinbase"` and `notify_after_cycle` took that default while
+    holding a venue it had just resolved (`notifications.py:265`).
+
+    On the paper-equities deployment `current_venue()` is `alpaca`: doctor's rail-22 FINDING is
+    built from alpaca's record and the WINDOW from a coinbase record that does not exist, so the
+    window is `missing:None` forever. The alert fires once, ever, and every later lapse is
+    suppressed against a window that can never change."""
+    from keel_core.telemetry import bind_venue
+
+    bind_venue("alpaca")
+    try:
+        windows = notifications.attestation_windows(
+            attestations.survey(repo, NOW, venue="alpaca"), NOW
+        )
+        asked: list[str] = []
+        original = repo.get_venue_cash_posture
+
+        def _record(venue: str) -> Any:
+            asked.append(venue)
+            return original(venue)
+
+        repo.get_venue_cash_posture = _record  # type: ignore[method-assign]
+        _cycle(repo, [], NOW)
+    finally:
+        bind_venue("coinbase")
+
+    assert asked, "the cycle never read a posture record at all"
+    assert set(asked) == {"alpaca"}, f"read the wrong venue: {asked}"
+    assert windows["attest.cash_posture"].endswith(":None")

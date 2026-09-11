@@ -308,7 +308,11 @@ def notify_after_cycle(
         # #793: an attestation alert goes out ONCE for the window it reports. Applied here and
         # not in `events_from_state`, which stays pure: the ledger is a repo read, and the
         # suppression must key off what was actually DELIVERED, which only this loop knows.
-        windows = attestation_windows(attestations.survey(repo, now_ts), now_ts)
+        # `venue=venue`, not the default. `survey` defaults to coinbase and this took it while
+        # holding the venue resolved at the top of this function -- so on an Alpaca deployment
+        # doctor's rail-22 FINDING came from alpaca's record and the WINDOW from a coinbase
+        # record that does not exist. `missing:None` never moves, so the alert fired once, ever.
+        windows = attestation_windows(attestations.survey(repo, now_ts, venue=venue), now_ts)
         events = unreported(events, windows=windows, already=reported_windows(repo))
 
         sent = 0

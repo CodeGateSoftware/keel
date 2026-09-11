@@ -92,7 +92,7 @@ def attestation_findings(
     subscription: Any | None,
     withdrawals_attested_at: int,
     now_ts: int,
-    withdrawals_enabled: Any = True,
+    withdrawals_enabled: bool | None = None,
 ) -> list[Finding]:
     """Rails 14 and 17 -- days remaining, not just valid/invalid.
 
@@ -104,8 +104,12 @@ def attestation_findings(
     `withdrawals_enabled` is the rail's OTHER key, and its absence here was the same lie one
     column over: rail 17 vetoes on `enabled is False` with its own sentence, and this function,
     handed the timestamp alone, reported `ok · 6 day(s) remain` for an account whose broker had
-    frozen withdrawals. It defaults to `True` so that a caller with only a timestamp still gets
-    the expiry verdicts it always got; both real callers pass the key.
+    frozen withdrawals. It defaults to **`None`**, not `True`: `None` is the rail's own word for
+    "nobody has checked", it routes to the never-attested FAIL below, and a caller who forgets
+    the argument therefore gets a finding that is too LOUD rather than one that is green for a
+    frozen account. `cash_posture.py:91-94` states the rule for exactly this shape -- "inventing
+    one at read time would let a writer forget to set one and have the reader quietly cover for
+    it". `bool | None` rather than `Any`, so mypy can object.
     """
     findings: list[Finding] = []
 

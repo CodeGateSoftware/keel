@@ -39,11 +39,20 @@ NOW = 1_800_000_000  # a fixed, realistic epoch: no fixture clock drift
 # -- builders ---------------------------------------------------------------------------------
 
 
-def _attestation(withdrawals_attested_at: int, now: int = NOW):
+def _attestation(withdrawals_attested_at: int, now: int = NOW, *, enabled: bool | None = True):
     """doctor's own computation, fed a `None` subscription (rail 14 is not what these events
-    are about) and the withdrawal-attestation freshness under test."""
+    are about) and the withdrawal-attestation freshness under test.
+
+    `enabled=True` explicitly. `attestation_findings` used to default it to `True` and #794
+    changed that to `None` -- "nobody has checked" -- because a defaulted `True` on a
+    safety-reporting function reports `ok` for an account whose broker has frozen withdrawals.
+    These tests are about the CLOCK, so they state the verdict rather than inherit it.
+    """
     return attestation_findings(
-        subscription=None, withdrawals_attested_at=withdrawals_attested_at, now_ts=now
+        subscription=None,
+        withdrawals_attested_at=withdrawals_attested_at,
+        withdrawals_enabled=enabled,
+        now_ts=now,
     )
 
 
