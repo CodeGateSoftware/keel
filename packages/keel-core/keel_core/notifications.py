@@ -70,9 +70,14 @@ class EventSpec:
 
 #: THE TAXONOMY (#444's five currently-silent events). Where each one's threshold comes from:
 #:
-#: * `attestation.expiring` -- doctor's `attest.withdrawals` WARN (<=2 of the 7 TTL days
-#:   remain) or FAIL (expired or never attested). Rail 17 fails CLOSED: an expired
-#:   attestation silently vetoes every entry, which is exactly the loop this event closes.
+#: * `attestation.expiring` -- doctor's `attest.withdrawals` or `attest.cash_posture` WARN or
+#:   FAIL. Both rails fail CLOSED: a lapsed attestation silently vetoes every entry, which is
+#:   exactly the loop this event closes. The threshold is `keel.attestations`' -- each rail's
+#:   own window, 48 hours of rail 17's 7-day TTL and a proportional 15 days of rail 22's 90-day
+#:   one -- and #793 made it ONE number per rail, shared with `keel doctor` and the cockpit
+#:   banner, after the three had drifted apart. Sent ONCE per attestation per window; see
+#:   `keel.notifications.unreported` for what a window is and why repeating it was worse than
+#:   saying nothing.
 #: * `rail.armed` -- doctor's `rail.streak_halt` HALTED / `rail.drawdown` FAIL. The kill
 #:   switch is deliberately NOT here: it is engaged by an operator at a TTY, who knows.
 #: * `setup.unplaced` -- a cycle that detected an entry setup and could not place it.

@@ -21,6 +21,7 @@ from decimal import Decimal
 import pytest
 from keel_core.notifications import NotificationSettings, send_event
 
+from keel import notifications
 from keel.commands.doctor import attestation_findings, rail_state_findings
 from keel.config import AutoTradeConfig, Caps, Config, MarketDataConfig
 from keel.notifications import (
@@ -223,8 +224,15 @@ class _Repo:
     Repository) pins that the notification layer READS ONLY: no order writes, no state
     writes, nothing a read-only surface could do."""
 
-    def __init__(self, *, withdrawals_attested_at: int, held: tuple[str, ...] = ()) -> None:
+    def __init__(
+        self,
+        *,
+        withdrawals_attested_at: int,
+        held: tuple[str, ...] = (),
+        withdrawals_enabled: bool | None = True,
+    ) -> None:
         self._withdrawals_attested_at = withdrawals_attested_at
+        self._withdrawals_enabled = withdrawals_enabled
         self._held = held
         self.state_writes: list[tuple[str, object]] = []
         #: #732's read. `None` is the unattested posture, which `cash_posture_findings` reports
@@ -235,6 +243,11 @@ class _Repo:
     def get_state(self, key: str, default: object = None) -> object:
         if key == "withdrawals_attested_at":
             return self._withdrawals_attested_at
+        # Rail 17's second key (#793). The double is a deployment that HAS attested, so the
+        # answer is the attestation's verdict; without it every fixture here reads as an account
+        # nobody ever attested for, and these tests are about the expiry clock.
+        if key == "withdrawals_enabled":
+            return self._withdrawals_enabled
         if key == "kill_switch":
             return False
         if key == "streak_halt_until":
@@ -300,7 +313,11 @@ def test_notify_after_cycle_reads_doctor_seams_and_sends_only_opted_in_events():
     assert sent == 1
     assert len(calls) == 1
     assert "attestation.expiring" in calls[0][1]
-    assert repo.state_writes == []  # notify-only: the layer writes NOTHING back
+    # Notify-only, with ONE exception since #793: the ledger of which attestation windows have
+    # already been alerted on. Pinned as an exact list rather than relaxed to "no writes I mind",
+    # because the property being defended is that nothing this layer writes can change what keel
+    # TRADES -- and that only holds while the set of keys is this short and this boring.
+    assert [key for key, _ in repo.state_writes] == [notifications.NOTIFIED_WINDOWS_KEY]
 
 
 def test_notify_after_cycle_without_a_url_makes_zero_network_calls(monkeypatch):

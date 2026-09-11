@@ -86,9 +86,22 @@ def test_a_tick_is_the_same_envelope_every_endpoint_answers_with(tmp_path: Any) 
     frames = list(events.stream(_cfg(tmp_path), now=clock.time, sleep=clock.sleep, max_sec=0))
     document = json.loads(frames[1].split("data: ", 1)[1])
 
-    assert set(document) == {"as_of", "engine", "data", "sort"}
+    assert set(document) == {"as_of", "engine", "data", "sort", "attestations"}
     assert document["as_of"].endswith("Z")
     assert document["engine"]["value"] in {"running", "stopped"}
+
+
+def test_a_tick_reports_no_attestations_it_is_a_heartbeat_not_a_reading(tmp_path: Any) -> None:
+    """#793 put `attestations` on the envelope, and the envelope is this document too.
+
+    It arrives as `null` and must: the stream reads no database, and `null` is `envelope`'s word
+    for "nothing was read", distinct from `[]`, which claims someone looked and found all clear.
+    Filling it in here would also be figures on the stream, which the test below forbids -- and
+    it would mean a heartbeat every few seconds opening the deployment database.
+    """
+    clock = _Clock()
+    frames = list(events.stream(_cfg(tmp_path), now=clock.time, sleep=clock.sleep, max_sec=0))
+    assert json.loads(frames[1].split("data: ", 1)[1])["attestations"] is None
 
 
 def test_a_tick_carries_a_revision_marker_and_nothing_else(tmp_path: Any) -> None:

@@ -282,6 +282,21 @@
 <p id="mode-banner" class="modebanner"></p>
 
 <!--
+  The attestation banner (#793). Empty in the markup and hidden while empty, like `#mode-banner`
+  above it, and filled by `main.js` on every paint from the ENVELOPE's `attestations`.
+
+  Above `#view` rather than inside it, because the thing it reports is true of the deployment and
+  not of the page: rail 17 expired on 2026-09-08 and `keel` placed no orders for three days while
+  the state sat in a card on the Status page, which is one page of eleven. Here it is on whichever
+  page the operator is actually reading.
+
+  Below the skip link's target for `#mode-banner`'s own reason, and with no `aria-live`: this
+  page keeps exactly one live region (see the note beside `#engine`) and the shell repaints every
+  15 seconds, so an alert region here would announce the same halt four times a minute.
+-->
+<div id="attest-banner" class="attestbanner"></div>
+
+<!--
   `#view` is where `main.js` paints, and `#content` is what the skip link targets (see the note
   beside it): a keyboard user taking skip-to-content lands ABOVE the mode banner rather than past
   it, so the one persistent statement about whether real money is involved is not the thing that

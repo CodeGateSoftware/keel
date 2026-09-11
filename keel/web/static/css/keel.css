@@ -433,6 +433,55 @@ header .sessionpart:empty { display: none; }
 .modebanner.mode-confirm,
 .modebanner.mode-live { color: var(--accent); }
 
+/* The attestation banner (#793). Unlike `.modebanner` above, this one IS an alert: every row in
+ * it names a rail that is refusing entries or is about to, and the remedy is a command the
+ * browser cannot run for the operator.
+ *
+ * `position: sticky` and not `fixed`: sticky participates in layout, so nothing underneath is
+ * covered and a short page does not end up with a strip floating over its last row. It is what
+ * "above the fold" has to mean on a page an operator scrolls -- the evidence for this feature is
+ * a state that WAS on screen and was scrolled past for three days.
+ *
+ * Hidden while empty, for `.modebanner`'s reason inverted: no alerts is a real answer, and the
+ * envelope distinguishes it from "nothing was read" (`null`) so the client never has to. */
+.attestbanner {
+  position: sticky;
+  top: 0;
+  z-index: 5;
+  padding: 0 1rem;
+  border-bottom: 1px solid var(--line);
+  background: var(--card);
+  font-size: 0.85rem;
+}
+.attestbanner:empty { display: none; }
+/* The left edge carries the tone, not the whole ground: a filled red strip across the top of
+ * every page is the loudest thing in the interface and it would be there for as long as the
+ * attestation is, which is how a warning becomes wallpaper. */
+.attestbanner.warn { border-left: 3px solid var(--warn); }
+.attestbanner.bad { border-left: 3px solid var(--bad); }
+.attestline {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 0.5rem;
+  margin: 0;
+  padding: 0.45rem 0;
+}
+.attestline + .attestline { border-top: 1px solid var(--line); }
+.attestline .rail { font-weight: 600; }
+.attestline .what { color: var(--muted); }
+.attestline .left { color: var(--muted); }
+/* The command is selectable text and looks it -- an operator's next move is to copy it. */
+.attestline .remedy {
+  margin-left: auto;
+  padding: 0.1rem 0.35rem;
+  border: 1px solid var(--line);
+  border-radius: 3px;
+  background: var(--bg);
+  font-family: var(--mono, ui-monospace, monospace);
+  user-select: all;
+}
+
 /* The toggle. It deliberately does NOT inherit the filled `button` rule: that one is for an
  * action that changes something on the server, and a filled teal disc beside the nav would be
  * the loudest thing in the header. `--control-line` for the border, not `--line`, for the

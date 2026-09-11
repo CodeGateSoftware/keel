@@ -10,9 +10,11 @@ however long nobody happened to look.
 
 ── WHAT THIS STREAM CARRIES, AND THE THING IT DELIBERATELY DOES NOT ─────────────────────────────
 
-A tick is an `envelope` -- the same four keys `keel/web/payload.py` puts on every `GET /api/*`
+A tick is an `envelope` -- the same keys `keel/web/payload.py` puts on every `GET /api/*`
 answer -- whose `data` holds exactly one string: a **revision marker**. No equity, no positions,
-no counts, no report of any kind.
+no counts, no report of any kind. `attestations` (#793) is on that envelope and arrives here as
+`null` for the same rule: a heartbeat reads no database, and `null` is the envelope's word for
+"nothing was read" as against `[]`, which claims someone looked.
 
 Two reasons, and the second is the one that decided it:
 

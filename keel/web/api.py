@@ -1259,7 +1259,35 @@ def respond(cfg: ServeConfig, path: str, query: Query) -> tuple[int, dict[str, A
         running=running,
         data=data,
         sort=_sort_echo(route, column, descending),
+        # `running`, not `route.needs_database`: the routes that answer without a database
+        # (`/api/setup`, `/api/venues`, `/api/gates`) are pages too, and an operator reading the
+        # setup checklist is exactly who needs to be told an attestation lapsed.
+        attestations=attestation_alerts(cfg, now_ts) if running else None,
     )
+
+
+def attestation_alerts(cfg: ServeConfig, now_ts: int) -> list[dict[str, Any]]:
+    """The banner rows for this deployment, on EVERY answered request (#793).
+
+    One extra read per request, and it is bought deliberately. The alternative -- computing it on
+    `/api/status` only -- is what shipped, and it put rail 17's expiry in a card on the one page
+    an operator was not looking at for three days while live placed nothing.
+
+    Never raises. `survey` already answers an unreadable attestation with `MISSING` rather than an
+    exception, and this adds the same promise for a connection that cannot be opened at all: a
+    database briefly locked by the agent mid-cycle must cost a banner, not a 500 on every page.
+    """
+    from keel import attestations
+
+    repo = None
+    try:
+        repo = open_repo(cfg.db_path)
+        return payload.attestation_alerts(attestations.survey(repo, now_ts), now_ts)
+    except Exception:  # pragma: no cover - the belt to `survey`'s braces
+        return []
+    finally:
+        if repo is not None:
+            close_repo(repo)
 
 
 def refusal_document(status: int, title: str, detail: str) -> dict[str, Any]:

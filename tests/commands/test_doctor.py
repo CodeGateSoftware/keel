@@ -72,7 +72,7 @@ class FakeSubscription:
 
 def test_rail17_fresh_reports_days_remaining() -> None:
     findings = attestation_findings(
-        subscription=None, withdrawals_attested_at=NOW - 4 * DAY, now_ts=NOW, ttl_sec=7 * DAY
+        subscription=None, withdrawals_attested_at=NOW - 4 * DAY, now_ts=NOW
     )
     (rail17,) = [f for f in findings if f.name == "attest.withdrawals"]
     assert rail17.status == "ok"
@@ -81,9 +81,7 @@ def test_rail17_fresh_reports_days_remaining() -> None:
 
 
 def test_rail17_absent_fails_and_names_the_attest_command() -> None:
-    findings = attestation_findings(
-        subscription=None, withdrawals_attested_at=0, now_ts=NOW, ttl_sec=7 * DAY
-    )
+    findings = attestation_findings(subscription=None, withdrawals_attested_at=0, now_ts=NOW)
     (rail17,) = [f for f in findings if f.name == "attest.withdrawals"]
     assert rail17.status == "fail"
     assert "keel withdrawals attest --enabled" in rail17.fix
@@ -91,7 +89,7 @@ def test_rail17_absent_fails_and_names_the_attest_command() -> None:
 
 def test_rail17_expired_fails_with_days_over() -> None:
     findings = attestation_findings(
-        subscription=None, withdrawals_attested_at=NOW - 9 * DAY, now_ts=NOW, ttl_sec=7 * DAY
+        subscription=None, withdrawals_attested_at=NOW - 9 * DAY, now_ts=NOW
     )
     (rail17,) = [f for f in findings if f.name == "attest.withdrawals"]
     assert rail17.status == "fail"
@@ -99,9 +97,7 @@ def test_rail17_expired_fails_with_days_over() -> None:
 
 
 def test_rail14_absent_fails_naming_the_venue() -> None:
-    findings = attestation_findings(
-        subscription=None, withdrawals_attested_at=0, now_ts=NOW, ttl_sec=7 * DAY
-    )
+    findings = attestation_findings(subscription=None, withdrawals_attested_at=0, now_ts=NOW)
     (rail14,) = [f for f in findings if f.name == "attest.subscription"]
     assert rail14.status == "fail"
     assert "keel subscription attest" in rail14.fix
@@ -109,9 +105,7 @@ def test_rail14_absent_fails_naming_the_venue() -> None:
 
 def test_rail14_attestation_due_soon_warns_with_days() -> None:
     record = FakeSubscription(Decimal("500"), NOW + 2 * DAY, "attested")
-    findings = attestation_findings(
-        subscription=record, withdrawals_attested_at=NOW, now_ts=NOW, ttl_sec=7 * DAY
-    )
+    findings = attestation_findings(subscription=record, withdrawals_attested_at=NOW, now_ts=NOW)
     (rail14,) = [f for f in findings if f.name == "attest.subscription"]
     assert rail14.status == "warn"
     assert "2 day" in rail14.detail
@@ -316,7 +310,7 @@ def test_exit_code_fails_only_on_real_faults() -> None:
 
 def test_every_finding_names_a_fix_or_says_none_needed() -> None:
     samples = attestation_findings(
-        subscription=None, withdrawals_attested_at=NOW, now_ts=NOW, ttl_sec=7 * DAY
+        subscription=None, withdrawals_attested_at=NOW, now_ts=NOW
     ) + rail_state_findings(
         kill_switch=False, streak_halt_until=0, drawdown_total=Decimal("0"), now_ts=NOW
     )
