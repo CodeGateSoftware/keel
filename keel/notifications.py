@@ -14,8 +14,16 @@ separate seams:
 * `notify_after_cycle` is the wiring, run at the tail of every agent cycle (see
   `keel.agent.run_once`). It reads the SAME repo keys doctor's `gather_findings` reads,
   derives the events, and hands them to `keel_core.notifications.send_event`. It never
-  raises and never writes: notify-only, per #444's scope. Nothing here is a control surface,
-  and nothing here increases any capability -- #436's TTY gates are untouched.
+  raises. Nothing here is a control surface, and nothing here increases any capability --
+  #436's TTY gates are untouched.
+
+  It writes exactly ONE key, `NOTIFIED_WINDOWS_KEY`, added by #793 and the only departure from
+  "notify-only, per #444's scope". Suppressing a repeated alert requires remembering what has
+  already been said and there is nowhere else to remember it; the alternative was an
+  `attestation.expiring` webhook on every cycle for as long as a rail stayed lapsed, which on
+  the live deployment meant two of them, hourly, indefinitely. No rail, report or decision reads
+  the key, so the worst a wrong value can do is send an alert twice or hold one back for one
+  window. `tests/test_notifications.py` pins the write list as EXACTLY that one key.
 
 The one threshold this module OWNS is `ALLOWANCE_NEARING_USED_PCT`: doctor's allowance
 finding cannot express "nearing" (it WARNs only once the allowance is fully exhausted), and
@@ -26,8 +34,9 @@ numbers.
 
 from __future__ import annotations
 
+import json
 import logging
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from decimal import Decimal
 from typing import TYPE_CHECKING, Any
@@ -41,6 +50,7 @@ from keel_core.notifications import (
 )
 from keel_core.telemetry import current_venue, log_event
 
+from keel import attestations
 from keel.commands import doctor
 from keel.config import Config
 from keel.execution import guards
@@ -66,6 +76,18 @@ _ATTESTATION_FINDINGS = frozenset({"attest.withdrawals", "attest.cash_posture"})
 
 #: Which rail each attestation finding belongs to, for the event message.
 _RAIL_LABEL = {"attest.withdrawals": "rail 17", "attest.cash_posture": "rail 22"}
+
+#: Each attestation finding's key in `keel.attestations`, which is where its expiry lives.
+#: Two tables rather than one because they answer to different modules and a finding can be in
+#: `_ATTESTATION_FINDINGS` without the model knowing it -- `test_every_finding_that_can_fire_the
+#: _event_has_a_window` is the pin that says they must agree.
+_ATTESTATION_MODEL_KEY = {
+    "attest.withdrawals": "withdrawal",
+    "attest.cash_posture": "cash_posture",
+}
+
+#: The repo key holding, per attestation finding, the window its last alert was sent for.
+NOTIFIED_WINDOWS_KEY = "notified_attestation_windows"
 
 #: The doctor findings the rail-armed event reads. `rail.kill_switch` is deliberately absent:
 #: the kill switch is engaged by an operator at a TTY (doctor renders it "a correct state,
@@ -221,7 +243,9 @@ def notify_after_cycle(
     """Derive this cycle's events and deliver the opted-in ones. Returns the delivery count.
 
     Runs AFTER the cycle's trading work, at `run_once`'s tail, and can never break it: every
-    failure -- an unreadable repo, a dead endpoint -- costs a notification, not a cycle.
+    failure -- an unreadable repo, a dead endpoint -- costs a notification, not a cycle. The one
+    write it makes (the #793 alert ledger, see the module docstring) is inside that promise: it
+    happens after delivery and its failure is logged and swallowed.
     Default-off short-circuits first (`notifications.events` empty means zero repo reads and
     zero network), and no configured URL (`KEEL_ALERT_WEBHOOK`, resolved via
     `keel_core.alerting.resolve_webhook_url`) means zero delivery attempts: the same
@@ -246,6 +270,7 @@ def notify_after_cycle(
                 withdrawals_attested_at=int(
                     repo.get_state("withdrawals_attested_at", default=0) or 0
                 ),
+                withdrawals_enabled=repo.get_state("withdrawals_enabled", default=None),
                 now_ts=now_ts,
             ),
             # #732. `attest.cash_posture` was in `_ATTESTATION_FINDINGS` and this call was not
@@ -280,10 +305,27 @@ def notify_after_cycle(
             stale_products=result.stale_products,
             held_products=repo.held_products(),
         )
+        # #793: an attestation alert goes out ONCE for the window it reports. Applied here and
+        # not in `events_from_state`, which stays pure: the ledger is a repo read, and the
+        # suppression must key off what was actually DELIVERED, which only this loop knows.
+        # `venue=venue`, not the default. `survey` defaults to coinbase and this took it while
+        # holding the venue resolved at the top of this function -- so on an Alpaca deployment
+        # doctor's rail-22 FINDING came from alpaca's record and the WINDOW from a coinbase
+        # record that does not exist. `missing:None` never moves, so the alert fired once, ever.
+        windows = attestation_windows(attestations.survey(repo, now_ts, venue=venue), now_ts)
+        events = unreported(events, windows=windows, already=reported_windows(repo))
+
         sent = 0
+        reported: dict[str, str] = {}
         for event in events:
             if send_event(resolved, event, settings, transport=transport):
                 sent += 1
+                window = windows.get(str(event.fields.get("finding", "")))
+                if window is not None:
+                    reported[str(event.fields["finding"])] = window
+        # Recorded only for what left the building. A webhook that was down, or an event the
+        # operator has not opted into, must not consume this window's one alert.
+        record_reported(repo, reported)
         if events:
             log_event(
                 _logger,
@@ -300,6 +342,90 @@ def notify_after_cycle(
         # enumerable here.
         log_event(_logger, logging.WARNING, "notification.cycle_failed")
         return 0
+
+
+# -- one alert per window (#793) ---------------------------------------------------------------
+#
+# `attestation.expiring` fired on every cycle in which doctor's finding was WARN or FAIL. On the
+# live deployment that is both rails at once, every cycle, for as long as they stay lapsed --
+# and an alert that repeats until it is fixed stops being read on about the third day. The event
+# is therefore sent once for the window it reports, and a window is the attestation's STATE
+# paired with its EXPIRY: entering the final stretch alerts once, expiring alerts again (a halt
+# is not a warning), renewing and lapsing again alerts again, and a rail that was never attested
+# at all -- rail 22, today -- alerts once rather than forever.
+
+
+def attestation_windows(surveyed: Sequence[Any], now_ts: int) -> dict[str, str]:
+    """Each attestation finding's current window, keyed by the FINDING name the event carries.
+
+    Keyed that way so the join to an event is the field the event already has (`finding`), not a
+    second mapping applied at delivery time.
+    """
+    by_key = {attestation.key: attestation for attestation in surveyed}
+    windows: dict[str, str] = {}
+    for finding_name, model_key in _ATTESTATION_MODEL_KEY.items():
+        attestation = by_key.get(model_key)
+        if attestation is None:
+            continue
+        windows[finding_name] = f"{attestation.state(now_ts)}:{attestation.expires_at}"
+    return windows
+
+
+def unreported(
+    events: Sequence[NotificationEvent],
+    *,
+    windows: Mapping[str, str],
+    already: Mapping[str, str],
+) -> list[NotificationEvent]:
+    """`events` minus the attestation alerts already sent for the window they are in. Pure.
+
+    **Only attestation alerts are ever dropped.** Every other event is a fact about the cycle
+    that just ran -- an armed rail, an allowance, a stale product with a position -- and has no
+    window to be inside. An event with no window in `windows` passes through untouched, so a
+    finding added to `_ATTESTATION_FINDINGS` and forgotten here keeps alerting rather than
+    falling silent: the failure that costs a duplicate is the one to prefer.
+    """
+    keep: list[NotificationEvent] = []
+    for event in events:
+        window = windows.get(str(event.fields.get("finding", "")))
+        if window is not None and already.get(str(event.fields.get("finding"))) == window:
+            continue
+        keep.append(event)
+    return keep
+
+
+def reported_windows(repo: Repository) -> dict[str, str]:
+    """The ledger, or `{}` when it cannot be read.
+
+    **Fails OPEN.** An unreadable or corrupt key means an alert is sent that may be a duplicate;
+    the other reading of the same failure withholds the one alert that says live is halted.
+    """
+    try:
+        raw = repo.get_state(NOTIFIED_WINDOWS_KEY, default=None)
+        if raw is None:
+            return {}
+        loaded = raw if isinstance(raw, dict) else json.loads(str(raw))
+        return {str(k): str(v) for k, v in loaded.items()} if isinstance(loaded, dict) else {}
+    except Exception:
+        return {}
+
+
+def record_reported(repo: Repository, sent: Mapping[str, str]) -> None:
+    """Merge the windows just alerted on into the ledger. Never raises.
+
+    **This module writes**, which `notify_after_cycle`'s docstring said it never did, and the
+    departure is deliberate rather than overlooked: suppressing a repeat requires remembering
+    what was already said, and there is nowhere else to remember it. The write is one state key
+    that no rail, report or decision reads -- nothing about what keel TRADES can turn on it, and
+    the worst a wrong value can do is send an alert twice or hold one back for one window.
+    """
+    if not sent:
+        return
+    try:
+        merged = {**reported_windows(repo), **{str(k): str(v) for k, v in sent.items()}}
+        repo.set_state(NOTIFIED_WINDOWS_KEY, json.dumps(merged, sort_keys=True))
+    except Exception:  # pragma: no cover - a ledger that cannot be written costs a duplicate
+        log_event(_logger, logging.WARNING, "notification.ledger_write_failed")
 
 
 def _unplaced_setups(result: LoopResult) -> tuple[UnplacedSetup, ...]:

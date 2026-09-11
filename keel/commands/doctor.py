@@ -30,7 +30,7 @@ from __future__ import annotations
 import json
 import re
 from collections.abc import Callable, Iterable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from decimal import ROUND_HALF_UP, Decimal
 from pathlib import Path
@@ -46,14 +46,12 @@ from keel_core.cash_posture import (
 from keel_core.telemetry import current_venue
 from keel_core.trade_scope import READ_ONLY, TRADING, TradeScopeState, VenueTradeScope
 
+from keel import attestations
 from keel.data.feed_scope import reports_consolidated_volume
 from keel.data.freshness import Freshness
 from keel.execution import sizing
 from keel.types import Granularity
 from keel.version import build_info, check_install
-
-#: Rail 17's TTL is the executor's constant; doctor only READS it (7 days).
-TTL_SEC = 7 * 86_400
 
 #: The window doctor judges data health (gaps, staleness) over -- the same 7-day horizon
 #: as the veto sweep, so every "recent" verdict in one run means the same thing.
@@ -94,9 +92,25 @@ def attestation_findings(
     subscription: Any | None,
     withdrawals_attested_at: int,
     now_ts: int,
-    ttl_sec: int = TTL_SEC,
+    withdrawals_enabled: bool | None = None,
 ) -> list[Finding]:
-    """Rails 14 and 17 -- days remaining, not just valid/invalid."""
+    """Rails 14 and 17 -- days remaining, not just valid/invalid.
+
+    Rail 17's TTL and its warning window both come from `keel.attestations`, which reads the
+    executor's constant. There was a `ttl_sec: int = TTL_SEC` parameter here and a module-level
+    `TTL_SEC = 7 * 86_400` above it under a comment reading "doctor only READS it" -- a second
+    copy of a number the comment promised was an import. Both callers used the default.
+
+    `withdrawals_enabled` is the rail's OTHER key, and its absence here was the same lie one
+    column over: rail 17 vetoes on `enabled is False` with its own sentence, and this function,
+    handed the timestamp alone, reported `ok · 6 day(s) remain` for an account whose broker had
+    frozen withdrawals. It defaults to **`None`**, not `True`: `None` is the rail's own word for
+    "nobody has checked", it routes to the never-attested FAIL below, and a caller who forgets
+    the argument therefore gets a finding that is too LOUD rather than one that is green for a
+    frozen account. `cash_posture.py:91-94` states the rule for exactly this shape -- "inventing
+    one at read time would let a writer forget to set one and have the reader quietly cover for
+    it". `bool | None` rather than `Any`, so mypy can object.
+    """
     findings: list[Finding] = []
 
     if subscription is None:
@@ -143,7 +157,11 @@ def attestation_findings(
                 )
             )
 
-    if withdrawals_attested_at <= 0:
+    # `enabled is None` joins a missing timestamp rather than becoming a REFUSED, and the rail's
+    # own words are why: it vetoes UNKNOWN with "no fresh attestation, or the broker did not
+    # report" and `False` with "withdrawals are suspended/restricted for this account". Those are
+    # different facts about the account and an operator acts on them differently.
+    if withdrawals_attested_at <= 0 or withdrawals_enabled is None:
         findings.append(
             Finding(
                 "attest.withdrawals",
@@ -154,9 +172,29 @@ def attestation_findings(
             )
         )
     else:
+        rail17 = replace(
+            attestations.definition("withdrawal"),
+            attested_at=withdrawals_attested_at,
+            expires_at=attestations.withdrawal_expiry(attested_at=withdrawals_attested_at),
+            satisfied=bool(withdrawals_enabled),
+        )
+        assert rail17.expires_at is not None
+        ttl_sec = rail17.expires_at - withdrawals_attested_at
         age = now_ts - withdrawals_attested_at
         remaining = _days(ttl_sec - age)
-        if remaining <= 0:
+        state = rail17.state(now_ts)
+        if state == attestations.REFUSED:
+            findings.append(
+                Finding(
+                    "attest.withdrawals",
+                    FAIL,
+                    "withdrawals suspended for this account",
+                    "the attestation is fresh and says NO; rail 17 halts entries until it says "
+                    "otherwise",
+                    "keel withdrawals attest --enabled",
+                )
+            )
+        elif state == attestations.EXPIRED:
             findings.append(
                 Finding(
                     "attest.withdrawals",
@@ -166,7 +204,7 @@ def attestation_findings(
                     "keel withdrawals attest --enabled",
                 )
             )
-        elif remaining <= 2:
+        elif state == attestations.EXPIRING:
             findings.append(
                 Finding(
                     "attest.withdrawals",
@@ -1588,6 +1626,9 @@ def gather_findings(repo: Any, config: Any, log_lines: Iterable[str], now_ts: in
     findings += attestation_findings(
         subscription=subscription,
         withdrawals_attested_at=int(repo.get_state("withdrawals_attested_at", default=0) or 0),
+        # Rail 17's other key. `None` -- never attested either way -- reaches the finding as the
+        # falsey it is, and `_withdrawals_attested_at` being 0 gets there first anyway.
+        withdrawals_enabled=repo.get_state("withdrawals_enabled", default=None),
         now_ts=now_ts,
     )
     # #718: a RECORDED window (`--attest-due`) that nothing reads back is a column nobody

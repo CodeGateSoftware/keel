@@ -734,6 +734,85 @@ def _attestation_payload(attestation: WithdrawalAttestationStatus) -> dict[str, 
     }
 
 
+def attestation_alerts(surveyed: Sequence[Any], now_ts: int) -> list[dict[str, Any]]:
+    """The attestations that need an operator, judged here and rendered by nobody else.
+
+    **Only the rows that are not `OK`.** Rule 2 puts presentation decisions in this module, and
+    "is there a banner" is one: a client handed every attestation would have to decide which
+    deserve one, and that decision would then live in two places once `keel doctor` grew a
+    second opinion about it. The list being empty IS the answer "nothing needs you".
+
+    `MISSING` alerts like an expiry does, deliberately. It reads as the milder word and it is the
+    more total failure: rail 22 had never been attested on 2026-09-11 and refused every live
+    entry, with no expiry to count down to because there was nothing to expire.
+    """
+    from keel import attestations as model
+
+    tones = _ATTESTATION_TONES
+    # `MISSING` has no instant at all -- `moment(None)` is `ABSENT` -- so its words carry the
+    # whole statement. "never attested" is the true one; "expired" would name a lapse that never
+    # happened, and rail 22 on this deployment has never been attested once.
+
+    alerts: list[dict[str, Any]] = []
+    for attestation in surveyed:
+        state = attestation.state(now_ts)
+        if state == model.OK:
+            continue
+        alerts.append(
+            {
+                "key": attestation.key,
+                "rail": attestation.rail,
+                "label": attestation.label,
+                "state": label(state, state=tones[state]),
+                # ONE instant, chosen here, with the words that make it mean something.
+                #
+                # The client cannot make this choice. `render.js` may read a `Field`'s `display`
+                # and its `state` and never its `value`, so a branch on "is this expiring or
+                # expired" would have to come off the rendered TEXT -- and Rule 2 puts the
+                # decision here regardless. It matters for one row in particular: `seconds_left`
+                # floors at zero, so an expired attestation offered a countdown would render
+                # "expires in 0s" beside the word "expired", two claims about the same instant
+                # with one of them false.
+                "when_label": _ATTESTATION_WHEN[state],
+                "when": (
+                    duration(attestation.seconds_left(now_ts), elapsed=False)
+                    if state == model.EXPIRING
+                    else moment(
+                        attestation.attested_at
+                        if state == model.REFUSED
+                        else attestation.expires_at
+                    )
+                ),
+                # A bare string, not a `Field`: it is a command to be typed, not a figure to be
+                # rendered, and the client copies it verbatim.
+                "remedy": attestation.remedy,
+            }
+        )
+    return alerts
+
+
+#: How alarming each state is. Module-level beside the wording table, not a local, because both
+#: are indexed by the same key and a test that pins one and not the other pins nothing: `tones`
+#: is read FIRST, so a state added to the model and missed here is the `KeyError` on every page
+#: that `test_the_banner_has_words_for_every_state_the_model_can_be_in` exists to prevent -- and
+#: for one revision that test could not see this dict at all.
+_ATTESTATION_TONES = {"expiring": WARN, "expired": BAD, "missing": BAD, "refused": BAD}
+
+#: The words that precede the one instant `attestation_alerts` sends, by state. Keyed by the
+#: model's own words and pinned against them by
+#: `test_the_banner_has_words_for_every_state_the_model_can_be_in` -- a state added to
+#: `keel.attestations` and missed here is a `KeyError` on every page, not a missing row.
+_ATTESTATION_WHEN = {
+    "expiring": "expires in",
+    "expired": "expired",
+    "missing": "never attested",
+    # Fresh, unexpired, and the answer was no. The instant that matters is when it was asked:
+    # the expiry is in the FUTURE here, and "expires 2026-09-18" beside "refused" reads as
+    # though there were something to wait for.
+    "refused": "attested",
+}
+
+
 def _session_payload(session: MarketSessionStatus) -> dict[str, Any]:
     return {
         "state": label(session.state, state=_SESSION_STATES.get(session.state or "", UNKNOWN)),
@@ -2948,6 +3027,7 @@ def envelope(
     data: dict[str, Any] | None,
     detail: str = "",
     sort: dict[str, Any] | None = None,
+    attestations: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """One `GET /api/*` success.
 
@@ -2962,12 +3042,20 @@ def envelope(
     `as_of` is the instant this response was built, and it is present even when `data` is not --
     that pairing is the requirement: a client showing "keel isn't running" should be able to say
     since when it was looking.
+
+    `attestations` rides the ENVELOPE rather than one endpoint's `data` because the thing it
+    reports is true of the deployment and not of the report (#793). Rail 17 expired, the Status
+    page said so in a card, and it went unread for three days while the operator was on other
+    pages. An envelope key is on every page. It is `null` -- never `[]` -- when there was no
+    deployment to read, for `data`'s own reason: an empty list is "nothing is wrong", which is a
+    claim a response that read nothing must not make.
     """
     return {
         "as_of": iso(now_ts),
         "engine": engine_state(running=running, detail=detail),
         "data": data,
         "sort": sort,
+        "attestations": attestations,
     }
 
 
@@ -2988,11 +3076,15 @@ def error_envelope(
 
     `data` is present and `null` so that a client reading `.data` on any response gets a value
     rather than `undefined` -- the key set stays constant across the two documents for the same
-    reason it stays constant across endpoints.
+    reason it stays constant across endpoints. `attestations` (#793) is here for that reason and
+    is always `null`: most refusals happen before the session cookie is checked, so filling it in
+    would mean an unauthenticated request reading the deployment database -- the same argument
+    that keeps `engine` out of this document.
     """
     return {
         "as_of": iso(now_ts),
         "data": None,
+        "attestations": None,
         "error": {"status": str(status), "title": title, "detail": detail},
     }
 

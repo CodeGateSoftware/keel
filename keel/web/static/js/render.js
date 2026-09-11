@@ -3757,6 +3757,80 @@ export function paperBanner(node, config) {
 }
 
 /**
+ * The attestation banner (#793) -- what is about to halt keel, or has already.
+ *
+ * Rail 17 expired on 2026-09-08 and live placed nothing for three days. The state was on the
+ * Status page the whole time, in a card, below the fold, on one page of eleven. So this is
+ * carried by the ENVELOPE and drawn from the shell, above `#view`: it is on whatever page the
+ * operator is actually reading.
+ *
+ * **Renders `alerts` and judges nothing.** The server sends only the rows that need someone
+ * (`payload.attestation_alerts`), already toned, so "is there a banner" is answered in one place
+ * rather than here and in `keel doctor` separately -- which is the divergence this whole feature
+ * exists to close.
+ *
+ * `null` (no deployment to read) and `[]` (nothing wrong) both draw nothing, and they must:
+ * `envelope` sends `null` rather than `[]` precisely so a response that read nothing cannot be
+ * mistaken for one that checked and found all clear, and a client that renders "all clear" for
+ * either would throw that distinction away.
+ *
+ * **No `aria-live`, deliberately.** This page keeps exactly one live region (see the note beside
+ * `#engine` in `index.html`) and it is spent on the engine banner. The trade is real: a screen
+ * reader is not interrupted when an attestation lapses. It is the same trade `#mode-banner`
+ * already makes for the statement "this is real money", and the alternative here is worse --
+ * the shell repaints every 15 seconds, so an alert region would announce the same halt four
+ * times a minute for as long as it lasts.
+ *
+ * @param {HTMLElement} node
+ * @param {any} alerts  the envelope's `attestations`: rows, `[]`, or `null`.
+ */
+export function attestationBanner(node, alerts) {
+  const rows = Array.isArray(alerts) ? alerts : [];
+  if (rows.length === 0) {
+    node.className = "attestbanner";
+    node.replaceChildren();
+    return;
+  }
+  // The banner's own tone is the worst tone in it: one expired attestation among three
+  // approaching ones is an outage, and styling the whole strip as a warning would file it under
+  // "soon" when entries are already being refused.
+  let tone = "warn";
+  for (const row of rows) {
+    const state = row.state && typeof row.state.state === "string" ? row.state.state : "";
+    if (state === "bad") tone = "bad";
+  }
+  node.className = "attestbanner ".concat(STATE_CLASS[tone] || "");
+  node.replaceChildren(...rows.map(attestationLine));
+}
+
+/**
+ * One row of the banner: which rail, what it is, what state, and the command that fixes it.
+ *
+ * The remedy is a `<code>` and not a link because there is nothing to link to -- rails 17 and 22
+ * are attested from a TTY, and #781 deliberately left them outside the browser gate. A banner
+ * that says "expired" without the words to type is a dead end.
+ *
+ * @param {any} alert
+ * @returns {HTMLElement}
+ */
+function attestationLine(alert) {
+  const line = el("p", "attestline");
+  line.append(el("span", "rail", "Rail ".concat(plain(alert.rail))));
+  line.append(el("span", "what", plain(alert.label)));
+  line.append(field(alert.state));
+
+  // ONE instant, with the words the server chose for it -- "expires in 1h", "expired
+  // 2026-09-08", "never attested". There is no branch here on purpose: picking between a
+  // countdown and a date would have to read the state off `Field.value`, which this file does
+  // not do, or off the rendered text, which is worse.
+  line.append(el("span", "left", plain(alert.when_label)));
+  line.append(field(alert.when));
+
+  line.append(el("code", "remedy", plain(alert.remedy)));
+  return line;
+}
+
+/**
  * The footer's build line, from `/api/config`.
  *
  * `reproducible` is the one judged field on that payload, and `payload.config_payload` calls it

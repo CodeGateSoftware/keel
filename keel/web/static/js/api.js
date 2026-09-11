@@ -76,6 +76,14 @@
  * @property {any}          data    The endpoint's payload, or `null` for nothing to render.
  * @property {ApiError|null} error  Present only when the request failed or was refused.
  * @property {any}          sort    The sort echo, or `null`. Unused here; #537's tables read it.
+ * @property {any}          attestations  The #793 banner's rows, `[]` for nothing wrong, or
+ *                                        `null` when nothing was read. **Kept even though
+ *                                        only `main.js`'s shell reads it**: this object is
+ *                                        the client's whole picture of one answer, and a
+ *                                        key dropped here is invisible -- reading it gives
+ *                                        `undefined`, which every consumer treats as
+ *                                        "nothing to show" rather than as a mistake. That
+ *                                        is exactly how the banner shipped dead.
  */
 
 /**
@@ -152,7 +160,7 @@ export function readingFrom(document_, ok, status) {
     const error = /** @type {ApiError} */ (
       document_.error || { status: status, title: "Refused", detail: "" }
     );
-    return { as_of: as_of, engine: stopped(error.title), data: null, error: error, sort: null };
+    return { as_of: as_of, engine: stopped(error.title), data: null, error: error, sort: null, attestations: null };
   }
 
   // Cases 1 and 2. `engine` is validated rather than trusted: this page is served from the same
@@ -171,6 +179,7 @@ export function readingFrom(document_, ok, status) {
     data: document_.data ?? null,
     error: null,
     sort: document_.sort ?? null,
+    attestations: document_.attestations ?? null,
   };
 }
 
@@ -219,6 +228,7 @@ export async function read(endpoint, params) {
         detail: String(cause),
       },
       sort: null,
+      attestations: null,
     };
   }
 
@@ -236,6 +246,7 @@ export async function read(endpoint, params) {
       data: null,
       error: { status: String(response.status), title: "Unreadable answer", detail: String(cause) },
       sort: null,
+      attestations: null,
     };
   }
 
@@ -306,6 +317,7 @@ export async function runAction(key, values, csrf) {
       data: null,
       error: { status: "0", title: "No answer", detail: String(cause) },
       sort: null,
+      attestations: null,
     };
   }
 
@@ -319,6 +331,7 @@ export async function runAction(key, values, csrf) {
       data: null,
       error: { status: String(response.status), title: "Unreadable answer", detail: String(cause) },
       sort: null,
+      attestations: null,
     };
   }
 

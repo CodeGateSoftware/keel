@@ -1259,7 +1259,61 @@ def respond(cfg: ServeConfig, path: str, query: Query) -> tuple[int, dict[str, A
         running=running,
         data=data,
         sort=_sort_echo(route, column, descending),
+        # `running`, not `route.needs_database`: the routes that answer without a database
+        # (`/api/setup`, `/api/venues`, `/api/gates`) are pages too, and an operator reading the
+        # setup checklist is exactly who needs to be told an attestation lapsed.
+        attestations=attestation_alerts(cfg, now_ts) if running else None,
     )
+
+
+def attestation_alerts(cfg: ServeConfig, now_ts: int) -> list[dict[str, Any]] | None:
+    """The banner rows for this deployment, on EVERY answered request (#793).
+
+    One extra read per request, and it is bought deliberately. The alternative -- computing it on
+    `/api/status` only -- is what shipped, and it put rail 17's expiry in a card on the one page
+    an operator was not looking at for three days while live placed nothing.
+
+    Never raises. `survey` already answers an unreadable attestation with `MISSING` rather than an
+    exception, and this adds the same promise for a connection that cannot be opened at all: a
+    database briefly locked by the agent mid-cycle must cost a banner, not a 500 on every page.
+
+    **`None` on failure, never `[]`.** `payload.envelope`'s own words: "an empty list is 'nothing
+    is wrong', which is a claim a response that read nothing must not make". The first version
+    returned `[]` here, which made exactly that claim -- and made it in the one case it was
+    written for, a database locked mid-cycle, which is when an operator most needs the banner.
+    """
+    from keel import attestations
+
+    repo = None
+    try:
+        repo = open_repo(cfg.db_path)
+        return payload.attestation_alerts(
+            attestations.survey(repo, now_ts, venue=_bound_venue(cfg)), now_ts
+        )
+    except Exception:  # pragma: no cover - the belt to `survey`'s braces
+        return None
+    finally:
+        if repo is not None:
+            close_repo(repo)
+
+
+def _bound_venue(cfg: ServeConfig) -> str:
+    """This deployment's venue, from the CONFIG rather than from `current_venue()`.
+
+    `current_venue()` is a `ContextVar` bound once at process entry
+    (`_common._load_cfg` -> `bind_venue(config.broker.name)`), and context variables do not
+    propagate into the threads a `ThreadingHTTPServer` answers requests on -- so reading it here
+    returns `None` on every request and falls back to coinbase, which is the exact bug being
+    fixed rather than a fix for it. The config file is the same fact, read the same way the rest
+    of this module reads it, and it is correct from any thread.
+    """
+    from keel.execution import guards
+
+    try:
+        broker = getattr(load_config(cfg.config_path), "broker", None)
+        return str(getattr(broker, "name", "") or "") or guards.DEFAULT_VENUE
+    except Exception:  # pragma: no cover - an unreadable config already costs the whole page
+        return guards.DEFAULT_VENUE
 
 
 def refusal_document(status: int, title: str, detail: str) -> dict[str, Any]:

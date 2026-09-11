@@ -39,6 +39,7 @@ import { indexUrl, rememberVersion } from "./docs.js";
 import { available, subscribe } from "./live.js";
 import {
   activityView,
+  attestationBanner,
   buildLine,
   engineBanner,
   gatesView,
@@ -161,6 +162,7 @@ const deploymentCardNode = must("deployment-card");
 const sessionEquityNode = must("session-equity");
 /** The persistent mode banner (#704). No buttons live in here, by design and by test. */
 const modeBannerNode = must("mode-banner");
+const attestBannerNode = must("attest-banner");
 /** The header's theme toggle (#597). Clicked, it flips and stores the choice `theme.js` restores. */
 const themeNode = /** @type {HTMLButtonElement} */ (must("theme-toggle"));
 
@@ -573,6 +575,9 @@ async function paint(route, rebuild, force) {
   const primary = readings[0];
   reachable = primary.error === null;
   engineBanner(engineNode, primary);
+  // Every paint, on every route -- the banner is the envelope's, not the view's, and it is
+  // redrawn here rather than in `mount` so that it survives a route whose `data` is `null`.
+  attestationBanner(attestBannerNode, primary.attestations);
 
   if (!rebuild) return;
 
