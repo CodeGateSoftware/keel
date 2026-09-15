@@ -73,38 +73,58 @@ allowlist:
   - DOGE
 
 # ---------------------------------------------------------------------------------------------
-# STANDING EXCEPTION: the five live rules bypassed the promotion gate, deliberately, and stay.
+# STANDING EXCEPTION -- RETIRED 2026-09-15. The five live-seeded rules are now `paper`.
 #
-# keel-live.db rules 1-5 were seeded straight to `status=live` on 2026-07-24 with promoted_at
-# NULL. `keel rules seed` printed "Do not leave live-seeded rules in place afterwards." They have
-# been left in place. That is a decision, reviewed 2026-08-08 and recorded here rather than left
-# silent -- the same standard docs/experiments/2026-07-20-allowlist-screen-first-run.md set for
-# PAXG: "The one thing not to do is leave it silently exempt because it was already there."
+# HISTORY. keel-live.db rules 1-5 were seeded straight to `status=live` on 2026-07-24 with
+# promoted_at NULL. `keel rules seed` printed "Do not leave live-seeded rules in place
+# afterwards." They were left in place deliberately, reviewed 2026-08-08, on this reasoning:
+# the promotion floor is min_trades=100 PER RULE and the strategy cannot reach it (BTC/ETH
+# ~2.59 trades/yr -> ~39 years; XLM ~63; ADA ~84; PAXG ~31), so waiting for the gate was "not a
+# slower path to the same place; it is no path," and the sandbox existed to accumulate the live
+# evidence the gate demands and cannot itself produce. That argument was sound and is NOT
+# what retired it.
 #
-# WHY KEEP THEM. The promotion floor is min_trades=100 PER RULE. This strategy cannot reach it.
-# Measured 2026-08-08 by backtesting each rule over ~5.02 years of daily bars:
-#   BTC  13 trades = 2.59/yr -> 100 trades in ~39 years
-#   ETH  13 trades = 2.59/yr -> ~39 years
-#   XLM   8 trades = 1.59/yr -> ~63 years
-#   ADA   6 trades = 1.19/yr -> ~84 years
-#   PAXG  4 trades = 3.20/yr -> ~31 years
-# Waiting for the gate is not a slower path to the same place; it is no path. The sandbox exists
-# to accumulate the live evidence the gate demands and cannot itself produce. Demoting these
-# rules would end the experiment without substituting anything for it.
+# WHAT RETIRED IT. Two of this block's own REVISIT triggers fired at once on 2026-09-15:
 #
-# WHAT BOUNDS THE RISK. Not the promotion gate -- it never ran. Instead: the caps below
-# (max_exposure_usd 200 total at once, max_per_order_usd 100), the 18 un-overridable guards.py
-# rails, rail 1's allowlist above, and rail 14's monthly subscription allowance. The bypass is of
-# the EVIDENCE gate, not of the SAFETY rails, and those are separate mechanisms.
+#   1. CAPS WERE RAISED past this sandbox's scale -- 200/100 -> 400/200 (see the caps note
+#      below). The trigger read "caps are raised above this sandbox's few-dollars-of-damage
+#      scale," and $400 is that. The raise was needed for a different reason entirely: guard 6
+#      was vetoing the weekly $50 DCA because BTC exposure ($101.81) already exceeded the old
+#      $100 per-asset ceiling. DCA, not the Turtle, is what needed the headroom.
 #
-# WHAT THIS IS NOT. Not a precedent for adding assets (see the allowlist note above), not a
-# reason to raise caps, and not a claim these rules are validated -- they are not, and neither
-# `promoted_at` nor any backtest here says otherwise.
+#   2. AN EXIT-LIFECYCLE DEFECT CAME TO LIGHT (issue #799). On 2026-08-25 rule 3's PAXG entry
+#      FILLED ($61.71, order id=4) and the protective SELL preview then threw
+#      `decimal.InvalidOperation`, aborting before `open_position` ran. There is no `positions`
+#      row, so no channel exit and no 2xATR stop can ever fire for that holding, its computed
+#      stop (4521.76) exists only in the log, and guard 6 still counts the $61.71 forever
+#      because it reads `orders`, not `positions`. A trend rule whose exits cannot fire is not
+#      running the experiment this block was protecting -- it is accumulating unmanaged spot.
+#      The fix landed on the retired `cb_client.py` and NOT on the adapter #524 migrated to, so
+#      the same failure would recur today.
 #
-# REVISIT IF: caps are raised above this sandbox's few-dollars-of-damage scale; the rule set
-# changes; a rule starts trading materially more often than the table above; or this sandbox is
-# treated as evidence for anything beyond itself. Full working:
-# docs/experiments/2026-08-07-unvalidated-skip-set-reassessment.md and docs/go-live-runbook.md §3.
+# The evidence question is unchanged and still points the same way: on 2026-09-15
+# `research significance` returned "not distinguishable from zero" for every rule tested
+# (BTC n=13 -> 5.05 effective, p=0.3963; ADA p=0.3218; XLM p=0.1593), at both fee regimes.
+# That was ALREADY conceded here ("not a claim these rules are validated") and is not new
+# grounds for demotion -- it is the reason the cap raise must not be read as sizing them up.
+#
+# WHAT BOUNDS THE RISK NOW. Only rule 6 (dca, BTC) is live, and DCA is fixed-budget
+# accumulation rather than an edge claim. The caps below, the 18 un-overridable guards.py
+# rails, rail 1's allowlist above, and rail 14's monthly allowance all still apply.
+#
+# WHAT THIS IS NOT. Not a judgement that the 2026-08-08 decision was wrong -- it was right on
+# its facts, and rules 3 and 5 did place live orders (2026-08-25 and 2026-08-22), so the
+# experiment was functioning, not inert. Not a precedent for adding assets. Not a claim these
+# rules are validated.
+#
+# THE PATH BACK. Re-promote to `live` when #799 is fixed AND verified on the adapter path (a
+# filled entry must produce a position row or an explicitly UNBRACKETED one), AND order id=4 is
+# reconciled, AND caps are either returned to the few-dollars scale or a fresh significance
+# verdict justifies the size. Re-promoting on the $400 caps without that is the mistake this
+# block now exists to prevent. DOGE (rule 7) is excluded from any such promotion for the reason
+# in its own allowlist note: no configuration is net-positive at the 1.2% taker rate.
+# Full working: docs/experiments/2026-08-07-unvalidated-skip-set-reassessment.md,
+# docs/go-live-runbook.md §3, and issues #797/#798/#799.
 # ---------------------------------------------------------------------------------------------
 
 target_weights:
