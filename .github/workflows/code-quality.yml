@@ -358,11 +358,31 @@ jobs:
       # Fails the job on findings. Add `--severity-threshold=high` to only fail on high/critical.
       # `--org` files the project under the SNYK_ORG organization -- the same variable the
       # preflight gates this job on, so a scan that runs is always a scan that lands somewhere.
+      # `--remote-repo-url` N'EST PAS DÉCORATIF, et son absence coûte cher.
+      #
+      # Les plafonds du plan gratuit Snyk (200 tests Open Source par mois, PAR
+      # ORGANISATION et partagés avec les autres dépôts) ne s'appliquent qu'aux
+      # dépôts PRIVÉS. keel est public, donc ses scans devraient être gratuits
+      # et illimités.
+      #
+      # Sauf que le CLI ne peut pas le deviner : un checkout `actions/checkout`
+      # n'expose pas de remote exploitable, si bien que Snyk classe par défaut
+      # TOUT scan lancé en CI comme un test PRIVÉ — y compris sur un dépôt
+      # public. Ce drapeau est le mécanisme documenté pour le lui dire.
+      #
+      # Sans lui, ce job consommerait le quota privé de l'organisation à chaque
+      # push sur `main` — ~196 par mois sur la période mesurée le 2026-09-14,
+      # soit à lui seul le plafond entier partagé par tous les dépôts.
+      #
+      # (Ce job est aujourd'hui `skipped` faute de `SNYK_TOKEN`/`SNYK_ORG`. Le
+      # drapeau est posé maintenant précisément pour que son activation ne
+      # vienne pas vider le quota sans prévenir.)
       - name: Snyk test
         env:
           SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
           SNYK_ORG: ${{ vars.SNYK_ORG }}
-        run: snyk test --org="$SNYK_ORG" --file=requirements.txt --package-manager=pip
+          REMOTE_REPO_URL: ${{ github.server_url }}/${{ github.repository }}
+        run: snyk test --org="$SNYK_ORG" --remote-repo-url="$REMOTE_REPO_URL" --file=requirements.txt --package-manager=pip
 
       # Reports the current dependency tree to the Snyk dashboard so newly-published CVEs against
       # these exact pins raise an alert between weekly runs. `always()` so a failing `snyk test`
@@ -374,7 +394,8 @@ jobs:
         env:
           SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
           SNYK_ORG: ${{ vars.SNYK_ORG }}
-        run: snyk monitor --org="$SNYK_ORG" --file=requirements.txt --package-manager=pip --project-name=keel
+          REMOTE_REPO_URL: ${{ github.server_url }}/${{ github.repository }}
+        run: snyk monitor --org="$SNYK_ORG" --remote-repo-url="$REMOTE_REPO_URL" --file=requirements.txt --package-manager=pip --project-name=keel
 
   # NO DOCKER SCAN JOB, on purpose. The reference workflow builds an image and runs
   # `snyk/actions/docker` against it. keel has no Dockerfile and ships no container -- it is
