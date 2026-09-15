@@ -833,3 +833,43 @@ def test_a_null_margin_rate_is_silent(caplog) -> None:
         CoinbaseAdapter(FakeTransport()).get_fee_summary()
 
     assert not [r for r in caplog.records if "margin_rate" in r.getMessage()]
+
+
+@pytest.mark.parametrize("field", ["base_size", "quote_size", "commission_total"])
+def test_preview_order_tolerates_an_empty_numeric_field(field: str) -> None:
+    """An empty string where Coinbase should have sent a number must not raise (#799).
+
+    On 2026-08-25 a live PAXG entry FILLED and the protective SELL's preview then raised
+    `decimal.InvalidOperation: ConversionSyntax` on `Decimal("")`. The exception propagated out
+    of the executor before `repo.open_position` ran, so the fill was never recorded: no position
+    row, no channel exit, no stop, and the BUY notional counted against the exposure caps
+    permanently because `_open_exposure_by_asset` reads `orders`, not `positions`.
+
+    The `"0"` in `_field(response, key, "0")` is a MISSING-KEY default. It does nothing when the
+    key is present and empty, which is the shape the venue actually sent. The retired
+    `keel/data/cb_client.py` was given `or "0"` for exactly this; the adapter that replaced it
+    (#524 flipped `_build_broker` to the registry) was not, so the crash survived its own fix.
+
+    Deleting the `or "0"` from the named conversion in `CoinbaseAdapter.preview_order` restores
+    `InvalidOperation` here and fails this test.
+    """
+    response = dict(load_fixture("cb_preview_order.json"))
+    response[field] = ""
+    adapter = CoinbaseAdapter(FakeTransport(preview=response))
+    spec = MarketIOCByQuote(product_id="BTC-USD", side=Side.BUY, quote_size=Decimal("100"))
+
+    preview = adapter.preview_order(spec)
+
+    assert getattr(preview, _PREVIEW_ATTR[field]) == Decimal("0")
+    # The other two must still parse from the fixture -- a blanket try/except that zeroed the
+    # whole Preview would satisfy the assertion above and is not the fix.
+    for other, attr in _PREVIEW_ATTR.items():
+        if other != field:
+            assert getattr(preview, attr) != Decimal("0")
+
+
+_PREVIEW_ATTR = {
+    "base_size": "est_base_size",
+    "quote_size": "est_quote_size",
+    "commission_total": "est_fee",
+}

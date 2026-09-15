@@ -329,9 +329,9 @@ class CoinbaseAdapter:
         return Preview(
             product_id=spec.product_id,
             side=spec.side,
-            est_base_size=Decimal(_field(response, "base_size", "0")),
-            est_quote_size=Decimal(_field(response, "quote_size", "0")),
-            est_fee=Decimal(_field(response, "commission_total", "0")),
+            est_base_size=Decimal(_field(response, "base_size", "0") or "0"),
+            est_quote_size=Decimal(_field(response, "quote_size", "0") or "0"),
+            est_fee=Decimal(_field(response, "commission_total", "0") or "0"),
             synthetic=False,
             detail={
                 key: str(value)

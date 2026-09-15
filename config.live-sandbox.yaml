@@ -57,6 +57,20 @@ allowlist:
   - PAXG
   - ADA
   - XLM
+  # DOGE added 2026-08-13 by operator instruction. Attestation + instrument attestation copied
+  # VERBATIM from keel.db (the operator's own 2026-08-11 records, attributed to them, not
+  # re-authored) so the live screen has the same basis the paper one does.
+  # ⚠️ THE EVIDENCE FOR IT IS WEAK AND THE OPERATOR WAS TOLD SO BEFORE THIS EDIT. DOGE was chosen
+  # on a DAILY net profit factor of 1.175 measured on n=13. On 2026-08-13 the same rule was
+  # re-measured on HOURLY bars at n=279 -- the only sample large enough to read -- and returned
+  # 0.348. Across all 20 rules the daily and hourly rankings correlate at rho = -0.009, i.e. not
+  # at all, so the daily figure that selected DOGE carries no information about its behaviour on
+  # the measurable sample. NO configuration of this rule on this asset is net-positive at the
+  # 1.2% taker rate we pay.
+  # ⚠️ Its source text below-the-line in the DB still says "exactly 5,000,000,000 DOGE issued per
+  # year"; run-log CORRECTION 3 (2026-08-11) established the figure is 5,256,000,000. The record
+  # was copied unedited rather than silently corrected -- fix it at source if you want it right.
+  - DOGE
 
 # ---------------------------------------------------------------------------------------------
 # STANDING EXCEPTION: the five live rules bypassed the promotion gate, deliberately, and stay.
@@ -111,12 +125,70 @@ caps:
   # max_exposure_usd = the TOTAL held-at-once ceiling AND the live sizing equity proxy, so it also
   # bounds order size: at risk_pct 0.01 and a ~2xATR stop, a proposed order lands around $60-80.
   # Think of it as "this sandbox is a $200 account." Raise it alongside the monthly cap as you scale.
-  max_exposure_usd: 200      # total open exposure across all positions AT ONCE (NOT per day, NOT per month)
-  max_per_order_usd: 100     # per-single-order ceiling
-  max_per_day_usd: 200       # per-rolling-24h ceiling
-  max_per_asset_pct: 0.50    # no single asset may exceed 50% of the $200 exposure ($100)
+  #
+  # Briefly raised to 500 on 2026-08-11 and reverted the same day. Recording why, so the same
+  # change is not made again for the same wrong reason: it was raised on the theory that sizing
+  # was why live had not traded, on the evidence that the live loop had never DETECTED a setup --
+  # every cycle logged `signals=0`. (The account that WAS deadlocked by sizing-vs-allowance is the
+  # PAPER one; see config.paperforward.yaml.)
+  #
+  # THAT EVIDENCE EXPIRED on 2026-09-11. Cycle d4f95d6c954b4c33 at 01:20Z detected a dca setup on
+  # BTC-USD (cts_score 4, confirm_3bar) and the executor vetoed the order on FOUR guards at once:
+  # total_exposure_cap (163.51 + 50.00 = 213.51 > 200), per_asset_concentration_cap (BTC 151.81 >
+  # the 0.50 * 200 = 100 ceiling), plus rails 17 and 22, both since attested. So this cap DOES now
+  # block a real order -- but raising it is still not the fix, for the reason in the next
+  # paragraph, and the per-asset ceiling binds before the total does.
+  #
+  # Raising it also has a cost that is easy to miss, because this value is a SIZING PROXY and not
+  # only a ceiling: risk per trade is 1% of THIS number, not of real equity. Real live equity is
+  # ~$478 (equity_points id 8, 2026-09-14), so at 500 each trade would risk $5 -- about 1.0% of
+  # what the account actually holds. Note that raising it CANNOT fix `doctor`'s sizing.admissible
+  # failure: order size scales 1:1 with this number, so the bands move with the cap and the ratio
+  # max_per_order_usd/max_exposure_usd is what binds. Measured 2026-09-15 on a scratch copy:
+  # at 400/200 every band still exceeded the cap (ADA $406.85-$542.47 against $200). The finest
+  # configured granularity is the actual lever -- see the market_data note below.
+  #
+  # Raise this only when the account has actually grown into it, and raise rail 14's monthly cap
+  # (stored in keel-live.db, NOT here -- still $200) in the same change:
+  #   keel --config config.live-sandbox.yaml --db keel-live.db subscription set --free-volume-usd 500
+  # Raised 200 -> 400 on 2026-09-15, with the arithmetic recorded. Measured BTC exposure at the
+  # time was $101.81 (the two filled DCA buys at fill economics, $50.00 + $51.81) against a $100
+  # ceiling -- already over before any new order, which is why guard 6 vetoed the weekly $50 DCA.
+  # At 400 the BTC ceiling is $200 and the projection is $101.81 + $50 = $151.81, clearing it
+  # with $48.19 of headroom.
+  #
+  # NOTE the figure that matters is $101.81, NOT the $151.81 in the veto message -- that one is
+  # already the PROJECTION (existing + proposed). Reading $151.81 as the existing exposure gives
+  # $151.81 + $50 = $201.81 and concludes, wrongly, that even a $400 cap still blocks DCA.
+  #
+  # The six turtle_breakout rules were demoted live -> paper in the same change: on 2026-09-15
+  # `research significance` returned "not distinguishable from zero" for every one tested
+  # (BTC n=13 -> 5.05 effective, p=0.3963; ADA p=0.3218; XLM p=0.1593), so this increase sizes up
+  # NOTHING with a measured edge. Only rule 6 (dca) stays live, and DCA is fixed-budget
+  # accumulation rather than an edge claim. Re-promoting a turtle rule onto this cap without a
+  # fresh significance verdict is the mistake this comment exists to prevent.
+  max_exposure_usd: 400      # total open exposure across all positions AT ONCE (NOT per day, NOT per month)
+  max_per_order_usd: 200     # per-single-order ceiling
+  max_per_day_usd: 200       # per-rolling-24h ceiling -- deliberately LEFT at 200, so one
+                             # max-sized order consumes the whole day's budget
+  max_per_asset_pct: 0.50    # no single asset may exceed 50% of the $400 exposure ($200)
 
 market_data:
+  # THE FINEST ENTRY HERE SETS POSITION SIZE, not just what the rules see. `doctor`'s
+  # sizing.admissible convention is "ATR(14) on the finest configured granularity", and order
+  # size is risk_pct * max_exposure_usd / stop_distance. A 2xATR stop on FIFTEEN_MINUTE bars is
+  # ~0.5% of BTC's price, so a $2 risk budget asks for an ~$875 position -- which is why every
+  # band fails max_per_order_usd while the caps look generous.
+  #
+  # Measured 2026-09-15 on a scratch copy of this profile at the CURRENT caps (200/100/0.01):
+  #   finest = FIFTEEN_MINUTE  -> [FAIL] 0 of 6 products fit ($100 cap; ADA $159.89-$213.19)
+  #   finest = ONE_HOUR        -> [warn] 1 of 6 fit       (ADA $96.40-$128.53 straddles)
+  #   finest = ONE_DAY         -> [ok]   6 of 6 fit       ($16.07-$77.21 orders)
+  #
+  # The turtle_breakout rules are 40/20-lookback donchian systems -- a DAILY convention. Running
+  # them on 15-minute bars is very likely not what was intended. DO NOT just delete the line:
+  # dropping a granularity changes what every rule EVALUATES on, not only what ATR measures, so
+  # it is a strategy change that belongs in a backtest on config.paperforward.yaml first.
   granularities:
     - ONE_DAY
     - ONE_HOUR
@@ -124,7 +196,29 @@ market_data:
   history_days: 365
 
 auto_trade:
-  mode: confirm   # LIVE, but every order asks for a typed `y` first (fails closed with no human)
+  # ⚠️ `autonomous` IS NOT A VALID VALUE HERE, and trying it takes the whole deployment down:
+  # `keel_core/config.py:346` rejects anything outside ('paper', 'confirm') with a ConfigError,
+  # so every command that loads this file fails, not just trading. This was tried on 2026-08-13
+  # and reverted. AUTONOMY IS A PROFILE CHOICE, NOT A MODE -- `mode: confirm` PLUS `keel autonomy
+  # on`, which is stored in the profile row, not in this file.
+  #
+  # WHAT IS ACTUALLY IN FORCE: `agent.py::_effective_mode` returns "autonomous" only when
+  # `config.auto_trade.mode == "confirm"` AND `repo.get_profile().is_autonomous(now)`. Autonomy
+  # has been granted since 2026-08-05 23:10 UTC with no expiry, so the effective mode IS already
+  # autonomous and orders place unattended -- verified 2026-08-13 by evaluating that expression
+  # against keel-live.db. `keel autonomy show` is the authority; this line alone tells you nothing.
+  #
+  # ⚠️ DO NOT read `mode: confirm` as "orders need confirming", and do NOT read a stored order's
+  # `confirmation` column as a config value -- it records the EXECUTOR mode `_effective_mode`
+  # produced (order 1, BTC dca 2026-08-07, reads `autonomous` while this file said `confirm`).
+  # The profile is read fresh each cycle, so `keel autonomy off` takes effect next cycle;
+  # `keel kill` is what stops trading immediately.
+  mode: confirm
+  # ⚠️ `enabled` IS A DEAD FLAG -- verified 2026-08-13. It is parsed into `AutoTradeConfig.enabled`
+  # at `packages/keel-core/keel_core/config.py:731` and read by NO code path anywhere in `keel/`
+  # or `packages/`. It is present in the shipped templates too. Setting it false does NOT disable
+  # auto-trading and never has; `mode` is the only control. Left as-is rather than silently
+  # flipped, because changing it would imply it does something. Either wire it up or delete it.
   enabled: false
   interval_sec: 900
 
