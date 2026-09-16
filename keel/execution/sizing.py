@@ -72,6 +72,33 @@ def quantize_down(value: Decimal, increment: Decimal) -> Decimal:
     return stepped.quantize(scale if isinstance(exponent, int) and exponent < 0 else Decimal(1))
 
 
+def quantize_up(value: Decimal, increment: Decimal) -> Decimal:
+    """`value` rounded UP to a multiple of `increment`.
+
+    The twin of `quantize_down`, and the direction is again the whole point -- but the reasoning
+    is NOT the same reasoning, so the two must not be collapsed into one helper with a flag that
+    callers pick idly. `quantize_down` is safe for a SIZE because rounding a size up spends more
+    than `guards.check` authorised. This one exists for a PROTECTIVE STOP on a long, where the
+    hazard runs the other way: rounding the stop DOWN moves it further from price and widens the
+    loss the position was sized against, silently, on every bracket.
+
+    A value already on the increment is returned unchanged rather than bumped a step higher.
+
+    Presentation follows `quantize_down` exactly -- never scientific notation, because `str()` of
+    the result is what goes on the wire (#513, and #802 for the price leg).
+    """
+    if increment <= 0:
+        return value
+    # `Decimal.__floordiv__` TRUNCATES toward zero rather than flooring, so the usual
+    # `-((-v) // i * i)` ceiling trick silently returns the FLOOR here. Step up explicitly.
+    stepped = (value // increment) * increment
+    if stepped < value:
+        stepped += increment
+    scale = increment.normalize()
+    exponent = scale.as_tuple().exponent
+    return stepped.quantize(scale if isinstance(exponent, int) and exponent < 0 else Decimal(1))
+
+
 def quote_increment_for(product_id: str) -> Decimal | None:
     """The venue's finest acceptable `quote_size` for `product_id`, or `None` if unknown.
 

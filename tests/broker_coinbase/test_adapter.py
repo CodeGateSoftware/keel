@@ -873,3 +873,48 @@ _PREVIEW_ATTR = {
     "quote_size": "est_quote_size",
     "commission_total": "est_fee",
 }
+
+
+def test_get_instrument_reads_the_quote_increment_too() -> None:
+    """The PRICE tick, alongside the size one (#802).
+
+    `Instrument` carried only `base_increment` while nothing read the quote side. A bracket
+    carries two PRICES, and sending them at the engine's precision had Coinbase reject every one
+    ("Too many decimals in order price"), so `executor._bracket_spec` now reads this.
+    """
+    adapter = CoinbaseAdapter(
+        FakeTransport(
+            product={
+                "product_id": "PAXG-USD",
+                "base_increment": "0.00000001",
+                "quote_increment": "0.01",
+            }
+        )
+    )
+
+    instrument = adapter.get_instrument("PAXG-USD")
+
+    assert instrument is not None
+    assert instrument.base_increment == Decimal("0.00000001")
+    assert instrument.quote_increment == Decimal("0.01")
+
+
+@pytest.mark.parametrize("bad", [None, "", "abc", "0", "-0.01"])
+def test_a_missing_or_unusable_quote_increment_still_yields_an_instrument(bad: object) -> None:
+    """Absent/unusable price tick is UNKNOWN, not fatal.
+
+    The product is still tradeable by size, so the read must not collapse to `None` and take the
+    `base_increment` down with it -- that would make every bracket send an unquantized SIZE as
+    well, which is the #513 failure this adapter already fixes. The caller treats
+    `quote_increment=None` as "send prices unrounded", exactly as it behaved before the field.
+    """
+    product: dict[str, object] = {"product_id": "BTC-USD", "base_increment": "0.00000001"}
+    if bad is not None:
+        product["quote_increment"] = bad
+    adapter = CoinbaseAdapter(FakeTransport(product=product))
+
+    instrument = adapter.get_instrument("BTC-USD")
+
+    assert instrument is not None, "an unusable price tick must not lose the size tick"
+    assert instrument.base_increment == Decimal("0.00000001")
+    assert instrument.quote_increment is None
