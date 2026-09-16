@@ -2684,6 +2684,37 @@ def _roll_stop(
         rule_kind=rule_name,
         available_base=held,
     )
+    # Built BEFORE the call and inside a try, for the same reason `place_bracket` is -- and more
+    # urgently. The old bracket is ALREADY CANCELLED by the time we get here, so an exception
+    # escaping this line leaves the position naked AND skips the CRITICAL below, which is
+    # strictly worse than the #799 shape it shares. A replacement that cannot be BUILT is the
+    # same event as one the venue REJECTS, and takes the same path.
+    try:
+        spec = _bracket_spec(
+            product_id,
+            qty,
+            target,
+            new_stop,
+            _base_increment_for(broker, repo, product_id, now_ts),
+            _price_increment_for(broker, repo, product_id, now_ts),
+        )
+    except (BracketPricesUnplaceable, ValueError) as exc:
+        log_event(
+            logger,
+            logging.CRITICAL,
+            "executor.position_unprotected",
+            product=product_id,
+            reason=f"the replacement bracket could not be expressed for this venue: {exc}",
+            attempted_stop=new_stop,
+            cancelled_order_id=old_stop_order_id,
+            detail=(
+                "the previous bracket was cancelled and its replacement could not be BUILT -- "
+                "this position currently has no protective stop at the exchange. The "
+                "unbracketed record is retained so the next cycle's sweep re-places it."
+            ),
+        )
+        return None
+
     result = _run_order(
         intent,
         broker,
@@ -2692,9 +2723,7 @@ def _roll_stop(
         "autonomous",
         None,
         now_ts,
-        spec=_bracket_spec(
-            product_id, qty, target, new_stop, _base_increment_for(broker, repo, product_id, now_ts)
-        ),
+        spec=spec,
     )
     if not result.placed:
         # The old bracket is already cancelled, so the position is NAKED right now. The

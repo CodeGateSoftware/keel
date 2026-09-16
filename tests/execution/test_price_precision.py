@@ -178,3 +178,117 @@ def test_place_bracket_sends_prices_on_the_tick(repo):  # noqa: F811
     spec = broker.place_calls[-1]["spec"]
     assert spec.stop_trigger_price == Decimal("4521.77")
     assert spec.take_profit_price == Decimal("5582.02")
+
+
+# -- the ratchet path, which is the one that matters most ---------------------------------------
+
+
+def test_a_rolled_stop_is_also_quantized(repo):  # noqa: F811
+    """`_roll_stop` is the SECOND `_bracket_spec` call site, and it was missed once already.
+
+    It is the trailing ratchet -- the thing that tightens a stop as a trade runs -- so leaving it
+    unquantized would keep #802 alive on the protective path that fires most often, while
+    `place_bracket` looked fixed.
+    """
+    repo.set_state(
+        f"{executor.BASE_INCREMENT_PREFIX}BTC-USD",
+        {"increment": "0.00000001", "quote_increment": "0.01", "fetched_at": NOW_TS},
+    )
+    broker = HeldBroker("BTC", available=Decimal("0.01"), total=Decimal("0.01"))
+    stop_id = place_bracket(
+        broker,
+        repo,
+        _config(),
+        product_id="BTC-USD",
+        qty=Decimal("0.01"),
+        stop=Decimal("49000"),
+        target=Decimal("53000"),
+        rule_name="pullback_continuation",
+        now_ts=NOW_TS,
+    )
+
+    executor.roll_to_break_even(
+        broker,
+        repo,
+        _config(),
+        product_id="BTC-USD",
+        old_stop_order_id=stop_id,
+        entry_price=Decimal("50000.004999"),  # a break-even stop off the tick
+        qty=Decimal("0.01"),
+        rule_name="pullback_continuation",
+        now_ts=NOW_TS + 100,
+    )
+
+    rolled = broker.place_calls[-1]["spec"]
+    assert rolled.stop_trigger_price == Decimal("50000.01"), "the rolled stop reached the tick"
+    assert str(rolled.stop_trigger_price) == "50000.01"
+
+
+# -- _price_increment_for ----------------------------------------------------------------------
+
+
+class _InstrumentBroker:
+    """A broker that answers `get_instrument` and counts how often it is asked."""
+
+    def __init__(self, quote_increment: str | None = "0.01") -> None:
+        self.calls = 0
+        self._quote_increment = quote_increment
+
+    def get_instrument(self, product_id: str):  # noqa: ANN201
+        from keel_broker_api.results import Instrument
+
+        self.calls += 1
+        return Instrument(
+            product_id=product_id,
+            base_increment=Decimal("0.00000001"),
+            quote_increment=(
+                None if self._quote_increment is None else Decimal(self._quote_increment)
+            ),
+        )
+
+
+def test_price_increment_is_read_from_the_cached_record(repo):  # noqa: F811
+    repo.set_state(
+        f"{executor.BASE_INCREMENT_PREFIX}PAXG-USD",
+        {"increment": "0.00000001", "quote_increment": "0.01", "fetched_at": NOW_TS},
+    )
+    broker = _InstrumentBroker()
+
+    assert executor._price_increment_for(broker, repo, "PAXG-USD", NOW_TS) == CENT
+    assert broker.calls == 0, "a warm cache must not reach the venue inside the order path"
+
+
+def test_both_increments_share_one_fetch(repo):  # noqa: F811
+    """The per-product read exists to keep ONE venue round-trip in the order path. Asking for the
+    price tick after the size one must not add a second."""
+    broker = _InstrumentBroker()
+
+    executor._base_increment_for(broker, repo, "PAXG-USD", NOW_TS)
+    assert executor._price_increment_for(broker, repo, "PAXG-USD", NOW_TS) == CENT
+    assert broker.calls == 1
+
+
+def test_a_record_without_a_quote_increment_reads_unknown(repo):  # noqa: F811
+    """A cache record written before #802 carries no `quote_increment` key. Unknown is correct --
+    nothing knew the tick when it was written -- and unknown must not become a guessed 0.01."""
+    repo.set_state(
+        f"{executor.BASE_INCREMENT_PREFIX}PAXG-USD",
+        {"increment": "0.00000001", "fetched_at": NOW_TS},
+    )
+
+    assert executor._price_increment_for(_InstrumentBroker(), repo, "PAXG-USD", NOW_TS) is None
+
+
+def test_a_venue_that_reports_no_tick_reads_unknown(repo):  # noqa: F811
+    assert (
+        executor._price_increment_for(
+            _InstrumentBroker(quote_increment=None), repo, "X-USD", NOW_TS
+        )
+        is None
+    )
+
+
+def test_no_broker_reads_unknown_rather_than_raising(repo):  # noqa: F811
+    """Paper mode passes no broker. `_base_increment_for` is documented as never raising, and
+    this must not be the function that reintroduces one into the order path."""
+    assert executor._price_increment_for(None, repo, "PAXG-USD", NOW_TS) is None
