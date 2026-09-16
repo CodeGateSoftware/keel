@@ -152,9 +152,15 @@ class Instrument:
     path. A port method shaped like the caller's need lets an adapter ask the venue for one
     product where the venue supports that, and filter locally where it does not.
 
-    **Only `base_increment`, for now.** Quote-side granularity and minimum sizes are the same
-    class of fact and would sit here naturally, but nothing reads them yet, and a field no caller
-    reads is a field no test meaningfully checks.
+    **`quote_increment` was added when a caller appeared (#802).** The paragraph here used to
+    say quote-side granularity "would sit here naturally, but nothing reads them yet, and a field
+    no caller reads is a field no test meaningfully checks." `executor._bracket_spec` now reads
+    it: a bracket carries two PRICES, and sending them at the engine's precision had every
+    protective bracket rejected with "Too many decimals in order price". Minimum sizes are still
+    absent for the original reason -- nothing reads them.
+
+    `None` means the venue did not report one, and callers must treat that as UNKNOWN rather
+    than as "no rounding needed".
     """
 
     product_id: str
@@ -163,6 +169,7 @@ class Instrument:
     #: constructing an Instrument carrying zero, which a caller would quantize against and get
     #: a division error or a silent zero size.
     base_increment: Decimal
+    quote_increment: Decimal | None = None
 
     def __post_init__(self) -> None:
         if self.base_increment <= 0:

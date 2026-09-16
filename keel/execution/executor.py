@@ -418,8 +418,41 @@ def _base_increment_for(
     if instrument is None:
         return None
     increment = instrument.base_increment
-    repo.set_state(key, {"increment": str(increment), "fetched_at": now_ts})
+    # Both increments ride ONE fetch and ONE cached record. Splitting them would double the
+    # venue round-trips inside the order-placement path -- the latency the per-product read in
+    # `get_instrument` exists to avoid -- for two fields of the same response (#802).
+    record: dict[str, object] = {"increment": str(increment), "fetched_at": now_ts}
+    if instrument.quote_increment is not None:
+        record["quote_increment"] = str(instrument.quote_increment)
+    repo.set_state(key, record)
     return increment
+
+
+def _price_increment_for(
+    broker: Any, repo: Repository, product_id: str, now_ts: int
+) -> Decimal | None:
+    """The venue's PRICE tick for `product_id`, or `None` if unknown -- never raises.
+
+    Reads the record `_base_increment_for` writes, and warms it through that function on a miss
+    so the two never issue separate fetches. `None` means UNKNOWN: prices go on the wire
+    unrounded, exactly as they did before #802. That is deliberately NOT a refusal -- refusing
+    here would leave a filled position with no stop at all, which is the outcome #799 documents.
+
+    A record written before #802 carries no `quote_increment` key and reads as unknown until it
+    expires, which is correct: nothing knew the tick when it was written.
+    """
+    key = f"{BASE_INCREMENT_PREFIX}{product_id}"
+    cached = repo.get_state(key)
+    if isinstance(cached, dict):
+        fetched_at = cached.get("fetched_at")
+        if isinstance(fetched_at, int) and now_ts - fetched_at < BASE_INCREMENT_TTL_SEC:
+            return _coerce_increment(cached.get("quote_increment"))
+
+    _base_increment_for(broker, repo, product_id, now_ts)
+    refreshed = repo.get_state(key)
+    if isinstance(refreshed, dict):
+        return _coerce_increment(refreshed.get("quote_increment"))
+    return None
 
 
 def _coerce_increment(raw: object) -> Decimal | None:
@@ -1785,6 +1818,17 @@ def _order_row(
     )
 
 
+class BracketPricesUnplaceable(RuntimeError):
+    """A bracket's two prices cannot be expressed on the venue's tick (#802).
+
+    Raised only when quantization COLLAPSES the pair -- rounding moves a long's stop up and its
+    target down, toward each other, so a coarse enough tick can invert a pair that was valid
+    before it. `BracketGTC.__post_init__` refuses the inverted pair; this names why, and gives
+    `place_bracket` something to catch so the failure takes the unbracketed-retry path rather
+    than escaping the call (the shape that stranded a position in #799).
+    """
+
+
 class SizePrecisionUnavailable(RuntimeError):
     """No quote increment is known for this product, so no size can be safely serialised (#513).
 
@@ -2016,6 +2060,7 @@ def _bracket_spec(
     target: Decimal,
     stop: Decimal,
     base_increment: Decimal | None = None,
+    price_increment: Decimal | None = None,
 ) -> BracketGTC:
     """The exit bracket as a port value: ONE order carrying both protective prices.
 
@@ -2034,12 +2079,31 @@ def _bracket_spec(
     #516's quantization is unchanged and still happens HERE, before the spec is built: quantize
     down when the increment is known, send unchanged when it is not. A bracket the venue refuses
     leaves a position unprotected, so this path must never become more likely to fail than it was.
+
+    **#802 gave the same treatment to the two PRICES, and in OPPOSITE directions.** Sending them
+    at the engine's precision is what had every bracket rejected ("Too many decimals in order
+    price"), so the tick applies here too -- but `quantize_down`'s reasoning is about SIZES
+    (rounding one up spends more than the rails authorised) and does not transfer. A long's
+    protective stop rounded DOWN sits further from price and widens the loss the position was
+    sized against; its target rounded UP becomes less reachable. So the stop rounds UP and the
+    target rounds DOWN -- each toward the safer answer, which means toward each other.
+
+    Because they move toward each other, a coarse tick can invert a pair that was valid before
+    it. That is `BracketPricesUnplaceable`, raised rather than sent, and caught by `place_bracket`.
     """
     size = (
         qty
         if base_increment is None or base_increment <= 0
         else _floor_or_original(qty, base_increment)
     )
+    if price_increment is not None and price_increment > 0:
+        stop = sizing.quantize_up(stop, price_increment)
+        target = sizing.quantize_down(target, price_increment)
+        if stop >= target:
+            raise BracketPricesUnplaceable(
+                f"{product_id!r}: at tick {price_increment} the stop quantizes to {stop} and the "
+                f"target to {target}, which is not a bracket -- refusing to send it"
+            )
     return BracketGTC(
         product_id=product_id,
         # A bracket keel places always EXITS a long: keel enters with a market IOC and protects
@@ -2115,6 +2179,35 @@ def place_bracket(
         rule_kind=rule_name,
         available_base=held,
     )
+    # Built BEFORE the call, and inside a try, deliberately. As an inline argument to
+    # `_run_order` any exception from here escaped `place_bracket` entirely -- past the
+    # `if not result.placed` recovery below -- which is exactly how #799 stranded a filled
+    # position: the entry was already on the books and the bookkeeping never ran. A bracket that
+    # cannot be BUILT is the same event as a bracket the venue REFUSES, and takes the same path.
+    try:
+        spec = _bracket_spec(
+            product_id,
+            qty,
+            target,
+            stop,
+            _base_increment_for(broker, repo, product_id, now_ts),
+            _price_increment_for(broker, repo, product_id, now_ts),
+        )
+    except (BracketPricesUnplaceable, ValueError) as exc:
+        repo.set_state(
+            f"{UNBRACKETED_PREFIX}{product_id}",
+            {"stop": stop, "target": target, "qty": qty},
+        )
+        log_event(
+            logger,
+            logging.WARNING,
+            "executor.bracket_not_placed",
+            product=product_id,
+            reason=f"the bracket could not be expressed for this venue: {exc}",
+            vetoed_by=[],
+        )
+        return None
+
     result = _run_order(
         intent,
         broker,
@@ -2123,9 +2216,7 @@ def place_bracket(
         "autonomous",
         None,
         now_ts,
-        spec=_bracket_spec(
-            product_id, qty, target, stop, _base_increment_for(broker, repo, product_id, now_ts)
-        ),
+        spec=spec,
     )
     if not result.placed:
         # The entry has ALREADY filled by the time we get here, so this is a real position with
@@ -2593,6 +2684,37 @@ def _roll_stop(
         rule_kind=rule_name,
         available_base=held,
     )
+    # Built BEFORE the call and inside a try, for the same reason `place_bracket` is -- and more
+    # urgently. The old bracket is ALREADY CANCELLED by the time we get here, so an exception
+    # escaping this line leaves the position naked AND skips the CRITICAL below, which is
+    # strictly worse than the #799 shape it shares. A replacement that cannot be BUILT is the
+    # same event as one the venue REJECTS, and takes the same path.
+    try:
+        spec = _bracket_spec(
+            product_id,
+            qty,
+            target,
+            new_stop,
+            _base_increment_for(broker, repo, product_id, now_ts),
+            _price_increment_for(broker, repo, product_id, now_ts),
+        )
+    except (BracketPricesUnplaceable, ValueError) as exc:
+        log_event(
+            logger,
+            logging.CRITICAL,
+            "executor.position_unprotected",
+            product=product_id,
+            reason=f"the replacement bracket could not be expressed for this venue: {exc}",
+            attempted_stop=new_stop,
+            cancelled_order_id=old_stop_order_id,
+            detail=(
+                "the previous bracket was cancelled and its replacement could not be BUILT -- "
+                "this position currently has no protective stop at the exchange. The "
+                "unbracketed record is retained so the next cycle's sweep re-places it."
+            ),
+        )
+        return None
+
     result = _run_order(
         intent,
         broker,
@@ -2601,9 +2723,7 @@ def _roll_stop(
         "autonomous",
         None,
         now_ts,
-        spec=_bracket_spec(
-            product_id, qty, target, new_stop, _base_increment_for(broker, repo, product_id, now_ts)
-        ),
+        spec=spec,
     )
     if not result.placed:
         # The old bracket is already cancelled, so the position is NAKED right now. The

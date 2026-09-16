@@ -268,7 +268,16 @@ class CoinbaseAdapter:
             return None
         if value <= 0:
             return None
-        return Instrument(product_id=product_id, base_increment=value)
+        # `quote_increment` is the PRICE tick, and it is optional in a way `base_increment` is
+        # not: a product missing it is still tradeable by size, so its absence returns an
+        # Instrument with `quote_increment=None` rather than no Instrument at all. The caller
+        # (`executor._bracket_spec`, #802) treats None as UNKNOWN and sends prices unrounded,
+        # which is what it did for every product before this field existed.
+        return Instrument(
+            product_id=product_id,
+            base_increment=value,
+            quote_increment=_positive_decimal_or_none(_field(raw, "quote_increment")),
+        )
 
     def list_products(self, product_type: str = "SPOT") -> list[dict[str, Any]]:
         """Every tradable product on the venue, as plain dicts. READ-ONLY market metadata.
@@ -535,3 +544,18 @@ def _cancel_outcome_from_success(success: object) -> CancelOutcome:
 
 
 __all__ = ["CoinbaseAdapter"]
+
+
+def _positive_decimal_or_none(raw: object) -> Decimal | None:
+    """A positive `Decimal` from the venue's string, or `None` -- never raises.
+
+    Mirrors `executor._coerce_increment`; kept here rather than imported because the adapter
+    package must not depend on the engine.
+    """
+    if raw is None:
+        return None
+    try:
+        value = Decimal(str(raw))
+    except ArithmeticError, TypeError, ValueError:
+        return None
+    return value if value > 0 else None
