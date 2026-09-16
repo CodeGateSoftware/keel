@@ -242,6 +242,7 @@ def execute(
             target=signal.setup.target,
             rule_name=signal.rule_name,
             now_ts=now_ts,
+            rule_id=signal.rule_id,  # #803 -- the same id the ENTRY order was written with
         )
         # Surfaced rather than discarded so `run_once` can point the tranche at its bracket.
         # See `ExecutionResult.bracket_order_id`.
@@ -2146,6 +2147,7 @@ def place_bracket(
     target: Decimal,
     rule_name: str,
     now_ts: int,
+    rule_id: int | None = None,
 ) -> int | None:
     """Place the exchange-side exit bracket for an open long position, or `None` if vetoed.
 
@@ -2177,6 +2179,11 @@ def place_bracket(
         notional=sizing.spend(qty, stop),
         is_dca=False,
         rule_kind=rule_name,
+        # #803: `rule_kind` is the KIND, and it is not an identity. Without the id the row this
+        # order belongs to is unrecoverable from the orders ledger, so every protective SELL
+        # read "unattributed" while its entry read the rule's name. Callers that hold a position
+        # pass `position["rule_id"]`; `None` stays None rather than being guessed from the kind.
+        rule_id=rule_id,
         available_base=held,
     )
     # Built BEFORE the call, and inside a try, deliberately. As an inline argument to
@@ -2268,6 +2275,7 @@ def scale_out(
     exit_price: Decimal,
     rule_name: str,
     now_ts: int,
+    rule_id: int | None = None,
 ) -> ExecutionResult:
     """Sell `qty` of an open position and RESIZE its protective bracket down to the remainder.
 
@@ -2411,6 +2419,7 @@ def scale_out(
         notional=sizing.spend(qty, exit_price),
         is_dca=False,
         rule_kind=rule_name,
+        rule_id=rule_id,  # #803, as in `place_bracket` above
         available_base=venue_held,
     )
     result = _run_order(intent, broker, repo, config, "autonomous", None, now_ts)
@@ -2453,6 +2462,7 @@ def scale_out(
         target=target,
         rule_name=rule_name,
         now_ts=now_ts,
+        rule_id=rule_id,  # #803 -- the resized bracket belongs to the same rule as the scale-out
     )
     if bracket_order_id is None:
         log_event(
@@ -2583,6 +2593,10 @@ def _roll_stop(
         )
         return None
 
+    # Read BEFORE the cancel-and-replace below, while the tranche still names the OLD bracket:
+    # the success path repoints it to the replacement, after which this id resolves to nothing.
+    rolled_position = repo.get_position_for_bracket(old_stop_order_id)
+
     target = repo.get_state(f"open_target:{product_id}")
     if target is None:
         log_event(
@@ -2682,6 +2696,14 @@ def _roll_stop(
         notional=sizing.spend(qty, new_stop),
         is_dca=False,
         rule_kind=rule_name,
+        # #803: resolved HERE rather than threaded through `_roll_stop`'s three public wrappers,
+        # because this function already holds the one thing that identifies the owner --
+        # `old_stop_order_id`, the bracket the tranche currently names. Reading the ledger is
+        # also the more honest source than a `rule_id` passed down a call chain: it is the same
+        # lookup the success path below already does to repoint the tranche. `None` (a tranche
+        # predating v21, or a bracket no tranche names) stays None, exactly as `rule_kind` alone
+        # behaved before -- a roll must never fail over missing attribution.
+        rule_id=(rolled_position or {}).get("rule_id"),
         available_base=held,
     )
     # Built BEFORE the call and inside a try, for the same reason `place_bracket` is -- and more

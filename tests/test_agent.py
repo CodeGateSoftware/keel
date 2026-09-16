@@ -904,6 +904,30 @@ def test_run_once_writes_the_seeded_rules_db_id_onto_the_order(repo):
     assert len(broker.place_calls) == 1
 
 
+def test_run_once_writes_the_rules_db_id_onto_the_POSITION_too(repo):
+    """The tranche inherits its owner from the ENTRY ORDER (#803).
+
+    The sibling above proves the ORDER carries `rules.id`. This proves the `positions` row does
+    too, and it is the assertion that matters for attribution: both exit paths build their
+    `OrderIntent` from a position, so a tranche with a NULL `rule_id` puts every protective SELL
+    back to "unattributed" no matter what the entry recorded.
+
+    It is also the only test that exercises the inheritance at all. Every other #803 test passes
+    `rule_id=` to `repo.open_position` directly, so replacing `agent._open_tranche`'s
+    `rule_id=order.get("rule_id")` with `None` left the whole suite green -- a mutant that
+    survived until this test existed.
+    """
+    rule_id = repo.insert_rule("dca", {"product_id": PRODUCT}, status="live")
+    broker = FakeBroker(series={(PRODUCT, Granularity.ONE_DAY): [_candle(0, "100")]})
+
+    run_once(broker, repo, _config(), now_ts=90_000)
+
+    positions = repo.get_open_positions(PRODUCT)
+    assert len(positions) == 1, "no tranche was recorded -- this test proves nothing"
+    assert positions[0]["rule_id"] == rule_id
+    assert positions[0]["rule_name"] == "dca", "the kind must survive alongside the id"
+
+
 # -- run_once: autonomy is a live-read profile choice --------------------------------------------
 
 

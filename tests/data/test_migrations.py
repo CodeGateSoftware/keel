@@ -49,7 +49,7 @@ def test_fresh_database_is_stamped_at_the_current_version() -> None:
     conn = db.connect(":memory:")
     db.migrate(conn)
     version = conn.execute("SELECT version FROM schema_version").fetchone()["version"]
-    assert version == db.SCHEMA_VERSION == 20
+    assert version == db.SCHEMA_VERSION == 21
 
 
 def test_fresh_database_gets_no_subscription_row() -> None:
@@ -624,7 +624,7 @@ def test_v14_migration_bumps_the_stored_version() -> None:
     conn = _v12_database()
     db.migrate(conn)
     stamped = conn.execute("SELECT version FROM schema_version").fetchone()["version"]
-    assert stamped == db.SCHEMA_VERSION == 20
+    assert stamped == db.SCHEMA_VERSION == 21
 
 
 def test_v14_migration_step_is_not_blocked_by_another_venues_existing_row() -> None:
@@ -785,7 +785,7 @@ def test_v15_migration_bumps_the_stored_version() -> None:
     conn = _v12_database()
     db.migrate(conn)
     stamped = conn.execute("SELECT version FROM schema_version").fetchone()["version"]
-    assert stamped == db.SCHEMA_VERSION == 20
+    assert stamped == db.SCHEMA_VERSION == 21
 
 
 def test_v15_the_12_to_15_chain_creates_the_table_with_the_column_already_present() -> None:
@@ -887,7 +887,7 @@ def test_an_existing_orders_table_gains_the_submit_book_by_ALTER() -> None:
     assert row["submit_best_bid"] is None
     assert row["submit_best_ask"] is None
     stamped = conn.execute("SELECT version FROM schema_version").fetchone()["version"]
-    assert stamped == db.SCHEMA_VERSION == 20
+    assert stamped == db.SCHEMA_VERSION == 21
 
 
 def test_v16_is_idempotent_per_column() -> None:
@@ -1047,7 +1047,7 @@ def test_migration_to_v20_adds_the_columns_and_the_new_tables() -> None:
     assert "idx_cycle_balances_mode_currency_ts" in index_names
 
     stamped = conn.execute("SELECT version FROM schema_version").fetchone()["version"]
-    assert stamped == db.SCHEMA_VERSION == 20
+    assert stamped == db.SCHEMA_VERSION == 21
 
 
 def test_v19_database_gains_v20_columns_as_NULL_no_backfill() -> None:
@@ -1094,7 +1094,7 @@ def test_v19_database_gains_v20_columns_as_NULL_no_backfill() -> None:
     assert instrument_row["attest_due_ts"] is None
 
     stamped = conn.execute("SELECT version FROM schema_version").fetchone()["version"]
-    assert stamped == db.SCHEMA_VERSION == 20
+    assert stamped == db.SCHEMA_VERSION == 21
 
 
 def test_v20_is_idempotent_per_column() -> None:
@@ -1165,7 +1165,7 @@ def test_v20_on_a_pre_v11_chain_does_not_duplicate_columns() -> None:
     assert {"cycle_balances", "audit_events"} <= table_names
 
     stamped = conn.execute("SELECT version FROM schema_version").fetchone()["version"]
-    assert stamped == db.SCHEMA_VERSION == 20
+    assert stamped == db.SCHEMA_VERSION == 21
 
 
 def test_cycle_balances_accepts_null_and_round_trips_a_decimal_string() -> None:
@@ -1249,3 +1249,80 @@ def test_the_recorded_balance_columns_are_text_and_nullable() -> None:
 
     for name in ("available", "total"):
         assert columns[name] == ("TEXT", 0), f"cycle_balances.{name} is {columns[name]}"
+
+
+# -- v21: positions.rule_id (#803) -------------------------------------------------------------
+
+
+def _v20_positions_table(conn: sqlite3.Connection) -> None:
+    """`positions` exactly as v20 shipped it -- every column through `status`, and no `rule_id`."""
+    conn.execute(
+        """
+        CREATE TABLE positions (
+            id                INTEGER PRIMARY KEY AUTOINCREMENT,
+            product_id        TEXT    NOT NULL,
+            rule_name         TEXT    NOT NULL,
+            opened_at         INTEGER NOT NULL,
+            closed_at         INTEGER,
+            qty               TEXT    NOT NULL,
+            entry_fill        TEXT    NOT NULL,
+            entry_fee         TEXT    NOT NULL,
+            initial_stop      TEXT,
+            realized_qty      TEXT,
+            realized_proceeds TEXT,
+            realized_fees     TEXT,
+            bracket_order_id  INTEGER,
+            status            TEXT    NOT NULL DEFAULT 'open'
+        )
+        """
+    )
+
+
+def test_migration_to_v21_adds_positions_rule_id() -> None:
+    conn = db.connect(":memory:")
+    db.migrate(conn)
+
+    columns = {row["name"] for row in conn.execute("PRAGMA table_info(positions)")}
+
+    assert "rule_id" in columns
+    assert "rule_name" in columns, "the KIND must survive alongside the id, not be replaced by it"
+
+
+def test_a_v20_database_gains_rule_id_as_NULL_no_backfill() -> None:
+    """NO BACKFILL, the call v12 made for `initial_stop`.
+
+    A tranche records its BRACKET order, never its ENTRY order, so there is no join back to the
+    row carrying the id. Matching on `(product_id, rule_name)` would re-attribute by guess and be
+    wrong wherever a rule row was replaced. NULL means "nobody recorded it".
+    """
+    conn = db.connect(":memory:")
+    conn.execute("CREATE TABLE IF NOT EXISTS schema_version (version INTEGER NOT NULL)")
+    conn.execute("INSERT INTO schema_version (version) VALUES (20)")
+    _v20_positions_table(conn)
+    conn.execute(
+        """
+        INSERT INTO positions (product_id, rule_name, opened_at, qty, entry_fill, entry_fee)
+        VALUES ('PAXG-USD', 'turtle_breakout', 1, '0.0132', '4673.23', '0.73')
+        """
+    )
+    conn.commit()
+
+    db.migrate(conn)
+
+    row = conn.execute("SELECT rule_name, rule_id FROM positions").fetchone()
+    assert row["rule_name"] == "turtle_breakout"
+    assert row["rule_id"] is None, "a pre-v21 tranche must read unknown, not a guessed owner"
+    stamped = conn.execute("SELECT version FROM schema_version").fetchone()["version"]
+    assert stamped == db.SCHEMA_VERSION == 21
+
+
+def test_v21_is_idempotent_on_a_database_that_already_has_the_column() -> None:
+    """`CREATE TABLE IF NOT EXISTS` never adds a column, so the ALTER is guarded by
+    `PRAGMA table_info` -- running it twice must not raise `duplicate column name`."""
+    conn = db.connect(":memory:")
+    db.migrate(conn)
+
+    db._migrate_v21_positions_rule_id(conn)
+
+    columns = [row["name"] for row in conn.execute("PRAGMA table_info(positions)")]
+    assert columns.count("rule_id") == 1

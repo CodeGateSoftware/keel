@@ -290,6 +290,7 @@ def reconcile_unbracketed_positions(
                 target=intent["target"],
                 rule_name=position.get("rule_name") or "rebracket",
                 now_ts=now_ts,
+                rule_id=position.get("rule_id"),  # #803
             )
         except Exception:
             log_exception(
@@ -549,6 +550,7 @@ def _rebracket_or_escalate(
             target=target,
             rule_name=position.get("rule_name") or "rebracket",
             now_ts=now_ts,
+            rule_id=position.get("rule_id"),  # #803
         )
     except Exception:
         log_exception(

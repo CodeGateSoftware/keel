@@ -1253,6 +1253,7 @@ class Repository:
         entry_fee: Decimal,
         initial_stop: Decimal | None = None,
         bracket_order_id: int | None = None,
+        rule_id: int | None = None,
     ) -> int:
         """Record a newly opened tranche and return its id.
 
@@ -1262,13 +1263,20 @@ class Repository:
         before v12 predates the column. Readers must disable the break-even arm for such a
         tranche rather than substitute the current stop, which is a different policy (see
         `db._migrate_v12_positions_initial_stop`).
+
+        `rule_id` is the `rules.id` that opened the tranche (#803), distinct from `rule_name`,
+        which is the rule's KIND. Only the id identifies the ROW, and it is what lets the
+        protective SELL that later exits this position be attributed: both exit paths build
+        their `OrderIntent` from a position, not from a signal, so without this they wrote
+        `orders.rule_id` NULL and rendered "unattributed". `None` means unknown -- pre-v21
+        tranches, and any entry whose order carried no id -- never "no owning rule".
         """
         cursor = self._conn.execute(
             """
             INSERT INTO positions
                 (product_id, rule_name, opened_at, qty, entry_fill, entry_fee,
-                 initial_stop, bracket_order_id, status)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'open')
+                 initial_stop, bracket_order_id, rule_id, status)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'open')
             """,
             (
                 product_id,
@@ -1279,6 +1287,7 @@ class Repository:
                 _dec_to_text(entry_fee),
                 None if initial_stop is None else _dec_to_text(initial_stop),
                 bracket_order_id,
+                rule_id,
             ),
         )
         self._conn.commit()
