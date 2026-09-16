@@ -20,7 +20,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
-SCHEMA_VERSION = 20
+SCHEMA_VERSION = 21
 
 # Creation order matters for readability (and for backends that validate FK targets eagerly);
 # SQLite itself only checks FK targets at DML time, but we still declare referenced tables first.
@@ -135,6 +135,18 @@ _SCHEMA_STATEMENTS: tuple[str, ...] = (
         entry_fill        TEXT    NOT NULL,
         entry_fee         TEXT    NOT NULL,
         initial_stop      TEXT,
+        -- The `rules.id` that opened this tranche (#803). `rule_name` above is the rule's KIND
+        -- ("dca", "turtle_breakout"), which is what the engine reconstructs a Rule from -- it
+        -- does not identify the ROW, so nothing could thread a rules.id onto the protective
+        -- SELL that later exits this position. Every bracket and exit order was therefore
+        -- written with `orders.rule_id` NULL and rendered "unattributed", leaving per-rule
+        -- accounting with entries attributed and exits anonymous -- the wrong half to lose.
+        --
+        -- NULL means unknown, never "no rule": tranches opened before v21 have no recorded id
+        -- and there is nothing to join them back through (`positions` references its BRACKET
+        -- order, never its ENTRY order), so they are left NULL rather than guessed at. Same
+        -- rule v12 set for `initial_stop`.
+        rule_id           INTEGER,
         -- Partial-exit accumulators (#502). `qty` is the quantity STILL HELD, and it is now
         -- mutable: `scale_out` sells a fraction of a tranche and leaves the rest running, so
         -- the legs of one trade land at different prices and different times. These three
@@ -1024,6 +1036,34 @@ def _migrate_v20_provenance_and_attest_windows(conn: sqlite3.Connection) -> None
         conn.execute("ALTER TABLE instrument_attestations ADD COLUMN attest_due_ts INTEGER")
 
 
+def _migrate_v21_positions_rule_id(conn: sqlite3.Connection) -> None:
+    """v21 adds `positions.rule_id` -- the `rules.id` that opened the tranche (#803).
+
+    `positions.rule_name` is a KIND, not an identity. It is what `agent._build_rule`
+    reconstructs a Rule from, and it was enough for everything the ledger did until an EXIT
+    needed attributing: `executor.place_bracket` and the scale-out path build their
+    `OrderIntent` from a POSITION rather than from a signal, so they had no `rules.id` to put on
+    `orders.rule_id`. Every protective SELL was written unattributed, and
+    `payload._order_payload` rendered it as such.
+
+    That is not a cosmetic gap. Per-rule accounting reading `orders.rule_id` saw entries
+    attributed and exits anonymous, which for a trend rule drops exactly the leg the outcome
+    lands on.
+
+    Idempotent by the usual `PRAGMA table_info` guard: a database stamped at v20 got `positions`
+    from v4's DDL, and `CREATE TABLE IF NOT EXISTS` never adds a column to an existing table.
+
+    **NO BACKFILL, deliberately** -- the same call v12 made for `initial_stop`. A tranche records
+    its BRACKET order (`bracket_order_id`), never its ENTRY order, so there is no join back to
+    the order that carries the id. Matching on `(product_id, rule_name)` would re-attribute by
+    guess and would be wrong wherever a rule row was replaced. NULL means "nobody recorded it",
+    and readers must show it as unknown rather than invent an owner.
+    """
+    columns = {row["name"] for row in conn.execute("PRAGMA table_info(positions)")}
+    if "rule_id" not in columns:
+        conn.execute("ALTER TABLE positions ADD COLUMN rule_id INTEGER")
+
+
 _MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
     2: _migrate_v2_broker_subscriptions,
     3: _migrate_v3_trade_outcomes,
@@ -1044,6 +1084,7 @@ _MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
     18: _migrate_v18_venue_cash_postures,
     19: _migrate_v19_equity_points,
     20: _migrate_v20_provenance_and_attest_windows,
+    21: _migrate_v21_positions_rule_id,
 }
 
 

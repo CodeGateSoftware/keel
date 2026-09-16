@@ -387,6 +387,12 @@ def _open_tranche(
         entry_fee=order["fee"] or Decimal("0"),
         entry_fill=entry_fill,
         initial_stop=initial_stop,
+        # Inherited from the ENTRY order rather than passed down separately (#803). That order
+        # was written with `rule_id=signal.rule_id`, so it already carries the identity of the
+        # row that fired -- and taking it from here means every caller of `_open_tranche` gets
+        # the attribution without a new argument to forget. `None` stays None: an order that
+        # recorded no id cannot be given one now.
+        rule_id=order.get("rule_id"),
     )
     if result.bracket_order_id is not None:
         repo.set_position_bracket(position_id, result.bracket_order_id)

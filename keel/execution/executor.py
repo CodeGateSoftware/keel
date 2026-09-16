@@ -242,6 +242,7 @@ def execute(
             target=signal.setup.target,
             rule_name=signal.rule_name,
             now_ts=now_ts,
+            rule_id=signal.rule_id,  # #803 -- the same id the ENTRY order was written with
         )
         # Surfaced rather than discarded so `run_once` can point the tranche at its bracket.
         # See `ExecutionResult.bracket_order_id`.
@@ -2146,6 +2147,7 @@ def place_bracket(
     target: Decimal,
     rule_name: str,
     now_ts: int,
+    rule_id: int | None = None,
 ) -> int | None:
     """Place the exchange-side exit bracket for an open long position, or `None` if vetoed.
 
@@ -2177,6 +2179,11 @@ def place_bracket(
         notional=sizing.spend(qty, stop),
         is_dca=False,
         rule_kind=rule_name,
+        # #803: `rule_kind` is the KIND, and it is not an identity. Without the id the row this
+        # order belongs to is unrecoverable from the orders ledger, so every protective SELL
+        # read "unattributed" while its entry read the rule's name. Callers that hold a position
+        # pass `position["rule_id"]`; `None` stays None rather than being guessed from the kind.
+        rule_id=rule_id,
         available_base=held,
     )
     # Built BEFORE the call, and inside a try, deliberately. As an inline argument to
@@ -2268,6 +2275,7 @@ def scale_out(
     exit_price: Decimal,
     rule_name: str,
     now_ts: int,
+    rule_id: int | None = None,
 ) -> ExecutionResult:
     """Sell `qty` of an open position and RESIZE its protective bracket down to the remainder.
 
@@ -2411,6 +2419,7 @@ def scale_out(
         notional=sizing.spend(qty, exit_price),
         is_dca=False,
         rule_kind=rule_name,
+        rule_id=rule_id,  # #803, as in `place_bracket` above
         available_base=venue_held,
     )
     result = _run_order(intent, broker, repo, config, "autonomous", None, now_ts)
@@ -2453,6 +2462,7 @@ def scale_out(
         target=target,
         rule_name=rule_name,
         now_ts=now_ts,
+        rule_id=rule_id,  # #803 -- the resized bracket belongs to the same rule as the scale-out
     )
     if bracket_order_id is None:
         log_event(
