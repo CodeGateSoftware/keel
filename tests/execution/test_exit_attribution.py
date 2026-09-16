@@ -17,7 +17,7 @@ from __future__ import annotations
 
 from decimal import Decimal
 
-from keel.execution.executor import place_bracket
+from keel.execution.executor import place_bracket, roll_to_break_even
 from tests.execution.test_executor import (
     NOW_TS,
     _config,
@@ -111,3 +111,87 @@ def test_an_unattributed_position_still_places_its_bracket(repo):  # noqa: F811
 
     assert bracket_id is not None
     assert repo.get_order(bracket_id)["rule_id"] is None
+
+
+def test_a_rolled_bracket_keeps_the_owning_rule_id(repo):  # noqa: F811
+    """The ratchet is the THIRD exit path, and it builds its own intent.
+
+    `place_bracket` and `scale_out` take `rule_id` from their caller; `_roll_stop` does not, and
+    threading it through its three public wrappers would have been three more signatures to keep
+    in step. It resolves the owner itself instead, from the bracket the tranche currently names.
+
+    Without that, every ratcheted stop -- the protective order that fires most often on a running
+    trend trade -- lands unattributed while its entry reads the rule's name.
+    """
+    rule_id = repo.insert_rule("turtle_breakout", {"product_id": "BTC-USD"}, status="live")
+    position_id = repo.open_position(
+        product_id="BTC-USD",
+        rule_name="turtle_breakout",
+        opened_at=NOW_TS,
+        qty=Decimal("0.01"),
+        entry_fill=Decimal("50000"),
+        entry_fee=Decimal("0.5"),
+        rule_id=rule_id,
+    )
+    broker = HeldBroker("BTC", available=Decimal("0.01"), total=Decimal("0.01"))
+    stop_id = place_bracket(
+        broker,
+        repo,
+        _config(),
+        product_id="BTC-USD",
+        qty=Decimal("0.01"),
+        stop=Decimal("49000"),
+        target=Decimal("53000"),
+        rule_name="turtle_breakout",
+        now_ts=NOW_TS,
+        rule_id=rule_id,
+    )
+    repo.set_position_bracket(position_id, stop_id)
+
+    rolled_id = roll_to_break_even(
+        broker,
+        repo,
+        _config(),
+        product_id="BTC-USD",
+        old_stop_order_id=stop_id,
+        entry_price=Decimal("50000"),
+        qty=Decimal("0.01"),
+        rule_name="turtle_breakout",
+        now_ts=NOW_TS + 100,
+    )
+
+    assert rolled_id is not None, "the roll did not happen -- this test proves nothing"
+    assert repo.get_order(rolled_id)["rule_id"] == rule_id
+
+
+def test_rolling_an_unattributed_position_still_replaces_the_stop(repo):  # noqa: F811
+    """A tranche predating v21 names no rule. The roll must still happen: refusing to re-protect
+    a position because its attribution is unknown would cancel a stop and not replace it."""
+    _seed_open_position(repo, "BTC-USD", Decimal("0.01"), Decimal("50000"))
+    broker = HeldBroker("BTC", available=Decimal("0.01"), total=Decimal("0.01"))
+    stop_id = place_bracket(
+        broker,
+        repo,
+        _config(),
+        product_id="BTC-USD",
+        qty=Decimal("0.01"),
+        stop=Decimal("49000"),
+        target=Decimal("53000"),
+        rule_name="turtle_breakout",
+        now_ts=NOW_TS,
+    )
+
+    rolled_id = roll_to_break_even(
+        broker,
+        repo,
+        _config(),
+        product_id="BTC-USD",
+        old_stop_order_id=stop_id,
+        entry_price=Decimal("50000"),
+        qty=Decimal("0.01"),
+        rule_name="turtle_breakout",
+        now_ts=NOW_TS + 100,
+    )
+
+    assert rolled_id is not None
+    assert repo.get_order(rolled_id)["rule_id"] is None

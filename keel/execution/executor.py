@@ -2593,6 +2593,10 @@ def _roll_stop(
         )
         return None
 
+    # Read BEFORE the cancel-and-replace below, while the tranche still names the OLD bracket:
+    # the success path repoints it to the replacement, after which this id resolves to nothing.
+    rolled_position = repo.get_position_for_bracket(old_stop_order_id)
+
     target = repo.get_state(f"open_target:{product_id}")
     if target is None:
         log_event(
@@ -2692,6 +2696,14 @@ def _roll_stop(
         notional=sizing.spend(qty, new_stop),
         is_dca=False,
         rule_kind=rule_name,
+        # #803: resolved HERE rather than threaded through `_roll_stop`'s three public wrappers,
+        # because this function already holds the one thing that identifies the owner --
+        # `old_stop_order_id`, the bracket the tranche currently names. Reading the ledger is
+        # also the more honest source than a `rule_id` passed down a call chain: it is the same
+        # lookup the success path below already does to repoint the tranche. `None` (a tranche
+        # predating v21, or a bracket no tranche names) stays None, exactly as `rule_kind` alone
+        # behaved before -- a roll must never fail over missing attribution.
+        rule_id=(rolled_position or {}).get("rule_id"),
         available_base=held,
     )
     # Built BEFORE the call and inside a try, for the same reason `place_bracket` is -- and more
