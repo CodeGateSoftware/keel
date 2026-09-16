@@ -146,6 +146,14 @@ _SCHEMA_STATEMENTS: tuple[str, ...] = (
         -- and there is nothing to join them back through (`positions` references its BRACKET
         -- order, never its ENTRY order), so they are left NULL rather than guessed at. Same
         -- rule v12 set for `initial_stop`.
+        --
+        -- NO FOREIGN KEY, unlike every other `rule_id` in this schema (`orders` and both
+        -- attestation tables declare one). The asymmetry is about PARITY, not about caring
+        -- less: SQLite cannot carry a constraint through `ALTER TABLE ... ADD COLUMN`, so a
+        -- database reaching v21 by MIGRATION physically cannot have one. Declaring it here
+        -- only would mean a fresh database enforces a rule a migrated one does not -- the two
+        -- diverge silently, and the difference surfaces as an IntegrityError on one deployment
+        -- and not another. Readers must treat this id as a hint that may name a deleted row.
         rule_id           INTEGER,
         -- Partial-exit accumulators (#502). `qty` is the quantity STILL HELD, and it is now
         -- mutable: `scale_out` sells a fraction of a tranche and leaves the rest running, so
@@ -1058,6 +1066,11 @@ def _migrate_v21_positions_rule_id(conn: sqlite3.Connection) -> None:
     the order that carries the id. Matching on `(product_id, rule_name)` would re-attribute by
     guess and would be wrong wherever a rule row was replaced. NULL means "nobody recorded it",
     and readers must show it as unknown rather than invent an owner.
+
+    **No foreign key**, unlike `orders.rule_id`. `ALTER TABLE ... ADD COLUMN` cannot carry a
+    constraint in SQLite, so a database reaching v21 by migration could not have one; declaring
+    it on the fresh DDL alone would leave fresh and migrated deployments enforcing different
+    rules. See the column comment in the `positions` DDL for the full reasoning.
     """
     columns = {row["name"] for row in conn.execute("PRAGMA table_info(positions)")}
     if "rule_id" not in columns:
