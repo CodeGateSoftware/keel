@@ -788,6 +788,26 @@ code,
 .stopped p { margin: 0 0 0.7rem; }
 .stopped .detail { color: var(--muted); font-size: 0.88rem; }
 
+/* How to get in (#634 follow-up): the command that RECOVERS the address, set apart from the
+ * detail prose rather than appended to it. The paragraph beside it runs five sentences, and a
+ * command added as a sixth is a command nobody sees -- which is how two people who knew this
+ * codebase were locked out and recovered by other means. Boxed, monospaced and selectable,
+ * because its whole purpose is to be copied into a terminal. */
+.how-to-get-in { margin: 0 0 1rem; }
+.how-to-get-in code {
+  display: block;
+  margin: 0.35rem 0 0.6rem;
+  padding: 0.5rem 0.7rem;
+  border: 1px solid var(--control-line);
+  border-radius: 4px;
+  background: var(--code-bg, rgba(127, 127, 127, 0.12));
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.95rem;
+  /* The one string on this page meant to leave it. */
+  user-select: all;
+  overflow-wrap: anywhere;
+}
+
 /* The reconnect field (#634): the one control on a refused page, so it is laid out as a row that
  * wraps rather than a form, and its border is `--control-line` -- the variable that exists
  * because WCAG 1.4.11 wants 3:1 on a control boundary and `--line` is decorative only. */

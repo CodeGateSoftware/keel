@@ -510,6 +510,27 @@ export function stoppedView(reading, setupHref) {
 }
 
 /**
+ * The `keel open` invocation that recovers THIS console's address.
+ *
+ * It returns a NODE and joins nothing, because this file may use neither template literals nor
+ * `+` -- `test_render_contains_no_arithmetic` bans the operator outright rather than try to tell
+ * string concatenation from money, and that bluntness is the point of the gate. `append` takes
+ * several strings, so the port is placed beside the command instead of being joined to it.
+ *
+ * A port the browser cannot report -- the default 80/443, where `location.port` is the empty
+ * string -- yields the bare command, which is still correct: `keel open` has its own default.
+ *
+ * @param {string} port  `window.location.port`, empty when the URL carries no explicit port.
+ * @returns {HTMLElement}
+ */
+function openCommandNode(port) {
+  const code = el("code");
+  if (port) code.append("keel open --port ", port);
+  else code.append("keel open");
+  return code;
+}
+
+/**
  * The "keel refused this browser" view (#634).
  *
  * ── WHY THIS IS NOT `stoppedView` ───────────────────────────────────────────────────────────
@@ -548,8 +569,37 @@ export function refusedView(reading, onReconnect) {
     card.append(el("p", "detail", reading.error.detail || reading.error.title));
   }
 
+  // ── HOW TO GET THE VALUE THIS FIELD WANTS ──────────────────────────────────────────────
+  // Added because the view told an operator what to paste and never where to get it. The
+  // refusal's own prose says the token "is never written to disk", which since #756 is only
+  // true of a server attached to a TERMINAL: run detached -- launchd, a pipe, a container --
+  // `runtime.py` records the address in a 0600 file precisely so `keel open` can hand it back.
+  // A reader who believes the sentence concludes the token is unrecoverable and restarts the
+  // server, which mints a NEW one and is the single worst move available. The command is the
+  // remedy, and it was named in `server.py`, in the launchd plist and in `runtime.py`'s own
+  // docstring -- everywhere except the screen the locked-out operator is looking at.
+  //
+  // The PORT is taken from `window.location`, the same source and the same reason as
+  // `timelineExportUrl` and the deployment card: it is a fact about where this page is, not a
+  // claim from a payload that just refused us. Nothing else about the deployment is named --
+  // the path in particular -- because the port is the one thing the reader demonstrably
+  // already knows (they reached this page on it), so naming it discloses nothing to a request
+  // that has NOT been admitted. That matters more once #648 lets this console answer beyond
+  // loopback.
+  const how = el("div", "detail how-to-get-in");
+  how.append(el("p", undefined, "To get this run's address, from your keel deployment directory:"));
+  how.append(openCommandNode(window.location.port));
+  const note = el("p");
+  note.append(
+    "It opens the console, and prints the address so you can paste it below. ",
+    "Attached to a terminal keel prints the address and keeps nothing; run as a service it ",
+    "records the address for that command and deletes it on shutdown.",
+  );
+  how.append(note);
+  card.append(how);
+
   const form = el("form");
-  const label = el("label", undefined, "Paste the address keel printed, or just its token");
+  const label = el("label", undefined, "Paste the address from that command, or just its token");
   label.setAttribute("for", "reconnect-address");
   const input = el("input");
   input.setAttribute("id", "reconnect-address");
