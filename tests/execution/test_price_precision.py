@@ -268,12 +268,17 @@ def test_both_increments_share_one_fetch(repo):  # noqa: F811
     assert broker.calls == 1
 
 
-def test_a_record_without_a_quote_increment_reads_unknown(repo):  # noqa: F811
-    """A cache record written before #802 carries no `quote_increment` key. Unknown is correct --
-    nothing knew the tick when it was written -- and unknown must not become a guessed 0.01."""
+def test_an_unparseable_quote_increment_reads_unknown(repo):  # noqa: F811
+    """Unknown must never become a guessed `0.01`.
+
+    This test used to assert that a record with the key ABSENT also read unknown. That was the
+    defect, not the contract -- see `test_a_record_written_before_the_field_existed_is_refetched`
+    below, and the live failure it names. What remains true is the narrower claim: a value that
+    is present and unusable is unknown, and is not repaired by guessing the common tick.
+    """
     repo.set_state(
         f"{executor.BASE_INCREMENT_PREFIX}PAXG-USD",
-        {"increment": "0.00000001", "fetched_at": NOW_TS},
+        {"increment": "0.00000001", "quote_increment": "not-a-number", "fetched_at": NOW_TS},
     )
 
     assert executor._price_increment_for(_InstrumentBroker(), repo, "PAXG-USD", NOW_TS) is None
@@ -292,3 +297,61 @@ def test_no_broker_reads_unknown_rather_than_raising(repo):  # noqa: F811
     """Paper mode passes no broker. `_base_increment_for` is documented as never raising, and
     this must not be the function that reintroduces one into the order path."""
     assert executor._price_increment_for(None, repo, "PAXG-USD", NOW_TS) is None
+
+
+# -- a cache record that predates the field must not wait out its TTL --------------------------
+
+
+def test_a_record_written_before_the_field_existed_is_refetched(repo):  # noqa: F811
+    """The live failure this covers (2026-09-17, keel-live.db).
+
+    `base_increment:PAXG-USD` was written by a pre-#802 build 24 hours before the cycle, so the
+    7-day TTL counted it FRESH and `_price_increment_for` returned the absent key as "unknown".
+    Prices went out unrounded and the venue rejected them -- for up to a week, on exactly the
+    deployment the fix was cut for, while the position sat unprotected.
+
+    "Unknown" is right when nothing knows the tick. It is wrong when the record simply predates
+    the question, and the two are distinguishable: a record that was WRITTEN with knowledge of
+    the field always carries the key, explicitly null when the venue reports none.
+    """
+    repo.set_state(
+        f"{executor.BASE_INCREMENT_PREFIX}PAXG-USD",
+        {"increment": "0.00001", "fetched_at": NOW_TS},  # no `quote_increment` key at all
+    )
+    broker = _InstrumentBroker()
+
+    assert executor._price_increment_for(broker, repo, "PAXG-USD", NOW_TS) == CENT
+    assert broker.calls == 1, "an incomplete record must be refetched, not waited out"
+
+
+def test_the_refetch_happens_once_and_then_the_record_is_complete(repo):  # noqa: F811
+    """Self-healing, not a fetch on every cycle."""
+    repo.set_state(
+        f"{executor.BASE_INCREMENT_PREFIX}PAXG-USD",
+        {"increment": "0.00001", "fetched_at": NOW_TS},
+    )
+    broker = _InstrumentBroker()
+
+    executor._price_increment_for(broker, repo, "PAXG-USD", NOW_TS)
+    executor._price_increment_for(broker, repo, "PAXG-USD", NOW_TS)
+
+    assert broker.calls == 1
+
+
+def test_a_venue_that_reports_no_tick_is_not_refetched_every_cycle(repo):  # noqa: F811
+    """The trap in the obvious fix.
+
+    "Refetch when the key is missing" would refetch FOREVER for a product whose venue genuinely
+    reports no tick, adding a venue round-trip to every order -- the latency the per-product read
+    exists to avoid. The key is therefore always written, explicitly null, so "absent" means
+    "written before the field" and nothing else.
+    """
+    broker = _InstrumentBroker(quote_increment=None)
+
+    assert executor._price_increment_for(broker, repo, "X-USD", NOW_TS) is None
+    assert executor._price_increment_for(broker, repo, "X-USD", NOW_TS) is None
+
+    assert broker.calls == 1, "a venue's honest 'no tick' must be cached, not re-asked"
+    record = repo.get_state(f"{executor.BASE_INCREMENT_PREFIX}X-USD")
+    assert "quote_increment" in record, "the key must be written even when the value is unknown"
+    assert record["quote_increment"] is None
