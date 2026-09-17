@@ -379,7 +379,7 @@ BASE_INCREMENT_TTL_SEC = 7 * 24 * 60 * 60
 
 
 def _base_increment_for(
-    broker: Any, repo: Repository, product_id: str, now_ts: int
+    broker: Any, repo: Repository, product_id: str, now_ts: int, *, force_refresh: bool = False
 ) -> Decimal | None:
     """The venue's finest acceptable `base_size` for `product_id`, cached, or `None` if unknown.
 
@@ -397,11 +397,17 @@ def _base_increment_for(
     """
     key = f"{BASE_INCREMENT_PREFIX}{product_id}"
     cached = repo.get_state(key)
-    if isinstance(cached, dict):
+    if not force_refresh and isinstance(cached, dict):
         fetched_at = cached.get("fetched_at")
         raw = cached.get("increment")
         if isinstance(fetched_at, int) and now_ts - fetched_at < BASE_INCREMENT_TTL_SEC:
             return _coerce_increment(raw)
+
+    # `force_refresh` skips the freshness check, never the record: a caller uses it when the
+    # record is fresh but INCOMPLETE (`_price_increment_for`, for a record predating
+    # `quote_increment`). Deleting the row first would be the shorter way to force a miss and the
+    # wrong one -- a venue call that then fails would have thrown away a perfectly good
+    # `base_increment` and put SELL sizes back on the wire unquantized, which is #513.
 
     if broker is None:
         # Paper mode passes no broker; expected, not an error (same reasoning as
@@ -422,9 +428,18 @@ def _base_increment_for(
     # Both increments ride ONE fetch and ONE cached record. Splitting them would double the
     # venue round-trips inside the order-placement path -- the latency the per-product read in
     # `get_instrument` exists to avoid -- for two fields of the same response (#802).
-    record: dict[str, object] = {"increment": str(increment), "fetched_at": now_ts}
-    if instrument.quote_increment is not None:
-        record["quote_increment"] = str(instrument.quote_increment)
+    # `quote_increment` is written ALWAYS, explicitly `None` when the venue reports none. The
+    # key's PRESENCE is what tells `_price_increment_for` this record was written by a build that
+    # knew to ask; writing it only when there is a value would make "venue has no tick"
+    # indistinguishable from "record predates the field", and the two need opposite handling --
+    # honour the first, refetch the second.
+    record: dict[str, object] = {
+        "increment": str(increment),
+        "fetched_at": now_ts,
+        "quote_increment": (
+            None if instrument.quote_increment is None else str(instrument.quote_increment)
+        ),
+    }
     repo.set_state(key, record)
     return increment
 
@@ -439,17 +454,31 @@ def _price_increment_for(
     unrounded, exactly as they did before #802. That is deliberately NOT a refusal -- refusing
     here would leave a filled position with no stop at all, which is the outcome #799 documents.
 
-    A record written before #802 carries no `quote_increment` key and reads as unknown until it
-    expires, which is correct: nothing knew the tick when it was written.
+    **A record that predates the field is a MISS, not an "unknown"** -- and the first cut of this
+    function got that wrong. It treated the absent key as unknown and let the 7-day TTL run, so a
+    deployment upgraded mid-TTL kept sending unrounded prices for up to a week, with the position
+    the fix was cut for sitting unprotected the whole time (live, 2026-09-17: a record written 24
+    hours earlier by the previous build counted as fresh, and the venue rejected the bracket
+    exactly as it had before the upgrade).
+
+    The two cases are distinguishable because the writer above always records the key, explicitly
+    `None` when the venue reports no tick. So `quote_increment` **absent** means "written before
+    anyone asked" -> refetch once; **present and null** means "the venue was asked and has none"
+    -> honour it, and do NOT re-ask on every cycle, which would put a venue round-trip back into
+    the order path this cache exists to keep out of it.
+
+    A returned `None` still means UNKNOWN: prices go on the wire unrounded, exactly as they did
+    before #802. That is deliberately NOT a refusal -- refusing here would leave a filled position
+    with no stop at all, which is the outcome #799 documents.
     """
     key = f"{BASE_INCREMENT_PREFIX}{product_id}"
     cached = repo.get_state(key)
-    if isinstance(cached, dict):
+    if isinstance(cached, dict) and "quote_increment" in cached:
         fetched_at = cached.get("fetched_at")
         if isinstance(fetched_at, int) and now_ts - fetched_at < BASE_INCREMENT_TTL_SEC:
             return _coerce_increment(cached.get("quote_increment"))
 
-    _base_increment_for(broker, repo, product_id, now_ts)
+    _base_increment_for(broker, repo, product_id, now_ts, force_refresh=True)
     refreshed = repo.get_state(key)
     if isinstance(refreshed, dict):
         return _coerce_increment(refreshed.get("quote_increment"))
