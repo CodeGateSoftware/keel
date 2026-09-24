@@ -589,13 +589,13 @@ export function refusedView(reading, onReconnect) {
   const how = el("div", "detail how-to-get-in");
   how.append(el("p", undefined, "To get this run's address, from your keel deployment directory:"));
   how.append(openCommandNode(window.location.port));
-  const note = el("p");
-  note.append(
+  const howNote = el("p");
+  howNote.append(
     "It opens the console, and prints the address so you can paste it below. ",
     "Attached to a terminal keel prints the address and keeps nothing; run as a service it ",
     "records the address for that command and deletes it on shutdown.",
   );
-  how.append(note);
+  how.append(howNote);
   card.append(how);
 
   const form = el("form");

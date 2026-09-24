@@ -2346,3 +2346,58 @@ def test_the_plans_table_offers_no_sort_control() -> None:
     body = _function_body(_source("render.js"), "plansView")
     assert "onSort" not in body
     assert "sort:" not in body
+
+
+def _duplicate_block_declarations(code: str) -> list[str]:
+    """Every `const`/`let`/`class` name declared twice in ONE block scope of `code`.
+
+    That is a `SyntaxError` for the whole module, and a module that does not parse runs nothing:
+    #810 declared `const note` twice in `refusedView`, and every console built from it loaded a
+    blank page. The repo has no JavaScript toolchain (see this module's docstring), so the parse
+    this check stands in for never happens in CI.
+
+    Braces delimit scopes, which is enough because `_code_only` has already removed the strings
+    and comments that could hold a stray one. A declaration inside parentheses -- `for (const x
+    of ...)` -- belongs to the loop, not the enclosing block, so it is skipped; destructuring
+    names nothing matchable after the keyword and is skipped the same way.
+    """
+    scopes: list[set[str]] = [set()]
+    parens = 0
+    found: list[str] = []
+    for match in re.finditer(r"[{}()]|\b(?:const|let|class)\s+([A-Za-z_$][\w$]*)", code):
+        token = match.group(0)
+        if token == "{":
+            scopes.append(set())
+        elif token == "}":
+            if len(scopes) != 1:
+                scopes.pop()
+        elif token == "(":
+            parens += 1
+        elif token == ")":
+            parens = max(parens - 1, 0)
+        elif parens == 0:
+            name = match.group(1)
+            if name in scopes[-1]:
+                found.append(name)
+            scopes[-1].add(name)
+    return found
+
+
+@pytest.mark.parametrize("name", sorted(p.name for p in _JS.glob("*.js")))
+def test_no_module_declares_a_name_twice_in_one_scope(name: str) -> None:
+    assert not _duplicate_block_declarations(_code_only(_source(name))), (
+        f"{name} redeclares {_duplicate_block_declarations(_code_only(_source(name)))} -- a "
+        "SyntaxError that stops the whole module, and the page, from running"
+    )
+
+
+def test_the_redeclaration_scan_can_fail() -> None:
+    """The #810 shape is caught; the same name in sibling blocks and loop heads is not."""
+    assert _duplicate_block_declarations(
+        "function f() {\n  const note = a;\n  if (x) {\n    const note = b;\n  }\n"
+        "  const note = c;\n}\n"
+    ) == ["note"]
+    assert not _duplicate_block_declarations(
+        "function f() {\n  for (const c of a) {\n  }\n  for (const c of b) {\n  }\n}\n"
+        "function g() {\n  const note = a;\n}\n"
+    )
