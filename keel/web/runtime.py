@@ -110,7 +110,6 @@ def record_serving(
     token: str,
     interactive: bool,
     profile: str = "",
-    mode: str = "",
 ) -> Path | None:
     """Record how to reach this server, unless a human is watching stdout.
 
@@ -118,6 +117,11 @@ def record_serving(
     decision is visible at the call site in `serve`, where the operator-facing sentence about it
     is also printed, and so a test can exercise both sides without touching the process's own
     streams.
+
+    `profile` names this console in the other consoles' switchers (#814). No mode rides along:
+    it would be read once here and shown until the process died, and `api._auto_trade_mode`
+    re-reads the config on every request precisely so a badge never states a mode the config no
+    longer declares. Each console's own badge reports its mode, live, once you arrive.
 
     Returns the path written, or `None` when the rule above says to write nothing.
     """
@@ -140,8 +144,6 @@ def record_serving(
     }
     if profile:
         data["profile"] = str(profile)
-    if mode:
-        data["mode"] = str(mode)
     body = json.dumps(data)
     # CREATED at `0600`, not corrected to it (#759 review). `Path.write_text` creates at the
     # process umask -- measured `0644` under the usual `022` -- and the `chmod` that followed left
@@ -305,50 +307,40 @@ def stdout_is_interactive() -> bool:
         return False
 
 
-def live_peers(current_port: int | None = None) -> list[dict[str, Any]]:
-    """All active peer console servers discovered in the runtime directory (#814).
+def live_peers(*, exclude_port: int) -> list[dict[str, Any]]:
+    """The OTHER consoles serving from this deployment root, as `{port, profile}` (#814).
 
-    Scans `run_dir()` for all `serve-*.json` records, verifying each against `live_record` (live
-    process and responding loopback port). Returns structured peer metadata sorted by port, with
-    wire-safe types (port as string, current as boolean).
+    Port and profile and nothing else. A record holds a bearer token, and #815 returned it here
+    inside a URL that `/api/config` carried into every console's page -- the paper console's page
+    held the live console's token. What a switcher needs to OFFER a console is its name and its
+    port; what it needs to ENTER one, `server._switch` reads from the record at click time and
+    hands only to the browser's navigation, never to the page.
+
+    Same deployment root only, by construction: `run_dir` is under `state_root()`, so another
+    deployment's consoles are never read (the rule `RUN_DIR_NAME`'s note states). Each record is
+    offered only if `live_record` says its process is still there, and `exclude_port` drops this
+    console's own -- the caller lists itself from its own arguments, because a console started
+    at a terminal writes no record at all.
     """
     directory = run_dir()
     if directory is None or not directory.is_dir():
         return []
-
-    peers: list[dict[str, Any]] = []
     try:
         entries = sorted(directory.glob("serve-*.json"))
     except OSError:
         return []
 
+    peers: list[dict[str, Any]] = []
     for entry in entries:
-        name = entry.stem
-        parts = name.split("-")
-        if len(parts) != 2:
-            continue
         try:
-            port = int(parts[1])
+            port = int(entry.stem.removeprefix("serve-"))
         except ValueError:
             continue
-
+        if port == exclude_port:
+            continue
         record = live_record(port)
         if record is None:
             continue
-
-        profile = str(record.get("profile", "") or "")
-        mode = str(record.get("mode", "") or "")
-        is_current = bool(current_port is not None and port == int(current_port))
-
-        peers.append(
-            {
-                "port": str(port),
-                "profile": profile,
-                "mode": mode,
-                "url": url_for(record),
-                "current": is_current,
-            }
-        )
-
-    peers.sort(key=lambda p: int(p["port"]))
+        peers.append({"port": port, "profile": str(record.get("profile") or "")})
+    peers.sort(key=lambda peer: peer["port"])
     return peers

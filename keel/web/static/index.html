@@ -219,6 +219,13 @@
       </details>
       <span id="session-equity" class="sessionpart"></span>
     </div>
+    <!--
+      THE CONSOLE SWITCHER (#814): BESIDE the chip, never inside it. The chip names this console in
+      plain text and may not be a control (#704); this is the one control, and all it does is
+      navigate to `/switch/<port>`, which hands the browser to another RUNNING console. Empty in
+      the markup and hidden while empty -- a deployment with one console has nothing to offer.
+    -->
+    <span id="console-switcher"></span>
   
     <!--
       THE THEME TOGGLE (#597): two states, and the stylesheet is the state machine.

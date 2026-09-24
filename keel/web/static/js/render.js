@@ -3686,6 +3686,10 @@ export function modeBadge(node, config) {
 //: sentence arrives from Python because that function CHOOSES between sentences on the basis of a
 //: config, which is a judgement. This one is the same words on every deployment, so it is UI copy
 //: in the class of `plansView`'s subtitle, and Rule 2 has nothing to say about it.
+//: The switcher's closed state: an instruction, never a console's name, so the header names this
+//: console in exactly one place -- the chip.
+const SWITCHER_PLACEHOLDER = "switch console\u2026";
+
 const SWITCHING_NOTE = "Mode and profile switching are terminal ceremonies with a runbook. ".concat(
   "This console reports the deployment it was pointed at and cannot change it.",
 );
@@ -3721,7 +3725,6 @@ export function deploymentCard(node, config) {
     node.replaceChildren();
     return;
   }
-  const peers = config && Array.isArray(config.peers) ? config.peers : [];
   const rows = [
     kv("deployment", config.profile || "\u2014"),
     kv("mode", mode),
@@ -3729,12 +3732,10 @@ export function deploymentCard(node, config) {
     kv("database", config.db_path || "\u2014"),
     kv("origin", window.location.origin),
   ];
-  if (peers.length !== 0 && peers.length !== 1) {
-    const peerLabels = peers.map((p) => {
-      const name = p.profile || String(p.port);
-      return p.current ? name.concat(" (current)") : name;
-    });
-    rows.push(kv("active profiles", peerLabels.join(", ")));
+  // The consoles running beside this one (#814), composed by `payload.profile_switcher`; empty,
+  // and so absent, when there are none.
+  if (config.switcher && config.switcher.display) {
+    rows.push(kv("running consoles", config.switcher.display));
   }
   node.replaceChildren(
     gridCard(rows),
@@ -3756,9 +3757,6 @@ export function deploymentCard(node, config) {
  * replacing it, so the badge keeps owning the mode word and its db/config tooltip -- three facts
  * reading `profile · mode · equity state`, each written by the one function that knows it.
  *
- * When multiple peer console daemons are running, the profile node renders an accessible
- * selector allowing instant browser navigation between running sessions (#814).
- *
  * The two halves are filled separately because they are separately absent: a profile is always
  * knowable (it is the database's filename), while the equity state can be genuinely unrecorded
  * on a deployment that has never flipped modes. `equity_state` is a `Field` carrying that
@@ -3771,25 +3769,7 @@ export function deploymentCard(node, config) {
  */
 export function sessionChip(profileNode, equityNode, config) {
   const profile = config && typeof config.profile === "string" ? config.profile : "";
-  const peers = config && Array.isArray(config.peers) ? config.peers : [];
-
-  if (peers.length !== 0 && peers.length !== 1) {
-    const options = peers.map((peer) => {
-      const name = peer.profile || "port ".concat(String(peer.port));
-      const modeStr = peer.mode ? " (".concat(peer.mode, ")") : "";
-      const opt = el("option", "", name.concat(modeStr));
-      if (peer.url) {
-        opt.setAttribute("value", String(peer.url));
-      }
-      if (peer.current) {
-        opt.setAttribute("selected", "selected");
-      }
-      return opt;
-    });
-    const select = el("select", "profile-select", ...options);
-    select.setAttribute("aria-label", "Switch running profile");
-    profileNode.replaceChildren(select);
-  } else if (profile) {
+  if (profile) {
     profileNode.replaceChildren(document.createTextNode(profile));
   } else {
     // Empty rather than a placeholder, and `keel.css` hides it while empty -- the same rule the
@@ -3801,6 +3781,48 @@ export function sessionChip(profileNode, equityNode, config) {
   } else {
     equityNode.replaceChildren();
   }
+}
+
+/**
+ * The console switcher (#814): the OTHER keel consoles serving from this deployment root, as a
+ * `<select>` beside the session chip -- never inside it.
+ *
+ * **Beside, because the chip may not be a control.** #704 refused the retail pattern of a chip
+ * that is also a dropdown (`test_neither_the_chip_nor_the_banner_builds_anything_clickable`), and
+ * #815 put one there anyway. The chip keeps naming THIS console in plain text; nothing here can
+ * make it name another.
+ *
+ * **Navigation only.** Each choice's `href` is `/switch/<port>` on this console, which redirects
+ * into that console's own session hand-off. It starts, stops and changes nothing -- switching a
+ * deployment's profile or mode is still the terminal ceremony it was -- and it never holds a
+ * token (see `payload.profile_switcher`). The first option is a disabled placeholder, so no
+ * console is ever shown as selected and choosing any real one is a `change`.
+ *
+ * `switchable` decides whether it appears at all, and is stated by the payload rather than read
+ * off a list's length. Built, then filled: `el` has no children form, and #815's
+ * `el("select", ..., ...options)` rendered an empty select.
+ *
+ * @param {HTMLElement} node
+ * @param {any} config  `/api/config`'s `data`, or `null`.
+ */
+export function consoleSwitcher(node, config) {
+  if (!(config && config.switcher && config.switcher.switchable)) {
+    node.replaceChildren();
+    return;
+  }
+  const select = el("select", "console-select");
+  select.setAttribute("aria-label", "Open another running keel console");
+  const placeholder = el("option", undefined, SWITCHER_PLACEHOLDER);
+  placeholder.setAttribute("value", "");
+  placeholder.setAttribute("disabled", "disabled");
+  placeholder.setAttribute("selected", "selected");
+  select.append(placeholder);
+  for (const choice of config.switcher.choices) {
+    const option = el("option", undefined, plain(choice.label));
+    option.setAttribute("value", plain(choice.href));
+    select.append(option);
+  }
+  node.replaceChildren(select);
 }
 
 /**

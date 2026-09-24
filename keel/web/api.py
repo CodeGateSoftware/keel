@@ -42,7 +42,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from keel.web import payload, runtime
-from keel.web.security import csrf_token
+from keel.web.security import csrf_token, local_deployment
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from keel.web.server import ServeConfig
@@ -198,13 +198,21 @@ def read_config(cfg: ServeConfig, _query: Query, _state: Any, now_ts: int) -> di
     edit gone wrong) must cost the page its badge, not its boot. `payload.config_payload`
     records the read-only boundary: nothing in this package writes `auto_trade.mode`.
     """
-    peers = runtime.live_peers(current_port=cfg.port)
+    profile = _profile_name(cfg.db_path)
     return payload.config_payload(
         cfg.build_info,
         describe=cfg.build,
         mode=_auto_trade_mode(cfg.config_path),
-        profile=_profile_name(cfg.db_path),
-        peers=peers,
+        profile=profile,
+        # The other consoles in this deployment root (#814), as names and token-free hrefs only;
+        # `payload.profile_switcher` says why. Read per request like the mode, so a console
+        # started after this one appears on the next load.
+        switcher=payload.profile_switcher(
+            profile,
+            cfg.port,
+            runtime.live_peers(exclude_port=cfg.port),
+            local_deployment(external_hosts=cfg.external_hosts, bound_host=cfg.host),
+        ),
         **_session_state(cfg.db_path, now_ts),
         db_path=cfg.db_path,
         config_path=cfg.config_path,

@@ -192,6 +192,13 @@ API_PREFIX = "/api/"
 #: `API_SETUP_PREFIX`.
 EVENTS_PATH = "/api/events"
 
+#: The profile switcher's one route (#814): `/switch/<port>` moves the browser to another console
+#: serving from this deployment root. A GET that redirects and changes nothing -- navigation, the
+#: one thing the session chip's docstring allows it -- and the reason the page never needs a
+#: peer's token: see `_switch`. `sw.js` declines these navigations by the same prefix, or it
+#: would answer them from its cached shell and the server would never see one.
+SWITCH_PREFIX = "/switch/"
+
 #: The write surface, in full, today. A path here maps to one `keel.commands.setup.Action`; there
 #: is no other POST this server answers, and `keel/web/__init__.py` is the file to read before
 #: adding one.
@@ -913,6 +920,54 @@ class KeelHandler(BaseHTTPRequestHandler):
             values[str(name)] = "" if value is None else str(value)
         return values
 
+    def _switch(self, target: str) -> None:
+        """Send the browser into another console serving from this deployment root (#814).
+
+        **The token travels the way `keel open` already sends it, and no other way.** The page
+        offers `/switch/<port>` and nothing more; this reads the peer's record NOW -- so a peer
+        restarted since the page loaded, with a new token, is still reached -- and answers with a
+        `303` to that peer's `?token=` address. The peer exchanges the token for its own cookie
+        and strips it from the URL (`do_GET`'s hand-off). Only the browser's navigation carries
+        it: no page script can read a redirect's `Location`, so the page never holds a session
+        token, its own or anyone's, which #815's `<option value>` did.
+
+        **Local only, by the floor `gated_action_permitted` holds for a release.** Entering the
+        live console from the paper one hands over the live console's session, so this requires
+        what reading the `0600` record directly would: this machine. A declared remote origin or
+        an off-loopback bind refuses, and so does a peer that is not loopback -- a tunnel presents
+        as loopback, which is why the deployment's posture is checked as well.
+
+        Behind `_admitted` (the caller's), so without this console's own session nothing about
+        any other is revealed, not even whether it is running. An unknown or dead port is a 404
+        and names no console.
+        """
+        if not gated_action_permitted(
+            self.client_address,
+            external_hosts=self.cfg.external_hosts,
+            bound_host=self.cfg.host,
+        ):
+            self._refuse(
+                403,
+                "Refused",
+                "Switching consoles is restricted to a loopback session on a loopback bind. Use "
+                "`keel open` at the terminal of the machine running keel.",
+            )
+            return
+        port = int(target) if target.isdigit() else None
+        if port == self.cfg.port:
+            self._send(303, "", extra=(("Location", "/"),))
+            return
+        record = runtime.live_record(port) if port is not None else None
+        if record is None:
+            self._refuse(
+                404,
+                "No such console",
+                "No keel console is running on that port now. Reload this page for the current "
+                "list.",
+            )
+            return
+        self._send(303, "", extra=(("Location", runtime.url_for(record)),))
+
     def do_GET(self) -> None:  # noqa: N802 - stdlib's naming, not ours
         self.body_consumed = False
         parsed = urlsplit(self.path)
@@ -945,6 +1000,10 @@ class KeelHandler(BaseHTTPRequestHandler):
             return
 
         if not self._admitted():
+            return
+
+        if parsed.path.startswith(SWITCH_PREFIX):
+            self._switch(parsed.path.removeprefix(SWITCH_PREFIX))
             return
 
         if parsed.path == EVENTS_PATH:
@@ -1113,15 +1172,12 @@ def serve(cfg: ServeConfig, *, echo: Callable[[str], None] = print) -> int:
     # printing the wrong one would be a false safety assurance about a live credential -- the
     # class of thing `payload._session_banner` refuses to do about mode.
     interactive = runtime.stdout_is_interactive()
-    profile = Path(running.db_path).stem if running.db_path else ""
-    mode = api._auto_trade_mode(running.config_path)
     recorded = runtime.record_serving(
         host=running.host,
         port=running.port,
         token=running.token,
         interactive=interactive,
-        profile=profile,
-        mode=mode,
+        profile=api._profile_name(running.db_path),
     )
     if recorded is None:
         echo("Stopping keel revokes it: the token is new every run and is never written to disk.")

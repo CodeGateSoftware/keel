@@ -390,7 +390,12 @@ header .sessionpart {
   text-overflow: ellipsis;
   white-space: nowrap;
 }
-header .profile-select {
+/* THE CONSOLE SWITCHER (#814), beside the chip. As quiet as the chip's text halves -- it is a way
+ * to another console, not a fact about this one -- and bounded the same way, since its options
+ * are operators' own filenames. */
+header #console-switcher { align-self: center; }
+header #console-switcher:empty { display: none; }
+header .console-select {
   background: var(--bg);
   color: var(--muted);
   border: 1px solid var(--control-line);
@@ -398,12 +403,11 @@ header .profile-select {
   font-size: 0.85em;
   font-family: inherit;
   padding: 0.1rem 0.3rem;
-  max-width: 14ch;
+  max-width: 20ch;
   cursor: pointer;
-  outline: none;
 }
-header .profile-select:hover,
-header .profile-select:focus-visible {
+header .console-select:hover,
+header .console-select:focus-visible {
   color: var(--fg);
   border-color: var(--accent);
 }
