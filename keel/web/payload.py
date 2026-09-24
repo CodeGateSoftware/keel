@@ -3275,6 +3275,7 @@ def config_payload(
     autonomous: bool = False,
     db_path: str = "",
     config_path: str = "",
+    peers: Sequence[Mapping[str, Any]] = (),
 ) -> dict[str, Any]:
     """The running build and the deployment it serves, for the consumers that need either by
     name.
@@ -3350,6 +3351,7 @@ def config_payload(
             on_state=GOOD,
             off_state=WARN,
         ),
+        "peers": list(peers),
     }
 
 

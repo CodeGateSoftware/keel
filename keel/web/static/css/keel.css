@@ -390,6 +390,23 @@ header .sessionpart {
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+header .profile-select {
+  background: var(--bg);
+  color: var(--muted);
+  border: 1px solid var(--control-line);
+  border-radius: 4px;
+  font-size: 0.85em;
+  font-family: inherit;
+  padding: 0.1rem 0.3rem;
+  max-width: 14ch;
+  cursor: pointer;
+  outline: none;
+}
+header .profile-select:hover,
+header .profile-select:focus-visible {
+  color: var(--fg);
+  border-color: var(--accent);
+}
 /* THE SEPARATORS. Generated rather than written into the markup, because each one belongs to the
  * part beside it: `display: none` takes a hidden part's pseudo-element with it, so a name that
  * never arrived cannot leave a lone middot behind. That is the pairing the `:empty` rule below

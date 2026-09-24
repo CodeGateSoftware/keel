@@ -41,7 +41,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from keel.web import payload
+from keel.web import payload, runtime
 from keel.web.security import csrf_token
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
@@ -198,11 +198,13 @@ def read_config(cfg: ServeConfig, _query: Query, _state: Any, now_ts: int) -> di
     edit gone wrong) must cost the page its badge, not its boot. `payload.config_payload`
     records the read-only boundary: nothing in this package writes `auto_trade.mode`.
     """
+    peers = runtime.live_peers(current_port=cfg.port)
     return payload.config_payload(
         cfg.build_info,
         describe=cfg.build,
         mode=_auto_trade_mode(cfg.config_path),
         profile=_profile_name(cfg.db_path),
+        peers=peers,
         **_session_state(cfg.db_path, now_ts),
         db_path=cfg.db_path,
         config_path=cfg.config_path,
