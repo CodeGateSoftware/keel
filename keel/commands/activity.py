@@ -101,6 +101,8 @@ from typing import Any
 
 from keel_core.paths import resolve_under_state_root
 
+from keel.execution import guards
+
 # -- bounds (see the module docstring) -----------------------------------------------------------
 
 #: Bytes of the log's TAIL that are ever read in one build. The whole point of the tail read is
@@ -613,14 +615,6 @@ def _short_num(value: Any, places: int = 4) -> str:
     return f"{head}.{tail}" if tail else head
 
 
-def _first_clause(text: str) -> str:
-    """The leading identifier of a `violation` string -- `"per_asset_concentration_cap: PAXG
-    exposure ... exceeds ..."` -> `"per_asset_concentration_cap"`. Which rail said no is what
-    belongs in a one-line summary; the arithmetic behind it belongs in the expansion."""
-    head = text.split(":", 1)[0].strip()
-    return head or text.strip()
-
-
 def _last_exc_line(text: str) -> str:
     """The final line of a traceback -- the exception type and message. The frames above it are
     the single largest thing in this log (they are why 330 lines occupy 815 KB) and the least
@@ -641,8 +635,11 @@ def _add(seq: list[str], value: Any) -> None:
 def summarise_cycle(cycle_id: str | None, events: Sequence[ActivityEvent]) -> ActivityCycle:
     """Turn one cycle's events into the row the overlay shows. PURE.
 
-    The five counts are deliberately the ones `keel agent`'s own human run-log one-liner already
-    taught an operator to read (`signals=0 blocked=0 entered=0 exited=0`), plus `errors`:
+    The five counts borrow their NAMES from `keel agent`'s human run-log one-liner (`signals=0
+    blocked=0 entered=0 exited=0`), plus `errors` -- but `blocked` here is wider than that line's.
+    The run-log counts only entries withheld before evaluation and prints rail vetoes as a
+    separate `vetoed=N` (#812), so for one cycle: this `blocked` = its `blocked` + `vetoed` +
+    unplaced entries no rail named. See `trading._vetoed_token`.
 
     * `signals` -- setups the rules produced, summed from `agent.signals_evaluated.signal_count`
       (which is `len(enter_signals)`, exactly what the run-log line counts). Falls back to
@@ -716,7 +713,7 @@ def summarise_cycle(cycle_id: str | None, events: Sequence[ActivityEvent]) -> Ac
         elif name == "guards.check_failed":
             violation = fields.get("violation")
             if isinstance(violation, str) and violation:
-                _add(highlights, f"rail veto: {_first_clause(violation)}")
+                _add(highlights, f"rail veto: {guards.rail_name(violation)}")
             else:
                 _add(highlights, "rail veto")
         elif name == "engine.setup_rejected":
@@ -1137,7 +1134,7 @@ def _generic_detail(ev: ActivityEvent) -> str:
 def render_event_detail(ev: ActivityEvent) -> str:
     """The human-readable right-hand side of one expanded event line -- the fields that MEAN
     something for the events this system actually emits: a `violation` in full (an operator needs
-    the arithmetic, which is exactly what the collapsed row's `_first_clause` drops), the `gate`
+    the arithmetic, which is exactly what the collapsed row's `guards.rail_name` drops), the `gate`
     that rejected a setup, the `reason` an entry was not placed, and a setup's entry/stop/target.
 
     Never raises on a missing or oddly-typed field -- every access is a `.get` with a visible `?`

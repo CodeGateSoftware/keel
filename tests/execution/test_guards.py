@@ -2269,3 +2269,22 @@ def test_an_entry_intent_still_uses_its_own_stop_for_rail9(repo):
     result = check(intent, repo, _config(), NOW_TS)
 
     assert _keys(result) == {"no_stop_widening"}
+
+
+@pytest.mark.parametrize(
+    ("violation", "rail"),
+    [
+        (
+            "account_dd_breaker_weekly: drawdown 0.0863 >= max_weekly_dd_pct 0.08",
+            "account_dd_breaker_weekly",
+        ),
+        ("base_balance: held 0 -- expects 12: refusing", "base_balance"),
+        ("max_entry_spread", "max_entry_spread"),
+        ("  book_unreadable  ", "book_unreadable"),
+    ],
+)
+def test_rail_name_is_the_leading_clause_of_a_violation(violation: str, rail: str) -> None:
+    """#812: every one-line summary of a veto (the cycle line, the activity overlay, `doctor`)
+    names the rail, not the arithmetic. A detail with a second colon still splits once, and the
+    routing gate's bare tokens are their own name."""
+    assert guards.rail_name(violation) == rail

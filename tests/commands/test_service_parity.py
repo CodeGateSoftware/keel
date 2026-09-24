@@ -680,3 +680,106 @@ def test_agent_cycle_lines_come_from_the_shared_renderer() -> None:
         ts=NOW_TS, skipped=True, skip_reason="market_closed", mode="paper", polled=0
     )
     assert trading_service.render_loop_result(skipped) == [f"[{NOW_TS}] skipped: market_closed"]
+
+
+def _entry(placed: bool, vetoed_by: list[str], reason: str = "") -> Any:
+    from keel.execution.executor import ExecutionResult
+
+    return ExecutionResult(
+        placed=placed, order_id=None, vetoed_by=vetoed_by, preview=None, reason=reason
+    )
+
+
+def _cycle_line(enter_results: list[Any]) -> str:
+    """One cycle's line, with a signal per entry result -- `run_once` appends the two together,
+    so a vetoed entry never comes without the signal that produced it."""
+    from keel import agent
+    from keel.strategy.rules.base import Action, Setup, Signal
+    from keel.types import Side
+
+    signal = Signal(
+        rule_name="turtle_breakout",
+        product_id="FET-USD",
+        action=Action.ENTER,
+        side=Side.BUY,
+        setup=Setup(
+            product_id="FET-USD",
+            direction="long",
+            entry=Decimal("0.16735"),
+            stop=Decimal("0.1625"),
+            target=Decimal("0.1963"),
+            context={},
+            ts=NOW_TS,
+        ),
+        cts_score=7,
+        entry_technique="signal_candle",
+        ts=NOW_TS,
+    )
+    result = agent.LoopResult(
+        ts=NOW_TS,
+        skipped=False,
+        skip_reason=None,
+        mode="paper",
+        polled=95,
+        products=["FET-USD"],
+        enter_signals=[signal] * len(enter_results),
+        enter_results=enter_results,
+    )
+    lines = trading_service.render_loop_result(result)
+    assert len(lines) == 1, lines
+    return lines[0]
+
+
+_WEEKLY = "account_dd_breaker_weekly: drawdown 0.0863 >= max_weekly_dd_pct 0.08"
+
+
+def test_cycle_line_counts_rail_vetoed_entries_and_names_the_rail() -> None:
+    """#812: the 2026-09-17 FET cycles printed `signals=3 blocked=0 entered=0`, indistinguishable
+    from a silent drop, while `account_dd_breaker_weekly` had refused all three. A vetoed entry
+    is now counted after `exited=`, with the rail that said no -- its leading clause only, the
+    arithmetic stays in the JSON log."""
+    line = _cycle_line([_entry(False, [_WEEKLY], "paper: vetoed by rails")] * 3)
+
+    assert line == (
+        f"[{NOW_TS}] mode=paper polled=95 products=['FET-USD'] stale=[] "
+        "signals=3 blocked=0 entered=0 exited=0 vetoed=3 (account_dd_breaker_weekly)"
+    )
+
+
+def test_cycle_line_counts_one_veto_per_entry_and_lists_each_rail_once() -> None:
+    """One entry tripping two rails is ONE vetoed entry, not two (the same rule
+    `activity.summarise_cycle` applies to the PAXG cycle of 2026-08-08). Every distinct rail is
+    named once, in the order the entries hit them."""
+    line = _cycle_line(
+        [
+            _entry(False, ["per_asset_concentration_cap: PAXG 0.41 > 0.40", _WEEKLY]),
+            _entry(False, ["total_exposure_cap: 0.9 > 0.8", _WEEKLY]),
+        ]
+    )
+
+    assert line.endswith(
+        " exited=0 vetoed=2 "
+        "(per_asset_concentration_cap, account_dd_breaker_weekly, total_exposure_cap)"
+    ), line
+
+
+def test_cycle_line_reports_vetoed_zero_without_a_rail_list_when_nothing_was_vetoed() -> None:
+    """A placed entry and an unplaced one with an EMPTY `vetoed_by` (a paper no-fill, a declined
+    confirm) are not rail vetoes. The token is still printed, so its absence never has to be
+    read as zero; the rail list is omitted."""
+    line = _cycle_line(
+        [
+            _entry(True, []),
+            _entry(False, [], "paper: no fill (position open or insufficient synthetic cash)"),
+        ]
+    )
+
+    assert line.endswith(" signals=2 blocked=0 entered=1 exited=0 vetoed=0"), line
+
+
+def test_cycle_line_names_a_routing_gate_token_that_has_no_colon() -> None:
+    """The live entry-spread gate reports bare tokens (`max_entry_spread`), not
+    `rail: detail` strings; the token itself is the name."""
+    line = _cycle_line([_entry(False, ["max_entry_spread"])])
+
+    assert line.endswith(" vetoed=1 (max_entry_spread)"), line

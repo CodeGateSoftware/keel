@@ -49,7 +49,7 @@ from keel_core.trade_scope import READ_ONLY, TRADING, TradeScopeState, VenueTrad
 from keel import attestations
 from keel.data.feed_scope import reports_consolidated_volume
 from keel.data.freshness import Freshness
-from keel.execution import sizing
+from keel.execution import guards, sizing
 from keel.types import Granularity
 from keel.version import build_info, check_install
 
@@ -777,7 +777,7 @@ def veto_findings(lines: Iterable[str], since_ts: float) -> list[Finding]:
             continue
         total += 1
         for violation in event.get("violations", []):
-            reason = str(violation).split(":", 1)[0].strip()
+            reason = guards.rail_name(str(violation))
             counts[reason] = counts.get(reason, 0) + 1
 
     if total == 0:
