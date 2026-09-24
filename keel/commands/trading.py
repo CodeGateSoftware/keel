@@ -19,6 +19,7 @@ from decimal import Decimal, InvalidOperation
 from keel import agent
 from keel.data.repository import Repository
 from keel.execution import equity as equity_mod
+from keel.execution.executor import ExecutionResult
 
 # -- the typed gates' wording, and the output lines (their ONE home) ------------------------------
 #
@@ -162,6 +163,26 @@ def reset_high_water_mark(repo: Repository) -> None:
     repo.set_state("equity_history", [])
 
 
+def _vetoed_token(enter_results: list[ExecutionResult]) -> str:
+    """`vetoed=N (rail, ...)` -- the entries the rails refused after evaluation (#812).
+
+    `blocked` counts only entries withheld BEFORE evaluation, so without this a vetoed cycle
+    printed `signals=3 blocked=0 entered=0`, which reads as a silent drop. N is one per entry,
+    not one per rail: an entry tripping two rails is still one setup. Each rail is named once,
+    by the leading clause of its violation string (`"account_dd_breaker_weekly: drawdown ..."`
+    -> `account_dd_breaker_weekly`); the arithmetic stays in the JSON log. Appended after
+    `exited=` so the `signals=[0-9]+` token the live runner greps is untouched.
+    """
+    vetoed = [r for r in enter_results if not r.placed and r.vetoed_by]
+    rails: list[str] = []
+    for r in vetoed:
+        for violation in r.vetoed_by:
+            rail = violation.split(":", 1)[0].strip() or violation.strip()
+            if rail not in rails:
+                rails.append(rail)
+    return f"vetoed={len(vetoed)} ({', '.join(rails)})" if rails else f"vetoed={len(vetoed)}"
+
+
 def render_loop_result(result: agent.LoopResult) -> list[str]:
     """The exact lines `keel agent` prints for one cycle -- the shared twin every front-end
     shows, so a cycle reads identically wherever it is rendered."""
@@ -173,7 +194,7 @@ def render_loop_result(result: agent.LoopResult) -> list[str]:
         f"[{result.ts}] mode={result.mode} polled={result.polled} "
         f"products={result.products} stale={result.stale_products} "
         f"signals={len(result.enter_signals)} blocked={len(result.blocked_entries)} "
-        f"entered={entered} exited={exited}"
+        f"entered={entered} exited={exited} {_vetoed_token(result.enter_results)}"
     ]
     if result.paper_equity is not None:
         lines.append(
