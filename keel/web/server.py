@@ -1113,8 +1113,15 @@ def serve(cfg: ServeConfig, *, echo: Callable[[str], None] = print) -> int:
     # printing the wrong one would be a false safety assurance about a live credential -- the
     # class of thing `payload._session_banner` refuses to do about mode.
     interactive = runtime.stdout_is_interactive()
+    profile = Path(running.db_path).stem if running.db_path else ""
+    mode = api._auto_trade_mode(running.config_path)
     recorded = runtime.record_serving(
-        host=running.host, port=running.port, token=running.token, interactive=interactive
+        host=running.host,
+        port=running.port,
+        token=running.token,
+        interactive=interactive,
+        profile=profile,
+        mode=mode,
     )
     if recorded is None:
         echo("Stopping keel revokes it: the token is new every run and is never written to disk.")

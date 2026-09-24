@@ -3721,14 +3721,23 @@ export function deploymentCard(node, config) {
     node.replaceChildren();
     return;
   }
+  const peers = config && Array.isArray(config.peers) ? config.peers : [];
+  const rows = [
+    kv("deployment", config.profile || "\u2014"),
+    kv("mode", mode),
+    kv("config", config.config_path || "\u2014"),
+    kv("database", config.db_path || "\u2014"),
+    kv("origin", window.location.origin),
+  ];
+  if (peers.length !== 0 && peers.length !== 1) {
+    const peerLabels = peers.map((p) => {
+      const name = p.profile || String(p.port);
+      return p.current ? name.concat(" (current)") : name;
+    });
+    rows.push(kv("active profiles", peerLabels.join(", ")));
+  }
   node.replaceChildren(
-    gridCard([
-      kv("deployment", config.profile || "\u2014"),
-      kv("mode", mode),
-      kv("config", config.config_path || "\u2014"),
-      kv("database", config.db_path || "\u2014"),
-      kv("origin", window.location.origin),
-    ]),
+    gridCard(rows),
     el("p", "muted", SWITCHING_NOTE),
   );
 }
@@ -3747,6 +3756,9 @@ export function deploymentCard(node, config) {
  * replacing it, so the badge keeps owning the mode word and its db/config tooltip -- three facts
  * reading `profile · mode · equity state`, each written by the one function that knows it.
  *
+ * When multiple peer console daemons are running, the profile node renders an accessible
+ * selector allowing instant browser navigation between running sessions (#814).
+ *
  * The two halves are filled separately because they are separately absent: a profile is always
  * knowable (it is the database's filename), while the equity state can be genuinely unrecorded
  * on a deployment that has never flipped modes. `equity_state` is a `Field` carrying that
@@ -3759,7 +3771,25 @@ export function deploymentCard(node, config) {
  */
 export function sessionChip(profileNode, equityNode, config) {
   const profile = config && typeof config.profile === "string" ? config.profile : "";
-  if (profile) {
+  const peers = config && Array.isArray(config.peers) ? config.peers : [];
+
+  if (peers.length !== 0 && peers.length !== 1) {
+    const options = peers.map((peer) => {
+      const name = peer.profile || "port ".concat(String(peer.port));
+      const modeStr = peer.mode ? " (".concat(peer.mode, ")") : "";
+      const opt = el("option", "", name.concat(modeStr));
+      if (peer.url) {
+        opt.setAttribute("value", String(peer.url));
+      }
+      if (peer.current) {
+        opt.setAttribute("selected", "selected");
+      }
+      return opt;
+    });
+    const select = el("select", "profile-select", ...options);
+    select.setAttribute("aria-label", "Switch running profile");
+    profileNode.replaceChildren(select);
+  } else if (profile) {
     profileNode.replaceChildren(document.createTextNode(profile));
   } else {
     // Empty rather than a placeholder, and `keel.css` hides it while empty -- the same rule the

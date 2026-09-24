@@ -889,6 +889,14 @@ themeNode.addEventListener("click", () => {
   }
 });
 
+//: In-app profile switcher navigation (#814).
+sessionProfileNode.addEventListener("change", (event) => {
+  const target = /** @type {HTMLSelectElement} */ (event.target);
+  if (target && target.value && target.value !== window.location.href) {
+    window.location.href = target.value;
+  }
+});
+
 /** Catch up immediately when a hidden tab is looked at again -- see the poll comment in `show`. */
 /**
  * The write path (#540): one delegated `submit` listener for every action form.

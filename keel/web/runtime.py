@@ -103,7 +103,15 @@ def record_path(port: int) -> Path:
     return directory / f"serve-{int(port)}.json"
 
 
-def record_serving(*, host: str, port: int, token: str, interactive: bool) -> Path | None:
+def record_serving(
+    *,
+    host: str,
+    port: int,
+    token: str,
+    interactive: bool,
+    profile: str = "",
+    mode: str = "",
+) -> Path | None:
     """Record how to reach this server, unless a human is watching stdout.
 
     `interactive` is the caller's `sys.stdout.isatty()` -- passed in rather than read here so the
@@ -123,15 +131,18 @@ def record_serving(*, host: str, port: int, token: str, interactive: bool) -> Pa
     # half-written record: `os.replace` is atomic within a directory. The temporary carries the
     # same `0600`, because it holds the same token for the moment it exists.
     staging = directory / f".serve-{int(port)}.json.tmp"
-    body = json.dumps(
-        {
-            "pid": os.getpid(),
-            "host": host,
-            "port": int(port),
-            "token": token,
-            "started_ts": int(time.time()),
-        }
-    )
+    data: dict[str, Any] = {
+        "pid": os.getpid(),
+        "host": host,
+        "port": int(port),
+        "token": token,
+        "started_ts": int(time.time()),
+    }
+    if profile:
+        data["profile"] = str(profile)
+    if mode:
+        data["mode"] = str(mode)
+    body = json.dumps(data)
     # CREATED at `0600`, not corrected to it (#759 review). `Path.write_text` creates at the
     # process umask -- measured `0644` under the usual `022` -- and the `chmod` that followed left
     # the token world-readable for the window between the two calls. The `0700` directory meant no
@@ -292,3 +303,52 @@ def stdout_is_interactive() -> bool:
         return bool(sys.stdout.isatty())
     except AttributeError, ValueError:
         return False
+
+
+def live_peers(current_port: int | None = None) -> list[dict[str, Any]]:
+    """All active peer console servers discovered in the runtime directory (#814).
+
+    Scans `run_dir()` for all `serve-*.json` records, verifying each against `live_record` (live
+    process and responding loopback port). Returns structured peer metadata sorted by port, with
+    wire-safe types (port as string, current as boolean).
+    """
+    directory = run_dir()
+    if directory is None or not directory.is_dir():
+        return []
+
+    peers: list[dict[str, Any]] = []
+    try:
+        entries = sorted(directory.glob("serve-*.json"))
+    except OSError:
+        return []
+
+    for entry in entries:
+        name = entry.stem
+        parts = name.split("-")
+        if len(parts) != 2:
+            continue
+        try:
+            port = int(parts[1])
+        except ValueError:
+            continue
+
+        record = live_record(port)
+        if record is None:
+            continue
+
+        profile = str(record.get("profile", "") or "")
+        mode = str(record.get("mode", "") or "")
+        is_current = bool(current_port is not None and port == int(current_port))
+
+        peers.append(
+            {
+                "port": str(port),
+                "profile": profile,
+                "mode": mode,
+                "url": url_for(record),
+                "current": is_current,
+            }
+        )
+
+    peers.sort(key=lambda p: int(p["port"]))
+    return peers
