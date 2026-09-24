@@ -691,8 +691,30 @@ def _entry(placed: bool, vetoed_by: list[str], reason: str = "") -> Any:
 
 
 def _cycle_line(enter_results: list[Any]) -> str:
+    """One cycle's line, with a signal per entry result -- `run_once` appends the two together,
+    so a vetoed entry never comes without the signal that produced it."""
     from keel import agent
+    from keel.strategy.rules.base import Action, Setup, Signal
+    from keel.types import Side
 
+    signal = Signal(
+        rule_name="turtle_breakout",
+        product_id="FET-USD",
+        action=Action.ENTER,
+        side=Side.BUY,
+        setup=Setup(
+            product_id="FET-USD",
+            direction="long",
+            entry=Decimal("0.16735"),
+            stop=Decimal("0.1625"),
+            target=Decimal("0.1963"),
+            context={},
+            ts=NOW_TS,
+        ),
+        cts_score=7,
+        entry_technique="signal_candle",
+        ts=NOW_TS,
+    )
     result = agent.LoopResult(
         ts=NOW_TS,
         skipped=False,
@@ -700,6 +722,7 @@ def _cycle_line(enter_results: list[Any]) -> str:
         mode="paper",
         polled=95,
         products=["FET-USD"],
+        enter_signals=[signal] * len(enter_results),
         enter_results=enter_results,
     )
     lines = trading_service.render_loop_result(result)
@@ -719,7 +742,7 @@ def test_cycle_line_counts_rail_vetoed_entries_and_names_the_rail() -> None:
 
     assert line == (
         f"[{NOW_TS}] mode=paper polled=95 products=['FET-USD'] stale=[] "
-        "signals=0 blocked=0 entered=0 exited=0 vetoed=3 (account_dd_breaker_weekly)"
+        "signals=3 blocked=0 entered=0 exited=0 vetoed=3 (account_dd_breaker_weekly)"
     )
 
 
@@ -751,7 +774,7 @@ def test_cycle_line_reports_vetoed_zero_without_a_rail_list_when_nothing_was_vet
         ]
     )
 
-    assert line.endswith(" signals=0 blocked=0 entered=1 exited=0 vetoed=0"), line
+    assert line.endswith(" signals=2 blocked=0 entered=1 exited=0 vetoed=0"), line
 
 
 def test_cycle_line_names_a_routing_gate_token_that_has_no_colon() -> None:

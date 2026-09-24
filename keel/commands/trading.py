@@ -19,6 +19,7 @@ from decimal import Decimal, InvalidOperation
 from keel import agent
 from keel.data.repository import Repository
 from keel.execution import equity as equity_mod
+from keel.execution import guards
 from keel.execution.executor import ExecutionResult
 
 # -- the typed gates' wording, and the output lines (their ONE home) ------------------------------
@@ -169,15 +170,21 @@ def _vetoed_token(enter_results: list[ExecutionResult]) -> str:
     `blocked` counts only entries withheld BEFORE evaluation, so without this a vetoed cycle
     printed `signals=3 blocked=0 entered=0`, which reads as a silent drop. N is one per entry,
     not one per rail: an entry tripping two rails is still one setup. Each rail is named once,
-    by the leading clause of its violation string (`"account_dd_breaker_weekly: drawdown ..."`
-    -> `account_dd_breaker_weekly`); the arithmetic stays in the JSON log. Appended after
-    `exited=` so the `signals=[0-9]+` token the live runner greps is untouched.
+    by `guards.rail_name`; the arithmetic stays in the JSON log. Appended after `exited=` so
+    the `signals=[0-9]+` token the live runner greps is untouched.
+
+    ENTRIES only. A rail-vetoed exit (`base_balance` refusing a sell) is not counted here.
+
+    **This line's `blocked` is not the activity overlay's.** `activity.summarise_cycle` counts
+    every unplaced entry as blocked, so for one cycle: overlay `blocked` = this `blocked` +
+    `vetoed` + unplaced entries no rail named (a paper no-fill, a declined confirm -- still
+    absent from this line).
     """
     vetoed = [r for r in enter_results if not r.placed and r.vetoed_by]
     rails: list[str] = []
     for r in vetoed:
         for violation in r.vetoed_by:
-            rail = violation.split(":", 1)[0].strip() or violation.strip()
+            rail = guards.rail_name(violation)
             if rail not in rails:
                 rails.append(rail)
     return f"vetoed={len(vetoed)} ({', '.join(rails)})" if rails else f"vetoed={len(vetoed)}"

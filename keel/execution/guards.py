@@ -274,6 +274,19 @@ class GuardResult:
     skipped_rails: list[str] = field(default_factory=list)
 
 
+def rail_name(violation: str) -> str:
+    """The rail a `violations` entry names -- its leading clause: `"per_asset_concentration_cap:
+    PAXG exposure ... exceeds ..."` -> `"per_asset_concentration_cap"`.
+
+    Every rail below writes `<rail>: <detail>`, and the executor's routing gate writes a bare
+    token (`max_entry_spread`), which is its own name. Which rail said no is what belongs in a
+    one-line summary (the cycle line, the activity overlay, `doctor`); the arithmetic behind it
+    belongs in the JSON log. The ONE parse of this format, so the summaries cannot drift (#812).
+    """
+    head = violation.split(":", 1)[0].strip()
+    return head or violation.strip()
+
+
 def _asset(product_id: object) -> str:
     """The base leg of `product_id`: the bucket key rails 1/4/5/6/8 group and compare by.
 
