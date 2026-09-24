@@ -352,4 +352,3 @@ def live_peers(current_port: int | None = None) -> list[dict[str, Any]]:
 
     peers.sort(key=lambda p: int(p["port"]))
     return peers
-
