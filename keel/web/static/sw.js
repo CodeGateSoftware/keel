@@ -73,6 +73,12 @@ const API_PREFIX = "/api/";
 //: The worker ends up holding the door shut against the only key.
 const SESSION_TOKEN_PARAM = "token";
 
+//: The profile switcher's route (#814), `server.SWITCH_PREFIX`. Like the token hand-off it is a
+//: navigation the SERVER must answer -- it redirects into another console -- so it is declined
+//: to the network the same way. Answered from the cache, it would load this console's shell again
+//: and the switch would silently do nothing.
+const SWITCH_PREFIX = "/switch/";
+
 /** The document every in-scope navigation resolves to -- `staticfiles.CLIENT_ENTRY`. */
 const SHELL = `${BASE}index.html`;
 
@@ -212,6 +218,7 @@ self.addEventListener("fetch", (event) => {
     // like it had worked and then refuse every read, which is the failure this whole exception
     // exists to prevent.
     if (url.searchParams.has(SESSION_TOKEN_PARAM)) return;
+    if (url.pathname.startsWith(SWITCH_PREFIX)) return;
 
     event.respondWith(
       caches.match(SHELL, { cacheName: CACHE }).then((hit) => hit || fetch(request)),

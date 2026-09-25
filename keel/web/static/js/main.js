@@ -48,6 +48,7 @@ import {
   deploymentCard,
   modeBadge,
   paperBanner,
+  consoleSwitcher,
   sessionChip,
   ordersView,
   balancesView,
@@ -160,6 +161,8 @@ const deploymentCardNode = must("deployment-card");
 /** The session chip's equity-state half (#704). Genuinely absent on a deployment that has never
  * flipped modes, which is why it is a `Field` and not a bare word. */
 const sessionEquityNode = must("session-equity");
+/** The console switcher (#814), beside the chip and never inside it. Empty with one console. */
+const consoleSwitcherNode = must("console-switcher");
 /** The persistent mode banner (#704). No buttons live in here, by design and by test. */
 const modeBannerNode = must("mode-banner");
 const attestBannerNode = must("attest-banner");
@@ -889,12 +892,12 @@ themeNode.addEventListener("click", () => {
   }
 });
 
-//: In-app profile switcher navigation (#814).
-sessionProfileNode.addEventListener("change", (event) => {
-  const target = /** @type {HTMLSelectElement} */ (event.target);
-  if (target && target.value && target.value !== window.location.href) {
-    window.location.href = target.value;
-  }
+//: The console switcher (#814). An option's value is `/switch/<port>` on this console -- never a
+//: token; the server redirects into the chosen console's own hand-off. The placeholder's value is
+//: empty and it is disabled, so every `change` is a real choice.
+consoleSwitcherNode.addEventListener("change", (event) => {
+  const select = /** @type {HTMLSelectElement} */ (event.target);
+  if (select.value) window.location.assign(select.value);
 });
 
 /** Catch up immediately when a hidden tab is looked at again -- see the poll comment in `show`. */
@@ -1696,6 +1699,9 @@ void read("config").then((reading) => {
   // process serves cannot change without a restart, and filling the chip here is what puts it on
   // every view rather than only where a status report happens to load.
   sessionChip(sessionProfileNode, sessionEquityNode, config);
+  // #814: the other consoles in this deployment root. From the boot read like the chip; a console
+  // started later appears on the next load, and `/switch/` resolves its address when followed.
+  consoleSwitcher(consoleSwitcherNode, config);
   // #755: the same boot read, for the same reason -- and the card must be filled even
   // though it is closed, because a `<details>` opens with no JavaScript involved and
   // there is no event to fill it on.

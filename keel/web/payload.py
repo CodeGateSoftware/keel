@@ -3275,7 +3275,7 @@ def config_payload(
     autonomous: bool = False,
     db_path: str = "",
     config_path: str = "",
-    peers: Sequence[Mapping[str, Any]] = (),
+    switcher: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """The running build and the deployment it serves, for the consumers that need either by
     name.
@@ -3309,6 +3309,10 @@ def config_payload(
     `keel.commands._common._require_interactive_confirmation` exists for), and the browser can
     display that decision and cannot make it. An absent `mode` (`""`) means the config could
     not be read -- the first-run state -- and the badge hides rather than guessing.
+
+    `switcher` (#814) is the one thing here about OTHER consoles: `profile_switcher`'s answer
+    for the ones serving beside this one. It names them and carries a token-free href to each;
+    see that function for why nothing more.
     """
     return {
         "version": str(getattr(build, "version", "") or ""),
@@ -3351,7 +3355,49 @@ def config_payload(
             on_state=GOOD,
             off_state=WARN,
         ),
-        "peers": list(peers),
+        "switcher": dict(switcher) if switcher is not None else profile_switcher("", 0, [], False),
+    }
+
+
+def profile_switcher(
+    profile: str, port: int, peers: Sequence[Mapping[str, Any]], local: bool
+) -> dict[str, Any]:
+    """The console switcher (#814): the other consoles serving from this deployment root.
+
+    `choices` are the consoles to go TO -- never this one, which the session chip names in plain
+    text. `display` names all of them, this one marked, for the deployment card.
+
+    **Names and token-free hrefs, and nothing else.** #815 put each console's
+    `http://.../?token=...` here, so every page held every console's session token -- the paper
+    console's page held the live one's -- against `security.py`'s "must never be written into the
+    page". A `href` is `/switch/<port>` on THIS console; `server._switch` reads the peer's record
+    when it is followed and hands the token to the browser's navigation, never to the page.
+
+    **This console comes from its own arguments**, never from a record: a console started at a
+    terminal writes none, and #815's list, built from records alone, then had no current entry --
+    the browser selected the first option, and the header named a deployment that was not the
+    one on screen. `peers` may or may not include this console; it is dropped either way.
+
+    **No mode in a label.** A peer's mode would be one recorded at its start-up and stale after
+    any config edit; the badge on the console you arrive at reads it live.
+
+    Rule 2: `label` and `display` arrive composed, so the client places strings. Rule 3:
+    `switchable` is stated, never inferred from a list length. Not `local` -- a declared remote
+    origin, or a bind off loopback -- offers nothing: the peers' loopback addresses cannot be
+    opened from the viewer's device, and `/switch/` refuses there anyway.
+    """
+    others = sorted(
+        (int(peer["port"]), str(peer.get("profile") or "") or f"port {int(peer['port'])}")
+        for peer in peers
+        if int(peer["port"]) != port
+    )
+    if not local or not others:
+        return {"switchable": False, "choices": [], "display": ""}
+    here = (port, f"{profile or f'port {port}'} (this console)")
+    return {
+        "switchable": True,
+        "choices": [{"label": label, "href": f"/switch/{number}"} for number, label in others],
+        "display": ", ".join(label for _number, label in sorted([here, *others])),
     }
 
 

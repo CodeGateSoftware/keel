@@ -293,14 +293,27 @@ def gated_action_permitted(
     in a quiet edit here. Until then a tunnelled deployment serves the read surface and refuses
     every gated action, which is the posture that fails safe.
     """
+    return local_deployment(external_hosts=external_hosts, bound_host=bound_host) and (
+        _is_loopback_peer(peer)
+    )
+
+
+def local_deployment(*, external_hosts: frozenset[str], bound_host: str) -> bool:
+    """No declared remote origin and a loopback bind: the half of `gated_action_permitted` that
+    holds for the whole process rather than per request.
+
+    Split out for the profile switcher (#814), which asks it at two moments: when `/api/config`
+    decides whether to OFFER a switch (no request peer to ask about -- the answer is the
+    deployment's posture), and when `/switch/<port>` decides whether to PERFORM one, where the
+    peer check is added exactly as it is for a release. One definition, so the offer and the
+    route cannot disagree about what "local" means.
+    """
     if external_hosts:
         return False
     # The bind, by the same rule as the peer, so `127.0.0.53` and `::1` are loopback here too and
     # a name that is not an address ("example.internal") is refused -- this decides a security
     # question, and "I could not tell" is not "yes".
-    if bound_host not in _LOOPBACK_NAMES and not _is_loopback_peer((bound_host, 0)):
-        return False
-    return _is_loopback_peer(peer)
+    return bound_host in _LOOPBACK_NAMES or _is_loopback_peer((bound_host, 0))
 
 
 def tokens_match(presented: str | None, expected: str) -> bool:
