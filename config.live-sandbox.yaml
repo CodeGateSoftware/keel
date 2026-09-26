@@ -187,11 +187,16 @@ caps:
   # NOTHING with a measured edge. Only rule 6 (dca) stays live, and DCA is fixed-budget
   # accumulation rather than an edge claim. Re-promoting a turtle rule onto this cap without a
   # fresh significance verdict is the mistake this comment exists to prevent.
+  # Per-asset ceiling raised 0.50 -> 0.75 on 2026-09-26 ($200 -> $300). BTC stood at $151.81 at
+  # cost (three $50 DCA buys), so the fourth projected to $201.81 and guard 6 vetoed it on
+  # 2026-09-25. Exposure is measured at COST, so a falling price never frees room: at 0.50 the
+  # weekly DCA was permanently capped at three buys. 0.75 admits three more ($301.81 is the
+  # first projection over). max_exposure_usd, the sizing proxy, is deliberately unchanged.
   max_exposure_usd: 400      # total open exposure across all positions AT ONCE (NOT per day, NOT per month)
   max_per_order_usd: 200     # per-single-order ceiling
   max_per_day_usd: 200       # per-rolling-24h ceiling -- deliberately LEFT at 200, so one
                              # max-sized order consumes the whole day's budget
-  max_per_asset_pct: 0.50    # no single asset may exceed 50% of the $400 exposure ($200)
+  max_per_asset_pct: 0.75    # no single asset may exceed 75% of the $400 exposure ($300)
 
 market_data:
   # THE FINEST ENTRY HERE SETS POSITION SIZE, not just what the rules see. `doctor`'s
