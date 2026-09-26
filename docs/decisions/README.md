@@ -17,3 +17,5 @@ by writing a new record that supersedes it, never by quietly editing an old one.
    no](0004-monetisation-not-now.md) · #603
 5. [0005 — keel does not trade options; the permissibility question is not
    reached](0005-options.md) · #637
+6. [0006 — Daily strategies are evaluated on the pooled sample, never per
+   asset](0006-pooled-evaluation-of-daily-strategies.md) · #822
