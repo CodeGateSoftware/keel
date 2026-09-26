@@ -425,6 +425,11 @@ def backtest_resolved(resolved: ResolvedBacktest) -> backtest_mod.BacktestResult
     )
 
 
+def _r_text(value: Decimal | None) -> str:
+    """An R aggregate for the `rules backtest` line: `n/a` when the sample has no R."""
+    return "n/a" if value is None else str(value)
+
+
 def run_rule_backtest(
     repo: Repository,
     config: Any | None,
@@ -446,10 +451,15 @@ def run_rule_backtest(
     )
     stats = backtest_resolved(resolved)
     sink, recorded = _line_sink(echo)
+    # Every figure names its unit (#820): the R pair is what the promotion gate judges; the
+    # `_px` pair is price units for a one-coin position, which is money, not R, and not
+    # comparable across assets.
     sink(
         f"rule {rule_id} ({resolved.row['kind']}): n_trades={stats.n_trades} "
-        f"win_rate={stats.win_rate:.2%} expectancy={stats.expectancy} "
-        f"profit_factor={stats.profit_factor} max_drawdown={stats.max_drawdown} "
+        f"win_rate={stats.win_rate:.2%} expectancy_r={_r_text(stats.expectancy_r)} "
+        f"max_drawdown_r={_r_text(stats.max_drawdown_r)} "
+        f"profit_factor={stats.profit_factor} expectancy_px={stats.expectancy} "
+        f"max_drawdown_px={stats.max_drawdown} (px = price units, 1-coin notional) "
         f"{_describe_fee(resolved.fee_pct, resolved.fee_source)}"
     )
     return (

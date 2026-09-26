@@ -1110,3 +1110,67 @@ def test_a_trailing_stop_stranded_by_a_gap_down_bar_exits_instead():
     assert trailed.trades[0].exit == Decimal("97")  # the gap bar's OPEN
     assert trailed.trades[0].exit_ts == 4 * _HOUR
     assert trailed.trades[0].outcome == "loss"
+
+
+# ---------------------------------------------------------------------------
+# #820: the closed SimTrade carries its initial risk, and R is signed by the outcome
+# ---------------------------------------------------------------------------
+
+
+def test_a_sim_entry_that_gaps_below_its_stop_and_loses_has_negative_r():
+    """(f) portfolio_sim's close path. The setup's stop is 94; the fill bar OPENS at 90,
+    below it. The trade loses; the signed denominator `(90 - 94) * qty` made that loss a
+    positive R. R divides by `|entry_fill - setup.stop| * qty`."""
+    hourly = [
+        _candle(0, "100", "101", "99", "100"),
+        _candle(_HOUR, "90", "92", "88", "89"),
+        _candle(2 * _HOUR, "89", "90", "88", "89"),
+    ]
+    candles_by_asset = {"BTC": {Granularity.ONE_HOUR: hourly, Granularity.ONE_DAY: []}}
+    result = run(
+        [_FirstBarRule("BTC-USD", Decimal("100"), Decimal("94"), Decimal("130"))],
+        candles_by_asset,
+        _config(),
+        start_ts=hourly[0].ts,
+        end_ts=hourly[-1].ts,
+        monthly_contribution=Decimal("100000"),
+        fee_pct=Decimal("0.01"),
+        slippage_pct=Decimal("0"),
+    )
+
+    assert len(result.trades) == 1
+    trade = result.trades[0]
+    assert trade.outcome == "loss"
+    assert trade.entry < Decimal("94")  # the fill really is below the stop
+    risk = Decimal("94") - trade.entry
+    assert trade.pnl is not None
+    assert trade.r_multiple == trade.pnl / (risk * trade.qty)
+    assert trade.r_multiple < 0
+    assert trade.initial_risk == risk
+
+
+def test_a_sim_trade_under_a_managed_stop_keeps_the_original_risk():
+    """The break-even roll moves the working stop to the entry; the trade's recorded risk is
+    still `|100 - 90| = 10` per unit, the ORIGINAL stop (`_Held.stop`'s docstring)."""
+    hourly = [
+        _candle(0, "100", "101", "99", "100"),
+        _candle(_HOUR, "100", "101", "99", "100"),
+        _candle(2 * _HOUR, "100", "111", "100", "108"),
+        _candle(3 * _HOUR, "106", "107", "99", "100"),
+    ]
+    result = _run_exit_policy_sim(
+        _ExitPolicyFirstBarRule(
+            "BTC-USD",
+            Decimal("100"),
+            Decimal("90"),
+            Decimal("130"),
+            {"be_roll_rr": Decimal("1"), "atr_period": 2},
+        ),
+        hourly,
+    )
+
+    assert len(result.trades) == 1
+    trade = result.trades[0]
+    assert trade.exit == Decimal("100")
+    assert trade.initial_risk == Decimal("10")
+    assert trade.r_multiple == Decimal("0")
