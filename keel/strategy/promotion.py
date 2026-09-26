@@ -33,6 +33,14 @@ axes move only with their own justification. The G4/overfitting gate is NOT pool
 judges the parameter SELECTION (the trial matrix behind `--pbo-session`), which is
 per-parameter-set evidence already, and this change does not alter its scope.
 
+**The floors are judged in R (#820).** Expectancy and realized R:R are read off the
+`BacktestResult`'s `*_r` fields -- each trade's net P&L over the risk it carried -- never off
+its price-unit fields. In price units a pool of assets at 100000 and at 0.1 is decided by the
+first, so a single high-priced product set the sign of G2 and of the #338 pooled reading.
+`min_expectancy` is therefore an R threshold. A sample with no R at all (no trade recorded an
+initial risk) cannot be judged on those axes and is REFUSED, the same fail-closed rule an
+unrun G4 gets below; `min_trades` and `min_win_rate` are counts and are judged as before.
+
 **Rules-table access:** `data/repository.py`'s `Repository` exposes typed `rules`-table
 methods (`insert_rule`/`get_rules`/`update_rule_status`, P3 Task 1); this module drives
 the lifecycle transitions purely through that surface. The `rules` table (see
@@ -44,7 +52,7 @@ is matched against `rules.kind`.
 from __future__ import annotations
 
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from decimal import Decimal
 from typing import Any
 
@@ -76,7 +84,11 @@ def next_status(status: str) -> str | None:
 
 @dataclass
 class PromotionConfig:
-    """Performance floors a rule's stats must clear to promote (spec §11/§4.5)."""
+    """Performance floors a rule's stats must clear to promote (spec §11/§4.5).
+
+    `min_expectancy` is in R (per trade) and `min_rr` is a ratio of mean R -- see the
+    module docstring's "judged in R" note (#820).
+    """
 
     min_trades: int = 100
     min_expectancy: Decimal = Decimal("0")
@@ -138,16 +150,36 @@ def promotion_class_of(rule: object) -> str:
     return getattr(rule, "promotion_class", DEFAULT_CLASS)
 
 
-def _realized_rr(stats: BacktestResult) -> Decimal:
-    """Realized reward:risk = avg win / avg loss magnitude.
+def _realized_rr(stats: BacktestResult) -> Decimal | None:
+    """Realized reward:risk = avg win / avg loss magnitude, IN R (#820).
 
-    `avg_loss` is stored as a non-positive `Decimal` (it's the mean pnl of losing
+    `avg_loss_r` is stored as a non-positive `Decimal` (it's the mean R of losing
     trades); a rule with no losing trades yet has no realized risk to measure against,
-    so it is treated as clearing any rr floor.
+    so it is treated as clearing any rr floor. `None` when the sample has no R at all --
+    the caller refuses rather than guessing.
+
+    In R, not price units: a price-unit ratio mixes a BTC win with an XLM loss, and one
+    asset's price then decides the ratio. (`insights._realized_rr_for_display` is the money
+    ratio, deliberately separate -- it is a display value, not a gate decision.)
     """
-    if stats.avg_loss == 0:
+    if stats.avg_win_r is None or stats.avg_loss_r is None:
+        return None
+    if stats.avg_loss_r == 0:
         return Decimal("Infinity")
-    return stats.avg_win / abs(stats.avg_loss)
+    return stats.avg_win_r / abs(stats.avg_loss_r)
+
+
+def _no_r_reason(n_trades: int, *, pooled: bool = False) -> str:
+    """The refusal a sample with no R gets on the expectancy and R:R axes (#820)."""
+    if pooled:
+        return (
+            f"pooled no R: none of the {n_trades} pooled trades carries an initial risk, so "
+            "expectancy and R:R cannot be judged in R -- refusing rather than passing"
+        )
+    return (
+        f"no R: none of the {n_trades} closed trades carries an initial risk, so expectancy "
+        "and R:R cannot be judged in R -- refusing rather than passing"
+    )
 
 
 def check_floors(stats: BacktestResult, cfg: PromotionConfig) -> tuple[bool, list[str]]:
@@ -169,12 +201,18 @@ def check_floors(stats: BacktestResult, cfg: PromotionConfig) -> tuple[bool, lis
     if stats.n_trades < cfg.min_trades:
         reasons.append(f"n_trades {stats.n_trades} < min_trades {cfg.min_trades}")
 
-    if stats.expectancy <= cfg.min_expectancy:
-        reasons.append(f"expectancy {stats.expectancy} <= min_expectancy {cfg.min_expectancy}")
-
+    # Expectancy and R:R are judged in R (#820). No R at all is a REFUSAL, not a pass --
+    # "nobody measured" must never read as "measured and fine" (see `can_promote`).
     rr = _realized_rr(stats)
-    if rr < cfg.min_rr:
-        reasons.append(f"rr {rr} < min_rr {cfg.min_rr}")
+    if stats.expectancy_r is None or rr is None:
+        reasons.append(_no_r_reason(stats.n_trades))
+    else:
+        if stats.expectancy_r <= cfg.min_expectancy:
+            reasons.append(
+                f"expectancy_r {stats.expectancy_r} <= min_expectancy {cfg.min_expectancy} (in R)"
+            )
+        if rr < cfg.min_rr:
+            reasons.append(f"rr_r {rr} < min_rr {cfg.min_rr} (in R)")
 
     if stats.win_rate < cfg.min_win_rate:
         reasons.append(f"win_rate {stats.win_rate} < min_win_rate {cfg.min_win_rate}")
@@ -263,12 +301,24 @@ def pool_stats(samples: Sequence[ProductSample]) -> tuple[BacktestResult, Pooled
     - pooled ``profit_factor`` = ``Σ(wins_i * avg_win_i) / |Σ(losses_i * avg_loss_i)|``,
                              with `stats.summarize`'s Infinity / 0 conventions.
     - pooled ``avg_mfe``/``avg_mae`` = trade-weighted means, same as expectancy.
+    - the ``*_r`` fields (#820) pool by the SAME arithmetic over each result's R sample,
+                             and exactly, because R carries its own counts: with
+                             ``m_i = n_i - n_excluded_no_risk_i`` (the trades with R),
+                             ``expectancy_r``/``avg_mfe_r``/``avg_mae_r`` are
+                             ``m_i``-weighted means, ``avg_win_r``/``avg_loss_r`` are
+                             weighted by ``n_wins_r_i``/``n_losses_r_i`` (so the money
+                             side's scratch inexactness does not arise), and
+                             ``profit_factor_r`` is the gross-R ratio. A result with no R
+                             (``m_i = 0``) contributes nothing but its exclusion count; a
+                             pool with no R at all reports every R field as ``None``.
+                             These are what the pooled floors judge.
     - ``trades``/``max_drawdown``/``max_losing_streak`` are NOT pooled: drawdown and
                              streak are path-dependent -- they depend on the ORDER of
                              trades across the union, which no per-result aggregate
                              carries -- so any value would be fabricated. They are set
-                             to empty/0, and the promotion gate reads none of them; a
-                             caller wanting real cross-product drawdown must pool
+                             to empty/0 (``max_drawdown_r`` to ``None``: an unknown,
+                             not a flat 0R), and the promotion gate reads none of them;
+                             a caller wanting real cross-product drawdown must pool
                              equity curves, not stats.
     """
     n_total = sum(s.stats.n_trades for s in samples)
@@ -317,6 +367,8 @@ def pool_stats(samples: Sequence[ProductSample]) -> tuple[BacktestResult, Pooled
         ),
     )
 
+    pooled_stats = replace(pooled_stats, **_pool_r(samples))
+
     reading = PooledReading(
         n_pooled=n_total,
         per_product=tuple(sorted(counts.items())),
@@ -324,6 +376,47 @@ def pool_stats(samples: Sequence[ProductSample]) -> tuple[BacktestResult, Pooled
         min_contribution=min(counts.values()) if counts else 0,
     )
     return pooled_stats, reading
+
+
+def _pool_r(samples: Sequence[ProductSample]) -> dict[str, Any]:
+    """The pooled `*_r` fields -- `pool_stats`' docstring states the arithmetic."""
+    excluded = sum(s.stats.n_excluded_no_risk for s in samples)
+    with_r = [s.stats for s in samples if s.stats.expectancy_r is not None]
+    weights = [st.n_trades - st.n_excluded_no_risk for st in with_r]
+    m_total = sum(weights)
+    if m_total == 0:
+        return {"n_excluded_no_risk": excluded}
+
+    def weighted_mean(values: list[Decimal | None]) -> Decimal:
+        pairs = zip(weights, values, strict=True)
+        return sum((w * v for w, v in pairs if v is not None), Decimal(0)) / m_total
+
+    wins_total = sum(st.n_wins_r for st in with_r)
+    losses_total = sum(st.n_losses_r for st in with_r)
+    gross_win = sum(
+        (st.n_wins_r * st.avg_win_r for st in with_r if st.avg_win_r is not None), Decimal(0)
+    )
+    gross_loss = sum(
+        (st.n_losses_r * st.avg_loss_r for st in with_r if st.avg_loss_r is not None),
+        Decimal(0),
+    )
+    return {
+        "expectancy_r": weighted_mean([st.expectancy_r for st in with_r]),
+        "avg_win_r": (gross_win / wins_total) if wins_total else Decimal(0),
+        "avg_loss_r": (gross_loss / losses_total) if losses_total else Decimal(0),
+        "profit_factor_r": (
+            (gross_win / abs(gross_loss))
+            if gross_loss != 0
+            else (Decimal("Infinity") if gross_win > 0 else Decimal(0))
+        ),
+        # path-dependent: not pooled (see `pool_stats`), and unknown rather than 0R
+        "max_drawdown_r": None,
+        "avg_mfe_r": weighted_mean([st.avg_mfe_r for st in with_r]),
+        "avg_mae_r": weighted_mean([st.avg_mae_r for st in with_r]),
+        "n_excluded_no_risk": excluded,
+        "n_wins_r": wins_total,
+        "n_losses_r": losses_total,
+    }
 
 
 def _pooled_floors(
@@ -355,14 +448,18 @@ def _pooled_floors(
             "discount pooled evidence pays for its larger n)"
         )
 
-    if pooled.expectancy <= cfg.min_expectancy:
-        reasons.append(
-            f"pooled expectancy {pooled.expectancy} <= min_expectancy {cfg.min_expectancy}"
-        )
-
+    # In R, and refused without R -- exactly `check_floors`' rule (#820).
     rr = _realized_rr(pooled)
-    if rr < cfg.min_rr:
-        reasons.append(f"pooled rr {rr} < min_rr {cfg.min_rr}")
+    if pooled.expectancy_r is None or rr is None:
+        reasons.append(_no_r_reason(reading.n_pooled, pooled=True))
+    else:
+        if pooled.expectancy_r <= cfg.min_expectancy:
+            reasons.append(
+                f"pooled expectancy_r {pooled.expectancy_r} <= min_expectancy "
+                f"{cfg.min_expectancy} (in R)"
+            )
+        if rr < cfg.min_rr:
+            reasons.append(f"pooled rr_r {rr} < min_rr {cfg.min_rr} (in R)")
 
     if pooled.win_rate < cfg.min_win_rate:
         reasons.append(f"pooled win_rate {pooled.win_rate} < min_win_rate {cfg.min_win_rate}")
@@ -590,10 +687,19 @@ def should_demote(rolling_stats: BacktestResult, cfg: PromotionConfig) -> bool:
     deliberately excludes `min_trades`: a live rule's rolling window is sized for
     timely decay detection (spec §6.3/§20.7), not for re-proving the original sample
     size, so requiring `min_trades` here would make demotion undetectable in practice.
+
+    Mirrors them in R too (#820), including the no-R case: `check_floors` refuses a sample
+    with no R, so this DEMOTES one -- missing evidence must never block pulling a rule back
+    from real money (`transition`'s asymmetry). An empty rolling window already demoted
+    before #820 (its price-unit expectancy was 0, not above the floor), so this adds no
+    new demotion path for it.
     """
-    if rolling_stats.expectancy <= cfg.min_expectancy:
+    rr = _realized_rr(rolling_stats)
+    if rolling_stats.expectancy_r is None or rr is None:
         return True
-    if _realized_rr(rolling_stats) < cfg.min_rr:
+    if rolling_stats.expectancy_r <= cfg.min_expectancy:
+        return True
+    if rr < cfg.min_rr:
         return True
     if rolling_stats.win_rate < cfg.min_win_rate:
         return True

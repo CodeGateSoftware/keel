@@ -569,3 +569,34 @@ def test_the_resolved_backtest_path_passes_the_per_product_rate(repo, monkeypatc
     assert seen == [backtest_mod.SLIPPAGE_CAP_PCT], (
         f"backtest_resolved priced fills at {seen} — the resolved rate is not reaching the engine"
     )
+
+
+def test_run_rule_backtest_line_labels_the_units_of_every_figure(repo: Repository) -> None:
+    """#820: the line used to print `expectancy=` and `max_drawdown=` bare -- price units for a
+    one-coin position, which read as R beside the gate that (since #820) judges R. The R
+    figures lead, and the price-unit ones carry a `_px` suffix and a legend saying what px is."""
+    import re
+
+    repo.insert_rule(
+        "dca", {"product_id": "BTC-USD", "cadence_days": 7}, status="candidate", now_ts=NOW_TS
+    )
+    repo.upsert_candles("BTC-USD", Granularity.ONE_DAY, _daily_candles(30))
+    out, err = _collect()
+    _outcome, stats = run_rule_backtest(
+        repo, _config(), 1, granularity_opt="ONE_DAY", echo=out.append, echo_err=err.append
+    )
+
+    keys = re.findall(r"(\w+)=", out[0])
+    assert keys[:7] == [
+        "n_trades",
+        "win_rate",
+        "expectancy_r",
+        "max_drawdown_r",
+        "profit_factor",
+        "expectancy_px",
+        "max_drawdown_px",
+    ]
+    assert f"expectancy_px={stats.expectancy} " in out[0]
+    assert f"max_drawdown_px={stats.max_drawdown} (px = price units, 1-coin notional)" in out[0]
+    assert stats.expectancy_r is None  # this flat series closes no trade that carries R
+    assert "expectancy_r=n/a " in out[0]

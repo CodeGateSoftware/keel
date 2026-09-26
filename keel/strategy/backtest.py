@@ -72,7 +72,14 @@ from dataclasses import dataclass
 from decimal import Decimal
 
 from keel.strategy.exit_policy import ExitPolicy, next_stop, policy_for, trailing_atr
-from keel.strategy.rules.base import Rule, Setup, Trade, TradeOutcome
+from keel.strategy.rules.base import (
+    Rule,
+    Setup,
+    Trade,
+    TradeOutcome,
+    initial_risk_of,
+    r_multiple_of,
+)
 from keel.strategy.stats import BacktestResult, summarize
 from keel.types import Candle, Granularity, Side
 
@@ -394,8 +401,10 @@ def _close_trade(
     exit_fee = exit_fill * qty * fee_pct
     pnl = (exit_fill - entry_fill) * qty - entry_fee - exit_fee
 
-    risk = (entry_fill - position.setup.stop) * qty
-    r_multiple = pnl / risk if risk != 0 else None
+    # The ORIGINAL stop (`setup.stop`), never the managed `position.stop`, and as a magnitude:
+    # a fill that gapped below the stop still risked the distance to it (#820).
+    initial_risk = initial_risk_of(entry_fill, position.setup.stop)
+    r_multiple = r_multiple_of(pnl, initial_risk, qty)
 
     # Annotated rather than inferred: without it the three branches widen `outcome` to plain
     # `str`, which `Trade.outcome` then rejects. Naming the alias also catches a typo in one of
@@ -420,6 +429,7 @@ def _close_trade(
         mfe=position.mfe,
         mae=position.mae,
         outcome=outcome,
+        initial_risk=initial_risk,
     )
 
 
@@ -436,6 +446,7 @@ def _open_trade(position: _OpenPosition) -> Trade:
         mfe=position.mfe,
         mae=position.mae,
         outcome="open",
+        initial_risk=initial_risk_of(position.entry_fill, position.setup.stop),
     )
 
 

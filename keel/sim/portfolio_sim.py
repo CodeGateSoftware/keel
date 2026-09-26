@@ -96,7 +96,7 @@ from keel.strategy.backtest import (
     _touches,
 )
 from keel.strategy.exit_policy import ExitPolicy, next_stop, policy_for, trailing_atr
-from keel.strategy.rules.base import Rule, Setup, Signal
+from keel.strategy.rules.base import Rule, Setup, Signal, initial_risk_of, r_multiple_of
 from keel.types import Candle, Granularity
 
 __all__ = [
@@ -157,6 +157,10 @@ class SimTrade:
     rule_kind: str
     cts_score: int
     entry_technique: str
+    #: Per-unit `|entry_fill - setup.stop|` against the ORIGINAL stop (#820), the risk
+    #: `r_multiple` divides by (times `qty`). `None` on a record with none; last and
+    #: defaulted so existing constructors keep working.
+    initial_risk: Decimal | None = None
 
 
 @dataclass
@@ -598,8 +602,8 @@ def _process_held(
     # keep the call site honest against `execution.streak.record_closed_trade`'s signature.
     account.record_trade_outcome(pnl, config, current.ts, is_dca=False)
 
-    risk = (h.entry_fill - setup.stop) * h.qty
-    r_multiple = pnl / risk if risk != 0 else None
+    initial_risk = initial_risk_of(h.entry_fill, setup.stop)
+    r_multiple = r_multiple_of(pnl, initial_risk, h.qty)
     outcome = "win" if pnl > 0 else "loss" if pnl < 0 else "scratch"
 
     trades.append(
@@ -618,6 +622,7 @@ def _process_held(
             rule_kind=h.rule.name,
             cts_score=h.cts_score,
             entry_technique=h.entry_technique,
+            initial_risk=initial_risk,
         )
     )
 

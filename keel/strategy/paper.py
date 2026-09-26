@@ -40,7 +40,7 @@ from keel_core.telemetry import log_event
 
 from keel.data.repository import Repository
 from keel.strategy.backtest import TAKER_FEE_PCT, _stop_exit_price, _touches
-from keel.strategy.rules.base import Action, Setup, Signal, Trade
+from keel.strategy.rules.base import Action, Setup, Signal, Trade, initial_risk_of, r_multiple_of
 from keel.strategy.stats import BacktestResult, summarize
 from keel.types import Candle, Side
 
@@ -396,8 +396,8 @@ class PaperTrader:
         exit_fee = exit_fill * position.qty * self._fee_pct
         pnl = (exit_fill - position.entry_fill) * position.qty - entry_fee - exit_fee
 
-        risk = (position.entry_fill - position.setup.stop) * position.qty
-        r_multiple = pnl / risk if risk != 0 else None
+        initial_risk = initial_risk_of(position.entry_fill, position.setup.stop)
+        r_multiple = r_multiple_of(pnl, initial_risk, position.qty)
 
         if pnl > 0:
             outcome = "win"
@@ -415,6 +415,7 @@ class PaperTrader:
             "qty": str(position.qty),
             "pnl": str(pnl),
             "r_multiple": str(r_multiple) if r_multiple is not None else None,
+            "initial_risk": str(initial_risk),
             "mfe": str(position.mfe),
             "mae": str(position.mae),
             "outcome": outcome,
@@ -447,6 +448,22 @@ class PaperTrader:
         return order_id
 
 
+def _journalled_initial_risk(exit_payload: dict, entry_payload: dict | None) -> Decimal | None:
+    """The per-unit initial risk a journalled paper trade carried (#820).
+
+    An exit written since #820 records it (`"initial_risk"`). One written before does not --
+    but its ENTRY payload has always recorded the achieved fill (`"entry"`) and the setup's
+    stop (`"stop"`), which is all the risk is, so an older track record keeps its R rather
+    than silently dropping out of every R aggregate. `None` only when neither is available.
+    """
+    recorded = exit_payload.get("initial_risk")
+    if recorded is not None:
+        return Decimal(recorded)
+    if entry_payload is not None and entry_payload.get("stop") is not None:
+        return initial_risk_of(Decimal(entry_payload["entry"]), Decimal(entry_payload["stop"]))
+    return None
+
+
 def track_record(repo: Repository, rule_name: str) -> BacktestResult:
     """Aggregate `rule_name`'s paper trades (from `orders(mode='paper')`) into a
     `BacktestResult`-shaped summary, directly comparable to `backtest.backtest()`'s
@@ -470,23 +487,33 @@ def track_record(repo: Repository, rule_name: str) -> BacktestResult:
 
     trades: list[Trade] = []
     for payload in exits:
-        r_multiple = payload["r_multiple"]
+        entry_payload = entries.pop(payload["entry_order_id"], None)
+        initial_risk = _journalled_initial_risk(payload, entry_payload)
+        pnl = Decimal(payload["pnl"])
+        qty = Decimal(payload["qty"])
+        stored_r = payload["r_multiple"]
         trades.append(
             Trade(
                 entry_ts=payload["entry_ts"],
                 exit_ts=payload["exit_ts"],
                 entry=Decimal(payload["entry"]),
                 exit=Decimal(payload["exit"]),
-                qty=Decimal(payload["qty"]),
+                qty=qty,
                 side=Side.BUY,
-                pnl=Decimal(payload["pnl"]),
-                r_multiple=Decimal(r_multiple) if r_multiple is not None else None,
+                pnl=pnl,
+                # Recomputed whenever the risk is known: a pre-#820 exit stored the SIGNED
+                # formula's value, which is wrong for any fill that gapped below its stop.
+                r_multiple=(
+                    r_multiple_of(pnl, initial_risk, qty)
+                    if initial_risk is not None
+                    else (Decimal(stored_r) if stored_r is not None else None)
+                ),
                 mfe=Decimal(payload["mfe"]),
                 mae=Decimal(payload["mae"]),
                 outcome=payload["outcome"],
+                initial_risk=initial_risk,
             )
         )
-        entries.pop(payload["entry_order_id"], None)
 
     for payload in entries.values():
         trades.append(
@@ -502,6 +529,7 @@ def track_record(repo: Repository, rule_name: str) -> BacktestResult:
                 mfe=Decimal(0),
                 mae=Decimal(0),
                 outcome="open",
+                initial_risk=_journalled_initial_risk({}, payload),
             )
         )
 

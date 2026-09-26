@@ -995,3 +995,89 @@ def test_a_trailing_stop_stranded_by_a_gap_down_bar_exits_instead() -> None:
     assert result.trades[0].exit == Decimal("97")  # the gap bar's OPEN
     assert result.trades[0].exit_ts == trigger_ts + 4 * 3600
     assert result.trades[0].outcome == "loss"
+
+
+# ---------------------------------------------------------------------------
+# #820: the trade carries its initial risk, and R is signed by the OUTCOME
+# ---------------------------------------------------------------------------
+
+
+def test_initial_risk_is_measured_from_the_achieved_fill_not_the_quoted_entry() -> None:
+    """(d) The setup quotes 100 but the market fills at the next bar's open, 102: the risk
+    the trade actually carried is `|102 - 94| = 8` per unit, and R divides by that."""
+    trigger_ts = 14 * 3600
+    after = [
+        ("102", "103", "101", "102"),  # fill bar: open 102 is the achieved fill
+        ("102", "118", "101", "117"),  # target 118 touched -> exit 118
+    ]
+    candles = _flat_then_run_bars(trigger_ts, after)
+    rule = _ScriptedParamRule(trigger_ts, Decimal("100"), Decimal("94"), Decimal("118"), {})
+
+    result = backtest(rule, candles, fee_pct=Decimal(0), slippage_pct=Decimal(0))
+
+    assert result.n_trades == 1
+    trade = result.trades[0]
+    assert trade.entry == Decimal("102")
+    assert trade.initial_risk == Decimal("8")
+    assert trade.r_multiple == Decimal("2")  # (118 - 102) / 8
+
+
+def test_a_managed_stop_still_measures_r_against_the_original_stop() -> None:
+    """(d) The break-even roll moves the working stop to 100, but the trade's risk -- and so
+    its R -- stays the ORIGINAL 10 (`_OpenPosition.stop`'s docstring). A scratch at the
+    rolled stop is a fee-only loss on a risk of 10, and the trade records that 10."""
+    trigger_ts = 14 * 3600
+    after = [
+        ("100", "101", "99", "100"),
+        ("100", "111", "100", "108"),
+        ("106", "107", "99", "100"),
+    ]
+    candles = _flat_then_run_bars(trigger_ts, after)
+    rule = _ScriptedParamRule(
+        trigger_ts, Decimal("100"), Decimal("90"), Decimal("130"), {"be_roll_rr": Decimal("1")}
+    )
+
+    result = backtest(rule, candles, fee_pct=Decimal("0.01"), slippage_pct=Decimal(0))
+
+    trade = result.trades[0]
+    assert trade.exit == Decimal("100")  # the ROLLED stop
+    assert trade.initial_risk == Decimal("10")  # |100 - 90|, not |100 - 100|
+    assert trade.pnl == Decimal("-2")  # fees only: 1 + 1
+    assert trade.r_multiple == Decimal("-0.2")
+
+
+def test_an_entry_that_gaps_below_its_stop_and_loses_has_negative_r() -> None:
+    """(e) The negative-risk flip. The setup's stop is 94; the next bar OPENS at 90, below it,
+    so the market fill is 90 and the same bar exits at its open (the gap-through fill). Net
+    of fees the trade loses 1.8. The signed denominator `(90 - 94) = -4` made that loss +0.45R;
+    a loss is negative R, full stop."""
+    trigger_ts = 14 * 3600
+    after = [
+        ("90", "92", "88", "89"),  # fill at 90 -- already below the 94 stop
+    ]
+    candles = _flat_then_run_bars(trigger_ts, after)
+    rule = _ScriptedParamRule(trigger_ts, Decimal("100"), Decimal("94"), Decimal("130"), {})
+
+    result = backtest(rule, candles, fee_pct=Decimal("0.01"), slippage_pct=Decimal(0))
+
+    assert result.n_trades == 1
+    trade = result.trades[0]
+    assert trade.entry == Decimal("90")
+    assert trade.outcome == "loss"
+    assert trade.pnl == Decimal("-1.8")
+    assert trade.r_multiple == Decimal("-0.45")
+    assert trade.initial_risk == Decimal("4")
+    assert result.expectancy_r == Decimal("-0.45")
+
+
+def test_an_open_trade_carries_its_initial_risk_too() -> None:
+    trigger_ts = 14 * 3600
+    after = [("100", "101", "99", "100")]
+    candles = _flat_then_run_bars(trigger_ts, after)
+    rule = _ScriptedParamRule(trigger_ts, Decimal("100"), Decimal("94"), Decimal("130"), {})
+
+    result = backtest(rule, candles, fee_pct=Decimal(0), slippage_pct=Decimal(0))
+
+    assert [t.outcome for t in result.trades] == ["open"]
+    assert result.trades[0].initial_risk == Decimal("6")
+    assert result.trades[0].r_multiple is None

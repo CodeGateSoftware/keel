@@ -516,9 +516,21 @@ def test_journal_report_since_until_window(repo: Repository) -> None:
 
 def test_journal_report_enriches_r_multiple_from_paper_track_record(repo: Repository) -> None:
     """A `trade_outcomes` row that matches a paper trade's (entry_ts, exit_ts) gets that
-    trade's real `r_multiple`/`outcome` rather than a pnl-sign guess."""
+    trade's real `r_multiple`/`outcome` rather than a pnl-sign guess.
+
+    The paper trade is self-consistent: 25 made on a risk of |100 - 90| = 10 is 2.5R. Since
+    #820 `track_record` recomputes R from the journalled fill and stop rather than trusting
+    a stored value the old signed formula may have written, so a fixture whose stored R
+    disagreed with its own pnl and stop would no longer be "the real r_multiple"."""
     _seed_paper_trade(
-        repo, "dca", entry_ts=1000, exit_ts=2000, pnl="10", r_multiple="2.5", outcome="win"
+        repo,
+        "dca",
+        entry_ts=1000,
+        exit_ts=2000,
+        exit_price="125",
+        pnl="25",
+        r_multiple="2.5",
+        outcome="win",
     )
     _seed_trade_outcome(
         repo, rule_name="dca", opened_at=1000, closed_at=2000, pnl_net="9.5", is_dca=False
@@ -871,3 +883,45 @@ def test_the_horizontal_axis_is_trade_order_not_calendar_time() -> None:
 
     xs = [point.x for point in curve.points]
     assert xs == [Decimal("0.00"), (curve.width / 2).quantize(Decimal("0.01")), curve.width]
+
+
+def test_rule_track_record_and_gate_distance_still_present_money_not_r(repo: Repository) -> None:
+    """(#820 regression) `insights` and the web payload label these fields as MONEY
+    (`_money(...)`, `money(...)`), so they must keep reading the pnl-based aggregates after
+    `BacktestResult` grew R twins. Built on a sample where R and pnl disagree in size and
+    sign-balance, so pointing any of them at R would fail here."""
+    from keel.strategy.rules.base import Trade
+    from keel.strategy.stats import summarize
+    from keel.types import Side
+
+    def trade(pnl: str, risk: str) -> Trade:
+        value = Decimal(pnl)
+        return Trade(
+            entry_ts=0,
+            exit_ts=1,
+            entry=Decimal("100000"),
+            exit=Decimal("100000") + value,
+            qty=Decimal("1"),
+            side=Side.BUY,
+            pnl=value,
+            r_multiple=value / Decimal(risk),
+            mfe=Decimal("0"),
+            mae=Decimal("0"),
+            outcome="win" if value > 0 else "loss",
+            initial_risk=Decimal(risk),
+        )
+
+    stats = summarize([trade("6000", "2000"), trade("-2000", "2000"), trade("-2000", "2000")])
+    assert stats.expectancy_r == Decimal("1") / 3
+    repo.insert_rule("dca", {"product_id": "BTC-USD"}, status="paper")
+    row = next(r for r in repo.get_rules() if r["kind"] == "dca")
+
+    record = build_rule_track_record(row, stats, _default_floor(_config()))
+
+    assert record.expectancy == Decimal("2000") / 3
+    assert record.avg_win == Decimal("6000")
+    assert record.avg_loss == Decimal("-2000")
+    assert record.max_drawdown == Decimal("4000")
+    assert record.realized_rr == Decimal("3")
+    assert record.gate is not None
+    assert record.gate.expectancy == Decimal("2000") / 3

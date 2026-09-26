@@ -32,7 +32,7 @@ from keel.sim.tiers import OVER_CAP, WITHIN_CAP, compute_tier_fee_result
 from keel.strategy.backtest import SLIPPAGE_CAP_PCT, SLIPPAGE_FLOOR_PCT, SlippageAssumption
 from keel.strategy.promotion import TREND_FOLLOW, PromotionConfig, floor_for_class
 from keel.strategy.rules.base import Rule, Setup, Trade
-from keel.strategy.stats import BacktestResult
+from keel.strategy.stats import BacktestResult, summarize
 from keel.types import Candle, Granularity, Side
 
 _HOUR = 3600
@@ -367,6 +367,9 @@ def _pooled_result(
     avg_loss: Decimal = Decimal("-90"),
     expectancy: Decimal = Decimal("30"),
 ) -> BacktestResult:
+    """Since #820 G2 judges expectancy and R:R in R, so the fixture carries the same numbers
+    on its R fields (a risk of 1 per unit, where R and price units coincide)."""
+    wins = round(n_trades * win_rate)
     return BacktestResult(
         trades=[],
         n_trades=n_trades,
@@ -379,7 +382,49 @@ def _pooled_result(
         max_losing_streak=3,
         avg_mfe=Decimal("2"),
         avg_mae=Decimal("1"),
+        expectancy_r=expectancy,
+        avg_win_r=avg_win,
+        avg_loss_r=avg_loss,
+        profit_factor_r=Decimal("2"),
+        max_drawdown_r=Decimal("5"),
+        avg_mfe_r=Decimal("2"),
+        avg_mae_r=Decimal("1"),
+        n_wins_r=wins,
+        n_losses_r=n_trades - wins,
     )
+
+
+def test_g2_refuses_a_pooled_sample_with_no_r():
+    """#820: a pool whose trades carry no initial risk cannot be judged on expectancy or R:R,
+    and G2 refuses it -- it does not fall back to the price-unit fields."""
+    no_r = BacktestResult(
+        trades=[],
+        n_trades=150,
+        win_rate=0.6,
+        avg_win=Decimal("150"),
+        avg_loss=Decimal("-90"),
+        expectancy=Decimal("30"),
+        profit_factor=Decimal("2"),
+        max_drawdown=Decimal("5"),
+        max_losing_streak=3,
+        avg_mfe=Decimal("2"),
+        avg_mae=Decimal("1"),
+        n_excluded_no_risk=150,
+    )
+
+    v = build_verdict(
+        pooled=no_r,
+        account_metrics=_PASSING_ACCOUNT_METRICS,
+        benchmark=_benchmark(),
+        coverage={},
+        promotion_cfg=CANONICAL,
+    )
+
+    assert v.g2_pass is False
+    assert v.reasons == [
+        "no R: none of the 150 closed trades carries an initial risk, so expectancy and "
+        "R:R cannot be judged in R -- refusing rather than passing"
+    ]
 
 
 def _benchmark(
@@ -1063,3 +1108,216 @@ def test_render_markdown_includes_the_pbo_section_when_a_run_is_supplied():
     assert "Overfitting diagnostics (PBO / CSCV)" in md
     # Placed before the gaps backlog and the caveats, which must both still be last.
     assert md.index("Overfitting diagnostics") < md.index("Knowledge & data gaps")
+
+
+# ---------------------------------------------------------------------------
+# #820: the edge table pools in R, in exit-time order, and says so truthfully
+# ---------------------------------------------------------------------------
+
+
+def _one_trade_series(price: Decimal, exit_bar: tuple[str, str, str, str]) -> list[Candle]:
+    """bar0 flat, bar1 the trigger, bar2 the fill bar at `price` whose range is `exit_bar`
+    (o, h, l, c as multiples of `price`) -- the trade opens at bar2's open and resolves
+    within it."""
+    o, h, low, c = (price * Decimal(x) for x in exit_bar)
+    flat = str(price)
+    return [
+        _candle(0, flat, flat, flat, flat),
+        _candle(_HOUR, flat, flat, flat, flat),
+        _candle(2 * _HOUR, str(o), str(h), str(low), str(c)),
+    ]
+
+
+_WIN_2R = ("1", "1.045", "0.995", "1.04")  # target +4% touched, stop -2% not
+_LOSS_1R = ("1", "1.005", "0.975", "0.98")  # stop -2% touched, target not
+
+
+def _scaled_rule(product_id: str, price: Decimal) -> _OneShotRule:
+    """Entry at `price`, stop 2% below, target 4% above: a win is +2R, a loss -1R, at ANY
+    price."""
+    return _OneShotRule(
+        product_id,
+        _HOUR,
+        entry=price,
+        stop=price * Decimal("0.98"),
+        target=price * Decimal("1.04"),
+    )
+
+
+def test_edge_table_pooled_expectancy_r_is_the_common_r_across_price_scales():
+    """(g) A BTC-scale rule and an XLM-scale rule that each made exactly +2R pool to +2R. In
+    price units the pool is BTC's 2000 averaged with XLM's 0.002 -- the number the table used
+    to print under the "R-multiples" label."""
+    btc, xlm = Decimal("100000"), Decimal("0.1")
+    rules = [_scaled_rule("BTC-USD", btc), _scaled_rule("XLM-USD", xlm)]
+    candles_by_asset = {
+        "BTC": {Granularity.ONE_HOUR: _one_trade_series(btc, _WIN_2R)},
+        "XLM": {Granularity.ONE_HOUR: _one_trade_series(xlm, _WIN_2R)},
+    }
+
+    edge = edge_table(rules, candles_by_asset, fee_pct=Decimal("0"), slippage_pct=Decimal("0"))
+
+    assert edge["one_shot:BTC"].expectancy_r == Decimal("2")
+    assert edge["one_shot:XLM"].expectancy_r == Decimal("2")
+    assert edge[POOLED_KEY].n_trades == 2
+    assert edge[POOLED_KEY].expectancy_r == Decimal("2")
+    assert edge[POOLED_KEY].expectancy == (Decimal("4000") + Decimal("0.004")) / 2
+
+
+def test_edge_table_pooled_sign_is_not_decided_by_the_highest_priced_asset():
+    """BTC loses 1R, XLM wins 2R: the pool made +0.5R per trade. In price units BTC's -2000
+    swamps XLM's +0.004 and the pool reads as a loser -- G2 used to see that number."""
+    btc, xlm = Decimal("100000"), Decimal("0.1")
+    rules = [_scaled_rule("BTC-USD", btc), _scaled_rule("XLM-USD", xlm)]
+    candles_by_asset = {
+        "BTC": {Granularity.ONE_HOUR: _one_trade_series(btc, _LOSS_1R)},
+        "XLM": {Granularity.ONE_HOUR: _one_trade_series(xlm, _WIN_2R)},
+    }
+
+    edge = edge_table(rules, candles_by_asset, fee_pct=Decimal("0"), slippage_pct=Decimal("0"))
+
+    assert edge[POOLED_KEY].expectancy < 0
+    assert edge[POOLED_KEY].expectancy_r == Decimal("0.5")
+
+
+def _timed_series(trigger_bar: int, win: bool) -> list[Candle]:
+    """Flat at 100 up to the trigger, a quiet fill bar, then a bar that hits the 110 target
+    (win) or the 90 stop (loss). The trade exits at `(trigger_bar + 2) * _HOUR`."""
+    bars = [_candle(i * _HOUR, "100", "100", "100", "100") for i in range(trigger_bar + 1)]
+    bars.append(_candle((trigger_bar + 1) * _HOUR, "100", "101", "99", "100"))
+    exit_bar = ("100", "111", "99", "110") if win else ("100", "101", "89", "90")
+    bars.append(_candle((trigger_bar + 2) * _HOUR, *exit_bar))
+    return bars
+
+
+def test_edge_table_pools_in_exit_time_order_so_max_drawdown_is_chronological():
+    """Rules listed A (loses, exits 2nd), B (wins, exits 1st), C (loses, exits 3rd).
+    Chronologically the pool is +1R, -1R, -1R: a 2R drawdown. Concatenated in RULE order it
+    is -1R, +1R, -1R, whose drawdown is 1R -- a path that never happened."""
+    rules = [
+        _OneShotRule("A-USD", 3 * _HOUR, Decimal("100"), Decimal("90"), Decimal("110")),
+        _OneShotRule("B-USD", 1 * _HOUR, Decimal("100"), Decimal("90"), Decimal("110")),
+        _OneShotRule("C-USD", 5 * _HOUR, Decimal("100"), Decimal("90"), Decimal("110")),
+    ]
+    candles_by_asset = {
+        "A": {Granularity.ONE_HOUR: _timed_series(3, win=False)},
+        "B": {Granularity.ONE_HOUR: _timed_series(1, win=True)},
+        "C": {Granularity.ONE_HOUR: _timed_series(5, win=False)},
+    }
+
+    edge = edge_table(rules, candles_by_asset, fee_pct=Decimal("0"), slippage_pct=Decimal("0"))
+
+    pooled = edge[POOLED_KEY]
+    assert [t.exit_ts for t in pooled.trades] == [3 * _HOUR, 5 * _HOUR, 7 * _HOUR]
+    assert pooled.max_drawdown_r == Decimal("2")
+    assert pooled.max_drawdown == Decimal("20")
+
+
+def _r_trade_at(exit_ts: int, pnl: str) -> Trade:
+    return Trade(
+        entry_ts=0,
+        exit_ts=exit_ts,
+        entry=Decimal("100"),
+        exit=Decimal("100") + Decimal(pnl),
+        qty=Decimal("1"),
+        side=Side.BUY,
+        pnl=Decimal(pnl),
+        r_multiple=Decimal(pnl) / 10,
+        mfe=Decimal("0"),
+        mae=Decimal("0"),
+        outcome="win" if Decimal(pnl) > 0 else "loss",
+        initial_risk=Decimal("10"),
+    )
+
+
+def test_group_trades_by_class_pools_in_exit_time_order():
+    rules = [
+        _ClassedRule("a", "A-USD", TREND_FOLLOW),
+        _ClassedRule("b", "B-USD", TREND_FOLLOW),
+        _ClassedRule("c", "C-USD", TREND_FOLLOW),
+    ]
+    edge = {
+        "a:A": summarize([_r_trade_at(2 * _HOUR, "-10")]),
+        "b:B": summarize([_r_trade_at(1 * _HOUR, "10")]),
+        "c:C": summarize([_r_trade_at(3 * _HOUR, "-10")]),
+    }
+
+    by_class = group_trades_by_class(edge, rules)
+
+    pooled = by_class[TREND_FOLLOW]
+    assert [t.exit_ts for t in pooled.trades] == [1 * _HOUR, 2 * _HOUR, 3 * _HOUR]
+    assert pooled.max_drawdown_r == Decimal("2")
+
+
+def _table(md: list[str]) -> list[list[str]]:
+    """The edge table's rows as cell lists (header first, the |---| rule dropped)."""
+    rows = [line for line in md if line.startswith("|") and not line.startswith("|---")]
+    return [[cell.strip() for cell in row.strip("|").split("|")] for row in rows]
+
+
+def test_edge_section_renders_r_columns_under_a_label_that_is_true():
+    result = summarize([_r_trade_at(_HOUR, "20"), _r_trade_at(2 * _HOUR, "-10")])
+
+    md = _render_edge_section({"rule:BTC": result, POOLED_KEY: result}, Decimal("0.012"))
+    table = _table(md)
+
+    assert table[0] == [
+        "Rule",
+        "N",
+        "Win%",
+        "Expectancy (R)",
+        "Avg win (R)",
+        "Avg loss (R)",
+        "Profit factor (R)",
+        "Max DD (R)",
+        "Losing streak",
+        "Avg MFE (R)",
+        "Avg MAE (R)",
+    ]
+    assert len(table) == 3
+    assert table[1] == [
+        "rule:BTC",
+        "2",
+        "50.0%",
+        "0.500",
+        "2.000",
+        "-1.000",
+        "2.000",
+        "1.000",
+        "1",
+        "0.000",
+        "0.000",
+    ]
+    assert table[2][0] == f"**{POOLED_KEY}**"
+    assert sum("R-multiple" in line for line in md) == 1
+    # No trade lacked a risk, so there is no exclusion note.
+    assert not any(line.startswith("Excluded from R") for line in md)
+
+
+def test_edge_section_shows_r_as_na_and_counts_trades_excluded_for_no_risk():
+    no_risk = Trade(
+        entry_ts=0,
+        exit_ts=_HOUR,
+        entry=Decimal("100"),
+        exit=Decimal("90"),
+        qty=Decimal("1"),
+        side=Side.BUY,
+        pnl=Decimal("-10"),
+        r_multiple=None,
+        mfe=Decimal("0"),
+        mae=Decimal("0"),
+        outcome="loss",
+        initial_risk=None,
+    )
+    with_r = summarize([_r_trade_at(_HOUR, "20"), no_risk])
+    none_r = summarize([no_risk])
+
+    md = _render_edge_section({"a:A": with_r, "b:B": none_r}, Decimal("0.012"))
+    table = _table(md)
+
+    assert table[1][3] == "2.000"
+    assert table[2][3:8] == ["n/a", "n/a", "n/a", "n/a", "n/a"]
+    notes = [line for line in md if line.startswith("Excluded from R")]
+    assert notes == [
+        "Excluded from R (no initial risk recorded): a:A 1 of 2 trades, b:B 1 of 1 trades."
+    ]

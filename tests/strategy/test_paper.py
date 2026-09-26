@@ -724,3 +724,107 @@ def test_funding_check_rejects_at_boundary_between_notional_and_actual_fill_cost
     assert trader.get_cash() == seed  # unchanged
     assert not trader.has_open_position("BTC-USD")
     assert repo.get_orders(mode="paper") == []
+
+
+# -- #820: R is signed by the outcome, and the trade carries its initial risk ----------------
+
+
+def test_a_paper_entry_filled_above_its_stop_that_loses_has_negative_r(repo):
+    """(f) paper's close path. The fill (100.05) sits BELOW nothing -- the setup's stop, 102,
+    is above it, so the signed denominator `(100.05 - 102) * qty` is negative and turned
+    this loss into a positive R. The risk is `|100.05 - 102| = 1.95` per unit; a loss on it
+    is negative R, and the exit payload records the risk it was measured against."""
+    trader = PaperTrader(repo)
+    setup = _setup(entry="100", stop="102", target="120")
+    trader.on_signal(_enter_signal(setup=setup), qty=Decimal("2"))
+
+    exit_id = trader.on_candle("BTC-USD", _candle(1_060, "100", "101", "99", "100"))
+
+    payload = json.loads(repo.get_order(exit_id)["raw_response"])
+    entry_fill = Decimal("100") * (Decimal(1) + SLIPPAGE_PCT)
+    risk = Decimal("102") - entry_fill
+    pnl = Decimal(payload["pnl"])
+    assert payload["outcome"] == "loss"
+    assert Decimal(payload["r_multiple"]) == pnl / (risk * Decimal("2"))
+    assert Decimal(payload["r_multiple"]) < 0
+    assert Decimal(payload["initial_risk"]) == risk
+
+    record = track_record(repo, "pullback_continuation")
+    assert [t.initial_risk for t in record.trades] == [risk]
+    assert record.trades[0].r_multiple == pnl / (risk * Decimal("2"))
+    assert record.expectancy_r == pnl / (risk * Decimal("2"))
+
+
+def test_track_record_recovers_initial_risk_for_a_legacy_exit_from_its_entry(repo):
+    """An exit journalled before #820 carries no `initial_risk`, and its stored `r_multiple`
+    may be the flipped, signed one. Its ENTRY payload still records the fill and the stop,
+    so the risk is recoverable -- and R is recomputed from it with the one shared formula
+    rather than trusted from a payload the old formula wrote."""
+    entry_payload = {
+        "role": "entry",
+        "rule_name": "legacy_rule",
+        "entry": "100.05",
+        "stop": "102",
+        "target": "120",
+        "qty": "1",
+        "ts": 1_000,
+    }
+    entry_id = repo.insert_order(
+        {
+            "mode": "paper",
+            "product_id": "BTC-USD",
+            "side": "BUY",
+            "order_type": "market",
+            "qty": Decimal("1"),
+            "limit_price": Decimal("100"),
+            "status": "filled",
+            "fee": Decimal("0"),
+            "expected_fill": Decimal("100"),
+            "actual_fill": Decimal("100.05"),
+            "raw_response": json.dumps(entry_payload),
+            "confirmation": "paper",
+            "rule_id": None,
+            "created_at": 1_000,
+            "updated_at": 1_000,
+        }
+    )
+    exit_payload = {
+        "role": "exit",
+        "rule_name": "legacy_rule",
+        "entry_order_id": entry_id,
+        "entry": "100.05",
+        "exit": "99.95",
+        "qty": "1",
+        "pnl": "-0.39",
+        "r_multiple": "0.2",  # the pre-#820 signed value: -0.39 / (100.05 - 102)
+        "mfe": "0.95",
+        "mae": "1.05",
+        "outcome": "loss",
+        "entry_ts": 1_000,
+        "exit_ts": 1_060,
+    }
+    repo.insert_order(
+        {
+            "mode": "paper",
+            "product_id": "BTC-USD",
+            "side": "SELL",
+            "order_type": "market",
+            "qty": Decimal("1"),
+            "limit_price": Decimal("100"),
+            "status": "filled",
+            "fee": Decimal("0"),
+            "expected_fill": Decimal("100"),
+            "actual_fill": Decimal("99.95"),
+            "raw_response": json.dumps(exit_payload),
+            "confirmation": "paper",
+            "rule_id": None,
+            "created_at": 1_060,
+            "updated_at": 1_060,
+        }
+    )
+
+    record = track_record(repo, "legacy_rule")
+
+    assert [t.initial_risk for t in record.trades] == [Decimal("1.95")]
+    assert record.trades[0].r_multiple == Decimal("-0.2")
+    assert record.expectancy_r == Decimal("-0.2")

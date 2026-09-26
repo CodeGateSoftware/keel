@@ -77,7 +77,7 @@ from keel.strategy.backtest import (
 )
 from keel.strategy.indicators_cts import DEFAULT_WEIGHTS
 from keel.strategy.promotion import PromotionConfig, check_floors, promotion_class_of
-from keel.strategy.rules.base import Rule
+from keel.strategy.rules.base import Rule, Trade
 from keel.strategy.stats import BacktestResult, summarize
 from keel.types import Candle, Granularity
 
@@ -169,8 +169,9 @@ def edge_table(
     stop/target resolution when the rule's own timeframe is coarser. Results are keyed
     `"{rule.name}:{asset}"` (not bare `rule.name`) so two rules of the same kind bound to
     different assets don't collide. `POOLED_KEY` (`"__pooled__"`) holds
-    `strategy.stats.summarize()` over every rule's trades concatenated -- the pooled sample
-    `build_verdict`'s G2 gate is checked against.
+    `strategy.stats.summarize()` over every rule's trades in EXIT-TIME order
+    (`_chronological`) -- the pooled sample `build_verdict`'s G2 gate is checked against, and
+    whose drawdown must be a path that happened, not one rule's history followed by the next's.
 
     `slippage_by_product` (#259) is passed through to each rule's `backtest()` unchanged; `None`
     (the default) keeps the flat `slippage_pct` for every rule, exactly as before #259. A caller
@@ -209,7 +210,7 @@ def edge_table(
         results[f"{rule.name}:{asset}"] = result
         pooled_trades.extend(result.trades)
 
-    results[POOLED_KEY] = summarize(pooled_trades)
+    results[POOLED_KEY] = summarize(_chronological(pooled_trades))
     return results
 
 
@@ -274,6 +275,18 @@ def accumulation_table(
     return rows
 
 
+def _chronological(trades: list[Trade]) -> list[Trade]:
+    """`trades` in exit-time order, for a pool drawn from several rules (#820).
+
+    A single rule's backtest is already chronological, but a pool concatenated rule by rule is
+    not, and `summarize`'s drawdown and losing streak walk the list in order -- so a
+    concatenated pool reports the drawdown of a sequence that never happened. The sort is
+    stable, and a still-open trade (no exit) sorts last: it is excluded from every aggregate
+    anyway.
+    """
+    return sorted(trades, key=lambda t: (t.exit_ts is None, t.exit_ts or 0))
+
+
 def group_trades_by_class(
     edge: dict[str, BacktestResult], rules: list[Rule]
 ) -> dict[str, BacktestResult]:
@@ -286,14 +299,15 @@ def group_trades_by_class(
     per-rule keys are `"{rule.name}:{asset}"` (the `POOLED_KEY` entry is ignored -- it pools
     across *all* classes and so isn't meaningful per-class). A rule whose edge entry is
     missing is skipped (absent data is a coverage gap, not a crash -- mirrors `edge_table`).
+    Each class's pool is summarised in exit-time order, like `edge_table`'s (`_chronological`).
     """
-    trades_by_class: dict[str, list] = {}
+    trades_by_class: dict[str, list[Trade]] = {}
     for rule in rules:
         result = edge.get(f"{rule.name}:{_asset(rule.product_id)}")
         if result is None:
             continue
         trades_by_class.setdefault(promotion_class_of(rule), []).extend(result.trades)
-    return {cls: summarize(trades) for cls, trades in trades_by_class.items()}
+    return {cls: summarize(_chronological(trades)) for cls, trades in trades_by_class.items()}
 
 
 # ---------------------------------------------------------------------------
@@ -773,13 +787,15 @@ def _render_edge_section(
     lines = [
         "## Edge table",
         "",
-        "Per-rule and pooled backtest stats (unit-less R-multiples). "
-        f"`{POOLED_KEY}` is the pooled sample G2 is checked against.",
+        "Per-rule and pooled backtest stats in R-multiples: each trade's net P&L over the risk "
+        "it carried (|entry fill - stop| x qty), so trades at any price pool on one scale. "
+        f"`{POOLED_KEY}` is every rule's trades in exit-time order -- the pooled sample G2 is "
+        "checked against, in R.",
         "",
         *cost_lines,
         "",
-        "| Rule | N | Win% | Expectancy | Avg win | Avg loss | Profit factor | Max DD | "
-        "Losing streak | Avg MFE | Avg MAE |",
+        "| Rule | N | Win% | Expectancy (R) | Avg win (R) | Avg loss (R) | Profit factor (R) | "
+        "Max DD (R) | Losing streak | Avg MFE (R) | Avg MAE (R) |",
         "|---|---|---|---|---|---|---|---|---|---|---|",
     ]
     ordered_keys = [key for key in edge if key != POOLED_KEY]
@@ -789,11 +805,19 @@ def _render_edge_section(
         result = edge[key]
         label = f"**{key}**" if key == POOLED_KEY else key
         lines.append(
-            f"| {label} | {result.n_trades} | {result.win_rate:.1%} | {result.expectancy} | "
-            f"{result.avg_win} | {result.avg_loss} | {result.profit_factor} | "
-            f"{result.max_drawdown} | {result.max_losing_streak} | {result.avg_mfe} | "
-            f"{result.avg_mae} |"
+            f"| {label} | {result.n_trades} | {result.win_rate:.1%} | "
+            f"{_r_cell(result.expectancy_r)} | {_r_cell(result.avg_win_r)} | "
+            f"{_r_cell(result.avg_loss_r)} | {_r_cell(result.profit_factor_r)} | "
+            f"{_r_cell(result.max_drawdown_r)} | {result.max_losing_streak} | "
+            f"{_r_cell(result.avg_mfe_r)} | {_r_cell(result.avg_mae_r)} |"
         )
+    excluded = [
+        f"{key} {edge[key].n_excluded_no_risk} of {edge[key].n_trades} trades"
+        for key in ordered_keys
+        if edge[key].n_excluded_no_risk
+    ]
+    if excluded:
+        lines.extend(["", f"Excluded from R (no initial risk recorded): {', '.join(excluded)}."])
     return lines
 
 
@@ -824,6 +848,16 @@ def _render_accumulation_section(accumulation: dict[str, DcaSleeve]) -> list[str
         "",
         *_render_holdings_table("Rule", accumulation),
     ]
+
+
+def _r_cell(value: Decimal | None) -> str:
+    """An R aggregate for the edge table: `n/a` when the sample had no R (never a 0 that
+    reads as a measured flat edge), `inf` for a profit factor with no losing R."""
+    if value is None:
+        return "n/a"
+    if value.is_infinite():
+        return "inf"
+    return f"{value:.3f}"
 
 
 def _render_account_section(account_metrics: dict, slippage_rows=None) -> list[str]:
