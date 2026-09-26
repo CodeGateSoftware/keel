@@ -41,6 +41,9 @@ from keel.strategy.promotion import (
     should_demote,
     transition,
 )
+from keel.strategy.rules.base import Trade
+from keel.strategy.stats import summarize
+from keel.types import Side
 
 
 def _stats(
@@ -54,7 +57,13 @@ def _stats(
 
     Defaults comfortably clear the default `PromotionConfig` floors (rr = 30/10 = 3.0 >=
     1.5, win_rate 0.6 >= 0.55, expectancy 14 > 0, n_trades 150 >= 100).
+
+    Since #820 the floors judge expectancy and R:R in R, so the fixture carries the same
+    numbers on its R fields (every trade carrying a risk of 1 per unit, where R and price
+    units coincide). A test that needs the two to DISAGREE builds its sample from trades
+    through `summarize` instead.
     """
+    wins = round(n_trades * win_rate)
     return BacktestResult(
         trades=[],
         n_trades=n_trades,
@@ -67,6 +76,16 @@ def _stats(
         max_losing_streak=4,
         avg_mfe=Decimal("20"),
         avg_mae=Decimal("8"),
+        expectancy_r=expectancy if n_trades else None,
+        avg_win_r=avg_win if n_trades else None,
+        avg_loss_r=avg_loss if n_trades else None,
+        profit_factor_r=Decimal("2") if n_trades else None,
+        max_drawdown_r=Decimal("50") if n_trades else None,
+        avg_mfe_r=Decimal("20") if n_trades else None,
+        avg_mae_r=Decimal("8") if n_trades else None,
+        n_excluded_no_risk=0,
+        n_wins_r=wins,
+        n_losses_r=n_trades - wins,
     )
 
 
@@ -958,3 +977,178 @@ def test_transition_without_rule_id_keeps_the_kind_level_lookup(repo: Repository
 
     assert status == "live"  # the newest row (paper) promoted, not the older candidate
     assert _rule_status(repo, newest) == "live"
+
+
+# -- #820: the floors judge expectancy and R:R in R, never in price units ---------------------
+
+
+def _trade_r(r: str, risk: str) -> Trade:
+    """A closed trade that made exactly `r` R on a per-unit risk of `risk` (qty 1)."""
+    pnl = Decimal(r) * Decimal(risk)
+    return Trade(
+        entry_ts=0,
+        exit_ts=1,
+        entry=Decimal("100"),
+        exit=Decimal("100") + pnl,
+        qty=Decimal("1"),
+        side=Side.BUY,
+        pnl=pnl,
+        r_multiple=Decimal(r),
+        mfe=Decimal("0"),
+        mae=Decimal("0"),
+        outcome="win" if pnl > 0 else "loss",
+        initial_risk=Decimal(risk),
+    )
+
+
+def _btc_loser_and_small_cap_winners() -> list[ProductSample]:
+    """Five products, ten trades each. BTC (risk 2000/unit) loses 1R on all ten; four
+    small-cap products (risk 0.002/unit) each win 2R six times and lose 1R four times.
+
+    In R the pool made (-10 + 4 * 8) / 50 = +0.44R per trade at an R:R of 2. In price units
+    BTC's -20000 swamps everything else and the pool reads as a loser with R:R ~0 -- one
+    high-priced asset decides the sign.
+    """
+    samples = [ProductSample("BTC-USD", summarize([_trade_r("-1", "2000") for _ in range(10)]))]
+    for i in range(1, 5):
+        trades = [_trade_r("2", "0.002") for _ in range(6)] + [
+            _trade_r("-1", "0.002") for _ in range(4)
+        ]
+        samples.append(ProductSample(f"SMALL-{i}-USD", summarize(trades)))
+    return samples
+
+
+def test_check_floors_judges_expectancy_and_rr_in_r() -> None:
+    """(h) The price-unit fields say this rule loses; its R says it wins 0.44R at 2:1."""
+    samples = _btc_loser_and_small_cap_winners()
+    stats = summarize([t for s in samples for t in s.stats.trades])
+    cfg = PromotionConfig(min_trades=50, min_win_rate=0.3)
+
+    assert stats.expectancy < 0  # price units: BTC decides the sign
+    assert stats.expectancy_r == Decimal("0.44")
+    ok, reasons = check_floors(stats, cfg)
+
+    assert reasons == []
+    assert ok is True
+
+
+def test_check_floors_fails_a_rule_whose_r_is_negative_whatever_its_price_units_say() -> None:
+    """The mirror image: BTC wins 1R ten times, the small caps lose 1R forty times. In price
+    units the BTC wins swamp the pool into a winner; in R it lost 30R over 50 trades."""
+    trades = [_trade_r("1", "2000") for _ in range(10)] + [
+        _trade_r("-1", "0.002") for _ in range(40)
+    ]
+    stats = summarize(trades)
+    cfg = PromotionConfig(min_trades=50, min_win_rate=0.1)
+
+    assert stats.expectancy > 0
+    ok, reasons = check_floors(stats, cfg)
+
+    assert ok is False
+    assert reasons == [
+        f"expectancy_r {stats.expectancy_r} <= min_expectancy {cfg.min_expectancy} (in R)",
+        f"rr_r 1 < min_rr {cfg.min_rr} (in R)",
+    ]
+
+
+def test_check_floors_refuses_a_sample_with_no_r_at_all() -> None:
+    """No trade carries an initial risk: expectancy and R:R cannot be judged in R, and a
+    floor that cannot be judged REFUSES -- the same fail-closed rule `can_promote` applies
+    to an unrun G4. The sample-size and win-rate axes are judged as before."""
+    stats = _stats()
+    stats.expectancy_r = None
+    stats.avg_win_r = None
+    stats.avg_loss_r = None
+    stats.n_excluded_no_risk = stats.n_trades
+    stats.n_wins_r = 0
+    stats.n_losses_r = 0
+
+    ok, reasons = check_floors(stats, PromotionConfig())
+
+    assert ok is False
+    assert reasons == [
+        "no R: none of the 150 closed trades carries an initial risk, so expectancy and "
+        "R:R cannot be judged in R -- refusing rather than passing"
+    ]
+
+
+def test_min_trades_and_win_rate_are_unaffected_by_r() -> None:
+    stats = _stats(n_trades=10, win_rate=0.1)
+
+    ok, reasons = check_floors(stats, PromotionConfig())
+
+    assert ok is False
+    assert reasons == [
+        "n_trades 10 < min_trades 100",
+        "win_rate 0.1 < min_win_rate 0.55",
+    ]
+
+
+def test_pool_stats_pools_r_trade_weighted() -> None:
+    """(h) pool_stats' R fields are recomputed from the per-product R aggregates, exactly as
+    the money fields are -- weighted by each product's R-sample counts."""
+    pooled, reading = pool_stats(_btc_loser_and_small_cap_winners())
+
+    assert reading.n_pooled == 50
+    assert pooled.expectancy < 0
+    assert pooled.expectancy_r == Decimal("0.44")
+    assert pooled.avg_win_r == Decimal("2")
+    assert pooled.avg_loss_r == Decimal("-1")
+    assert pooled.profit_factor_r == Decimal("48") / Decimal("26")
+    assert pooled.n_wins_r == 24
+    assert pooled.n_losses_r == 26
+    assert pooled.n_excluded_no_risk == 0
+    # path-dependent: not pooled, and None rather than a fabricated 0R
+    assert pooled.max_drawdown_r is None
+
+
+def test_the_pooled_path_judges_the_pool_in_r() -> None:
+    """(h) #338's pooled promotion. The candidate is the BTC reading (short on trades, and a
+    loser); the pool's price-unit expectancy is negative only because of BTC's price. Judged
+    in R the pool clears, and the pooled path carries the decision."""
+    samples = _btc_loser_and_small_cap_winners()
+    own = samples[0].stats
+    cfg = PromotionConfig(min_trades=50, min_win_rate=0.3)
+
+    decision = can_promote(own, cfg, pbo=_pbo(), pooled_samples=samples)
+
+    assert decision.reasons == []
+    assert decision.floors_pass is True
+    assert decision.promotable is True
+
+
+def test_the_pooled_path_refuses_a_pool_with_no_r() -> None:
+    no_r = _stats(n_trades=10, win_rate=0.6)
+    no_r.expectancy_r = None
+    no_r.avg_win_r = None
+    no_r.avg_loss_r = None
+    no_r.n_excluded_no_risk = 10
+    no_r.n_wins_r = 0
+    no_r.n_losses_r = 0
+    samples = [ProductSample(f"P{i}-USD", no_r) for i in range(5)]
+    cfg = PromotionConfig(min_trades=50)
+
+    decision = can_promote(no_r, cfg, pbo=_pbo(), pooled_samples=samples)
+
+    assert decision.floors_pass is False
+    assert (
+        "pooled no R: none of the 50 pooled trades carries an initial risk, so expectancy "
+        "and R:R cannot be judged in R -- refusing rather than passing"
+    ) in decision.reasons
+
+
+def test_should_demote_mirrors_the_floors_in_r() -> None:
+    """`should_demote` mirrors `check_floors`' performance checks, so it judges R too; and a
+    rolling sample with no R is DEMOTED -- missing evidence must never block pulling a rule
+    back from real money (`transition`'s asymmetry)."""
+    samples = _btc_loser_and_small_cap_winners()
+    winner_in_r = summarize([t for s in samples for t in s.stats.trades])
+    cfg = PromotionConfig(min_win_rate=0.3)
+
+    assert should_demote(winner_in_r, cfg) is False
+
+    no_r = _stats()
+    no_r.expectancy_r = None
+    no_r.avg_win_r = None
+    no_r.avg_loss_r = None
+    assert should_demote(no_r, cfg) is True

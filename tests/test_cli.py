@@ -1009,18 +1009,31 @@ def test_rules_promote_reports_both_readings_and_promotes_via_the_pooled_path(
         repo.insert_rule("pullback_continuation", {"product_id": product}, status="paper")
 
     def fake_backtest(rule, candles, **kwargs):
+        # The same figures in R (#820: the floors judge R): 4 or 10 wins of 16.
+        btc = rule.product_id == "BTC-USD"
+        wins = 4 if btc else 10
+        expectancy = Decimal("-2") if btc else Decimal("14")
         return BacktestResult(
             trades=[],
             n_trades=16,
-            win_rate=0.25 if rule.product_id == "BTC-USD" else 0.625,
+            win_rate=0.25 if btc else 0.625,
             avg_win=Decimal("30"),
             avg_loss=Decimal("-10"),
-            expectancy=Decimal("-2") if rule.product_id == "BTC-USD" else Decimal("14"),
+            expectancy=expectancy,
             profit_factor=Decimal("2"),
             max_drawdown=Decimal("50"),
             max_losing_streak=4,
             avg_mfe=Decimal("20"),
             avg_mae=Decimal("8"),
+            expectancy_r=expectancy,
+            avg_win_r=Decimal("30"),
+            avg_loss_r=Decimal("-10"),
+            profit_factor_r=Decimal("2"),
+            max_drawdown_r=Decimal("50"),
+            avg_mfe_r=Decimal("20"),
+            avg_mae_r=Decimal("8"),
+            n_wins_r=wins,
+            n_losses_r=16 - wins,
         )
 
     monkeypatch.setattr(rules_cmd.backtest_mod, "backtest", fake_backtest)

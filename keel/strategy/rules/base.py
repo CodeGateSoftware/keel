@@ -177,6 +177,37 @@ class Trade:
     mfe: Decimal
     mae: Decimal
     outcome: TradeOutcome
+    #: The risk the trade carried, PER UNIT: `|entry_fill - setup.stop|` -- the ACHIEVED fill
+    #: against the setup's ORIGINAL stop, never a managed (ratcheted) level (#820). `r_multiple`
+    #: divides by `initial_risk * qty`, and MFE/MAE (per unit) convert to R by dividing by it.
+    #: `None` when no risk was recorded (a trade built before #820, or one with no stop); such a
+    #: trade has no R and is excluded from `stats.summarize`'s R aggregates. Last, and
+    #: defaulted, so every pre-#820 constructor keeps working.
+    initial_risk: Decimal | None = None
+
+
+def initial_risk_of(entry_fill: Decimal, stop: Decimal) -> Decimal:
+    """A trade's per-unit initial risk: the distance from the ACHIEVED fill to the setup's
+    stop, as a magnitude (#820).
+
+    Unsigned on purpose. The signed form `(entry_fill - stop)` goes negative when the fill
+    gaps below the stop, and dividing a LOSS by a negative risk printed it as a positive R.
+    Risk is a distance; the sign of R comes from the P&L alone.
+    """
+    return abs(entry_fill - stop)
+
+
+def r_multiple_of(pnl: Decimal, initial_risk: Decimal | None, qty: Decimal) -> Decimal | None:
+    """`pnl` in R: net P&L over the whole position's initial risk, `initial_risk * qty`.
+
+    The ONE formula every close path uses (`backtest._close_trade`, `paper._close`,
+    `portfolio_sim._process_held`) and every aggregate reads (`stats.summarize`), so the R a
+    trade records and the R its summary pools cannot drift apart (#820). `None` -- no R, not
+    0R -- when the risk is unknown or zero: a trade that risked nothing measured nothing.
+    """
+    if initial_risk is None or initial_risk == 0:
+        return None
+    return pnl / (initial_risk * qty)
 
 
 #: The arithmetic a declared dimension carries: `"int"` means the legitimate values are
