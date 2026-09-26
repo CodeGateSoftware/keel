@@ -17,7 +17,7 @@ from __future__ import annotations
 
 from decimal import Decimal
 
-from keel.strategy.rules.base import Rule, Setup
+from keel.strategy.rules.base import Rule, Setup, completed_days
 from keel.types import Candle, Granularity
 
 _SECONDS_PER_DAY = 86_400
@@ -53,6 +53,9 @@ class Dca(Rule):
     #: `granularity_param`: DCA decides on daily candles unconditionally, so there is no
     #: timeframe knob to persist and nothing to convert back.
     decimal_params = ("budget_usd", "dip_bonus_pct")
+    #: Accumulation, not round trips: the edge report gives it an accumulation row (buys, cost,
+    #: mark-to-market) instead of a backtest, and keeps it out of the pooled G2 sample (#821).
+    accumulates = True
 
     def __init__(
         self,
@@ -84,7 +87,11 @@ class Dca(Rule):
         """Pure. On a cadence boundary, a market-buy long `Setup` sized to `budget_usd` (scaled
         up on dips); off-cadence (or with no daily candles), `None`.
         """
-        candles = candles_by_tf.get(Granularity.ONE_DAY)
+        # COMPLETED days only (#821): the account sim's last daily bar is the still-forming day,
+        # stored with the completed day's OHLC -- reading it from hour 0 bought at a close that
+        # hadn't happened yet and put the cadence day one day ahead of live. Live already passes
+        # only closed candles, which `completed_days` keeps (see its docstring).
+        candles = completed_days(candles_by_tf)
         if not candles:
             return None
 

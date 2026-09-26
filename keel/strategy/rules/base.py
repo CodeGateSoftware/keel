@@ -23,6 +23,40 @@ from typing import Any, ClassVar, Literal
 
 from keel.types import Candle, Granularity, Side
 
+_DAY_SECONDS = 24 * 60 * 60
+
+
+def completed_days(candles_by_tf: dict[Granularity, list[Candle]]) -> list[Candle]:
+    """The `ONE_DAY` series with any still-FORMING last bar dropped.
+
+    Shared by every rule that decides on daily candles (`TurtleBreakout`, `Dca` -- #821 moved it
+    here from `turtle_breakout.py`, which still imports it as `_completed_days`).
+
+    The account sim (`sim.portfolio_sim`) slices its daily series with
+    `bisect_right(daily_ts, t)` against the current hourly bar `t`, so its last daily bar
+    always CONTAINS that hourly bar -- it is the current, still-forming day, and its DB OHLC is
+    the completed day (lookahead if consumed intraday).
+
+    The live agent (`agent.run_once`) passes an `ONE_HOUR` key too, but `data.market_feed`
+    persists only CLOSED candles, so its last daily bar has already closed. Keying the drop on
+    the mere PRESENCE of `ONE_HOUR` therefore threw away a completed day there and left the
+    rule deciding on a bar up to 48h old -- a day of lag on every breakout.
+
+    So the test is where the hourly series SITS, not whether it exists: the newest daily bar is
+    still forming unless the newest hourly bar opens at or after that day's close. In the sim
+    that is never true (its hourly bar is by construction inside the day), so the sim's guard is
+    unchanged; in the live agent it is true from the first full hour of the next UTC day. A
+    daily-only input (the edge backtester's native series, no `ONE_HOUR` key) is returned as
+    is: every bar in it has already closed.
+    """
+    daily = candles_by_tf.get(Granularity.ONE_DAY, [])
+    hourly = candles_by_tf.get(Granularity.ONE_HOUR)
+    if not hourly or not daily:
+        return daily
+    if hourly[-1].ts < daily[-1].ts + _DAY_SECONDS:
+        return daily[:-1]
+    return daily
+
 
 class Action(str, Enum):
     """What the evaluation engine decided to do for a rule/product on this bar."""
@@ -307,6 +341,13 @@ class Rule(ABC):
     #: arrives as a LIST, not a quoted string, and that function answers a narrower question
     #: (which values an operator may legitimately quote in `rules add --params`).
     tuple_params: ClassVar[tuple[str, ...]] = ()
+    #: Whether this rule ACCUMULATES -- scheduled buys that are never sold (`Dca`) -- rather
+    #: than trading a risk-defined setup to an exit. Read off the class by `sim.report`, which
+    #: routes an accumulating rule away from the round-trip backtest into its own accumulation
+    #: row (#821): run through `backtest()` it has no exit, so it produced either nothing (N 0)
+    #: or, with a daily timeframe declared, a fee-only round trip per buy closed on its fill bar
+    #: by its `target=entry` sentinel -- neither of which belongs in the pooled G2 sample.
+    accumulates: ClassVar[bool] = False
     #: Why the last `detect()` call declined, or `None` if it fired (or never recorded one).
     #: `strategy.engine.evaluate` merges it into the `engine.no_signal` event it already emits,
     #: so a cycle reporting `signals=0` can say whether price was 1% or 40% off the trigger.

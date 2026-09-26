@@ -8,7 +8,9 @@ is passed in by the caller.
 **Module map:**
 - `edge_table` -- reruns `strategy.backtest.backtest` per rule (Task 5.1's "edge pass"),
   keyed by `"{rule.name}:{asset}"`, plus a pooled `"__pooled__"` entry summarizing every rule's
-  trades together.
+  trades together. Accumulating rules (`Rule.accumulates`, i.e. `Dca`) are NOT in it (#821).
+- `accumulation_table` -- the edge pass for accumulating rules: buys, cost basis and
+  mark-to-market value from daily candles, never a round trip and never pooled.
 - `build_verdict` -- the three gates from spec §6.2 (G1 data sufficiency, G2 promotion floors via
   `strategy.promotion.check_floors`, G3 risk-adjusted edge vs a `BenchmarkResult`).
 - `analyze_gaps` -- the six deterministic "lacked information" detectors from spec §6.1, read
@@ -60,9 +62,10 @@ from dataclasses import dataclass
 from decimal import Decimal
 from typing import TYPE_CHECKING
 
+from keel.execution import sizing
 from keel.execution.guards import _asset
 from keel.sim.benchmark import BenchmarkResult
-from keel.sim.portfolio_sim import SimResult, SimTelemetry
+from keel.sim.portfolio_sim import DcaSleeve, SimResult, SimTelemetry
 from keel.sim.tiers import OVER_CAP, WITHIN_CAP, TierFeeResult
 from keel.strategy.backtest import (
     SLIPPAGE_CAP_PCT,
@@ -91,6 +94,7 @@ __all__ = [
     "POOLED_KEY",
     "GapItem",
     "Verdict",
+    "accumulation_table",
     "analyze_gaps",
     "build_verdict",
     "edge_table",
@@ -176,11 +180,19 @@ def edge_table(
     A rule whose asset has no cached candles for its timeframe gets an empty series (an all-zero
     `BacktestResult`, `n_trades=0`) rather than raising -- absent data is a data-coverage gap
     (see `analyze_gaps`), not a crash.
+
+    An ACCUMULATING rule (`Rule.accumulates` -- `Dca`) is skipped entirely: no key, nothing
+    pooled (#821). It has no exit, so `backtest()` gave it N 0 (it never even saw daily
+    candles) or, handed them, a fee-only round trip per buy -- either way a sample G2 must not
+    be fed. `accumulation_table` reports it instead, and `group_trades_by_class` skips it by
+    the same absence.
     """
     results: dict[str, BacktestResult] = {}
     pooled_trades = []
 
     for rule in rules:
+        if rule.accumulates:
+            continue
         asset = _asset(rule.product_id)
         tf = _rule_trading_tf(rule)
         per_tf = candles_by_asset.get(asset, {})
@@ -199,6 +211,67 @@ def edge_table(
 
     results[POOLED_KEY] = summarize(pooled_trades)
     return results
+
+
+def accumulation_table(
+    rules: list[Rule],
+    candles_by_asset: dict[str, dict[Granularity, list[Candle]]],
+    fee_pct: Decimal,
+    slippage_pct: Decimal,
+    slippage_by_product: Callable[[str], Decimal] | None = None,
+) -> dict[str, DcaSleeve]:
+    """The edge pass for ACCUMULATING rules (`Rule.accumulates` -- `Dca`), keyed like
+    `edge_table` (`"{rule.name}:{asset}"`) but never mixed into it (#821).
+
+    Each rule is driven over its asset's `ONE_DAY` series, one completed day at a time: every
+    bar in that series has closed, so `Dca.detect`'s completed-day guard keeps them all, and
+    each day is decided once -- the same two rules `sim.portfolio_sim` now applies to the
+    account sleeve. A buy decided on a closed day fills at the NEXT day's open (slipped, plus
+    the entry fee), sized `sizing.dca_size(size_usd, entry)` exactly as the account sim sizes
+    it; a decision on the series' last day has no next bar and is dropped, as it is there.
+
+    The row is accumulation, not round trips: the number of buys, the cash they cost (fees
+    included), and that holding marked at the last daily close, with its unrealized P&L.
+    Nothing here is a trade, so none of it reaches `__pooled__` or G2. Risk-defined rules are
+    ignored (they are `edge_table`'s); a rule whose asset has no daily candles gets a
+    zero-buy row rather than raising.
+    """
+    rows: dict[str, DcaSleeve] = {}
+    for rule in rules:
+        if not rule.accumulates:
+            continue
+        asset = _asset(rule.product_id)
+        daily = candles_by_asset.get(asset, {}).get(Granularity.ONE_DAY, [])
+        slip = (
+            slippage_by_product(rule.product_id)
+            if slippage_by_product is not None
+            else slippage_pct
+        )
+        decided: set[int] = set()
+        buys, qty, cost = 0, Decimal("0"), Decimal("0")
+        for i in range(len(daily) - 1):
+            fill_bar = daily[i + 1]
+            setup = rule.detect({Granularity.ONE_DAY: daily[: i + 1]})
+            if setup is None:
+                continue
+            # Once per decision day -- the day after the completed bar, as in the account
+            # sim. One bar per day makes this a no-op on a clean series; a duplicated daily
+            # bar would otherwise buy twice.
+            day = fill_bar.ts // 86_400
+            if day in decided:
+                continue
+            decided.add(day)
+            budget = setup.context.get("size_usd")
+            if budget is None or setup.entry <= 0:
+                continue
+            buy_qty = sizing.dca_size(budget, setup.entry)
+            fill = fill_bar.open * (Decimal(1) + slip)
+            buys += 1
+            qty += buy_qty
+            cost += fill * buy_qty * (Decimal(1) + fee_pct)
+        last_close = daily[-1].close if daily else Decimal("0")
+        rows[f"{rule.name}:{asset}"] = DcaSleeve.marked(buys, qty, cost, last_close)
+    return rows
 
 
 def group_trades_by_class(
@@ -724,6 +797,35 @@ def _render_edge_section(
     return lines
 
 
+def _render_holdings_table(first_column: str, rows: dict[str, DcaSleeve]) -> list[str]:
+    """One Markdown row per accumulated holding (`DcaSleeve`), shared by the edge pass's
+    accumulation section and the account's DCA sleeve so the two read identically."""
+    lines = [
+        f"| {first_column} | Buys | Qty | Cost basis | Last close | Value | Unrealized P&L |",
+        "|---|---|---|---|---|---|---|",
+    ]
+    for key, row in rows.items():
+        lines.append(
+            f"| {key} | {row.buys} | {row.qty} | {row.cost_usd} | {row.last_close} | "
+            f"{row.value_usd} | {row.unrealized_pnl} |"
+        )
+    return lines
+
+
+def _render_accumulation_section(accumulation: dict[str, DcaSleeve]) -> list[str]:
+    """Accumulating rules' edge pass (#821), kept apart from the round-trip edge table."""
+    return [
+        "## DCA accumulation (not round trips)",
+        "",
+        "Accumulating rules buy on a cadence and never sell, so they have no win rate, "
+        "expectancy or R-multiples. Each row is its buys over the daily series (decided on "
+        "completed days, once per day, filled at the next open), their cost including fees, and "
+        f"the holding marked at the last close. Not in `{POOLED_KEY}`, not in G2.",
+        "",
+        *_render_holdings_table("Rule", accumulation),
+    ]
+
+
 def _render_account_section(account_metrics: dict, slippage_rows=None) -> list[str]:
     lines = ["## Account results", "", "| Metric | Value |", "|---|---|"]
     for key, label in _ACCOUNT_METRIC_LABELS:
@@ -734,8 +836,24 @@ def _render_account_section(account_metrics: dict, slippage_rows=None) -> list[s
     per_asset = account_metrics.get("per_asset_pnl")
     if per_asset:
         lines.append("")
-        lines.append("Per-asset P&L:")
+        # REALIZED rule P&L: `build_account_metrics` sums closed round trips only. The DCA
+        # sleeve is never closed, so it was invisible here while inside `ending_value` (#821).
+        lines.append("Per-asset realized rule P&L (closed round trips; the DCA sleeve is below):")
         lines.extend(f"- {asset}: {pnl}" for asset, pnl in sorted(per_asset.items()))
+    sleeve = account_metrics.get("dca_sleeve")
+    if sleeve:
+        lines.extend(
+            [
+                "",
+                "### DCA sleeve (accumulation, marked to market)",
+                "",
+                "Bought on the DCA cadence and never sold: unrealized, marked at each asset's "
+                "last close. Cost basis includes entry fees. Included in the ending value above, "
+                "not in the trade count or the realized P&L.",
+                "",
+                *_render_holdings_table("Asset", sleeve),
+            ]
+        )
     # #259: the edge table above priced fills PER PRODUCT; these dollar figures did not. The
     # note lives HERE -- where a reader compares a thin asset's edge PF against its dollar
     # P&L -- not only beside the edge table where it was easy to miss.
@@ -935,6 +1053,7 @@ def render_markdown(
     pbo_gate: tuple[bool, list[str]] | None = None,
     fee_pct: Decimal | None = None,
     slippage_rows: list[SlippageAssumption] | None = None,
+    accumulation: dict[str, DcaSleeve] | None = None,
 ) -> str:
     """Render the full report (spec §6 structure, plus Issue #86's tier/fee matrix) as one
     Markdown string.
@@ -949,11 +1068,14 @@ def render_markdown(
     the overfitting section is emitted only when a PBO run was actually performed.
     `slippage_rows` (#259) follows it too: the per-product assumed-slippage table is rendered
     beside the edge table's fee line only when the caller priced fills per product and says so.
+    `accumulation` (#821, `accumulation_table`'s output) renders the accumulating rules' own
+    section right after the edge table, only when there is at least one such rule.
     """
     sections = [
         _render_verdict_section(verdict, in_sample),
         _render_coverage_section(sim),
         _render_edge_section(edge, fee_pct, slippage_rows),
+        *([_render_accumulation_section(accumulation)] if accumulation else []),
         _render_account_section(account_metrics, slippage_rows),
         _render_benchmark_section(account_metrics, benchmark, slippage_rows),
         _render_tier_section(tier_results or []),

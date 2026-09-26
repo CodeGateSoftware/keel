@@ -184,7 +184,11 @@ def build_account_metrics(
         "sortino": metrics_mod.sortino(returns),
         "trade_count": len(closed_trades),
         "avg_hold_hours": avg_hold_hours,
+        # REALIZED rule P&L from closed round trips only -- the DCA sleeve is never closed.
         "per_asset_pnl": per_asset_pnl,
+        # The DCA sleeve, marked at each asset's last close (#821): in `ending_value` above,
+        # and until #821 nowhere else in the report.
+        "dca_sleeve": portfolio_sim.dca_sleeve(sim),
     }
 
 
@@ -431,6 +435,14 @@ def run_simulation(
         slippage_pct=SIM_SLIPPAGE_PCT,
         slippage_by_product=slippage_by_product,
     )
+    # Accumulating rules (DCA) are not round trips: their edge pass is its own row (#821).
+    accumulation = report_mod.accumulation_table(
+        rules,
+        candles_by_asset,
+        fee_pct=fee_pct,
+        slippage_pct=SIM_SLIPPAGE_PCT,
+        slippage_by_product=slippage_by_product,
+    )
 
     sim = portfolio_sim.run(
         rules,
@@ -531,6 +543,7 @@ def run_simulation(
         tier_results=tier_results,
         fee_pct=fee_pct,
         slippage_rows=slippage_rows,
+        accumulation=accumulation,
     )
 
     out = out_path if out_path is not None else default_report_path(now_ts)

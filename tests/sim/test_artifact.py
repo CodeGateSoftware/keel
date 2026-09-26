@@ -14,7 +14,7 @@ from decimal import Decimal
 
 from keel.sim.artifact import _svg_bars, _svg_drawdown, _svg_line, render_html
 from keel.sim.benchmark import BenchmarkResult
-from keel.sim.portfolio_sim import SimResult, SimTelemetry
+from keel.sim.portfolio_sim import DcaSleeve, SimResult, SimTelemetry
 from keel.sim.report import GapItem, Verdict
 
 _HOUR = 3600
@@ -223,3 +223,37 @@ def test_svg_bars_renders_one_bar_per_asset():
 def test_svg_bars_empty_dict_does_not_raise():
     svg = _svg_bars({})
     assert "<svg" in svg
+
+
+def test_render_html_shows_the_dca_sleeve_as_its_own_table_beside_realized_pnl():
+    """#821: the artifact's per-asset chart is REALIZED rule P&L; the never-closed DCA sleeve
+    gets its own marked-to-market table (one row per asset, every figure in order)."""
+    metrics = _account_metrics()
+    metrics["dca_sleeve"] = {
+        "BTC": DcaSleeve.marked(3, Decimal("1.5"), Decimal("150"), Decimal("120")),
+    }
+
+    html = render_html(_sim(), _benchmark(), _verdict(), _gaps(), metrics)
+
+    assert html.count("<h2>Per-asset realized rule P&amp;L</h2>") == 1
+    assert html.count("<h2>DCA sleeve (accumulation, marked to market)</h2>") == 1
+    section = html.split("<h2>DCA sleeve (accumulation, marked to market)</h2>", 1)[1]
+    table = section.split("</table>", 1)[0]
+    header = [cell.split("</th>")[0] for cell in table.split("<th>")[1:]]
+    assert header == [
+        "Asset",
+        "Buys",
+        "Qty",
+        "Cost basis",
+        "Last close",
+        "Value",
+        "Unrealized P&amp;L",
+    ]
+    body_rows = table.split("<tbody>", 1)[1].split("<tr>")[1:]
+    cells = [[c.split("</td>")[0] for c in row.split("<td>")[1:]] for row in body_rows]
+    assert cells == [["BTC", "3", "1.5", "150", "120", "180.0", "30.0"]]
+
+
+def test_render_html_omits_the_sleeve_table_when_there_is_no_sleeve():
+    html = render_html(_sim(), _benchmark(), _verdict(), _gaps(), _account_metrics())
+    assert "DCA sleeve" not in html
