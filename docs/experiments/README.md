@@ -25,6 +25,14 @@ Index is **newest first**, by the date each document carries in its filename.
 
 ## 2026-09
 
+- [`2026-09-26-hourly-turtle-5year-backtest.md`](2026-09-26-hourly-turtle-5year-backtest.md) — The
+  hourly `turtle_breakout` over five years, in R at per-product slippage: **4,871 trades,
+  235–289 per product, 0 of 19 positive** at 1.20% or 0.60% taker, and only BTC, ETH and SOL
+  positive at 0%. The mechanism: a 2 × ATR hourly stop sits a median 2.75% from entry, so the
+  round-trip fee alone costs about 0.87 R per trade, against about 0.21 R on a daily stop.
+  Not pre-registered; it records the #823 run. Driver
+  `2026-09-26-hourly-turtle-5year-backtest.py`, per-trade data
+  `2026-09-26-hourly-turtle-5year-backtest.jsonl`.
 - [`2026-09-05-restatement-restated.md`](2026-09-05-restatement-restated.md) — The 08-13
   restatement restated on `v0.13.3`: its verdict holds (**0 of 240** at the taker rate, priced
   per product) and the engine turns out to be innocent — three of its printed cells reproduce
