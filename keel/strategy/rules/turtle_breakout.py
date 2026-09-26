@@ -64,10 +64,13 @@ from __future__ import annotations
 from decimal import Decimal
 
 from keel.analysis.indicators import adx, atr, donchian_high, donchian_low, macd
-from keel.strategy.rules.base import ParamSpec, Rule, Setup
-from keel.types import Candle, Granularity
 
-_DAY_SECONDS = 24 * 60 * 60
+# The forming-day guard lives in `rules.base` since #821 (`Dca` needs the same rule). The
+# private alias keeps every `turtle_breakout._completed_days` reference -- docstrings in
+# `data.freshness`/`commands.activity`, and the schedule tests -- pointing at the real thing.
+from keel.strategy.rules.base import ParamSpec, Rule, Setup
+from keel.strategy.rules.base import completed_days as _completed_days
+from keel.types import Candle, Granularity
 
 
 def _gap_pct(close: float, entry_level: float) -> float | None:
@@ -79,33 +82,6 @@ def _gap_pct(close: float, entry_level: float) -> float | None:
     if close <= 0:
         return None
     return (entry_level - close) / close * 100
-
-
-def _completed_days(candles_by_tf: dict[Granularity, list[Candle]]) -> list[Candle]:
-    """The `ONE_DAY` series with any still-FORMING last bar dropped.
-
-    The account sim (`sim.portfolio_sim`) slices its daily series with
-    `bisect_right(daily_ts, t)` against the current hourly bar `t`, so its last daily bar
-    always CONTAINS that hourly bar -- it is the current, still-forming day, and its DB OHLC is
-    the completed day (lookahead if consumed intraday).
-
-    The live agent (`agent.run_once`) passes an `ONE_HOUR` key too, but `data.market_feed`
-    persists only CLOSED candles, so its last daily bar has already closed. Keying the drop on
-    the mere PRESENCE of `ONE_HOUR` therefore threw away a completed day there and left the
-    rule deciding on a bar up to 48h old -- a day of lag on every breakout.
-
-    So the test is where the hourly series SITS, not whether it exists: the newest daily bar is
-    still forming unless the newest hourly bar opens at or after that day's close. In the sim
-    that is never true (its hourly bar is by construction inside the day), so the sim's guard is
-    unchanged; in the live agent it is true from the first full hour of the next UTC day.
-    """
-    daily = candles_by_tf.get(Granularity.ONE_DAY, [])
-    hourly = candles_by_tf.get(Granularity.ONE_HOUR)
-    if not hourly or not daily:
-        return daily
-    if hourly[-1].ts < daily[-1].ts + _DAY_SECONDS:
-        return daily[:-1]
-    return daily
 
 
 class TurtleBreakout(Rule):

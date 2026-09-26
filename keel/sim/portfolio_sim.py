@@ -17,12 +17,23 @@ only skipped if it still doesn't pass, or clamps below `DUST_FLOOR`); it is neve
 
 **DCA is a separate sleeve, not a slot-occupant (Issue #85):** a DCA-class setup (`no_stop` /
 `order_class == "dca"` context, `strategy/rules/dca.py`) is scheduled accumulation, not a
-risk-defined trade -- it is evaluated and (re)bought on every bar regardless of whether that
-asset's RULE slot is currently held, via `account.open(..., dca=True)`, which accumulates into a
-separate per-asset DCA lot (`SimAccount.dca_positions`) that this simulator never closes (DCA has
-no exit signal by design). Before this fix, DCA and rule trades shared the single per-asset
+risk-defined trade -- it is evaluated on every bar regardless of whether that asset's RULE
+slot is currently held (and bought at most once per UTC day, see below), via
+`account.open(..., dca=True)`, which accumulates into a separate per-asset DCA lot
+(`SimAccount.dca_positions`) that this simulator never closes (DCA has no exit signal by
+design). Before this fix, DCA and rule trades shared the single per-asset
 `held` slot, so an asset accumulating DCA (which never exits) permanently froze that asset's rule
 evaluation.
+
+**One DCA decision per UTC day, per (asset, rule) (#821):** the loop is hourly but a DCA rule
+decides on DAILY candles, so its latest completed day -- and therefore its `detect` result -- is
+the same on all 24 bars of a day. Without a guard every cadence day bought 24 times (a $50 budget
+over 9 cadence days spent ~$10,768, not $450). `_process_dca_signals` therefore records the UTC
+day of each DCA decision and takes at most one per (asset, rule) per day -- whether it filled or
+was vetoed, exactly as the live agent trades once per UTC day. Each buy is logged
+(`SimResult.dca_buys`), and `dca_sleeve` marks the never-closed lots at each asset's final close
+(`SimResult.final_prices`) so the report can show the sleeve instead of leaving it only inside
+`ending_value`.
 
 **Interpretive notes** (the plan's Task 6 prose leaves a few specifics implicit):
 
@@ -93,9 +104,12 @@ __all__ = [
     "IDLE_SPAN_MIN_HOURS",
     "MOVE_THRESHOLD_PCT",
     "WINDOW_BARS",
+    "DcaBuy",
+    "DcaSleeve",
     "SimResult",
     "SimTelemetry",
     "SimTrade",
+    "dca_sleeve",
     "run",
 ]
 
@@ -120,6 +134,7 @@ MOVE_THRESHOLD_PCT = Decimal("0.05")
 DUST_FLOOR = Decimal("1")
 
 _SECONDS_PER_HOUR = 3600
+_SECONDS_PER_DAY = 86_400
 
 
 @dataclass
@@ -158,6 +173,44 @@ class SimTelemetry:
     mfe_giveback_samples: list[Decimal] = field(default_factory=list)
 
 
+@dataclass(frozen=True)
+class DcaBuy:
+    """One DCA accumulation buy (#821). `decision_ts` is the hourly bar the decision was taken
+    on (its UTC day is the once-per-day key); `notional` is the budgeted spend at the decision
+    price (`sizing.spend(qty, setup.entry)`); `cost_usd` is the cash the fill actually took --
+    the slipped next-bar open times `qty`, plus the entry fee."""
+
+    asset: str
+    rule_kind: str
+    decision_ts: int
+    fill_ts: int
+    qty: Decimal
+    notional: Decimal
+    cost_usd: Decimal
+
+
+@dataclass(frozen=True)
+class DcaSleeve:
+    """An accumulated DCA holding, marked to market (#821) -- the account sim's never-closed
+    sleeve for one asset, or the edge pass's accumulation row for one DCA rule. NOT a round
+    trip: nothing here was sold, so the P&L is unrealized.
+
+    `cost_usd` is every buy's cash outlay, fees included, so `unrealized_pnl` is net of entry
+    costs; `value_usd` is `qty * last_close`."""
+
+    buys: int
+    qty: Decimal
+    cost_usd: Decimal
+    last_close: Decimal
+    value_usd: Decimal
+    unrealized_pnl: Decimal
+
+    @classmethod
+    def marked(cls, buys: int, qty: Decimal, cost_usd: Decimal, last_close: Decimal) -> DcaSleeve:
+        value = qty * last_close
+        return cls(buys, qty, cost_usd, last_close, value, value - cost_usd)
+
+
 @dataclass
 class SimResult:
     trades: list[SimTrade]
@@ -174,6 +227,28 @@ class SimResult:
     # (`SimAccount.monthly_volume`) -- feeds the Coinbase One tier/fee analysis (Issue #86,
     # `sim.tiers`), which needs per-month volume to compute over-cap fees correctly.
     monthly_volume: dict[int, Decimal] = field(default_factory=dict)
+    # Every DCA buy, in order (#821) -- the sleeve's buy count and fee-inclusive cost basis.
+    dca_buys: list[DcaBuy] = field(default_factory=list)
+    # Each asset's last hourly close seen by the run: what `dca_sleeve` marks the sleeve at.
+    final_prices: dict[str, Decimal] = field(default_factory=dict)
+
+
+def dca_sleeve(result: SimResult) -> dict[str, DcaSleeve]:
+    """The run's DCA sleeve per asset, marked at that asset's final close (#821).
+
+    `qty` is the account's own lot (`result.dca_positions`); the buy count and cost basis come
+    from `result.dca_buys`. An asset with a lot but no final price is marked at zero rather than
+    silently at cost -- a missing mark must look like one."""
+    sleeve: dict[str, DcaSleeve] = {}
+    for asset, lot in sorted(result.dca_positions.items()):
+        buys = [b for b in result.dca_buys if b.asset == asset]
+        sleeve[asset] = DcaSleeve.marked(
+            buys=len(buys),
+            qty=lot.qty,
+            cost_usd=sum((b.cost_usd for b in buys), Decimal("0")),
+            last_close=result.final_prices.get(asset, Decimal("0")),
+        )
+    return sleeve
 
 
 @dataclass
@@ -299,6 +374,9 @@ def run(
     # -- that is pyramiding (§26.1), a separate feature with its own exposure-rail implications.
     held: dict[tuple[str, str], _Held] = {}
     latest_price: dict[str, Decimal] = {}
+    # (asset, rule_name, utc_day) of every DCA decision taken -- at most one per day (#821).
+    dca_decided: set[tuple[str, str, int]] = set()
+    dca_buys: list[DcaBuy] = []
     idle: dict[str, _IdleAnchor] = {}
 
     last_month_start: int | None = None
@@ -366,10 +444,19 @@ def run(
             telemetry.signals_emitted += len(signals)
             _record_cts_telemetry(signals, candles_by_tf, telemetry)
 
-            # DCA continuation runs every bar regardless of the RULE slot's state -- a DCA
-            # sleeve keeps buying on its own cadence even while a rule position is held.
+            # DCA runs regardless of the RULE slot's state -- a DCA sleeve keeps buying on its
+            # own cadence even while a rule position is held -- but decides once per UTC day.
             _process_dca_signals(
-                asset, idx, hourly, signals, account, config, t, monthly_volume_cap
+                asset,
+                idx,
+                hourly,
+                signals,
+                account,
+                config,
+                t,
+                monthly_volume_cap,
+                decided=dca_decided,
+                buys=dca_buys,
             )
 
             fired = _process_rule_signals(
@@ -420,6 +507,8 @@ def run(
         telemetry=telemetry,
         dca_positions=dict(account.dca_positions),
         monthly_volume=account.monthly_volume(),
+        dca_buys=dca_buys,
+        final_prices=dict(latest_price),
     )
 
 
@@ -574,6 +663,9 @@ def _process_dca_signals(
     config: Config,
     now_ts: int,
     monthly_volume_cap: Decimal | None = None,
+    *,
+    decided: set[tuple[str, str, int]],
+    buys: list[DcaBuy],
 ) -> None:
     """Buy every DCA-class signal this bar into the separate DCA sleeve (`account.dca_positions`,
     via `account.open(..., dca=True)`), regardless of whether the asset's RULE slot is currently
@@ -583,11 +675,22 @@ def _process_dca_signals(
     (Issue #86) it would push this UTC month's trading volume past `monthly_volume_cap` -- DCA is
     SKIPPED for the cycle in that case, not partially filled, matching its fixed-budget-per-cycle
     semantics (unlike the RULE slot's risk-sized notional, which IS clamped, see
-    `_process_rule_signals`)."""
+    `_process_rule_signals`).
+
+    **Once per UTC day (#821).** A DCA rule decides on daily candles, so its signal repeats on
+    every hourly bar of the day. `decided` holds `(asset, rule, utc_day)` for every decision
+    already taken; a repeat is dropped before anything else runs. The day is marked when the
+    decision is TAKEN, not only when it fills: a vetoed or unfillable buy is that day's
+    decision, as it is live, where the agent trades once per UTC day."""
+    day = now_ts // _SECONDS_PER_DAY
     for signal in signals:
         setup = signal.setup
         if setup is None or not _is_dca_setup(setup):
             continue
+        key = (asset, signal.rule_name, day)
+        if key in decided:
+            continue
+        decided.add(key)
 
         try:
             budget = setup.context.get("size_usd") or config.dca.budget_usd
@@ -621,7 +724,19 @@ def _process_dca_signals(
             continue  # no next bar to fill at -- the signal is lost, not a rejection
 
         fill_bar = hourly[fill_idx]
+        cash_before = account.cash_usdc
         account.open(intent, fill_bar.open, fill_bar.ts, dca=True)
+        buys.append(
+            DcaBuy(
+                asset=asset,
+                rule_kind=signal.rule_name,
+                decision_ts=now_ts,
+                fill_ts=fill_bar.ts,
+                qty=qty,
+                notional=notional,
+                cost_usd=cash_before - account.cash_usdc,
+            )
+        )
 
 
 def _process_rule_signals(
