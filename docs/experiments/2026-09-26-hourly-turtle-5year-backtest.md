@@ -108,6 +108,13 @@ paid.**
 
 ## 5. Relationship to earlier records, and one correction
 
+**Pricing.** Every figure here is priced per product, as
+[the per-product restatement](2026-09-01-per-product-slippage-restatement.md) established:
+5.0–100.8 bp per leg, not the flat 5 bp floor. The two earlier records below were priced at
+that floor. Their numbers are optimistic by the amounts the restatement measured, and their
+**verdicts are unaffected**: the correction only ever moves a cost up, and both were already
+negative at the fee paid.
+
 - [`2026-08-11-hourly-backtest-turtle-breakout.md`](2026-08-11-hourly-backtest-turtle-breakout.md)
   found the same thing at a 5 bp flat slippage floor, with profit factors in price units: 0 of
   19 above 1.0 at 1.20%. This record restates it with per-product slippage (#259), in R (#820),
