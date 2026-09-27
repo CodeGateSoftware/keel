@@ -209,12 +209,14 @@ class SubscriptionConfig:
 @dataclass(frozen=True)
 class TierConfig:
     """One Coinbase One subscription tier (Issue #86) -- `sim.tiers`/`keel simulate`'s tier/fee
-    analysis matrix compares staying WITHIN a tier's fee-free monthly trading-volume allowance
-    against trading freely and paying the taker fee on volume EXCEEDING it.
+    analysis matrix compares staying WITHIN a tier's monthly trading-volume allowance (priced
+    at zero fee) against trading freely and paying the taker fee on volume EXCEEDING it. The
+    zero-fee side models Coinbase One on the main Coinbase platform; it is HYPOTHETICAL for
+    keel's orders, which go through Advanced Trade and pay its maker/taker fees (#836).
 
-    `free_volume_usd is None` means an UNLIMITED fee-free allowance (Premium) -- there is no
-    volume beyond which fees apply, so within-cap and over-cap analysis collapse to the same
-    (always fee-free) result for that tier.
+    `free_volume_usd is None` means an UNLIMITED allowance (Premium) -- there is no volume
+    beyond which the modelled fee applies, so within-cap and over-cap analysis collapse to the
+    same result for that tier.
     """
 
     name: str

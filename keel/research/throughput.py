@@ -5,9 +5,10 @@ Two questions this module answers, both with the same discipline the engine appl
 everywhere else -- report the truth, refuse to flatter:
 
 * **Throughput.** A venue's attested monthly buy cap (rail 14) caps monthly BUY
-  notional, and the cross-verification showed that cap is the *profitability
-  boundary*: inside it the reconstructed rules sit at break-even, outside it the
-  taker fee decides. So the honest throughput of a venue is
+  notional. (The cross-verification once called that cap the *profitability
+  boundary*, on the premise that buys inside it were fee-free; on Advanced Trade they
+  are not -- keel's orders pay the taker fee inside the cap too, #836.) So the honest
+  throughput of a venue is
   ``min(expected signals, allowance / mean trade notional)`` -- and at the measured
   numbers (a $4,212 mean hourly proposal against a $500/month Basic allowance) that
   is a fraction of a trade per month, which is exactly what the report must say

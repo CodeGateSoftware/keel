@@ -1,5 +1,10 @@
 # keel — Broker Port & Adapter Plugins — Design Spec
 
+> **Fee note (added 2026-09-27, #836).** Where this design mentions a "claimed fee-free
+> allowance", note that for keel's Coinbase orders (Advanced Trade) no fee-free allowance
+> exists: they pay the maker/taker schedule inside rail 14's cap. Nothing on this page has
+> been rewritten.
+
 **Date:** 2026-07-19
 **Status:** Design approved, not yet implemented
 **Implements:** `2026-07-18-keel-monorepo-architecture-design.md` §7 and §12 step 3.

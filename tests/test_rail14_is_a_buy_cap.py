@@ -30,12 +30,19 @@ from tests.research.test_significance import _outcomes
 _ROOT = Path(__file__).resolve().parent.parent
 _RAIL_DOC = _ROOT / "docs/rails/rail-14-subscription-allowance.md"
 _FEE_NOTE = "#836"
-#: A sentence asserting the venue waives fees inside the cap. Mentioning the words to say they
-#: do NOT apply is allowed; claiming them is not.
+#: A sentence asserting the venue waives fees inside the cap. Matched against NORMALISED text
+#: (`_claims`): markdown emphasis and blockquote markers stripped, whitespace collapsed -- the
+#: pre-#836 doc split the phrase across a line and wrapped it in `**`, which a raw regex misses.
 _CLAIM = re.compile(
-    r"lets the account trade taker-fee-free|trade taker-fee-free|fee-free monthly volume allowance",
+    r"lets the account trade taker-fee-free|fee-free monthly volume allowance"
+    r"|the monthly volume the venue .{0,60} lets the account trade",
     re.I,
 )
+
+
+def _claims(text: str) -> bool:
+    flat = re.sub(r"\s+", " ", re.sub(r"[*_`]|^\s*>", "", text, flags=re.M))
+    return bool(_CLAIM.search(flat))
 
 
 def test_subscription_set_help_calls_it_a_buy_cap_not_a_fee_waiver() -> None:
@@ -77,7 +84,7 @@ def test_the_tier_section_says_its_within_cap_rows_are_hypothetical_on_advanced_
 
 def test_the_rail_14_doc_no_longer_claims_fees_are_waived() -> None:
     doc = _RAIL_DOC.read_text(encoding="utf-8")
-    assert not _CLAIM.search(doc), "the rail 14 doc still claims the venue waives fees"
+    assert not _claims(doc), "the rail 14 doc still claims the venue waives fees"
     assert "buy cap" in doc.lower()
     assert _FEE_NOTE in doc
 
@@ -85,9 +92,11 @@ def test_the_rail_14_doc_no_longer_claims_fees_are_waived() -> None:
 def test_every_record_that_described_a_fee_free_regime_carries_the_fee_note() -> None:
     """Records are appended to, never rewritten. A record that priced or described a
     fee-free regime keeps its text and gains a dated note pointing at #836."""
-    records = sorted((_ROOT / "docs/experiments").glob("*.md")) + sorted(
-        (_ROOT / "docs/research").glob("*.md")
-    )
+    records = [
+        path
+        for folder in ("docs/experiments", "docs/research", "docs/superpowers/specs")
+        for path in sorted((_ROOT / folder).glob("*.md"))
+    ]
     missing = [
         path.name
         for path in records
@@ -97,3 +106,21 @@ def test_every_record_that_described_a_fee_free_regime_carries_the_fee_note() ->
     assert not missing, "records describing a fee-free regime without the #836 note:\n  " + (
         "\n  ".join(missing)
     )
+
+
+#: The paragraph this PR retracted, verbatim from the pre-#836 doc, including its line break and
+#: its `**…**` emphasis. The detector must catch it, or the doc test above passes by vacuum.
+_RETRACTED = (
+    "The cap is the subscription tier's `free_volume_usd`: the monthly volume the venue "
+    "(Coinbase\n"
+    "Advanced Trade, at time of writing) lets the account trade **taker-fee-free**. That makes "
+    "the\n"
+    "rail's economics, not just its accounting:"
+)
+
+
+def test_the_claim_detector_catches_the_retracted_paragraph() -> None:
+    """Review of #837: the first `_CLAIM` never matched the real doc (a newline split the phrase
+    and `**` wrapped it), so the doc test could not fail. Pinned against the actual old text."""
+    assert _claims(_RETRACTED)
+    assert not _claims("keel's orders pay the venue's maker/taker fee inside the buy cap")

@@ -1,5 +1,11 @@
 # Accumulation policy: bounded value averaging and band rebalancing vs static DCA: design
 
+> **Fee note (added 2026-09-27, #836).** D2/D3's "allowance-aware" fee model prices buys
+> fee-free up to $500 a month. For keel's orders that regime is hypothetical: they go through
+> Coinbase Advanced Trade, which charges its maker/taker schedule on every order. The design's
+> flat-taker sensitivity run is the one that matches live; the resulting record's verdict is
+> the same under both. Nothing on this page has been rewritten.
+
 **Date:** 2026-09-27 · **Issue:** #831 · **Status:** DRAFT, revision 2 (selective trimming, band floor, dual bootstrap blocks), for review. No code or simulation
 runs until this is approved. §9 lists the decisions the review has to make.
 

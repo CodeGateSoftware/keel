@@ -49,9 +49,10 @@ from keel.research.throughput import design_effect, detectable_edge, n_eff
 #: The two fee regimes the reconstruction is priced at. Labels, not truth: the driver threads
 #: the deployment's own `config.fees.taker_pct` when it has one, and these constants stand in
 #: for callers that genuinely have no config (library use, tests). `outside_allowance_taker`
-#: matches `backtest.TAKER_FEE_PCT` (120 bp, both legs); `inside_allowance_fee_free` is the
-#: rail-14 allowance regime where the venue charges nothing on monthly BUY notional up to the
-#: cap -- the profitability boundary, not a budget to spend.
+#: matches `backtest.TAKER_FEE_PCT` (120 bp, both legs); `inside_allowance_fee_free` is a
+#: HYPOTHETICAL zero-fee regime. It was modelled as the rail-14 cap where the venue charges
+#: nothing, but keel's Advanced Trade orders pay the taker fee inside the cap too (#836); the
+#: key keeps its historical name so recorded results stay comparable.
 FEE_REGIMES: dict[str, Decimal] = {
     "outside_allowance_taker": Decimal("0.012"),
     "inside_allowance_fee_free": Decimal("0"),
