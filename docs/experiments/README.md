@@ -25,6 +25,13 @@ Index is **newest first**, by the date each document carries in its filename.
 
 ## 2026-09
 
+- [`2026-09-27-accumulation-policy.md`](2026-09-27-accumulation-policy.md) — Static DCA vs
+  bounded value averaging, deposits steered to underweights, and selective band trimming, on
+  equal $500 monthly deposits with allowance-aware fees. **Pre-registered** (design #834,
+  driver pushed before the run). **No arm beats static DCA** under the decision rule, in either
+  run or fee model. Band trimming leads on the historical 5-year path (+13.5%) but improves
+  Sortino in only 36–43% of 2,000 bootstrap paths; value averaging is the most consistent
+  (58–61%) and still far from 0.95. Driver `2026-09-27-accumulation-policy.py`, data `.jsonl`.
 - [`2026-09-27-turtle-sma200-filter.md`](2026-09-27-turtle-sma200-filter.md) — A 200-day SMA
   trend filter on the daily `turtle_breakout`, **pre-registered** (driver committed before
   the run): `above`, `slope` and `both` arms against the unfiltered baseline on a common
