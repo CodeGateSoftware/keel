@@ -12,10 +12,11 @@ having passed first -- that ordering is safety-critical and is exercised directl
 **Sizing.** ENTER signals size via `sizing.size` (fixed-fractional risk, off the setup's
 entry/stop) for risk-defined rules, or `sizing.dca_size` (budget/price, no stop) for the DCA
 order class (`setup.context["order_class"] == "dca"` or `["no_stop"]`, matching
-`strategy/engine.py`'s own class test). `execution/guards.py` documents the same design choice
-this module reuses: `config.caps.max_exposure_usd` stands in for account equity in
-fixed-fractional sizing, since neither module has a separate equity oracle -- it is the funded
-trading-capital ceiling (§2.8) `max_per_asset_pct` is already a fraction of.
+`strategy/engine.py`'s own class test). A DCA budget is the RULE's `setup.context["size_usd"]`,
+with `config.dca.budget_usd` only as the fallback (`_dca_budget`, #840). `execution/guards.py`
+documents the same design choice this module reuses: `config.caps.max_exposure_usd` stands in
+for account equity in fixed-fractional sizing, since neither module has a separate equity oracle
+-- it is the funded trading-capital ceiling (§2.8) `max_per_asset_pct` is already a fraction of.
 
 **EXIT signals** carry no `setup` (`strategy/rules/base.Signal` docstring: `setup` is `None` for
 EXIT/NONE) -- the position being closed is reconstructed from the orders audit log
@@ -333,6 +334,28 @@ def _clear_resting_bracket(broker: Any, repo: Repository, product_id: str, now_t
 
 def _is_dca_setup(context: dict[str, Any]) -> bool:
     return bool(context.get("no_stop")) or context.get("order_class") == "dca"
+
+
+def _dca_budget(context: dict[str, Any], fallback: Decimal) -> tuple[Decimal, str]:
+    """`(USD to spend, where it came from)` for a DCA setup -- `"rule"` or `"config"` (#840).
+
+    The RULE's amount wins: `context["size_usd"]`, which `Dca.detect` computes as
+    `budget_usd x (1 + dip bonus)`. `fallback` (the config's `dca.budget_usd`) is used only when
+    that key is absent or is not a positive, finite number. "Positive" alone is not enough:
+    `Decimal('Infinity') > 0`, and an infinite `budget_usd` becomes an infinite `size_usd` with
+    nothing raising (`commands/rules.py`'s non-finite-param check says why). A `bool` is an `int`
+    to Python and is refused too -- `True` is not an amount of dollars.
+
+    The fallback is not checked here: a zero or negative config budget still reaches
+    `sizing.dca_size` exactly as it always did, and the rails see whatever notional it yields.
+    """
+    size_usd = context.get("size_usd")
+    if isinstance(size_usd, bool) or not isinstance(size_usd, Decimal | int | float):
+        return fallback, "config"
+    amount = Decimal(str(size_usd)) if isinstance(size_usd, float) else Decimal(size_usd)
+    if not amount.is_finite() or amount <= 0:
+        return fallback, "config"
+    return amount, "rule"
 
 
 #: How long a withdrawal-capability attestation stays fresh (§65.4). Deliberately short: the
@@ -733,17 +756,31 @@ def _build_intent(
 
         is_dca = _is_dca_setup(setup.context)
         if is_dca:
-            # CAREFUL: the live path sizes DCA from the CONFIG's `dca.budget_usd`, and ignores
-            # the RULE's own `budget_usd` / the `size_usd` the rule computed from it (which is
-            # sitting right there in `setup.context`). That is deliberate -- the config is the
-            # operator-facing dial and a rule row is not reviewed on every deploy -- but it means
-            # the two can disagree silently, and a rule row saying 25 while the config says 50
-            # spends 50. It surprised us once; do not assume the rule's number is what moves.
-            # The account simulator (`sim/portfolio_sim.py`) prefers `context["size_usd"]` and
-            # only falls back to this config value, so a divergence also makes the sim and the
-            # live path model different position sizes. Keep rule, config and
-            # `deploy/live-rules.json` in agreement.
-            qty = sizing.dca_size(config.dca.budget_usd, setup.entry)
+            # CAREFUL: DCA is sized from the RULE's amount -- `setup.context["size_usd"]`, which
+            # `Dca.detect` computes from the rule's own `budget_usd` -- and the config's
+            # `dca.budget_usd` is only the FALLBACK for a setup without a usable one (#840).
+            # This reverses the earlier design, where live always spent the config value on the
+            # grounds that "the config is the operator-facing dial and a rule row is not reviewed
+            # on every deploy". The operator reversed that on 2026-09-27: with rules at $40, $25
+            # and $15 and the config at $50, every buy spent $50 -- about $978 a month against
+            # the rules' $467 and rail 14's $500 cap. Paper sizes through this same function, and
+            # the account sim (`sim/portfolio_sim.py`) already preferred `size_usd`, so all three
+            # now agree. Which source sized the order is logged (`executor.dca_sized`), because a
+            # fallback means a setup arrived without the rule's number and deserves a look.
+            # The rails are unchanged: `notional` below is computed from this qty, so rail 14 and
+            # every other guard see the smaller, real order.
+            budget, source = _dca_budget(setup.context, config.dca.budget_usd)
+            log_event(
+                logger,
+                logging.INFO if source == "rule" else logging.WARNING,
+                "executor.dca_sized",
+                product=signal.product_id,
+                rule=signal.rule_name,
+                rule_id=signal.rule_id,
+                source=source,
+                budget_usd=str(budget),
+            )
+            qty = sizing.dca_size(budget, setup.entry)
             stop = None
         else:
             equity = (
@@ -1876,8 +1913,10 @@ def _order_spec(intent: OrderIntent) -> OrderSpec:
     finer than the product's increment, which is how the first live `turtle_breakout` entry was
     rejected (order 3, 2026-08-22, `quote_size: "23.00803473938010547532738517"`).
 
-    DCA never tripped this only because its `budget_usd` is a round constant: `"50.000...0"` is
-    26 decimal places too, and the venue accepts it because the VALUE is exactly 50.
+    DCA never tripped this only because its budget was a round constant: `"50.000...0"` is
+    26 decimal places too, and the venue accepts it because the VALUE is exactly 50. Since #840
+    the budget is the rule's `size_usd`, which a non-zero dip bonus makes non-round; the BUY
+    quantization below covers it like any other entry.
 
     **SELL is quantized too (#516), but its UNKNOWN case is the opposite of BUY's, deliberately.**
 

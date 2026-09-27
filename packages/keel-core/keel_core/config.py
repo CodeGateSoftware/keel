@@ -148,6 +148,17 @@ class MoneyMgmtConfig:
 
 @dataclass(frozen=True)
 class DcaConfig:
+    """The `dca:` block. `budget_usd` is a FALLBACK, not what a DCA buy spends (#840).
+
+    Every DCA buy -- live (`execution.executor._build_intent`), paper (the same function) and
+    the account sim (`sim.portfolio_sim`) -- is sized from the RULE's own amount, the
+    `size_usd` that `Dca.detect` puts in its setup's context (`budget_usd x (1 + dip bonus)`).
+    `budget_usd` here sizes a DCA buy only when a setup carries no positive, finite `size_usd`,
+    and the executor logs `executor.dca_sized` with `source="config"` when it does. Until
+    2026-09-27 live spent this value on every buy and ignored the rule's; the operator reversed
+    that after the $40/$25/$15 rules were each spending the $50 configured here.
+    """
+
     budget_usd: Decimal = Decimal("0")
     cadence_days: int = 7
 

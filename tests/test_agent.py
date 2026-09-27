@@ -3194,6 +3194,44 @@ def test_paper_enter_sizes_off_paper_equity(repo):
     assert orders[0]["qty"] != Decimal("1"), "must not fill the old fixed 1-unit qty"
 
 
+def test_paper_dca_fill_is_sized_from_the_rules_amount_not_the_config_budget(repo):
+    """(#840) Paper sizes through the same `executor._build_intent` as live, so a $15 DCA rule
+    on a $50 config fills $15 on paper too -- live, paper and the account sim agree. Driven by
+    the real `Dca.detect`, so the context key it writes is the one being read."""
+    from keel.strategy.paper import PaperTrader
+
+    trader = PaperTrader(repo)
+    trader.seed_cash(Decimal("30000"), now_ts=1_000)
+    repo.set_state("last_feed_ts", 90_000)
+    config = _paper_config()
+    assert config.dca.budget_usd == Decimal("50")
+    price = Decimal("30")
+    candle = Candle(ts=0, open=price, high=price, low=price, close=price, volume=Decimal("1"))
+    rule = Dca(product_id=PRODUCT, cadence_days=1, budget_usd=Decimal("15"))
+    setup = rule.detect({Granularity.ONE_DAY: [candle]})
+    assert setup is not None
+    signal = Signal(
+        rule_name=rule.name,
+        product_id=PRODUCT,
+        action=Action.ENTER,
+        side=Side.BUY,
+        setup=setup,
+        cts_score=0,
+        entry_technique="market",
+        ts=setup.ts,
+    )
+
+    result = agent._paper_enter(
+        trader, signal, repo, config, now_ts=90_000, paper_equity=Decimal("30000")
+    )
+
+    assert result.placed, result
+    orders = repo.get_orders(mode="paper")
+    assert len(orders) == 1
+    assert orders[0]["qty"] == Decimal("0.5")  # 15 / 30, not 50 / 30
+    assert orders[0]["qty"] * price == Decimal("15")
+
+
 def test_paper_mode_never_runs_the_entry_spread_gate(repo):
     """#350's max-spread gate is live-path ONLY: paper fills are synthetic and see no book, so
     `_paper_enter` never previews an order and the gate (fail-closed on an unreadable book for

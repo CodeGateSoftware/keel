@@ -69,6 +69,10 @@ money_mgmt:
   streak_cooloff_days: 0
 
 dca:
+  # FALLBACK only (#840). Each DCA buy -- live, paper and the account sim -- spends the RULE's own
+  # amount (`size_usd`, computed from the rule's `budget_usd`; see `keel rules list`). This
+  # value sizes a DCA buy only when a setup arrives without a positive `size_usd`, and the
+  # executor logs `executor.dca_sized` with `source=config` when it does.
   budget_usd: 50
   cadence_days: 7
 

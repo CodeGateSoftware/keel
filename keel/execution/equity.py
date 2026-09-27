@@ -121,9 +121,10 @@ def sizing_equity(mark_to_market: Decimal, pending_purification: Decimal) -> Dec
     inflate the equity the sizing formula reads from" -- riba compounding into position size,
     a correctness bug independent of the fiqh point (KB §65.9: non-compliant income is given
     away, never recognised as trading capital). Every path that derives sizing equity from a
-    LIVE balance read must go through this helper; config-constant sizing inputs
-    (`caps.max_exposure_usd`, `dca.budget_usd`, a funded `paper.starting_equity_usd`) are
-    immune by construction and pass through unchanged.
+    LIVE balance read must go through this helper; constant sizing inputs
+    (`caps.max_exposure_usd`, a DCA rule's own `budget_usd` -- or `dca.budget_usd`, its
+    fallback (#840) -- and a funded `paper.starting_equity_usd`) are immune by construction and
+    pass through unchanged.
 
     Floored at zero: pending purification can exceed the mark-to-market read (a reward-heavy
     ledger against a mostly-withdrawn account), and a negative equity base would size a
