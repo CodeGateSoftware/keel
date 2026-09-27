@@ -1,13 +1,14 @@
-"""Allowance-throughput planning (#478): route WITHIN fee-free allowances, and say
+"""Allowance-throughput planning (#478): route WITHIN each venue's monthly buy cap, and say
 honestly how long the evidence takes.
 
 Two questions this module answers, both with the same discipline the engine applies
 everywhere else -- report the truth, refuse to flatter:
 
-* **Throughput.** A venue's fee-free volume allowance (rail 14) caps monthly BUY
-  notional, and the cross-verification showed that cap is the *profitability
-  boundary*: inside it the reconstructed rules sit at break-even, outside it the
-  taker fee decides. So the honest throughput of a venue is
+* **Throughput.** A venue's attested monthly buy cap (rail 14) caps monthly BUY
+  notional. (The cross-verification once called that cap the *profitability
+  boundary*, on the premise that buys inside it were fee-free; on Advanced Trade they
+  are not -- keel's orders pay the taker fee inside the cap too, #836.) So the honest
+  throughput of a venue is
   ``min(expected signals, allowance / mean trade notional)`` -- and at the measured
   numbers (a $4,212 mean hourly proposal against a $500/month Basic allowance) that
   is a fraction of a trade per month, which is exactly what the report must say
@@ -84,7 +85,7 @@ def detectable_edge(effective_n: Decimal) -> Decimal:
 
 @dataclass(frozen=True)
 class VenueThroughput:
-    """One venue's honest monthly throughput at its fee-free allowance.
+    """One venue's honest monthly throughput within its monthly buy cap.
 
     ``monthly_allowance`` is None for an unlimited (Premium, in force) record --
     the same convention rail 14 uses, where an unlimited allowance has no cap to
@@ -230,9 +231,11 @@ def render_report(venues: list[VenueThroughput], target_edge: Decimal) -> list[s
     as license to trade through the cap would be worse than no planner."""
     lines: list[str] = [
         "Allowance throughput plan (#478)",
-        "Rail 14 is the profitability boundary: these numbers route trades",
-        "WITHIN fee-free allowances; an allowance is never enlarged or breached",
-        f"to fit more. Design effect {design_effect()} (k={MEAN_EPISODE_SIZE},",
+        "Rail 14 is a monthly buy cap: these numbers route trades WITHIN each",
+        "venue's attested buy cap; a cap is never enlarged or breached to fit",
+        "more. Trades inside it still pay the venue's fee (Advanced Trade has no",
+        "fee-waiver tier, #836).",
+        f"Design effect {design_effect()} (k={MEAN_EPISODE_SIZE},",
         f"ICC={EPISODE_ICC}): pooled trades are divided by it before any",
         "time-to-detection claim, per #427.",
         "",

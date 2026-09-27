@@ -2,8 +2,10 @@
 
 Given a completed sim run's per-month trading VOLUME (`portfolio_sim.SimResult.monthly_volume`,
 Issue #85's buys+sells convention) and a `keel.config.TierConfig`, this module answers: for a
-given Coinbase One tier, does staying WITHIN the tier's fee-free monthly volume allowance (a
-throttled run, 0 trading fees, but the subscription is still due) or trading freely and paying
+given Coinbase One tier, does staying WITHIN the tier's monthly volume allowance (a throttled
+run, 0 trading fees, but the subscription is still due -- a HYPOTHETICAL regime for keel's
+orders, which go through Advanced Trade and pay its maker/taker fees inside any cap, #836) or
+trading freely and paying
 the taker fee on volume EXCEEDING it ("over cap") net out ahead, once the tier's own monthly
 subscription cost is subtracted too?
 

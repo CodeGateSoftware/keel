@@ -1,25 +1,27 @@
-# Rail 14 — subscription allowance (the fee-free monthly volume cap)
+# Rail 14 — the monthly buy cap
 
 Rail 14 is one of keel's hard rails: checks in `keel/execution/guards.py` that run before every
 order, in every mode, and cannot be switched off or widened from `config.yaml`. This one caps
 the **month-to-date live BUY notional** — everything the agent has bought this UTC calendar
-month, from the orders audit log, plus the order being placed — at the venue's **fee-free
-monthly volume allowance**.
+month, from the orders audit log, plus the order being placed — at the venue's attested
+**monthly buy cap** (`free_volume_usd` in the record; the field keeps its historical name).
 
-## What it bounds — and why that is a profitability boundary, not a budget
+## What it bounds: spend, not fees
 
-The cap is the subscription tier's `free_volume_usd`: the monthly volume the venue (Coinbase
-Advanced Trade, at time of writing) lets the account trade **taker-fee-free**. That makes the
-rail's economics, not just its accounting:
+The cap is a limit keel puts on its **own** buying. It is not a fee waiver, and nothing inside
+it is free: keel places its orders through **Coinbase Advanced Trade**, which charges its
+maker/taker schedule on every order whatever the cap says (#836). DCA is **not** exempt —
+recurring buys are exactly the spend this rail exists to cap.
 
-> Inside the allowance the measured strategies are indistinguishable from break-even; outside
-> it the taker fee (120 bp) makes them decisively negative. **"It is not a budget limit; it is
-> the profitability boundary."**
-> — `docs/research/2026-08-20-quant-lab-note-cross-verification.md`, §5
-
-On the hourly clock every round trip outside the allowance costs more than one full unit of
-risk, so the rail is what keeps the agent from buying a known-losing trade. DCA is **not**
-exempt — recurring buys are exactly the spend this rail exists to cap.
+> **Correction (2026-09-27, #836).** This page used to describe the cap as volume the venue
+> waives the taker fee on, and as *"the profitability boundary"*. That was wrong for keel's
+> orders. On 2026-09-27 the account's own `get_transaction_summary` reported
+> the **Intro** tier (0.9% taker, 0.5% maker) with `has_promo_fee: false`, and every live fill
+> had paid a fee. Coinbase One's "zero trading fees up to $500/month" applies on the main
+> Coinbase platform, not Advanced Trade, where the listed Coinbase One benefit is a fee
+> rebate. The rail's mechanism and every number it enforces are unchanged; only the claim
+> about fees was removed. Research that modelled an "inside the allowance, fee-free" regime
+> carries a dated note saying that regime is hypothetical for keel's orders.
 
 ## Where the setting lives — the database, not config.yaml
 
@@ -32,7 +34,7 @@ on every order, so a new attestation takes effect on the very next one, with no 
 # Assert which tier the venue is on (the normal path; upgrades exactly one number)
 keel subscription attest --venue <venue> --tier <tier>
 
-# Escape hatch: a raw allowance without naming a tier (recorded as tier=unknown)
+# Escape hatch: a raw monthly buy cap without naming a tier (recorded as tier=unknown)
 keel subscription set --venue <venue> --free-volume-usd 500
 ```
 

@@ -1,5 +1,13 @@
 # Rule-family significance: is a family's edge distinguishable from zero at the fee actually paid?
 
+> **Fee note (added 2026-09-27, #836).** This record describes a fee-free regime inside a
+> venue's monthly allowance. For keel's orders that regime is **hypothetical**: they go through
+> Coinbase Advanced Trade, which has no fee-waiver tier. On 2026-09-27 the account reported the
+> Intro tier (0.9% taker, 0.5% maker, `has_promo_fee: false`), and every live fill had paid a
+> fee; Coinbase One's zero trading fees apply on the main Coinbase platform, not Advanced
+> Trade. Figures priced at the taker fee are the realistic ones; figures priced at zero fee
+> describe a regime keel cannot reach. Nothing on this page has been rewritten.
+
 **Issue #475.** Driver: [`2026-08-21-rule-family-significance.py`](2026-08-21-rule-family-significance.py)
 (pre-registered in its docstring before the run). Artifact: every number below is a row of
 [`2026-08-21-rule-family-significance.jsonl`](2026-08-21-rule-family-significance.jsonl) — 180

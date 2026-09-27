@@ -261,11 +261,15 @@ def test_render_family_states_regime_n_n_eff_and_verdict() -> None:
     assert "0.399" in text
 
 
-def test_render_family_inside_allowance_uses_the_fee_free_wording() -> None:
+def test_render_family_labels_a_zero_fee_regime_hypothetical() -> None:
+    """#836: a zero fee is not a regime keel's orders can reach -- Advanced Trade has no
+    fee-waiver tier -- so the verdict names it hypothetical rather than "the fee-free
+    allowance". The caller's regime label is still echoed verbatim."""
     stat = significance("rsi_meanrev", "inside_allowance_fee_free", ZERO, _outcomes(50, 50))
     text = "\n".join(render_family(stat)).lower()
     assert "inside_allowance_fee_free" in text
-    assert "fee-free" in text
+    assert "the fee-free allowance" not in text
+    assert "zero fee (hypothetical" in text
     assert "not distinguishable" in text
 
 

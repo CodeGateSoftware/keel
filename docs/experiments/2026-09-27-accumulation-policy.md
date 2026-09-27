@@ -1,5 +1,12 @@
 # Accumulation policy after fees: no arm beats static DCA
 
+> **Fee note (added 2026-09-27, #836).** The headline "allowance-aware" fee model priced buys
+> fee-free up to $500 a month. For keel's orders that regime is **hypothetical**: they go
+> through Coinbase Advanced Trade, which charges its maker/taker schedule on every order (0.9%
+> taker on 2026-09-27), so the **flat-taker sensitivity run is the one that matches live**. The
+> verdict is identical under both fee models, so it is unaffected. Nothing on this page has
+> been rewritten.
+
 **Date:** 2026-09-27
 **Issue:** #831 · **Design:** [`2026-09-27-accumulation-policy-design.md`](../superpowers/specs/2026-09-27-accumulation-policy-design.md)
 (revision 2, approved as #834)

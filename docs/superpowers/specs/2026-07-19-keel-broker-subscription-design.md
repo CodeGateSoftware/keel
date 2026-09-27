@@ -1,5 +1,11 @@
 # keel — Per-Venue Subscription Tracking & Lapse Detection — Design Spec
 
+> **Fee note (added 2026-09-27, #836).** This design models Coinbase One's allowance as
+> fee-free trading volume. That benefit applies on the main Coinbase platform, not on Advanced
+> Trade, where keel places its orders and pays maker/taker fees inside any cap. keel's own live
+> account turned out to be exactly the case §"fee charged while the user claims a fee-free
+> allowance" describes. Nothing on this page has been rewritten.
+
 **Date:** 2026-07-19
 **Status:** Design approved, not yet implemented
 **Relates to:** `2026-07-19-keel-broker-port-design.md` (resolves its §13 "Fee schedule" open question);

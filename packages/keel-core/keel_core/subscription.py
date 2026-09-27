@@ -33,7 +33,7 @@ class SubscriptionStatus(str, Enum):
 class BrokerSubscription:
     """One venue's subscription, as last attested by the user.
 
-    `free_volume_usd is None` means an UNLIMITED fee-free allowance (Premium) -- there is no cap,
+    `free_volume_usd is None` means an UNLIMITED monthly buy cap (Premium) -- there is no cap,
     which is not the same as a cap of zero.
 
     `tier_name` may be `'unknown'`, which `keel subscription set` produces: a raw cap the user

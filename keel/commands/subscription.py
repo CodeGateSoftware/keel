@@ -228,7 +228,10 @@ def subscription_attest(
     "--free-volume-usd",
     "free_volume_raw",
     required=True,
-    help="Raw fee-free monthly volume in USD, e.g. 500.",
+    help=(
+        "Monthly BUY cap in USD (rail 14), e.g. 500. A cap keel puts on its own buying, "
+        "not a fee waiver: Advanced Trade orders pay the venue's maker/taker fee (#836)."
+    ),
 )
 @click.option(
     "--pacing",

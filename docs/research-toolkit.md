@@ -34,7 +34,7 @@ carefully as the "answers" column — that column is the actual product.
 | `deflate.py` | given N trials tried, the Sharpe bar the winner had to clear, and how much data that needs | what N and correlation to assume — it reports a band across assumptions rather than guess one | `keel research deflate` (`keel trials deflate`) |
 | `walkforward.py` | does a GIVEN fixed parameter set hold up across rolling train/test windows, and does it degrade | which parameter set, fold or window is best — none is ever computed | `keel research walk-forward` (`keel trials walk-forward`) |
 | `independence.py` | how much two rules' (or two horizons') signals overlap in time, position and P&L | whether either rule is profitable, or which one to keep | `keel research independence` |
-| `throughput.py` | how much volume a fee-free allowance can honestly carry this month, and how long evidence takes to accumulate | it never enlarges an allowance to fit a plan — a product that doesn't fit is deferred, not squeezed in | `keel research throughput` |
+| `throughput.py` | how much volume a venue's monthly buy cap can honestly carry this month, and how long evidence takes to accumulate | it never enlarges an allowance to fit a plan — a product that doesn't fit is deferred, not squeezed in | `keel research throughput` |
 | `cts_factors.py` | do the 11 CTS confluence factors carry independent evidence, or is one momentum read counted three times | the biased ("obvious") conditional sample is computed but never allowed to carry the headline | `keel research factors` |
 | `tuning.py` | for a declared parameter space, does a train/held-out study produce a candidate clearing held-out sign AND PBO ≤ 0.5 | it never auto-tunes a live/paper profile, and a pass is a hypothesis, not a promotion | `keel research tuning` |
 | `bias.py` | does a rule's decision at bar N change when bars after N become visible (lookahead / recursive drift) | whether the rule is profitable — this is about information leakage only | `keel research lookahead` (`keel rules lookahead`) |
@@ -55,10 +55,11 @@ command surface just doesn't duplicate what already works.
 
 The question is a one-proportion test against break-even, with the null set by the fee *actually
 paid*: `keel/research/significance.py` prices the same reconstructed trades at both fee regimes
-a keel deployment can be in — the 120 bp taker fee outside the venue's fee-free allowance, and
-zero inside it — and never averages the two, because the cross-verification behind #475 found the
-fee difference *is* the result (decisively negative outside, indistinguishable from break-even
-inside). It also refuses to pool trades as if they were independent: signals fire in herds (about
+it was designed around — the 120 bp taker fee, and zero — and never averages the two, because the
+cross-verification behind #475 found the fee difference *is* the result (decisively negative at
+the taker fee, indistinguishable from break-even at zero). **The zero-fee regime is hypothetical
+for keel's orders** (#836): they go through Coinbase Advanced Trade, which has no fee-waiver
+tier, so the taker-fee figures are the realistic ones. It also refuses to pool trades as if they were independent: signals fire in herds (about
 eight assets the same UTC day, ICC 0.212), so `n_eff` divides the pooled count by
 `throughput.design_effect()` before any standard error is formed — a pooled 100 comes out to
 roughly 39 effective observations, not 100.
