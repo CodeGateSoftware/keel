@@ -3232,6 +3232,66 @@ def test_paper_dca_fill_is_sized_from_the_rules_amount_not_the_config_budget(rep
     assert orders[0]["qty"] * price == Decimal("15")
 
 
+@pytest.mark.parametrize(
+    "size_usd",
+    [Decimal("0"), Decimal("-15"), Decimal("Infinity"), Decimal("NaN"), "15", True],
+    ids=["zero", "negative", "infinity", "nan", "string", "bool"],
+)
+def test_paper_dca_skips_a_buy_whose_rule_computed_an_invalid_size_usd(repo, caplog, size_usd):
+    """`_paper_enter` must skip a DCA buy the same way the live path does when the rule's
+    `size_usd` is PRESENT but not usable (orchestrator ruling 2026-09-27): falling back to
+    `config.dca.budget_usd` here would spend more than a rule that computed 0, a negative
+    amount, non-finite, or garbage ever asked for. `executor._build_intent` raises
+    `DcaSizeInvalid`; `_paper_enter` must catch it, place nothing, and report the skip."""
+    from keel.strategy.paper import PaperTrader
+
+    trader = PaperTrader(repo)
+    trader.seed_cash(Decimal("30000"), now_ts=1_000)
+    repo.set_state("last_feed_ts", 90_000)
+    config = _paper_config()
+    assert config.dca.budget_usd == Decimal("50")
+    signal = Signal(
+        rule_name="dca",
+        product_id=PRODUCT,
+        action=Action.ENTER,
+        side=Side.BUY,
+        setup=Setup(
+            product_id=PRODUCT,
+            direction="long",
+            entry=Decimal("30"),
+            stop=Decimal("0"),
+            target=Decimal("30"),
+            context={"order_class": "dca", "no_stop": True, "size_usd": size_usd},
+            ts=90_000,
+        ),
+        cts_score=0,
+        entry_technique="market",
+        ts=90_000,
+    )
+
+    with caplog.at_level(logging.WARNING, logger="keel.agent"):
+        result = agent._paper_enter(
+            trader, signal, repo, config, now_ts=90_000, paper_equity=Decimal("30000")
+        )
+
+    assert result.placed is False
+    assert result.order_id is None
+    assert result.vetoed_by == []
+    assert result.reason == (
+        f"paper: dca: rule computed an invalid size_usd={size_usd!r}; buy skipped, "
+        "not sized from config"
+    )
+    assert repo.get_orders(mode="paper") == []
+    events = [
+        getattr(r, _FIELDS_ATTR)
+        for r in caplog.records
+        if r.getMessage() == "agent.paper_dca_size_invalid"
+    ]
+    assert len(events) == 1
+    assert events[0]["product"] == PRODUCT
+    assert events[0]["rule"] == "dca"
+
+
 def test_paper_mode_never_runs_the_entry_spread_gate(repo):
     """#350's max-spread gate is live-path ONLY: paper fills are synthetic and see no book, so
     `_paper_enter` never previews an order and the gate (fail-closed on an unreadable book for

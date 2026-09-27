@@ -72,6 +72,16 @@ class Dca(Rule):
             raise ValueError("budget_usd must be positive")
         if lookback_days <= 0:
             raise ValueError("lookback_days must be positive")
+        if dip_bonus_pct < 0:
+            # 0 (the default) stays allowed -- it disables dip-scaling entirely, per
+            # `PARAM_DOCS` above. A NEGATIVE value would shrink the budget as price drops, the
+            # inverse of what a "dip bonus" means, and would make `Dca.detect` emit a
+            # `size_usd` smaller than `budget_usd` on every drawdown -- which the executor
+            # (`execution.executor._dca_budget`) treats as an INVALID size_usd once it goes
+            # non-positive, skipping the buy entirely rather than resizing it (orchestrator
+            # ruling 2026-09-27). Refusing it here, at construction, is cheaper than discovering
+            # it as a silently-skipped live buy.
+            raise ValueError("dip_bonus_pct must not be negative")
 
         self.name = name
         self.product_id = product_id

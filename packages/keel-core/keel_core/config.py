@@ -148,15 +148,28 @@ class MoneyMgmtConfig:
 
 @dataclass(frozen=True)
 class DcaConfig:
-    """The `dca:` block. `budget_usd` is a FALLBACK, not what a DCA buy spends (#840).
+    """The `dca:` block. `budget_usd` is a FALLBACK, not what a DCA buy spends (#840), and it
+    fills in ONLY when a setup's `size_usd` is ABSENT -- the key missing, or explicitly `None`.
 
-    Every DCA buy -- live (`execution.executor._build_intent`), paper (the same function) and
-    the account sim (`sim.portfolio_sim`) -- is sized from the RULE's own amount, the
-    `size_usd` that `Dca.detect` puts in its setup's context (`budget_usd x (1 + dip bonus)`).
-    `budget_usd` here sizes a DCA buy only when a setup carries no positive, finite `size_usd`,
-    and the executor logs `executor.dca_sized` with `source="config"` when it does. Until
-    2026-09-27 live spent this value on every buy and ignored the rule's; the operator reversed
-    that after the $40/$25/$15 rules were each spending the $50 configured here.
+    Every DCA buy -- live (`execution.executor._build_intent`), paper (the same function, via
+    `agent._paper_enter`) and the account sim (`sim.portfolio_sim._process_dca_signals`) -- is
+    sized from the RULE's own amount, the `size_usd` that `Dca.detect` puts in its setup's
+    context (`budget_usd x (1 + dip bonus)`). All three paths share one predicate
+    (`execution.executor._dca_budget`), so "usable" means the same thing everywhere:
+
+    - `size_usd` ABSENT (missing, or `None`) -> falls back to `budget_usd` here, logged as
+      `executor.dca_sized` with `source="config"`.
+    - `size_usd` PRESENT but not a positive, finite number (zero, negative, `NaN`/`Infinity`, a
+      `bool`, or anything not a number at all) -> does NOT fall back. The buy is SKIPPED instead
+      (a WARNING logged, no order placed, no position opened), on every path alike.
+
+    That asymmetry is deliberate (orchestrator ruling 2026-09-27): a rule that computed an
+    invalid `size_usd` meant to buy LESS, or not at all, and falling back to this shared config
+    value in that case would spend MORE than the rule ever asked for -- a rule meant to buy
+    less must never spend more. Only a setup that carries no opinion at all (no `size_usd`) gets
+    this config's opinion instead. Until 2026-09-27 live spent this value on every buy and
+    ignored the rule's; the operator reversed that after finding every DCA rule was spending
+    this one shared value rather than its own tuned budget.
     """
 
     budget_usd: Decimal = Decimal("0")

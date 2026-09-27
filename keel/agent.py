@@ -789,6 +789,13 @@ def _paper_enter(
     max_exposure` proxy `_build_intent` falls back to absent an override -- that proxy only ever
     existed to gate the guard check, and sizing the fill off it would score the track record on
     trades no real paper balance could have produced.
+
+    A DCA setup whose `size_usd` is PRESENT but not usable makes `_build_intent` raise
+    `DcaSizeInvalid` (orchestrator ruling 2026-09-27, mirroring `executor.execute`'s own catch):
+    caught here too, before any paper fill, and reported as a not-placed result rather than
+    promoted on a trade the rule never asked for. Paper scores the promotion gate on its
+    recorded fills, so silently resizing to `config.dca.budget_usd` here would let a broken rule
+    promote on evidence live would have refused to produce.
     """
 
     def _result(placed, order_id=None, vetoed_by=None, reason=""):
@@ -800,9 +807,27 @@ def _paper_enter(
             reason=reason,
         )
 
-    intent = executor._build_intent(
-        signal, None, repo, config, now_ts, equity_override=paper_equity
-    )
+    try:
+        intent = executor._build_intent(
+            signal, None, repo, config, now_ts, equity_override=paper_equity
+        )
+    except executor.DcaSizeInvalid as exc:
+        log_event(
+            logger,
+            logging.WARNING,
+            "agent.paper_dca_size_invalid",
+            product=signal.product_id,
+            rule=signal.rule_name,
+            rule_id=signal.rule_id,
+            size_usd=repr(exc.size_usd),
+        )
+        return _result(
+            False,
+            reason=(
+                f"paper: dca: rule computed an invalid size_usd={exc.size_usd!r}; buy skipped, "
+                "not sized from config"
+            ),
+        )
     if intent is None:
         return _result(False, reason="paper: nothing to size")
 

@@ -10,7 +10,6 @@ opt-in.
 from __future__ import annotations
 
 import json
-import re
 import sys
 from decimal import Decimal
 from pathlib import Path
@@ -146,67 +145,63 @@ def test_committed_manifest_is_valid(tmp_path: Path) -> None:
     assert len(dca) == 1, "the live DCA rule is missing from the manifest"
 
     # This used to pin the rule's budget at "25" with the rationale "must not revert to the
-    # default 50". That rationale was backwards, because the number it protected was never the
-    # number being spent: the live executor sizes DCA from `config.dca.budget_usd`
-    # (`execution/executor.py::_build_intent`) and ignores the RULE's `budget_usd` entirely. So
-    # the rule row said 25, the config said 50, and 50 was what moved. The rule's value is read
-    # only by the account simulator, which means the divergence also made the sim model a
-    # position size the live path would never take.
+    # default 50", then (still before #840) switched to an AGREEMENT assertion that the
+    # manifest's budget must equal `config.dca.budget_usd`. Both versions were reasoning about a
+    # world where the live executor sized DCA from `config.dca.budget_usd`
+    # (`execution/executor.py::_build_intent`) and ignored the RULE's `budget_usd` entirely --
+    # so the rule row could say 25, the config could say 50, and 50 is what moved live while the
+    # account simulator, which read the rule's value, modeled a position size live never took.
+    # AGREEMENT closed that gap by requiring the manifest and the config to match.
     #
-    # 50 is the intended budget, so all three now agree, and assertion (1) below checks the
-    # AGREEMENT rather than a literal -- a hardcoded number here would just re-create the drift
-    # it is supposed to catch, one deploy later.
+    # #840 reverses which value is real: the live executor now spends the RULE's own `budget_usd`
+    # (the `size_usd` its setup carries -- see `_dca_budget`), and `config.dca.budget_usd` is only
+    # the FALLBACK for a setup whose `size_usd` is absent. The rule row is now the number that
+    # actually moves, live and in the sim alike, and it is MEANT to be free to diverge from the
+    # config -- letting an operator tune one rule's budget away from the shared config value is
+    # exactly what #840 made possible. Requiring the manifest to agree with the config would break
+    # the moment that divergence is actually used, so this test no longer asserts that agreement.
+    # Right now `deploy/live-rules.json` defines a single DCA rule, at $50 -- matching this
+    # config's value -- but that coincidence is what assertion (2) below pins down explicitly,
+    # not a fact this test takes for granted or asserts on its own.
     #
-    # But agreement alone is now a WEAKER guard than the "25" literal it replaced, and that
-    # weakness needs to be guarded explicitly rather than left as a silent regression: 50 is
-    # *also* `Dca.__init__`'s constructor default (see `keel/strategy/rules/dca.py`), and
-    # `deploy/live-rules.json`'s DCA params are, right now, EXACTLY those constructor defaults.
-    # That means "the manifest's budget equals the config's budget" is satisfied both by a
-    # correctly-provisioned box AND by a box where `keel init` silently reseeded the rule at
-    # `candidate` from constructor defaults -- the exact failure mode this test used to exist to
-    # catch. Values can no longer tell those two states apart. Two more assertions below make up
-    # for that: (2) status, which is the only thing that still can, and (3) a pinned check on
-    # the coincidence itself, so that if the operator ever moves the budget off the default, the
-    # value check regains its old power and (3) is what tells them so.
+    # What is still true, and still worth guarding: `deploy/live-rules.json`'s DCA params are,
+    # right now, EXACTLY `Dca.__init__`'s constructor defaults (see `keel/strategy/rules/dca.py`).
+    # That means the VALUE alone cannot prove this rule wasn't reseeded by a fresh `keel init`
+    # rather than deliberately provisioned, since the operator's intended value and `keel init`'s
+    # default are, today, the same number. Two assertions below make up for that: (1) status,
+    # which is the only thing that still can, and (2) a pinned check on the coincidence itself,
+    # so that if the operator ever moves the budget off the default, the value check regains its
+    # own power and (2) is what tells them so.
     #
     # SCOPE: this asserts the COMMITTED FILE, not a deployment's database, so it catches a
     # reseeded box's state being COMMITTED -- not the reseed itself. `rule_manifest.py apply`
     # is what reports that drift against a live DB.
 
-    # (1) AGREEMENT -- the manifest's budget must match config.dca.budget_usd, the value the live
-    # executor actually spends.
-    live_config = REPO_ROOT / "config.live-sandbox.yaml"
-    configured = re.search(r"^dca:\n(?:.*\n)*?  budget_usd: (\S+)$", live_config.read_text(), re.M)
-    assert configured is not None, "config.live-sandbox.yaml no longer declares dca.budget_usd"
-    assert Decimal(dca[0]["params"]["budget_usd"]) == Decimal(configured.group(1)), (
-        "the live DCA rule's budget_usd must match config.dca.budget_usd, which is the value the "
-        "executor actually spends -- if they diverge, the simulator and the live path disagree"
-    )
-
-    # (2) NOT SEED-SHAPED -- status is the only discriminator assertion (1) leaves standing
-    # between "the operator's 50" and "keel init's 50". `keel init` always seeds fresh rules at
-    # `candidate` (`docs/RELEASING.md`), and nothing in this test path promotes them, so a
-    # reseeded box's manifest would show `candidate` even though its budget_usd matches the
-    # config byte-for-byte. A correctly-provisioned deployment has every rule at `live`.
+    # (1) NOT SEED-SHAPED -- status is the only discriminator standing between "the operator's
+    # 50" and "keel init's 50" now that the manifest's budget is not checked against anything
+    # else. `keel init` always seeds fresh rules at `candidate` (`docs/RELEASING.md`), and
+    # nothing in this test path promotes them, so a reseeded box's manifest would show
+    # `candidate` even though its budget_usd matches the constructor default byte-for-byte. A
+    # correctly-provisioned deployment has every rule at `live`.
     assert dca[0]["status"] == "live", (
         "the live DCA rule is not status=live -- if this is a candidate, keel init likely "
         "reseeded it from Dca's constructor defaults rather than preserving an operator's tuned "
-        "value, and assertion (1) above cannot catch that on its own (see comment)"
+        "value, and nothing else here can catch that on its own (see comment)"
     )
     assert all(r["status"] != "candidate" for r in rebuilt), (
         "a rule in the committed live manifest is status=candidate -- that shape matches a fresh "
         "`keel init` reseed from constructor defaults, not a deliberately-provisioned deployment"
     )
 
-    # (3) THE COINCIDENCE IS PINNED, NOT ASSUMED -- assertion (2) only carries the weight it does
+    # (2) THE COINCIDENCE IS PINNED, NOT ASSUMED -- assertion (1) only carries the weight it does
     # because the operator's intended DCA params happen, today, to equal Dca's constructor
     # defaults. Pin that equality explicitly instead of taking it on faith. If it ever stops
     # being true -- e.g. the operator deliberately moves the budget off 50 -- THIS assertion is
-    # what fails, and failing here is good news dressed as a test failure: it means assertion (1)
-    # has regained the ability to catch a `keel init` revert on its own (a reseed would then
-    # produce a *different* number, not a coincidentally-matching one), and the status check in
-    # (2) is no longer the last line of defense. Whoever hits this failure should update this
-    # comment, not just delete the assertion.
+    # what fails, and failing here is good news dressed as a test failure: it means the
+    # manifest's value would now visibly differ from a reseed's, so the VALUE alone regains the
+    # power to catch a `keel init` revert, and the status check in (1) is no longer the last
+    # line of defense. Whoever hits this failure should update this comment, not just delete the
+    # assertion.
     manifest_params = dca[0]["params"]
     default_params = Dca(product_id=manifest_params["product_id"]).describe()["params"]
     for key, expected in default_params.items():
@@ -214,9 +209,10 @@ def test_committed_manifest_is_valid(tmp_path: Path) -> None:
             continue  # trivially equal -- it's the constructor arg we just passed in
         assert Decimal(str(manifest_params[key])) == Decimal(str(expected)), (
             f"deploy/live-rules.json's DCA {key} ({manifest_params[key]!r}) no longer matches "
-            f"Dca's constructor default ({expected!r}). Assertions (1)/(2) above still hold, but "
-            "the reasoning behind assertion (2) -- that status is the ONLY thing distinguishing "
-            "a deliberate value from a reseeded default -- no longer applies to this parameter: "
-            "a reseed would now produce a visibly different value, so assertion (1) alone would "
-            "catch it again."
+            f"Dca's constructor default ({expected!r}). Assertion (1) above still holds, but the "
+            "reasoning behind it -- that status is the ONLY thing distinguishing a deliberate "
+            "value from a reseeded default -- no longer applies to this parameter: a reseed "
+            "would now produce a visibly different value here, and THIS comparison catches that "
+            "on its own, without needing assertion (1)'s status check as the last line of "
+            "defense."
         )

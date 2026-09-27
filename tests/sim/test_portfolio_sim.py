@@ -13,6 +13,9 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 from decimal import Decimal
+from typing import Any
+
+import pytest
 
 from keel.config import (
     Caps,
@@ -425,16 +428,30 @@ def test_idle_span_recorded_on_big_move_with_no_signal():
 # ---------------------------------------------------------------------------
 
 
+#: Sentinel for `_OnceDcaRule.size_usd` meaning "not overridden -- use `budget_usd`, as every
+#: caller before the size_usd override existed did". Distinct from `None`, which a caller can
+#: pass explicitly to drive the ABSENT/`None` fallback case in `_process_dca_signals`.
+_UNSET = object()
+
+
 class _OnceDcaRule(Rule):
-    """Fires a DCA-class setup exactly once (on the asset's first bar) -- used only to prove a
-    DCA lot and a RULE position can coexist for the same asset within one `run()`."""
+    """Fires a DCA-class setup exactly once (on the asset's first bar) -- used to prove a DCA
+    lot and a RULE position can coexist for the same asset within one `run()`, and (via
+    `size_usd`) to drive `_process_dca_signals`'s size_usd handling with a controlled value
+    distinct from `budget_usd`."""
 
     name = "dca_once"
     params: dict = {}
 
-    def __init__(self, product_id: str, budget_usd: Decimal = Decimal("50")) -> None:
+    def __init__(
+        self,
+        product_id: str,
+        budget_usd: Decimal = Decimal("50"),
+        size_usd: Any = _UNSET,
+    ) -> None:
         self.product_id = product_id
         self.budget_usd = budget_usd
+        self.size_usd = budget_usd if size_usd is _UNSET else size_usd
 
     def detect(self, candles_by_tf: dict[Granularity, list[Candle]]) -> Setup | None:
         hourly = candles_by_tf[Granularity.ONE_HOUR]
@@ -447,7 +464,7 @@ class _OnceDcaRule(Rule):
             entry=latest.close,
             stop=Decimal("0"),
             target=latest.close,
-            context={"no_stop": True, "order_class": "dca", "size_usd": self.budget_usd},
+            context={"no_stop": True, "order_class": "dca", "size_usd": self.size_usd},
             ts=latest.ts,
         )
 
@@ -550,6 +567,65 @@ def test_dca_and_rule_positions_coexist_on_the_same_asset():
     assert "BTC" in result.dca_positions
     assert result.dca_positions["BTC"].qty > 0
     assert any(tr.asset == "BTC" for tr in result.trades)  # the RULE position also opened
+
+
+def test_dca_size_usd_none_falls_back_to_the_config_budget():
+    """`size_usd` ABSENT -- here explicitly `None`, which `_process_dca_signals` (via the shared
+    `executor._dca_budget`) treats identically to a missing key -- falls back to
+    `config.dca.budget_usd`, not the rule's own (very different) `budget_usd`."""
+    hourly = [
+        _candle(0, "100", "101", "99", "100"),
+        _candle(_HOUR, "100", "102", "98", "101"),
+        _candle(2 * _HOUR, "101", "103", "100", "102"),
+    ]
+    dca_rule = _OnceDcaRule("BTC-USD", budget_usd=Decimal("999"), size_usd=None)
+    candles_by_asset = {"BTC": {Granularity.ONE_HOUR: hourly, Granularity.ONE_DAY: []}}
+    config = _config(dca=DcaConfig(budget_usd=Decimal("50")))
+
+    result = run(
+        [dca_rule],
+        candles_by_asset,
+        config,
+        start_ts=hourly[0].ts,
+        end_ts=hourly[-1].ts,
+        monthly_contribution=Decimal("100000"),
+    )
+
+    assert "BTC" in result.dca_positions
+    assert result.dca_positions["BTC"].qty * Decimal("100") == Decimal("50")  # config, not 999
+
+
+@pytest.mark.parametrize(
+    "size_usd",
+    [Decimal("0"), Decimal("-50"), Decimal("Infinity"), Decimal("NaN"), "50", True],
+    ids=["zero", "negative", "infinity", "nan", "string", "bool"],
+)
+def test_dca_skips_a_buy_whose_size_usd_is_present_but_invalid(size_usd):
+    """`size_usd` PRESENT but not usable must NOT fall back to `config.dca.budget_usd` (the same
+    orchestrator ruling `executor._dca_budget` enforces live and on paper): a rule that computed
+    an invalid amount meant to buy less, and the sim spending the config's unrelated budget
+    instead would model a buy the rule never asked for. The cycle is skipped instead -- no DCA
+    lot opens at all."""
+    hourly = [
+        _candle(0, "100", "101", "99", "100"),
+        _candle(_HOUR, "100", "102", "98", "101"),
+        _candle(2 * _HOUR, "101", "103", "100", "102"),
+    ]
+    dca_rule = _OnceDcaRule("BTC-USD", size_usd=size_usd)
+    candles_by_asset = {"BTC": {Granularity.ONE_HOUR: hourly, Granularity.ONE_DAY: []}}
+    config = _config(dca=DcaConfig(budget_usd=Decimal("50")))
+
+    result = run(
+        [dca_rule],
+        candles_by_asset,
+        config,
+        start_ts=hourly[0].ts,
+        end_ts=hourly[-1].ts,
+        monthly_contribution=Decimal("100000"),
+    )
+
+    assert "BTC" not in result.dca_positions
+    assert result.dca_buys == []
 
 
 # ---------------------------------------------------------------------------

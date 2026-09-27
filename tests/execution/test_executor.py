@@ -881,24 +881,59 @@ def test_live_dca_sizes_from_the_rules_size_usd_not_the_config_budget(repo, capl
 
 
 @pytest.mark.parametrize(
+    ("size_usd", "expected"),
+    [
+        (25, Decimal("25")),  # an int -- goes through `Decimal(size_usd)`, not `str()`
+        (25.0, Decimal("25")),  # a float with an exact binary representation
+        # 0.1 is NOT exact in binary: `Decimal(0.1)` is
+        # 0.1000000000000000055511151231257827021181583404541015625. `_dca_budget` must go
+        # through `Decimal(str(size_usd))` for a float, or this asserts the wrong number.
+        (0.1, Decimal("0.1")),
+    ],
+    ids=["int", "float_exact", "float_inexact"],
+)
+def test_live_dca_sizes_from_an_int_or_float_size_usd(repo, caplog, size_usd, expected):
+    """(a') `_dca_budget` accepts an `int` or `float` `size_usd`, not just `Decimal` -- and a
+    float is converted via `str()` so `0.1` becomes the decimal a human meant."""
+    broker = FakeBroker()
+
+    with caplog.at_level(logging.INFO, logger="keel.execution.executor"):
+        result = execute(
+            _dca_signal_sized(size_usd),
+            broker,
+            repo,
+            _config(),
+            mode="autonomous",
+            now_ts=NOW_TS,
+        )
+
+    assert result.placed is True, result.vetoed_by
+    order = repo.get_order(result.order_id)
+    assert order["qty"] == expected / Decimal("50000")
+    assert len(broker.place_calls) == 1
+    assert broker.place_calls[0]["spec"].quote_size == expected
+    events = _dca_sizing_events(caplog)
+    assert len(events) == 1
+    assert events[0]["source"] == "rule"
+    assert Decimal(events[0]["budget_usd"]) == expected
+
+
+@pytest.mark.parametrize(
     ("size_usd", "include"),
     [
         (None, False),  # key absent
         (None, True),  # key present, value None
-        (Decimal("0"), True),
-        (Decimal("-25"), True),
-        (Decimal("Infinity"), True),  # `> 0` passes it; see `commands/rules.py` (#840)
-        (Decimal("NaN"), True),
-        ("25", True),  # not a number
-        (True, True),  # a bool is an int in Python; it is not an amount
     ],
-    ids=["absent", "none", "zero", "negative", "infinity", "nan", "string", "bool"],
+    ids=["absent", "none"],
 )
-def test_live_dca_falls_back_to_the_config_budget_without_a_usable_size_usd(
+def test_live_dca_falls_back_to_the_config_budget_when_size_usd_is_absent(
     repo, caplog, size_usd, include
 ):
-    """(b) No positive, finite `size_usd` -> the config's `dca.budget_usd` (50) sizes the buy,
-    and the fallback is recorded as such."""
+    """(b) `size_usd` ABSENT -- the key is missing, or present as `None` -- falls back to the
+    config's `dca.budget_usd` (50), and the fallback is recorded as such. A size_usd that is
+    PRESENT but not usable is a DIFFERENT case (orchestrator ruling 2026-09-27): see
+    `test_live_dca_skips_a_buy_whose_rule_computed_an_invalid_size_usd` below -- that one must
+    NOT fall back, or a rule meant to buy less would spend more."""
     broker = FakeBroker()
 
     with caplog.at_level(logging.INFO, logger="keel.execution.executor"):
@@ -918,6 +953,60 @@ def test_live_dca_falls_back_to_the_config_budget_without_a_usable_size_usd(
     assert len(events) == 1
     assert events[0]["source"] == "config"
     assert Decimal(events[0]["budget_usd"]) == Decimal("50")
+
+
+def _dca_size_invalid_events(caplog: pytest.LogCaptureFixture) -> list[dict[str, Any]]:
+    from keel_core.telemetry import _FIELDS_ATTR
+
+    return [
+        getattr(r, _FIELDS_ATTR)
+        for r in caplog.records
+        if r.getMessage() == "executor.dca_size_invalid"
+    ]
+
+
+@pytest.mark.parametrize(
+    "size_usd",
+    [
+        Decimal("0"),
+        Decimal("-25"),
+        Decimal("Infinity"),  # `> 0` alone passes it; see `commands/rules.py` (#840)
+        Decimal("NaN"),
+        "25",  # not a number
+        True,  # a bool is an int in Python; it is not an amount
+    ],
+    ids=["zero", "negative", "infinity", "nan", "string", "bool"],
+)
+def test_live_dca_skips_a_buy_whose_rule_computed_an_invalid_size_usd(repo, caplog, size_usd):
+    """(b') `size_usd` PRESENT but not usable must NEVER fall back to the config (orchestrator
+    ruling 2026-09-27): a rule that computed 0, a negative amount, a non-finite value, or
+    garbage meant to buy LESS -- or nothing -- and spending the config's larger, unrelated
+    `budget_usd` would spend MORE than the rule asked for. The buy is skipped instead: no
+    broker call (`NoNetworkBroker` proves it), no order row, and a WARNING logged."""
+    broker = NoNetworkBroker()
+
+    with caplog.at_level(logging.WARNING, logger="keel.execution.executor"):
+        result = execute(
+            _dca_signal_sized(size_usd),
+            broker,
+            repo,
+            _config(),
+            mode="autonomous",
+            now_ts=NOW_TS,
+        )
+
+    assert result.placed is False
+    assert result.order_id is None
+    assert result.vetoed_by == []
+    assert result.preview is None
+    assert result.reason == (
+        f"dca: rule computed an invalid size_usd={size_usd!r}; buy skipped, not sized from config"
+    )
+    assert repo.get_orders(mode="live") == []
+    events = _dca_size_invalid_events(caplog)
+    assert len(events) == 1
+    assert events[0]["product"] == "BTC-USD"
+    assert events[0]["rule"] == "dca"
 
 
 def test_a_dca_rules_detect_feeds_the_live_order_size_end_to_end(repo):
