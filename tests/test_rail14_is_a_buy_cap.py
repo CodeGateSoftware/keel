@@ -124,3 +124,17 @@ def test_the_claim_detector_catches_the_retracted_paragraph() -> None:
     and `**` wrapped it), so the doc test could not fail. Pinned against the actual old text."""
     assert _claims(_RETRACTED)
     assert not _claims("keel's orders pay the venue's maker/taker fee inside the buy cap")
+
+
+def test_the_config_templates_keel_setup_writes_make_no_free_allowance_claim() -> None:
+    """Review round 2 of #837: `keel setup` copies these templates into a new deployment, so a
+    fee-free claim here would spread to every install. The `fees:` comment used to say Advanced
+    Trade fees applied only "to volume beyond a tier's free allowance"."""
+    for name in ("config.live.yaml", "config.yaml"):
+        text = (_ROOT / "keel/templates" / name).read_text(encoding="utf-8")
+        # YAML comments wrap across lines; drop each line's `#` marker before flattening.
+        flat = " ".join(re.sub(r"^\s*#", " ", text, flags=re.M).split()).lower()
+        assert "beyond a tier's free allowance" not in flat, name
+        assert "always fee-free" not in flat, name
+        assert "no free allowance on advanced trade" in flat, name
+        assert _FEE_NOTE in text, name

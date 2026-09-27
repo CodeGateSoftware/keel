@@ -244,10 +244,12 @@ class LoggingConfig:
 
 @dataclass(frozen=True)
 class FeesConfig:
-    """Coinbase Advanced trading fees applied to volume beyond a tier's free allowance
-    (Issue #86) -- the `<$1k-30d-volume` account tier's published rate. `taker_pct` is the sim's
-    default fee-schedule rate (fills are modeled market-style, at next-bar open); `maker_pct` is
-    exposed for a caller that wants to model limit-order fills instead."""
+    """Coinbase Advanced trading fees (Issue #86). They apply to EVERY keel order: Advanced Trade
+    has no free allowance (#836). The defaults are a conservative sim figure -- the account
+    measured the Intro tier at 0.9% taker / 0.5% maker on 2026-09-27 -- kept so recorded results
+    stay comparable. `taker_pct` is the sim's default fee-schedule rate (fills are modeled
+    market-style, at next-bar open); `maker_pct` is exposed for a caller that wants to model
+    limit-order fills instead."""
 
     taker_pct: Decimal = Decimal("0.012")
     maker_pct: Decimal = Decimal("0.006")

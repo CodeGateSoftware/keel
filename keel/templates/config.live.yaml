@@ -123,12 +123,12 @@ subscription:
   unsubscribed_allowance_usd: 0
   pacing: opportunistic  # opportunistic (monthly cap only) | even_daily (also paces per business day)
 
-# Coinbase One subscription tiers (Issue #86) -- zero-fee monthly TRADING VOLUME (buys + sells)
-# on the main Coinbase platform. NOT Advanced Trade, where keel's orders pay maker/taker fees
-# (#836): the sim's within-cap rows are hypothetical for keel.
-# allowance per tier, used by `keel simulate`'s tier/fee analysis matrix to compare staying
-# within a tier's free volume (throttled, 0 trading fees, but you still pay the subscription)
-# against trading freely and paying the taker fee on volume EXCEEDING it.
+# Coinbase One subscription tiers (Issue #86): each tier's monthly TRADING VOLUME (buys + sells)
+# allowance, used by `keel simulate`'s tier/fee analysis matrix to compare staying within a
+# tier's allowance (throttled, 0 trading fees, but you still pay the subscription) against
+# trading freely and paying the taker fee on volume EXCEEDING it. That zero-fee allowance is a
+# main-Coinbase-platform benefit, NOT Advanced Trade, where keel's orders pay maker/taker fees
+# (#836) -- so the within-cap rows are hypothetical for keel.
 # free_volume_usd: null means unlimited (Premium -- no cap to exceed).
 tiers:
   - name: Basic
@@ -141,8 +141,10 @@ tiers:
     free_volume_usd: null
     subscription_usd_month: 299.99
 
-# Coinbase Advanced trading fees applied to volume beyond a tier's free allowance, for a
-# <$1k-30d-volume account (Coinbase's published fee schedule). taker_pct is the sim's default --
+# Coinbase Advanced trading fees. They apply to EVERY keel order -- there is no free allowance
+# on Advanced Trade (#836). On 2026-09-27 the account measured the Intro tier at 0.9% taker /
+# 0.5% maker; these values are kept at 1.2% / 0.6% as the conservative sim figure, so recorded
+# results stay comparable. taker_pct is the sim's default --
 # it fills market-style at next-bar open; maker_pct is exposed for a caller that wants to model
 # limit-order fills instead.
 fees:
