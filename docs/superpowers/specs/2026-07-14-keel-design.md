@@ -1,5 +1,11 @@
 # keel — Design Spec
 
+> **Fee note (added 2026-09-27, #836).** This design assumes "the Coinbase One zero-fee benefit
+> covers the trades this tool places". It does not: keel places its orders through Coinbase
+> Advanced Trade, which charges its maker/taker schedule on every order (0.9% taker on the
+> account's Intro tier, 2026-09-27); Coinbase One's zero trading fees apply on the main Coinbase
+> platform only. Nothing on this page has been rewritten.
+
 **Date:** 2026-07-14
 **Status:** ⚠️ SUPERSEDED by `2026-07-15-keel-autotrade-design.md` — that spec extends this preview-only advisory MVP into an autonomous auto-trading agent (SQLite tracking, rule engine, safety rails). This doc remains the record of the original advisory design.
 **Author:** Elmehdi Aitbrahim (with Claude)
