@@ -53,8 +53,11 @@ to call it.
 Deliberately NOT enforced here (outside the spend-cap subset, per the plan): the halal allowlist,
 min-move/anti-scalping, no-averaging-into-losers, no-stop-widening, sell-only-on-rule,
 correlation-adjusted sizing, and stale-data/kill-switch -- those rails need state (an audit log,
-`agent_state`, a live feed) this pure ledger doesn't model. DCA is NOT exempt from any cap
-enforced here, matching rail 14's explicit non-exemption for DCA spend.
+`agent_state`, a live feed) this pure ledger doesn't model. DCA is exempt from exactly the caps
+`guards.check` exempts it from among those enforced here: the total-exposure cap (#841 -- rail 14,
+the monthly allowance, bounds DCA instead) and the rail 11/16 breakers. Every other cap here --
+per-order, per-day, per-asset concentration, USDC-funding and the monthly allowance -- binds DCA,
+matching rail 14's explicit non-exemption for DCA spend.
 
 Two separate position slots (Issue #85): a single per-asset RULE-trade slot (`positions`, one
 open/close position per asset -- risk-defined entries from `pullback_continuation`,
@@ -291,10 +294,11 @@ class SimAccount:
 
     def can_open(self, intent: OpenIntent, config: Config, now_ts: int) -> tuple[bool, list[str]]:
         """Check `intent` against every spend cap, collecting *all* violations (no
-        short-circuit), mirroring `execution.guards.check`. DCA is not exempt from any of these
-        (matches rail 14). This is the hard safety veto -- callers (e.g. `sim.portfolio_sim`)
-        that want to avoid tripping it should CLAMP a candidate notional down to
-        `max_affordable_notional` first, not weaken this check."""
+        short-circuit), mirroring `execution.guards.check`. DCA is exempt from the total-exposure
+        cap and the rail 11/16 breakers, exactly as in `guards.check` (#841), and bound by every
+        other cap here (matches rail 14). This is the hard safety veto -- callers (e.g.
+        `sim.portfolio_sim`) that want to avoid tripping it should CLAMP a candidate notional down
+        to `max_affordable_notional` first, not weaken this check."""
         reasons: list[str] = []
 
         # per-order $ cap (optional -- non-binding by default, see keel.config.Caps)
@@ -313,10 +317,13 @@ class SimAccount:
                 f"{projected_day} exceeds max_per_day_usd {config.caps.max_per_day_usd}"
             )
 
-        # total open-exposure cap (rule + DCA combined)
+        # total open-exposure cap (rule + DCA combined) -- DCA exempt, matching `guards.check`'s
+        # `is_buy and not intent.is_dca` gate on rail 4 (#841): rail 14 bounds DCA, not
+        # `max_exposure_usd`. DCA lots still count in `_total_notional`, so they still consume
+        # the headroom a RULE entry sees here.
         total_exposure = self._total_notional()
         projected_exposure = total_exposure + intent.notional
-        if projected_exposure > config.caps.max_exposure_usd:
+        if not intent.is_dca and projected_exposure > config.caps.max_exposure_usd:
             reasons.append(
                 f"total_exposure_cap: open exposure {total_exposure} + {intent.notional} = "
                 f"{projected_exposure} exceeds max_exposure_usd {config.caps.max_exposure_usd}"
