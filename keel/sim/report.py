@@ -100,6 +100,7 @@ __all__ = [
     "edge_table",
     "group_trades_by_class",
     "render_markdown",
+    "rule_keys",
 ]
 
 # G1: an asset's ONE_HOUR coverage below this many bars (~166 days) is excluded from the pooled
@@ -120,6 +121,37 @@ DEFAULT_MAE_MFE_THRESHOLD = Decimal("50")
 
 # `edge_table`'s pooled entry key.
 POOLED_KEY = "__pooled__"
+
+
+def rule_keys(rules: list[Rule]) -> list[str]:
+    """One row key per rule in `rules`, positionally -- unique across the list (#829).
+
+    The key is `"{rule.name}:{asset}"`, which is what every existing reader of these tables
+    expects, and it stays exactly that whenever it is unique. Only rules that SHARE it -- two
+    rules of one kind on one asset, e.g. the deployment's $50 and $5 BTC DCA rows -- are told
+    apart, by their `rules.id` (`"dca#19:BTC"`), or by their 1-based position among the
+    colliding rules when a hand-built rule has no id. Before this, the later rule overwrote the
+    earlier one's row, and `group_trades_by_class`, looking both up by the shared key, counted
+    the survivor twice and the other not at all.
+
+    `edge_table`, `accumulation_table` and `group_trades_by_class` must each be handed the SAME
+    `rules` list for their keys to agree -- `simulate` passes one list to all three.
+    """
+    bases = [f"{rule.name}:{_asset(rule.product_id)}" for rule in rules]
+    counts: dict[str, int] = {}
+    for base in bases:
+        counts[base] = counts.get(base, 0) + 1
+    seen: dict[str, int] = {}
+    keys: list[str] = []
+    for rule, base in zip(rules, bases, strict=True):
+        if counts[base] == 1:
+            keys.append(base)
+            continue
+        seen[base] = seen.get(base, 0) + 1
+        tag = rule.rule_id if rule.rule_id is not None else seen[base]
+        keys.append(f"{rule.name}#{tag}:{_asset(rule.product_id)}")
+    return keys
+
 
 # A coverage "first_ts starts this much later than requested" margin (30 days) before flagging
 # partial history -- small pagination/inception-boundary slop shouldn't itself be a gap.
@@ -166,9 +198,10 @@ def edge_table(
     convention). A rule is backtested on the series for ITS OWN trading timeframe
     (`_rule_trading_tf` -- `ONE_HOUR` for the hourly rules, `ONE_DAY` for the daily-native
     `TurtleBreakout`), with the `ONE_HOUR` series passed as `finer_candles` for intrabar
-    stop/target resolution when the rule's own timeframe is coarser. Results are keyed
-    `"{rule.name}:{asset}"` (not bare `rule.name`) so two rules of the same kind bound to
-    different assets don't collide. `POOLED_KEY` (`"__pooled__"`) holds
+    stop/target resolution when the rule's own timeframe is coarser. Results are keyed by
+    `rule_keys` -- `"{rule.name}:{asset}"`, so two rules of the same kind on different assets
+    don't collide, and disambiguated by rule id when two share one asset (#829).
+    `POOLED_KEY` (`"__pooled__"`) holds
     `strategy.stats.summarize()` over every rule's trades in EXIT-TIME order
     (`_chronological`) -- the pooled sample `build_verdict`'s G2 gate is checked against, and
     whose drawdown must be a path that happened, not one rule's history followed by the next's.
@@ -191,7 +224,7 @@ def edge_table(
     results: dict[str, BacktestResult] = {}
     pooled_trades = []
 
-    for rule in rules:
+    for rule, key in zip(rules, rule_keys(rules), strict=True):
         if rule.accumulates:
             continue
         asset = _asset(rule.product_id)
@@ -207,7 +240,7 @@ def edge_table(
             slippage_pct=slippage_pct,
             slippage_by_product=slippage_by_product,
         )
-        results[f"{rule.name}:{asset}"] = result
+        results[key] = result
         pooled_trades.extend(result.trades)
 
     results[POOLED_KEY] = summarize(_chronological(pooled_trades))
@@ -222,7 +255,8 @@ def accumulation_table(
     slippage_by_product: Callable[[str], Decimal] | None = None,
 ) -> dict[str, DcaSleeve]:
     """The edge pass for ACCUMULATING rules (`Rule.accumulates` -- `Dca`), keyed like
-    `edge_table` (`"{rule.name}:{asset}"`) but never mixed into it (#821).
+    `edge_table` (`rule_keys`: `"{rule.name}:{asset}"`, disambiguated on collision) but never
+    mixed into it (#821).
 
     Each rule is driven over its asset's `ONE_DAY` series, one completed day at a time: every
     bar in that series has closed, so `Dca.detect`'s completed-day guard keeps them all, and
@@ -238,7 +272,7 @@ def accumulation_table(
     zero-buy row rather than raising.
     """
     rows: dict[str, DcaSleeve] = {}
-    for rule in rules:
+    for rule, key in zip(rules, rule_keys(rules), strict=True):
         if not rule.accumulates:
             continue
         asset = _asset(rule.product_id)
@@ -271,7 +305,7 @@ def accumulation_table(
             qty += buy_qty
             cost += fill * buy_qty * (Decimal(1) + fee_pct)
         last_close = daily[-1].close if daily else Decimal("0")
-        rows[f"{rule.name}:{asset}"] = DcaSleeve.marked(buys, qty, cost, last_close)
+        rows[key] = DcaSleeve.marked(buys, qty, cost, last_close)
     return rows
 
 
@@ -296,14 +330,15 @@ def group_trades_by_class(
     `build_verdict`'s G2 gate checks against each class's own floor (KB §25.5): a
     low-win/high-R:R trend-follower is judged by the trend floor rather than the global one,
     while other classes keep the canonical floor. `edge` is `edge_table`'s output; its
-    per-rule keys are `"{rule.name}:{asset}"` (the `POOLED_KEY` entry is ignored -- it pools
+    per-rule keys come from `rule_keys(rules)`, so `rules` must be the list `edge_table` was
+    given (the `POOLED_KEY` entry is ignored -- it pools
     across *all* classes and so isn't meaningful per-class). A rule whose edge entry is
     missing is skipped (absent data is a coverage gap, not a crash -- mirrors `edge_table`).
     Each class's pool is summarised in exit-time order, like `edge_table`'s (`_chronological`).
     """
     trades_by_class: dict[str, list[Trade]] = {}
-    for rule in rules:
-        result = edge.get(f"{rule.name}:{_asset(rule.product_id)}")
+    for rule, key in zip(rules, rule_keys(rules), strict=True):
+        result = edge.get(key)
         if result is None:
             continue
         trades_by_class.setdefault(promotion_class_of(rule), []).extend(result.trades)
