@@ -199,8 +199,8 @@ RESEARCH_INDEX: tuple[ResearchModuleEntry, ...] = (
     ResearchModuleEntry(
         module="throughput.py",
         question=(
-            "Allowance-throughput planning: how many signals a venue's fee-free volume "
-            "allowance can actually carry per month, and how long -- in EFFECTIVE "
+            "Allowance-throughput planning: how many signals a venue's monthly buy cap "
+            "(rail 14) can actually carry per month, and how long -- in EFFECTIVE "
             "observations, via the herding design effect -- the evidence honestly takes to "
             "gather."
         ),
@@ -755,7 +755,7 @@ def research_throughput(
     products_json: str | None,
     allowances_json: str | None,
 ) -> None:
-    """Allowance-throughput planning: how many signals a fee-free allowance can carry a month,
+    """Allowance-throughput planning: how many signals a monthly buy cap can carry a month,
     and how long the evidence honestly takes to accumulate (throughput.py).
 
     Pure arithmetic -- no db, no candles, no rule. `--venues-json` states what

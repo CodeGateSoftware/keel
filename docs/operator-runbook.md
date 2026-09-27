@@ -998,7 +998,8 @@ fourth does not, which is most of why they drift apart.
   actual equity it stops binding before available cash does, and the refusal comes later and less
   legibly from the funding check (rail 13). In paper mode the proxy is bypassed: sizing uses the
   paper account's own equity.
-- **rail 14's monthly allowance** — the fee-free monthly BUY volume. It lives in the **database,
+- **rail 14's monthly buy cap** — the most the agent may BUY in a UTC month. It is a cap, not a
+  fee waiver: Advanced Trade orders pay the venue's maker/taker fee inside it (#836). It lives in the **database,
   not `config.yaml`**: the `broker_subscriptions` row written by `keel subscription attest --venue
   coinbase --tier <tier>`, or set directly with `keel subscription set --free-volume-usd N`.
   `config.yaml` only supplies the tier catalogue and the unattested fallback

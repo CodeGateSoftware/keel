@@ -1367,7 +1367,8 @@ def simulate(
     `docs/superpowers/plans/2026-07-17-engine-validation-simulation.md` Task 8.
 
     Also computes a Coinbase One subscription-tier/fee analysis (Issue #86): for each configured
-    tier (`config.tiers`), whether staying WITHIN its fee-free monthly trading-volume allowance
+    tier (`config.tiers`), whether staying WITHIN its monthly trading-volume allowance -- priced at
+    zero fee, which is hypothetical for keel's Advanced Trade orders (#836) --
     (a separate, throttled sim run per finite-free-volume tier) or trading freely and paying the
     taker fee on volume EXCEEDING it ("over cap") nets out ahead. This means up to 3 total sim
     passes (natural + one throttled run per finite-free-volume tier) unless `--skip-within-cap`.

@@ -3,8 +3,9 @@ actually paid?
 
 This module measures. It does not score, gate, or change anything. It is report-only evidence
 for the promotion gate, and its most important output is the refusal: the honest result to
-date is that no shipped family is net positive at the 120 bp taker fee and the fee-free
-allowance reconstruction sits at break-even, so a significance tool here must be able to say
+date is that no shipped family is net positive at the 120 bp taker fee and the zero-fee
+reconstruction sits at break-even (a regime keel's orders never reach, #836), so a significance
+tool here must be able to say
 "not distinguishable from zero" and mean it. A tool that cannot say no is a flattery tool.
 
 The question is a one-proportion test with the break-even as the null, priced at the fee
@@ -13,11 +14,14 @@ actually paid:
 * **Break-even from payoff.** A family whose average win is `b` times its average loss breaks
   even at win rate `1/(1+b)` (the note's eq. 3 with `kappa` folded into the prices the
   backtest already charges). The edge is `win_rate - break_even`, in win-rate points.
-* **Two fee regimes, never an average of them.** Outside the venue's fee-free volume
-  allowance every round trip pays the taker rate on both legs; inside it pays none. The same
+* **Two fee regimes, never an average of them.** At the taker rate every round trip pays it
+  on both legs; at zero it pays none. **The zero-fee regime is hypothetical for keel's orders**
+  (#836): they go through Coinbase Advanced Trade, which has no fee-waiver tier, so a
+  deployment's realistic figure is the taker one. The same
   reconstructed trades are evaluated at BOTH rates because the cross-verification
   (`docs/research/2026-08-20-quant-lab-note-cross-verification.md` §5) showed the fee IS the
-  result: decisively negative outside, indistinguishable from break-even inside. `fee_pct`
+  result: decisively negative at the taker rate, indistinguishable from break-even at zero.
+  `fee_pct`
   is a parameter, not a constant, so a deployment threads its own `config.fees.taker_pct`.
 * **n_eff, never raw n (#427).** Signals fire in herds (~8 assets the same day, ICC 0.212),
   so pooled trades are divided by `throughput.design_effect()` before any standard error is
@@ -232,7 +236,9 @@ def render_family(stat: FamilySignificance) -> list[str]:
     if stat.fee_pct > 0:
         fee_phrase = f"the {fee_bp} bp taker fee"
     else:
-        fee_phrase = "the fee-free allowance"
+        # A zero fee is a HYPOTHETICAL regime for keel's orders: Advanced Trade has no fee-waiver
+        # tier, and the account pays its maker/taker schedule inside rail 14's cap too (#836).
+        fee_phrase = "a zero fee (hypothetical: Advanced Trade orders are never fee-free, #836)"
 
     if stat.verdict == "insufficient_n":
         verdict_line = (

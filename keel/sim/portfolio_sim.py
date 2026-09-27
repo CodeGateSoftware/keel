@@ -341,8 +341,9 @@ def run(
     `monthly_volume_cap` (Issue #86, Coinbase One tier/fee analysis): when `None` (default), the
     account trades naturally -- sizing is clamped only by `SimAccount.max_affordable_notional`'s
     existing six caps (cash / concentration / exposure / etc, Issue #85), which can push a
-    month's trading VOLUME (buys+sells) past any particular subscription tier's fee-free
-    allowance. When set to a `Decimal`, every order's clamp ALSO floors headroom to the volume
+    month's trading VOLUME (buys+sells) past any particular subscription tier's monthly
+    volume allowance. When set to a `Decimal`, every order's clamp ALSO floors headroom to the
+    volume
     remaining before that ceiling this UTC month, so the account never trades enough in a month
     to exceed `monthly_volume_cap` -- i.e. it never owes a fee under a tier whose free allowance
     equals `monthly_volume_cap`. This throttles both the RULE-slot clamp and the DCA sleeve (DCA
@@ -708,7 +709,7 @@ def _process_dca_signals(
         if monthly_volume_cap is not None:
             remaining = monthly_volume_cap - account.month_volume(now_ts)
             if notional > remaining:
-                continue  # would exceed the fee-free monthly volume cap -- skip this cycle
+                continue  # would exceed the tier's monthly volume allowance -- skip this cycle
 
         intent = OpenIntent(
             asset=asset,

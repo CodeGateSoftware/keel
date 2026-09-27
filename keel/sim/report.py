@@ -991,10 +991,15 @@ def _render_tier_section(tier_results: list[TierFeeResult]) -> list[str]:
     lines = [
         "## Subscription tier & fee analysis",
         "",
-        "For each Coinbase One tier: staying WITHIN the fee-free monthly trading-volume "
+        "For each Coinbase One tier: staying WITHIN the tier's monthly trading-volume "
         "allowance (a throttled run, 0 trading fees, subscription still due) vs trading freely "
         'and paying the taker fee on volume EXCEEDING it ("over cap"). Premium\'s allowance is '
         "unlimited, so its within-cap and over-cap rows are identical.",
+        "",
+        "**The within-cap rows are HYPOTHETICAL for keel's orders.** Coinbase One's zero trading "
+        "fees apply on the main Coinbase platform, not Advanced Trade, where keel places its "
+        "orders and pays the maker/taker schedule inside any cap (#836). Read the over-cap rows "
+        "as the realistic ones.",
         "",
     ]
     if not tier_results:

@@ -67,8 +67,9 @@ def _non_negative_int(value: Any, key: str) -> int:
 
 
 # Issue #85: `max_per_order_usd`/`max_per_day_usd` were Phase-1 PLACEHOLDER guesses ($100/$300),
-# never real Coinbase limits -- Coinbase One's only subscription constraint is monthly fee-free
-# trading VOLUME (`SubscriptionConfig.assumed_free_volume_usd`), not a per-order or per-day $ cap.
+# never real Coinbase limits -- Coinbase One's only subscription constraint is a monthly zero-fee
+# trading VOLUME (main Coinbase platform only -- not Advanced Trade, where keel trades, #836)
+# (`SubscriptionConfig.assumed_free_volume_usd`), not a per-order or per-day $ cap.
 # Risk-sized rule orders routinely land in the $400-24k range, so a $100/$300 default silently
 # rejected 100% of them. These two fields are now OPTIONAL internal risk knobs -- a user MAY
 # still tighten them in `config.yaml` -- but absent an explicit value they default to this
@@ -180,7 +181,8 @@ _VALID_AUTO_TRADE_MODES = ("paper", "confirm")
 class SubscriptionConfig:
     """Subscription-related settings. Three fields, three distinct roles — do not conflate them.
 
-    `assumed_free_volume_usd` is the **simulator's** assumed fee-free monthly volume
+    `assumed_free_volume_usd` is the **simulator's** assumed monthly volume allowance (priced at
+    zero fee in the tier analysis -- hypothetical for keel's Advanced Trade orders, #836)
     (`sim/account.py`'s `_monthly_allowance_cap`). It is a pinned, reproducible assumption for
     backtests. It is NOT the live cap: rail 14 derives that from the attested
     `broker_subscriptions` record, so that upgrading a tier changes one place. This field was

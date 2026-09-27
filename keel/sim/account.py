@@ -84,8 +84,10 @@ Bookkeeping notes:
   `exit_fill = price * (1 - slippage_pct)`, `fee = fill * qty * fee_pct` on each leg.
 
 **Sim/live divergence, intentional and documented (Issue #85):** `_day_volume`/`_month_volume`
-sum BOTH opens (buys) AND closes (sells) as trading VOLUME -- matching Coinbase One's actual
-fee-free perk, which is a monthly *volume* allowance, not a buy-only spend cap.
+sum BOTH opens (buys) AND closes (sells) as trading VOLUME -- matching Coinbase One's zero-fee
+perk, which is a monthly *volume* allowance, not a buy-only spend cap. That perk applies on the
+main Coinbase platform, not Advanced Trade where keel trades (#836), so the sim's allowance is
+modelled, not a fee waiver keel's orders receive.
 `execution.guards.check` (rails 3/14, `_daily_spend_usd`/`_monthly_buy_spend_usd`) still counts
 BUY notional only, and is deliberately left untouched by this issue (live executor/guards are a
 separate, safety-reviewed follow-up). This means `SimAccount.can_open` and `guards.check` can

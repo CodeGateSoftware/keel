@@ -364,8 +364,9 @@ class PooledSample:
 def realized_fee_pct(trips: Sequence[RoundTrip]) -> Decimal:
     """The pool's realized fee fraction: fees paid over notional traded, both legs.
 
-    The forward trades' regime is an OUTCOME, not an assumption — inside the fee-free
-    allowance this is ~0, at the taker rate ~120 bp — so it is measured off the same round
+    The forward trades' regime is an OUTCOME, not an assumption — at a zero fee this would be
+    ~0 (a regime keel's Advanced Trade orders never reach, #836), at the taker rate ~120 bp — so
+    it is measured off the same round
     trips the win rate is, and reported beside it. Where a pure ledger row contributes (no
     orders twin), its fee is the exit leg only, so the fraction is a lower bound —
     `render_report` labels it rather than letting it pose as the both-legs figure.
