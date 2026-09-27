@@ -1,6 +1,6 @@
 # Accumulation policy: bounded value averaging and band rebalancing vs static DCA: design
 
-**Date:** 2026-09-27 · **Issue:** #831 · **Status:** DRAFT, for review. No code or simulation
+**Date:** 2026-09-27 · **Issue:** #831 · **Status:** DRAFT, revision 2 (selective trimming, band floor, dual bootstrap blocks), for review. No code or simulation
 runs until this is approved. §9 lists the decisions the review has to make.
 
 ## 1. Purpose and non-goals
@@ -85,11 +85,27 @@ month *t*'s trades, `H_t = Σ_i H_{t,i}`, and `t = 1, 2, …` the month index.
 
   If every `s_i = 0`, the arm splits D by `w_i`. It never sells, so it pays no sell fees and
   raises no sale-rail question (§6). It is the cheapest way to lean towards targets.
-- **D. DCA plus threshold band rebalancing (sells).** Arm A's monthly buy, then, on the same
-  day, if **any** asset's weight drifts outside a **±15% relative band**
-  (`|h_i / H − w_i| > 0.15 · w_i`, decision **D5**), trade every asset back to `w_i`: sell
-  overweights, then buy underweights with the proceeds. A *relative* band scales with the
-  weight: BTC's corridor is 25.5–34.5%, and a 6% asset's is 5.1–6.9%.
+- **D. DCA plus selective band trimming (sells).** Each month, in this order:
+  1. **Buy** `w_i · D` of each asset, as in arm A.
+  2. **Trim, selectively.** Only an asset **above its upper band** (`h_i / H > w_i + b_i`) is
+     sold, and only down to `w_i`. Assets inside their bands are not touched; unneeded churn
+     costs fees, and sales are never free (§4).
+  3. **Redeploy** the trim proceeds, net of fees and slippage, to assets **below `w_i`**, in
+     proportion to each one's shortfall (arm C's formula applied to the proceeds).
+
+  The band is **`b_i = max(0.15 · w_i, 0.015)`**: ±15% relative, with an absolute floor of
+  ±1.5 points (decision **D5**). The floor keeps small sleeves from triggering on noise:
+
+  | weight `w_i` | relative 15% | `b_i` | corridor | binding |
+  |---|---|---|---|---|
+  | 0.30 (BTC) | 0.045 | 0.045 | 25.5–34.5% | relative |
+  | 0.20 (ETH, PAXG) | 0.030 | 0.030 | 17.0–23.0% | relative |
+  | 0.06 (SOL, XLM, LTC, ADA, LINK) | 0.009 | 0.015 | 4.5–7.5% | floor |
+
+  In the PAXG-free primary run the weights are renormalised (BTC 0.375, ETH 0.25, the others
+  0.075), and the same formula applies: BTC 0.056, ETH 0.0375, the others 0.015.
+  **A lower-band breach alone triggers no trade.** An underweight asset is filled only from
+  trim proceeds or from the regular monthly buy; buying it without a sale would just be arm C.
 
 That is three treatments against one baseline: three comparisons, stated beside every
 difference.
@@ -138,16 +154,21 @@ hit, so the design isn't chosen blind:
 - **Primary comparison:** the Sortino difference between each arm and A, with the max
   drawdown difference beside it.
 - **Inference.** One historical path is one sample. A **stationary block bootstrap** of
-  *joint* daily asset returns (keeping cross-correlation; mean block 20 days; 2,000 paths;
-  fixed seed) runs every arm on the same resampled paths. The quantity reported is the
-  distribution of Δ(arm − A).
-  - **Stated limitation:** 20-day blocks destroy multi-month mean reversion, which is exactly
-    what value averaging feeds on, so the bootstrap is biased *against* arm B. A 60-day-block
-    sensitivity is reported beside it, and the historical path is always shown.
-- **Decision rule (draft, decision D6):** an arm is "better than static DCA" only if
-  `P(ΔSortino > 0) ≥ 0.95` across bootstrap paths **and** its median Δmax-drawdown is not
-  worse. Anything else is "not better than static DCA after fees": a complete and useful
-  result.
+  *joint* daily asset returns (keeping cross-correlation; 2,000 paths per block length; fixed
+  seed) runs every arm on the same resampled paths. The quantity reported is the distribution
+  of Δ(arm − A), at **two mean block lengths, reported side by side in every results table**:
+  - **20 days:** short-term noise. This destroys multi-month mean reversion, which is exactly
+    what value averaging feeds on, so it is biased *against* arm B.
+  - **60 days:** keeps quarter-length cycles. It is closer to the regime value averaging
+    needs, at the cost of fewer effective independent blocks.
+
+  The historical path is always shown beside both.
+- **Decision rule (draft, decision D6):** an arm is "better than static DCA" only if, **under
+  both the 20-day and the 60-day blocks**, `P(ΔSortino > 0) ≥ 0.95` **and** its median
+  Δmax-drawdown is not worse. Requiring both means the block length cannot be chosen after
+  seeing which one favours an arm. An arm that passes at one length only is reported as
+  "block-length-dependent", not "better". Anything else is "not better than static DCA after
+  fees": a complete and useful result.
 - **Expectation (to be recorded before running):** arm C roughly equals A (nearly free,
   small effect); arm B trails in rising markets (cash drag) and leads after drawdowns, with no
   robust Sortino edge; arm D is hurt on the 5-year PAXG-free run (sell fees, correlated
@@ -163,8 +184,8 @@ hit, so the design isn't chosen blind:
 | D2 | Monthly deposit | $500 (the tier's fee-free allowance) |
 | D3 | Fee model | allowance-aware (buys fee-free to $500/month, sells at taker), plus a flat-taker sensitivity run |
 | D4 | Value averaging bounds and path | C_min 0 (buy-only), C_max 3, g = 0 |
-| D5 | Rebalancing band | ±15% **relative** to each target weight, checked monthly |
-| D6 | Decision rule | P(ΔSortino > 0) ≥ 0.95 and median ΔmaxDD not worse |
+| D5 | Rebalancing band and trimming | `b_i = max(0.15·w_i, 0.015)`, checked monthly; **selective**: trim only upper-band breaches down to target, proceeds to underweights by shortfall |
+| D6 | Decision rule | P(ΔSortino > 0) ≥ 0.95 **and** median ΔmaxDD not worse, under **both** 20- and 60-day bootstrap blocks |
 
 A choice to *add* an arm (for example value averaging with sells, or a wider band) should be
 made here, before freezing, so it counts as a declared trial rather than a later one.
