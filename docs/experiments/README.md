@@ -25,6 +25,13 @@ Index is **newest first**, by the date each document carries in its filename.
 
 ## 2026-09
 
+- [`2026-09-27-turtle-sma200-filter.md`](2026-09-27-turtle-sma200-filter.md) — A 200-day SMA
+  trend filter on the daily `turtle_breakout`, **pre-registered** (driver committed before
+  the run): `above`, `slope` and `both` arms against the unfiltered baseline on a common
+  window. **No arm is distinguishable from the baseline.** `slope`/`both` lift the point
+  estimate from +0.27 R to about +0.41 R on 60% of the entries, inside a 95% interval about
+  1.3 R wide; `above` does slightly worse. Also records two trials-ledger write-side defects,
+  fixed in the same change. Driver `2026-09-27-turtle-sma200-filter.py`, data `.jsonl`.
 - [`2026-09-26-hourly-turtle-5year-backtest.md`](2026-09-26-hourly-turtle-5year-backtest.md) — The
   hourly `turtle_breakout` over five years, in R at per-product slippage: **4,871 trades,
   235–289 per product, 0 of 19 positive** at 1.20% or 0.60% taker, and only BTC, ETH and SOL
