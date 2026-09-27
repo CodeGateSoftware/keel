@@ -148,7 +148,11 @@ def compute_row_hash(record: TrialRecord) -> str:
 #: So the check is here, at the write, where it is a refusal rather than a catastrophe. It is also
 #: why #726's gauntlet artifacts are FLAT keys -- `final_p05`, `final_p50` -- rather than a nested
 #: quantile ladder: the shape a reader can survive is the shape a writer may use.
-_SUMMARY_SCALARS = (Decimal, int, float, str, bool)
+#:
+#: NOT `float` (#830). A float is hashed as a JSON number on the write and read back as a
+#: `Decimal`, so the row's own hash never verifies again and `verify_chain` reports it as tampered
+#: forever. Store a `Decimal`, or its numeric string: both round-trip exactly.
+_SUMMARY_SCALARS = (Decimal, int, str, bool)
 
 
 def _validate_summary(summary: Mapping[str, Any]) -> None:
@@ -159,6 +163,18 @@ def _validate_summary(summary: Mapping[str, Any]) -> None:
                 "or None. A nested value would make this append-only ledger unreadable on the "
                 "next read_trials, permanently -- store a flat key per figure instead"
             )
+        # `_decode_summary` reads every string back as `Decimal(value)`, so a word here (a
+        # verdict, an arm name) raises on READ and bricks the chain the same way a nested value
+        # would. Words belong in `params`, which is stored and read back verbatim.
+        if isinstance(value, str):
+            try:
+                Decimal(value)
+            except ArithmeticError:
+                raise ValueError(
+                    f"summary[{key!r}] is the non-numeric string {value!r}; every summary string "
+                    "is read back as a Decimal, so this row would make the ledger unreadable -- "
+                    "put words in params instead"
+                ) from None
 
 
 def _validate(record: TrialRecord) -> None:

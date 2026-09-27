@@ -291,3 +291,59 @@ def test_the_scalar_summary_values_the_gauntlet_writes_all_round_trip(tmp_path) 
     assert stored.summary["dominance_1st"] is True
     assert stored.summary["trial_sharpe_variance"] is None
     assert ledger.verify_chain(path) == []
+
+
+def test_a_non_numeric_string_summary_value_is_refused_at_append_time(tmp_path) -> None:
+    """The same catastrophe through a different door. `_decode_summary` turns every string into
+    `Decimal(value)`, so a word -- a verdict, an arm name -- raises `InvalidOperation` on READ,
+    and one such row bricks the append-only chain forever. A numeric string is fine: it is how
+    a `Decimal` is stored."""
+    path = tmp_path / "ledger.jsonl"
+    for value in ("off", "no improvement distinguishable from the baseline", ""):
+        with pytest.raises(ValueError, match="summary"):
+            ledger.append_trial(
+                path,
+                trial_id="t1",
+                session="s",
+                rule="r",
+                provenance="a_priori",
+                kind="ablation",
+                decision="diagnostic_only",
+                series_missing=True,
+                summary={"verdict": value},
+            )
+    assert not path.exists(), "a refused append must not have written a row"
+
+    ledger.append_trial(
+        path,
+        trial_id="t1",
+        session="s",
+        rule="r",
+        provenance="a_priori",
+        kind="ablation",
+        decision="diagnostic_only",
+        series_missing=True,
+        summary={"expectancy_r": "0.2697"},
+    )
+    (stored,) = ledger.read_trials(path)
+    assert stored.summary["expectancy_r"] == Decimal("0.2697")
+
+
+def test_a_float_summary_value_is_refused_at_append_time(tmp_path) -> None:
+    """A float is hashed as a JSON number when written but read back as a `Decimal`, so the
+    row's own hash never verifies again: `verify_chain` reports it as tampered, forever. A
+    `Decimal` (or its numeric string) round-trips exactly, which is what a summary figure is."""
+    path = tmp_path / "ledger.jsonl"
+    with pytest.raises(ValueError, match="summary"):
+        ledger.append_trial(
+            path,
+            trial_id="t1",
+            session="s",
+            rule="r",
+            provenance="a_priori",
+            kind="ablation",
+            decision="diagnostic_only",
+            series_missing=True,
+            summary={"win_rate": 0.2673},
+        )
+    assert not path.exists(), "a refused append must not have written a row"
