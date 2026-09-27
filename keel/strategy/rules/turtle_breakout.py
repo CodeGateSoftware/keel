@@ -154,7 +154,18 @@ class TurtleBreakout(Rule):
             "nominal take-profit distance in R; the real exit is the channel-low -- it "
             "exists to clear the engine's rr>=1 kill-zone gate and let winners run."
         ),
+        "trend_filter": (
+            "long-term trend gate on entries (default off): 'above' = close over its SMA, "
+            "'slope' = SMA rising, 'both'. Fewer entries against a falling market (#830)."
+        ),
+        "trend_sma_period": "SMA length (bars) for trend_filter; 200 = the classic 200-day.",
+        "trend_slope_lookback": (
+            "bars back the SMA slope is measured over when trend_filter is slope/both."
+        ),
     }
+
+    #: `trend_filter`'s closed vocabulary. "off" is the default and filters nothing.
+    TREND_FILTERS: tuple[str, ...] = ("off", "above", "slope", "both")
 
     # The declared parameter space (issue #528): what a sweep may legitimately explore on
     # this rule, stated HERE so the trials count is derived from the rule rather than
@@ -199,6 +210,9 @@ class TurtleBreakout(Rule):
         volume_ma_period: int = 20,  # lookback for the average-volume comparison (days)
         volume_mult: float = 1.2,  # breakout volume must exceed volume_mult x the average
         target_rr: Decimal = Decimal("6"),  # distant nominal take-profit; see detect()
+        trend_filter: str = "off",  # long-term SMA gate (#830): off | above | slope | both
+        trend_sma_period: int = 200,  # the SMA's length, in bars of `granularity`
+        trend_slope_lookback: int = 5,  # slope = SMA[t] - SMA[t - lookback]
         name: str = "turtle_breakout",
     ) -> None:
         if entry_lookback <= 0:
@@ -211,6 +225,14 @@ class TurtleBreakout(Rule):
             raise ValueError("atr_period must be positive")
         if volume_ma_period <= 0:
             raise ValueError("volume_ma_period must be positive")
+        if trend_filter not in self.TREND_FILTERS:
+            raise ValueError(
+                f"trend_filter must be one of {self.TREND_FILTERS}, not {trend_filter!r}"
+            )
+        if trend_sma_period <= 0:
+            raise ValueError("trend_sma_period must be positive")
+        if trend_slope_lookback <= 0:
+            raise ValueError("trend_slope_lookback must be positive")
 
         self.name = name
         self.product_id = product_id
@@ -229,6 +251,9 @@ class TurtleBreakout(Rule):
             "volume_ma_period": volume_ma_period,
             "volume_mult": volume_mult,
             "target_rr": target_rr,
+            "trend_filter": trend_filter,
+            "trend_sma_period": trend_sma_period,
+            "trend_slope_lookback": trend_slope_lookback,
         }
         # memoizes the S1-filter decision by the completed-history's last ts, so the account
         # sim's repeated intraday calls on the same forming day don't re-replay (only ever
@@ -322,6 +347,9 @@ class TurtleBreakout(Rule):
                 "adx", adx=adx_now, adx_threshold=self.params["adx_threshold"], **breakout
             )
 
+        if self.params["trend_filter"] != "off" and not self._passes_trend_filter(daily, breakout):
+            return None
+
         if self.params["use_macd_confirm"]:
             closes = [float(c.close) for c in work]
             histogram = macd(closes)[2]
@@ -387,6 +415,40 @@ class TurtleBreakout(Rule):
             context=context,
             ts=current.ts,
         )
+
+    def _passes_trend_filter(self, daily: list[Candle], breakout: dict) -> bool:
+        """The long-term trend gate (#830): `True` lets the entry through; `False` has already
+        recorded why on `last_rejection`.
+
+        A simple moving average of `trend_sma_period` closes, ending at the decision bar.
+        `above` needs the close over it; `slope` needs it higher than it was
+        `trend_slope_lookback` bars ago; `both` needs both. It runs after the ADX gate, so it
+        only costs anything on a bar that has already broken out in a trend.
+
+        Too little history to compute it DECLINES (`trend_filter_history`) rather than passing:
+        a filtered rule must never take an entry its filter could not see, or an arm measured
+        "with the filter" would include trades made without it.
+        """
+        period = self.params["trend_sma_period"]
+        lookback = self.params["trend_slope_lookback"]
+        mode = self.params["trend_filter"]
+        needed = period + (lookback if mode in ("slope", "both") else 0)
+        if len(daily) < needed:
+            self._decline("trend_filter_history", bars=len(daily), bars_needed=needed, **breakout)
+            return False
+        closes = [float(c.close) for c in daily[-needed:]]
+        sma_now = sum(closes[-period:]) / period
+        numbers: dict = {"sma": sma_now, "trend_filter": mode}
+        passes = True
+        if mode in ("above", "both"):
+            passes = passes and closes[-1] > sma_now
+        if mode in ("slope", "both"):
+            sma_before = sum(closes[-period - lookback : -lookback]) / period
+            numbers["sma_before"] = sma_before
+            passes = passes and sma_now > sma_before
+        if not passes:
+            self._decline("trend_filter", **numbers, **breakout)
+        return passes
 
     def exit_signal(self, held: Setup, candles_by_tf: dict[Granularity, list[Candle]]) -> bool:
         """The asymmetric Turtle channel exit: a close at/below the prior exit-lookback

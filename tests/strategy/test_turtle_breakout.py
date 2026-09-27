@@ -806,3 +806,119 @@ class TestVolumeFilter:
         series = _with_breakout_volume(_breakout_candles(), breakout_vol=110.0)
         assert _rule(min_volume_filter=True).detect({Granularity.ONE_DAY: series}) is None
         assert _rule(min_volume_filter=False).detect({Granularity.ONE_DAY: series}) is not None
+
+
+# -- the 200-day SMA trend filter (#830) -----------------------------------------------------------
+#
+# Small periods so the fixtures stay readable: a 10-bar SMA and a 5-bar slope lookback stand in
+# for the 200 / 5 the experiment runs. `adx_threshold=0` takes the ADX gate out of the way -- the
+# filter runs after it, and these tests are about the filter alone. Every fixture asserts its own
+# premise (above/below the SMA, rising/falling slope, a real breakout) so it cannot pass for the
+# wrong reason.
+
+_TF = {"trend_sma_period": 10, "trend_slope_lookback": 5, "adx_threshold": 0.0}
+
+
+def _closes_to_candles(closes: list[float]) -> list[Candle]:
+    return [_candle(i, c, c + 0.5, c - 0.5, c) for i, c in enumerate(closes)]
+
+
+def _rising() -> list[float]:
+    return [100.0 + i for i in range(30)] + [140.0]
+
+
+def _above_but_falling() -> list[float]:
+    return [300.0 - 6 * i for i in range(30)] + [128.0, 130.0, 132.0, 134.0, 136.0, 175.0]
+
+
+def _below_but_rising() -> list[float]:
+    return [100.0 + 10 * i for i in range(25)] + [275.0 + 2 * i for i in range(5)] + [290.0]
+
+
+def _sma(closes: list[float], period: int, back: int = 0) -> float:
+    end = len(closes) - back
+    return sum(closes[end - period : end]) / period
+
+
+def _premise(closes: list[float], above: bool, rising: bool) -> None:
+    assert closes[-1] > max(closes[-6:-1]), "fixture is not a 5-bar Donchian breakout"
+    assert (closes[-1] > _sma(closes, 10)) is above
+    assert (_sma(closes, 10) > _sma(closes, 10, back=5)) is rising
+
+
+def _fires(trend_filter: str, closes: list[float]) -> bool:
+    rule = _rule(trend_filter=trend_filter, **_TF)
+    return rule.detect({Granularity.ONE_DAY: _closes_to_candles(closes)}) is not None
+
+
+class TestTrendFilter:
+    def test_off_by_default_and_unchanged(self) -> None:
+        rule = TurtleBreakout(product_id="BTC-USD")
+        assert rule.params["trend_filter"] == "off"
+        assert rule.params["trend_sma_period"] == 200
+        assert rule.params["trend_slope_lookback"] == 5
+        # below a falling SMA, and it still fires: "off" filters nothing.
+        _premise(_above_but_falling(), above=True, rising=False)
+        _premise(_below_but_rising(), above=False, rising=True)
+        assert _fires("off", _above_but_falling())
+        assert _fires("off", _below_but_rising())
+
+    def test_above_requires_the_close_above_the_sma(self) -> None:
+        _premise(_rising(), above=True, rising=True)
+        assert _fires("above", _rising())
+        assert _fires("above", _above_but_falling())
+        assert not _fires("above", _below_but_rising())
+
+    def test_slope_requires_a_rising_sma(self) -> None:
+        assert _fires("slope", _rising())
+        assert not _fires("slope", _above_but_falling())
+        assert _fires("slope", _below_but_rising())
+
+    def test_both_requires_both(self) -> None:
+        assert _fires("both", _rising())
+        assert not _fires("both", _above_but_falling())
+        assert not _fires("both", _below_but_rising())
+
+    def test_a_filtered_bar_names_the_gate_and_the_numbers(self) -> None:
+        closes = _below_but_rising()
+        rule = _rule(trend_filter="above", **_TF)
+        assert rule.detect({Granularity.ONE_DAY: _closes_to_candles(closes)}) is None
+        assert rule.last_rejection is not None
+        assert rule.last_rejection["gate"] == "trend_filter"
+        assert rule.last_rejection["sma"] == _sma(closes, 10)
+
+    def test_too_little_history_for_the_sma_declines_rather_than_passing(self) -> None:
+        """A filter that cannot be evaluated must not wave the entry through: that would make
+        the filtered arm trade bars the filter never saw."""
+        closes = _rising()[-14:]  # enough for the 5-bar channel, not for SMA10 + 5 back
+        rule = _rule(trend_filter="slope", **_TF)
+        assert rule.detect({Granularity.ONE_DAY: _closes_to_candles(closes)}) is None
+        assert rule.last_rejection is not None
+        assert rule.last_rejection["gate"] == "trend_filter_history"
+
+    def test_an_unknown_mode_is_refused(self) -> None:
+        import pytest
+
+        with pytest.raises(ValueError):
+            _rule(trend_filter="sometimes")
+        with pytest.raises(ValueError):
+            _rule(trend_filter="above", trend_sma_period=0)
+        with pytest.raises(ValueError):
+            _rule(trend_filter="slope", trend_slope_lookback=0)
+
+    def test_a_stored_row_round_trips(self) -> None:
+        rule = agent.build_rule_from_params(
+            "turtle_breakout",
+            {
+                "product_id": "BTC-USD",
+                "trend_filter": "both",
+                "trend_sma_period": 200,
+                "trend_slope_lookback": 5,
+            },
+        )
+        assert isinstance(rule, TurtleBreakout)
+        assert (
+            rule.params["trend_filter"],
+            rule.params["trend_sma_period"],
+            rule.params["trend_slope_lookback"],
+        ) == ("both", 200, 5)
