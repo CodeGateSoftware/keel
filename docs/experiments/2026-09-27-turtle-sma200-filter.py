@@ -146,7 +146,7 @@ def _stats(trades: list[Trade]) -> dict[str, Any]:
     s = summarize(sorted(trades, key=lambda t: t.exit_ts or 0))
     out: dict[str, Any] = {
         "n": s.n_trades,
-        "win_rate": round(s.win_rate, 4),
+        "win_rate": str(round(Decimal(str(s.win_rate)), 4)),
         "expectancy_r": None if s.expectancy_r is None else str(round(s.expectancy_r, 4)),
         "avg_win_r": None if s.avg_win_r is None else str(round(s.avg_win_r, 4)),
         "avg_loss_r": None if s.avg_loss_r is None else str(round(s.avg_loss_r, 4)),
@@ -251,8 +251,8 @@ def main() -> None:
             row["evaluated"] = row["n"] >= FLOOR
             if arm != "off":
                 low, high = _bootstrap_difference(pooled[arm], pooled["off"])
-                row["diff_expectancy_r_ci95_low"] = round(low, 4)
-                row["diff_expectancy_r_ci95_high"] = round(high, 4)
+                row["diff_expectancy_r_ci95_low"] = str(round(Decimal(str(low)), 4))
+                row["diff_expectancy_r_ci95_high"] = str(round(Decimal(str(high)), 4))
                 row["verdict"] = (
                     "not evaluated (N < 100)"
                     if not row["evaluated"]
@@ -277,13 +277,16 @@ def main() -> None:
                         "trend_sma_period": SMA_PERIOD,
                         "trend_slope_lookback": SLOPE_LOOKBACK,
                         "units": "per_trade_pnl is R, not dollars",
+                        "verdict": row.get("verdict", "baseline"),
                     },
                     provenance="a_priori",
                     kind="ablation",
                     decision="diagnostic_only",
                     per_trade_pnl=series,
                     series_missing=not series,
-                    summary={k: v for k, v in row.items() if k not in ("row",)},
+                    # Numbers only: `read_trials` decodes every summary string as a Decimal, so
+                    # the arm name and the verdict ride in `params`.
+                    summary={k: v for k, v in row.items() if k not in ("row", "arm", "verdict")},
                 )
     print(f"wrote {args.out}")
 
