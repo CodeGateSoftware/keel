@@ -148,6 +148,7 @@ from keel.commands.confirm import (  # noqa: F401 -- deliberate re-export, pinne
 )
 from keel.commands.credentials import credentials_group
 from keel.commands.db import db_group
+from keel.commands.dca import dca_group
 from keel.commands.doctor import doctor_cmd
 from keel.commands.fetch import assess_products as _assess_products  # noqa: F401 -- pinned by tests
 
@@ -1210,6 +1211,14 @@ cli.add_command(autonomy_group)
 # The `rules` group is defined in `keel.commands.rules`; register it here. `rules_seed` is also
 # imported by `init` below, which invokes it to seed candidate rules on a fresh install.
 cli.add_command(rules_group)
+
+
+# -- dca ------------------------------------------------------------------------------
+
+# The `dca` group is defined in `keel.commands.dca`: a thin CLI over `keel.commands.dca_plan`
+# (the pure service) that proposes a multi-asset DCA schedule and, on approval at a terminal,
+# writes one `candidate` `dca` rule per asset through `rules.add_rule_row`.
+cli.add_command(dca_group)
 
 
 # -- research (the front door over keel/research/*, issue #601) -----------------------------

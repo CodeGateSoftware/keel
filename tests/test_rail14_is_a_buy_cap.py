@@ -138,3 +138,14 @@ def test_the_config_templates_keel_setup_writes_make_no_free_allowance_claim() -
         assert "always fee-free" not in flat, name
         assert "no free allowance on advanced trade" in flat, name
         assert _FEE_NOTE in text, name
+
+
+def test_the_dca_plan_calls_rail_14_a_buy_cap_and_never_fee_free() -> None:
+    """#836: the plan prints rail 14 as a monthly BUY cap and says it is not a fee waiver."""
+    from keel.commands.dca_plan import RAIL14_NOTE
+
+    text = RAIL14_NOTE.lower()
+    assert "buy cap" in text
+    assert "not a fee waiver" in text
+    assert "fee-free" not in text
+    assert not _claims(RAIL14_NOTE)

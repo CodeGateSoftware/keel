@@ -45,6 +45,8 @@ SERVICE_MODULES = [
     "keel.commands.brokers",
     "keel.commands.confirm",
     "keel.commands.db",
+    "keel.commands.dca",
+    "keel.commands.dca_plan",
     "keel.commands.fetch",
     "keel.commands.insights",
     "keel.commands.monitor",
