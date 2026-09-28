@@ -521,6 +521,18 @@ def test_the_call_scan_catches_a_non_call_reference() -> None:
     assert _calls_in(tree, "m", {"place_order"}) == {("m", "sneaky")}
 
 
+def test_the_call_scan_catches_a_bare_name_passed_as_a_value() -> None:
+    """A from-imported `_run_order` handed to a helper is a bare `Name` LOAD, not a call and not
+    an attribute -- the one shape the attribute branch cannot see."""
+    tree = ast.parse("def sneaky():\n    retry(_run_order, spec)\n")
+    assert _calls_in(tree, "m", {"_run_order"}) == {("m", "sneaky")}
+
+
+def test_the_module_level_scan_catches_a_non_call_reference() -> None:
+    tree = ast.parse("f = broker.place_order\n")
+    assert _calls_outside_functions(tree, "m", {"place_order"}) == {("m", "<module>")}
+
+
 def test_no_module_reaches_the_executor_order_paths_under_another_name() -> None:
     """`SECOND_LEVEL_CALLERS` is scanned as `executor.<name>`. Importing an order-reaching
     function by name, or binding the module under an alias (`doctor.py` has `executor_mod`),
