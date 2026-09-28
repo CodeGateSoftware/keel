@@ -312,7 +312,7 @@ and has already produced one. Establish which account a number came from before 
 | `equity_state_mode` | `paper` | `live` | `paper` | `paper` |
 | launchd job | `com.keel.paperforward` | `com.keel.live` | `com.keel.paper-hourly` | `com.keel.paper-equities` |
 | cadence | daily (day-stamp) | daily, UTC (UTC day-stamp) | **hourly**, UTC (UTC hour-stamp) | daily, in the US session (UTC day-stamp) |
-| rules traded | daily turtle, `paper` | daily turtle + DCA, `live` | **hourly** turtle, `paper` | daily turtle on equities, `paper` |
+| rules traded | daily turtle, `paper` | DCA `live` (7 rules); daily turtle `paper` (since 2026-09-27) | **hourly** turtle, `paper` | daily turtle on equities, `paper` |
 
 ### Installing and verifying a profile's launchd job
 
