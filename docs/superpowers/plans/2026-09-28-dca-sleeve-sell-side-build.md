@@ -47,7 +47,7 @@
   - a documented `_migrate_vNN_*` function that is idempotent via `PRAGMA table_info` or `IF NOT EXISTS`, with no backfill;
   - an entry in `_MIGRATIONS`;
   - a bump to `SCHEMA_VERSION`;
-  - tests in `tests/data/test_migrations.py`. These include relaxing the `stamped == db.SCHEMA_VERSION == 21` assertion in `test_a_v20_database_gains_rule_id_as_NULL_no_backfill` to `stamped == db.SCHEMA_VERSION`, because a v20 database now migrates to head, not to 21 (see P6 Task 1).
+  - tests in `tests/data/test_migrations.py`. The literal `== 21` (or `== db.SCHEMA_VERSION == 21`) is pinned in **eight** tests, not one: `test_fresh_database_is_stamped_at_the_current_version` (line 52), `test_v14_migration_bumps_the_stored_version` (627), `test_v15_migration_bumps_the_stored_version` (788), `test_an_existing_orders_table_gains_the_submit_book_by_ALTER` (890), `test_migration_to_v20_adds_the_columns_and_the_new_tables` (1050), `test_v19_database_gains_v20_columns_as_NULL_no_backfill` (1097), `test_v20_on_a_pre_v11_chain_does_not_duplicate_columns` (1168) and `test_a_v20_database_gains_rule_id_as_NULL_no_backfill` (1316). Every one of these relaxes to `stamped == db.SCHEMA_VERSION` (or `version == db.SCHEMA_VERSION`), because a database that migrates to head no longer lands on 21 once v22 exists. P6 Task 1 relaxes all eight in one step, and its own new v22 assertions are written against `db.SCHEMA_VERSION`, not the literal `22`, so P17's v23 bump does not repeat this exact break.
 - **Commit trailer.** Every commit message ends with `Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>`. Every PR body ends with `🤖 Generated with [Claude Code](https://claude.com/claude-code)`.
 - **The spec's file names are wrong in one place.** `book_exit` lives in `keel/execution/streak.py`, not `keel/streak.py`.
 
@@ -55,8 +55,8 @@
 
 - **S1: no new sell reaches the venue without `keel autonomy on --sells` at a TTY.**
   - The live `autonomy on` flag alone never releases one.
-  - Mechanised by `tests/execution/test_sell_side_invariants.py`, created in P1. It pins, by AST scan, the exact set of functions that call `_run_order` or `broker.place_order`.
-  - `executor.reduce` may not appear in that set before P18.
+  - Mechanised by `tests/execution/test_sell_side_invariants.py`, created in P1. It pins, by AST scan, the exact set of functions that call `_run_order` or `broker.place_order` (`RUN_ORDER_CALLERS`/`PLACEMENT_CALLERS`), **and** the exact set of functions outside `executor.py` that call `executor.execute`/`executor.scale_out`/`executor.place_bracket`/`executor.roll_stop_to`/`executor.roll_to_break_even`/`executor.trail_stop_atr` (`SECOND_LEVEL_CALLERS`), so a new sell path one level removed from `_run_order` -- e.g. a CLI handler calling `executor.execute(EXIT)` or `executor.scale_out(...)` directly -- also turns this module red.
+  - `executor.reduce` may not appear in either set before P18.
   - In P18 its one call must sit behind `sleeve.sells_released(...)`, which reads `Profile.is_autonomous_for_sells`.
 - **S2: v1 execution is preview-only.**
   - Every `sleeve_sell` rule class declares `execution: Execution` with `Execution = Literal["preview"]`, and the registry-wide test in the invariants module asserts it.
@@ -252,6 +252,12 @@ Each ruling is stated as `what — why — cost if wrong`.
 - **R32.** The account sim (`portfolio_sim`) books a distribution against its one averaged DCA lot per asset. The per-rule accumulation row (`report.accumulation_table`) is the FIFO-faithful one, and it carries the pinned hand computation.
   - Why: `SimAccount.dca_positions` is one lot per asset by design (#85). Re-plumbing it to FIFO lots is out of proportion to a fidelity test.
   - Cost if wrong: the account sim's realised P&L on distributions is average-cost. Its docstring says so.
+- **R33** (added in review round 1, #882). `guards._open_exposure_by_asset` (Task 4.0) contributes zero notional for any PRODUCT whose net filled quantity is `<= 0`, instead of its net notional, regardless of the prices the closing legs traded at.
+  - Why: the function nets BUY/SELL **notional**, which is the right figure for a position still partly held. It is the wrong figure for one closed in full at a different price than its entry: PAXG tranche 3 closed at a real loss (4673.23 -> 4400) leaves a $3.61 notional residual that is not exposure, because zero units are held. Left unfixed, P4's own acceptance test cannot pass and #798's phantom exposure survives any loss-making close, declared or ordinary.
+  - Cost if wrong: exposure rails 4/5/6 could under- or over-state a closed product's contribution to its asset bucket. The fix only changes behaviour when a product's net qty is `<= 0`; every still-open product nets by notional exactly as before, pinned by `test_a_partial_close_still_nets_by_notional`.
+- **R34** (added in review round 1, #883). `executor.reduce`'s confirm branch (Task 18.1) asks the typed-yes gate BEFORE it cancels the resting protective bracket, by wrapping the caller's `confirm_fn` rather than calling `_clear_resting_bracket` directly ahead of `_run_order`. A leg that does not close the position in full re-brackets the remainder afterward, via `place_bracket`, the same choreography `scale_out` (#502) uses.
+  - Why: the original draft cancelled the bracket unconditionally before `_run_order` (and therefore before the human's answer, which `_run_order` asks internally). A decline, or no TTY, left a stopped tranche naked at the exchange with no `unbracketed:` record -- the cancel had already happened and nothing said so. `execute()`'s own EXIT path has the same ordering today (pre-existing, out of scope here); `reduce()` is new code and need not repeat it.
+  - Cost if wrong: a declined or failed confirm now leaves the bracket resting rather than cancelled, which is the safe direction; a partial confirmed sale is followed by a second `place_bracket` call the venue must accept, the same call `scale_out` already makes routinely.
 
 ---
 
@@ -329,8 +335,9 @@ No PR is L. Spec §11's PR 1 was split across P3 and P13, its PR 2 across P5–P
 **Interfaces:**
 - Produces:
   - `PLACEMENT_CALLERS: set[tuple[str, str]]` and `RUN_ORDER_CALLERS: set[tuple[str, str]]`, which later PRs edit only under a ruling;
+  - `SECOND_LEVEL_CALLERS: set[tuple[str, str]]`, the pinned set of functions that call `executor.execute`/`executor.scale_out`/`executor.place_bracket`/`executor.roll_stop_to`/`executor.roll_to_break_even`/`executor.trail_stop_atr` (the names a caller outside `executor.py` actually spells to reach `_run_order` through `RUN_ORDER_CALLERS`'s four functions — `_roll_stop` itself is private and reached only through its three wrapper functions). A new CLI sell path that calls `executor.execute(EXIT)` or `executor.scale_out(...)` without going through the sells gate fails here, one level before it would need to fail at `RUN_ORDER_CALLERS`. Grown only under a ruling, same as `RUN_ORDER_CALLERS`;
   - `WEB_FORBIDDEN_NAMES: frozenset[str]`, which P4, P6, P7 and P17 grow;
-  - the helper `_functions_calling(names, roots)`.
+  - the helpers `_functions_calling(names, roots)` and `_functions_calling_attr(base, names, roots)`, the second scoped to a specific attribute base (`executor.<name>`) so a same-named method on a different object — `conn.execute`, most of all — cannot collide.
 
 - [ ] **Step 1: Write the tests.**
 
@@ -344,6 +351,14 @@ until a ruling declares it. That is how "no new sell reaches the venue unless th
 is armed" stays a checked fact rather than a promise: `executor.reduce` cannot join
 `RUN_ORDER_CALLERS` until P18, and P18's own test asserts the call sits behind
 `sleeve.sells_released`.
+
+`RUN_ORDER_CALLERS` alone only pins the functions that call `_run_order` directly, all four of
+which live inside `executor.py` itself. A new sell path added anywhere ELSE in the codebase --
+say a CLI command in `keel/commands/dca.py` that calls `executor.execute(EXIT)` or
+`executor.scale_out(...)` straight from its handler -- never appears there and this module stays
+green. `SECOND_LEVEL_CALLERS` closes that gap: it pins every function, anywhere under `keel`,
+that calls one of `executor`'s order-reaching entry points by name (`executor.<name>`), so a new
+second-level caller turns this module red the same way a new first-level one does.
 """
 
 from __future__ import annotations
@@ -365,6 +380,33 @@ RUN_ORDER_CALLERS = {
     ("keel.execution.executor", "place_bracket"),
     ("keel.execution.executor", "scale_out"),
     ("keel.execution.executor", "_roll_stop"),
+}
+
+#: The names a caller OUTSIDE `executor.py` spells, as `executor.<name>`, to reach one of
+#: `RUN_ORDER_CALLERS`'s four functions. `execute`, `place_bracket` and `scale_out` are the
+#: names directly; `_roll_stop` is private and has no external caller today -- it is reached
+#: only through its three wrapper functions (`roll_stop_to`, `roll_to_break_even`,
+#: `trail_stop_atr`), so those three stand in for it here.
+SECOND_LEVEL_NAMES = {
+    "execute",
+    "place_bracket",
+    "scale_out",
+    "roll_stop_to",
+    "roll_to_break_even",
+    "trail_stop_atr",
+}
+
+#: Every function, anywhere under `keel`, that calls `executor.<name>` for a name in
+#: `SECOND_LEVEL_NAMES`. Today: the rule ENTER/EXIT dispatch (`run_once`, `_handle_exits`), the
+#: stop-management loop (`_manage_stops`, via `roll_stop_to`), and the two reconcile sweeps that
+#: re-place a missing bracket (via `place_bracket`). `scale_out`'s wrapper names have no external
+#: caller yet -- the #502 CLI path is not built -- so none appears below for them.
+SECOND_LEVEL_CALLERS = {
+    ("keel.agent", "_handle_exits"),
+    ("keel.agent", "_manage_stops"),
+    ("keel.agent", "run_once"),
+    ("keel.execution.reconcile", "reconcile_unbracketed_positions"),
+    ("keel.execution.reconcile", "_rebracket_or_escalate"),
 }
 
 #: Operations the browser and the MCP server must never name (S4). Grown by the PR that
@@ -407,6 +449,39 @@ def _functions_calling(names: set[str], roots: tuple[str, ...] = ("keel",)) -> s
     return found
 
 
+def _calls_via_attr(tree: ast.AST, module: str, base: str, names: set[str]) -> set[tuple[str, str]]:
+    """Like `_calls_in`, but only counts `<base>.<name>(...)` -- an attribute call whose object is
+    literally the name `base`. This is what keeps `executor.execute` from being confused with
+    `conn.execute`, `repo.execute` or any other `.execute(...)` in the tree: `_calls_in` matches on
+    the bare method name alone and would treat all of them as the same caller.
+    """
+    found: set[tuple[str, str]] = set()
+    for func in ast.walk(tree):
+        if not isinstance(func, ast.FunctionDef | ast.AsyncFunctionDef):
+            continue
+        for node in ast.walk(func):
+            if (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr in names
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id == base
+            ):
+                found.add((module, func.name))
+    return found
+
+
+def _functions_calling_attr(
+    base: str, names: set[str], roots: tuple[str, ...] = ("keel",)
+) -> set[tuple[str, str]]:
+    found: set[tuple[str, str]] = set()
+    for root in roots:
+        for path in sorted(glob.glob(os.path.join(_ROOT, root, "**", "*.py"), recursive=True)):
+            with open(path, encoding="utf-8") as fh:
+                found |= _calls_via_attr(ast.parse(fh.read()), _module_of(path), base, names)
+    return found
+
+
 def test_only_run_order_calls_place_order() -> None:
     assert _functions_calling({"place_order"}) == PLACEMENT_CALLERS
 
@@ -415,9 +490,23 @@ def test_the_run_order_callers_are_exactly_the_pinned_set() -> None:
     assert _functions_calling({"_run_order"}) == RUN_ORDER_CALLERS
 
 
+def test_the_second_level_callers_are_exactly_the_pinned_set() -> None:
+    assert _functions_calling_attr("executor", SECOND_LEVEL_NAMES) == SECOND_LEVEL_CALLERS
+
+
 def test_the_scan_is_false_capable() -> None:
     tree = ast.parse("def sneaky():\n    executor._run_order(1)\n")
     assert _calls_in(tree, "m", {"_run_order"}) == {("m", "sneaky")}
+
+
+def test_the_attr_scan_does_not_confuse_executor_execute_with_conn_execute() -> None:
+    tree = ast.parse(
+        "def sneaky():\n"
+        "    conn.execute('SELECT 1')\n"
+        "def honest():\n"
+        "    executor.execute(1)\n"
+    )
+    assert _calls_via_attr(tree, "m", "executor", {"execute"}) == {("m", "honest")}
 
 
 def test_the_browser_and_mcp_name_no_sell_side_operation() -> None:
@@ -447,9 +536,9 @@ def test_the_browser_and_mcp_name_no_sell_side_operation() -> None:
     assert offenders == []
 ```
 
-- [ ] **Step 2: Run the tests.** Run: `uv run pytest tests/execution/test_sell_side_invariants.py -v`. Expected: 4 PASS.
-  - These tests pin the present state; the red phase is `test_the_scan_is_false_capable`, which proves the scanner can fail.
-  - If either set comparison fails because the scan found an extra caller, **stop**. Read that caller and record a ruling before widening the set.
+- [ ] **Step 2: Run the tests.** Run: `uv run pytest tests/execution/test_sell_side_invariants.py -v`. Expected: 6 PASS.
+  - These tests pin the present state; the red phase is `test_the_scan_is_false_capable` and `test_the_attr_scan_does_not_confuse_executor_execute_with_conn_execute`, which prove each scanner can fail.
+  - If any set comparison fails because the scan found an extra caller, **stop**. Read that caller and record a ruling before widening the set.
 
 - [ ] **Step 3: Commit.**
 
@@ -663,8 +752,10 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 - Test: `tests/commands/test_doctor_position_watch.py` (new)
 
 **Interfaces:**
-- Produces: `position_watch_findings(open_positions: list[dict], live_rules: list[dict], resting: Callable[[dict], bool], retry_products: set[str]) -> list[Finding]`.
+- Produces: `position_watch_findings(open_positions: list[dict], all_rules: list[dict], resting: Callable[[dict], bool], retry_products: set[str], *, managed_status: str = "live") -> list[Finding]`.
 - It returns exactly two findings, named `position.unmanaged` and `position.unprotected`. Each is `OK` or `WARN`, never `FAIL`, and has `products` populated when it warns (#642).
+- `all_rules` is every rule row regardless of status, not only `live` ones. #811's first acceptance bullet requires `position.unmanaged`'s WARN to name "the rule's current status" (e.g. `paper`) for the product it warns about, and a rule that owns a demoted tranche is, by definition, no longer `live` -- so the function cannot both filter its input to `live` and report the status of a row that filtering just removed. The `live`-only membership test still decides WHO is managed; a second lookup over the same `all_rules` list finds each unmanaged product's most recent rule (by `id`, if more than one rule ever named the product) to name its status, or reports "no rule" when none ever did.
+- `managed_status` is keyword-only, defaults to `"live"`, and is the status string that counts as "actively managed". A paper profile's engine promotes to `status="paper"`, never `"live"` (`agent.py`'s own `rule_status = "paper" if config.auto_trade.mode == "paper" else "live"`, line ~1700), so `get_rules("live")` -- and, before this fix, the hardcoded `"live"` comparison below -- is empty on every paper deployment, and every open paper tranche would WARN as unmanaged. `doctor.py`'s wiring (Step 4) passes `managed_status="paper"` on a paper profile.
 
 - [ ] **Step 1: Write the failing tests.**
 
@@ -703,6 +794,11 @@ BTC_DCA = {
     "status": "open",
 }
 LIVE_BTC_DCA_RULE = {"id": 6, "kind": "dca", "status": "live", "params": {"product_id": "BTC-USD"}}
+#: rule 3 exactly as #811 found it: demoted from `live` to `paper` on 2026-09-15, its tranche
+#: still open. This is the row `position.unmanaged` must resolve PAXG-USD's status against.
+PAXG_PAPER_TURTLE_RULE = {
+    "id": 3, "kind": "turtle_breakout", "status": "paper", "params": {"product_id": "PAXG-USD"}
+}
 
 
 def _by_name(findings):
@@ -712,12 +808,19 @@ def _by_name(findings):
 def test_the_live_database_shape_reports_paxg_under_both_findings() -> None:
     found = _by_name(
         position_watch_findings(
-            [BTC_DCA, PAXG_TRANCHE_3], [LIVE_BTC_DCA_RULE], lambda p: False, set()
+            [BTC_DCA, PAXG_TRANCHE_3],
+            [LIVE_BTC_DCA_RULE, PAXG_PAPER_TURTLE_RULE],
+            lambda p: False,
+            set(),
         )
     )
     assert found["position.unmanaged"].status == WARN
     assert found["position.unmanaged"].products == ("PAXG-USD",)
     assert "tranche 3" in found["position.unmanaged"].detail
+    # #811's first acceptance bullet: the WARN names the owning rule's CURRENT status, not
+    # just its name -- rule 3 was demoted `live` -> `paper`, and that demotion is the whole
+    # reason PAXG-USD stopped being watched.
+    assert "paper" in found["position.unmanaged"].detail
     assert found["position.unprotected"].status == WARN
     assert found["position.unprotected"].products == ("PAXG-USD",)
     assert "4521.76" in found["position.unprotected"].detail
@@ -745,8 +848,16 @@ def test_unmanaged_matches_on_product_not_on_rule_id() -> None:
 
 
 def test_a_demoted_dca_rule_surfaces_its_tranches_as_unmanaged() -> None:
-    found = _by_name(position_watch_findings([BTC_DCA], [], lambda p: False, set()))
+    paper_dca = {"id": 9, "kind": "dca", "status": "paper", "params": {"product_id": "BTC-USD"}}
+    found = _by_name(position_watch_findings([BTC_DCA], [paper_dca], lambda p: False, set()))
     assert found["position.unmanaged"].status == WARN
+    assert "paper" in found["position.unmanaged"].detail
+
+
+def test_a_product_with_no_rule_at_all_names_that_in_the_status() -> None:
+    found = _by_name(position_watch_findings([PAXG_TRANCHE_3], [], lambda p: True, set()))
+    assert found["position.unmanaged"].status == WARN
+    assert "no rule" in found["position.unmanaged"].detail
 ```
 
 - [ ] **Step 2: Run the tests to see them fail.** Run: `uv run pytest tests/commands/test_doctor_position_watch.py -v`. Expected: FAIL with `ImportError: cannot import name 'position_watch_findings'`.
@@ -756,9 +867,11 @@ def test_a_demoted_dca_rule_surfaces_its_tranches_as_unmanaged() -> None:
 ```python
 def position_watch_findings(
     open_positions: list[dict[str, Any]],
-    live_rules: list[dict[str, Any]],
+    all_rules: list[dict[str, Any]],
     resting: Callable[[dict[str, Any]], bool],
     retry_products: set[str],
+    *,
+    managed_status: str = "live",
 ) -> list[Finding]:
     """Is anything still WATCHING each held tranche (#811)?
 
@@ -780,12 +893,32 @@ def position_watch_findings(
     WARN, never FAIL: holding spot without a stop can be a human's choice (PAXG since
     2026-09-22). What was wrong is that nobody was told, and FAIL would halt cycles over a state
     the operator already accepted.
+
+    `all_rules` is every rule row, of any status -- not just `live` ones. Membership in
+    `managed` is decided by `status == managed_status` alone, but #811's first acceptance bullet
+    requires the `position.unmanaged` WARN to name the owning rule's CURRENT status (e.g.
+    `paper`), and a rule moved out of `managed_status` is exactly the row that produced the WARN
+    in the first place. Filtering the input to that status before it arrives here would throw
+    that row away before its status could be read. `status_by_product` resolves it from the full
+    set instead, taking the highest `id` when more than one rule has ever named a product, and
+    reporting `"no rule"` when none has.
+
+    `managed_status` defaults to `"live"`, the status a live profile promotes to. A PAPER
+    profile promotes to `status="paper"` instead (`agent.py`'s own
+    `rule_status = "paper" if config.auto_trade.mode == "paper" else "live"`), and never writes
+    a `"live"` row, so a paper deployment calling this with the default would find `managed`
+    permanently empty and WARN `position.unmanaged` on every open tranche it holds -- correctly
+    managed rules and all. The caller passes `managed_status="paper"` there.
     """
     managed = {
         str((row.get("params") or {}).get("product_id"))
-        for row in live_rules
-        if row.get("status") == "live"
+        for row in all_rules
+        if row.get("status") == managed_status
     }
+    status_by_product: dict[str, str] = {}
+    for row in sorted(all_rules, key=lambda r: r.get("id") or 0):
+        status_by_product[str((row.get("params") or {}).get("product_id"))] = str(row.get("status"))
+
     unmanaged = [p for p in open_positions if str(p["product_id"]) not in managed]
     unprotected = [
         p
@@ -798,7 +931,11 @@ def position_watch_findings(
     def _describe(rows: list[dict[str, Any]], *, levels: bool) -> str:
         parts = []
         for p in rows:
-            text = f"{p['product_id']} tranche {p['id']} ({p['rule_name']}, qty {p['qty']})"
+            status = status_by_product.get(str(p["product_id"]), "no rule")
+            text = (
+                f"{p['product_id']} tranche {p['id']} ({p['rule_name']}, {status}, "
+                f"qty {p['qty']})"
+            )
             if levels:
                 text += f", stop {p['initial_stop']}, no resting bracket, no retry record"
             parts.append(text)
@@ -845,18 +982,25 @@ def position_watch_findings(
 - [ ] **Step 4: Wire it into `gather_findings`,** directly after `unbooked_exit_findings`:
 
 ```python
-    # #811. LIVE rules only: paper rules evaluate on the paper profile's own database.
+    # #811. `all_rules` -- every status, not just "live" -- so `position.unmanaged` can name a
+    # demoted rule's current status. `managed_status` mirrors `agent.py`'s own
+    # `rule_status = "paper" if config.auto_trade.mode == "paper" else "live"`: a paper profile
+    # promotes to `status="paper"`, never `"live"`, so passing the default here would WARN on
+    # every open paper tranche (#881).
     findings += position_watch_findings(
         repo.get_open_positions(),
-        repo.get_rules("live"),
+        repo.get_rules(),
         lambda position: reconcile_mod._has_resting_bracket(repo, position),
         {key[len(executor_mod.UNBRACKETED_PREFIX):]
          for key in repo.get_state_keys(executor_mod.UNBRACKETED_PREFIX)
          if repo.get_state(key) is not None},
+        managed_status="paper" if config.auto_trade.mode == "paper" else "live",
     )
 ```
 
   Add a test to `tests/commands/test_doctor.py` beside the existing change-counter read-only test. The new test runs `gather_findings` on a repo seeded with PAXG tranche 3, and asserts the two names are present and that the change counter is unchanged.
+
+  **Add a paper-profile test.** `tests/commands/test_doctor.py`'s own `gather_findings` tests already build their repo with `_seeded_repo(tmp_path / "keel.db")` and their config with `load_config(valid_config_path)` (both defined/imported at the top of that file). Seed a repo with an open tranche (`repo.open_position(...)`) and a `status="paper"` rule for the same product (never `"live"`), take `config = load_config(valid_config_path)` and derive a paper config from it with `dataclasses.replace(config, auto_trade=dataclasses.replace(config.auto_trade, mode="paper"))` (`AutoTradeConfig`/`Config` are both frozen dataclasses, `packages/keel-core/keel_core/config.py`). Assert `gather_findings(repo, paper_config, [], now_ts)` reports `position.unmanaged` as `OK`. Before this fix (`managed_status` hardcoded to `"live"`), the same fixture WARNs; the test must fail red for that reason first.
 
 - [ ] **Step 5: Run the tests, run `--json`, then commit.**
   - Run: `uv run pytest tests/commands/test_doctor_position_watch.py tests/commands/test_doctor.py -q`. Expected: PASS.
@@ -882,11 +1026,12 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 **Files:**
 - Create: `keel/execution/sleeve.py`
 - Modify: `keel/commands/doctor.py`
-- Test: `tests/execution/test_sleeve.py` (new), `tests/commands/test_doctor_ledger_drift.py` (new)
+- Test: `tests/execution/test_sleeve.py` (new), `tests/commands/test_doctor_ledger_drift.py` (new), `tests/commands/test_doctor.py` (append, one paper-profile wiring test)
 
 **Interfaces:**
 - Produces: `sleeve.ledger_qty(positions: Iterable[dict]) -> Decimal`, the sum of open tranche `qty`. It is the definition `Holding.qty` must equal (P5 pins it).
-- Produces: `doctor.ledger_drift_findings(ledger_by_product: dict[str, Decimal], orders_by_product: dict[str, Decimal], increments: dict[str, Decimal | None]) -> list[Finding]`, named `ledger.drift`.
+- Produces: `sleeve.orders_qty(repo: Repository, product_id: str, mode: str) -> Decimal`, net filled BUY - SELL qty from `orders` tagged `mode`. This is deliberately NOT a call to `executor._held_position`: that function hardcodes `mode="live"` BY DESIGN (see `agent._book_paper_exit`'s docstring -- "the live exit path is unreachable from paper BY CONSTRUCTION... routing paper exits through `executor.execute` would put a real broker behind them"), so a paper cycle's rules always see qty 0 there, on purpose. `ledger.drift` is a read-only doctor comparison, not a placement path, and it must compare the ledger against the SAME mode's orders on a paper profile, or every open paper tranche reads as a stranded fill.
+- Produces: `doctor.ledger_drift_findings(ledger_by_product: dict[str, Decimal], orders_by_product: dict[str, Decimal], increments: dict[str, Decimal | None]) -> list[Finding]`, named `ledger.drift`. Unchanged in shape; the mode fix lives entirely in what its caller builds `orders_by_product` from (Step 3's wiring, below).
 
 - [ ] **Step 1: Write the failing tests.**
 
@@ -894,7 +1039,10 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 # tests/execution/test_sleeve.py
 from decimal import Decimal
 
+from keel.data.db import connect, migrate
+from keel.data.repository import Repository
 from keel.execution import sleeve
+from keel.types import Side
 
 
 def test_ledger_qty_sums_what_is_still_held() -> None:
@@ -904,6 +1052,36 @@ def test_ledger_qty_sums_what_is_still_held() -> None:
 
 def test_ledger_qty_of_nothing_is_zero_not_none() -> None:
     assert sleeve.ledger_qty([]) == Decimal("0")
+
+
+def _repo() -> Repository:
+    conn = connect(":memory:")
+    migrate(conn)
+    return Repository(conn)
+
+
+def _order(*, mode: str, side: str, qty: Decimal) -> dict:
+    return dict(mode=mode, product_id="BTC-USD", side=side, order_type="market", qty=qty,
+                limit_price=Decimal("100000"), status="filled", fee=Decimal("0"),
+                expected_fill=Decimal("100000"), actual_fill=Decimal("100000"),
+                created_at=0, updated_at=0)
+
+
+def test_orders_qty_reads_the_requested_mode_only() -> None:
+    """#881: on a paper profile every fill is `mode='paper'`. `orders_qty` must be told which
+    mode to read, unlike `executor._held_position`, which hardcodes `mode='live'` on purpose."""
+    repo = _repo()
+    repo.insert_order(_order(mode="paper", side=Side.BUY.value, qty=Decimal("0.001")))
+    repo.insert_order(_order(mode="live", side=Side.BUY.value, qty=Decimal("5")))
+    assert sleeve.orders_qty(repo, "BTC-USD", mode="paper") == Decimal("0.001")
+    assert sleeve.orders_qty(repo, "BTC-USD", mode="live") == Decimal("5")
+
+
+def test_orders_qty_nets_sells_and_floors_at_zero() -> None:
+    repo = _repo()
+    repo.insert_order(_order(mode="paper", side=Side.BUY.value, qty=Decimal("0.001")))
+    repo.insert_order(_order(mode="paper", side=Side.SELL.value, qty=Decimal("0.002")))
+    assert sleeve.orders_qty(repo, "BTC-USD", mode="paper") == Decimal("0")
 ```
 
 ```python
@@ -963,11 +1141,37 @@ from collections.abc import Iterable
 from decimal import Decimal
 from typing import Any
 
+from keel.data.repository import Repository
+from keel.types import Side
+
 
 def ledger_qty(positions: Iterable[dict[str, Any]]) -> Decimal:
     """Sum of `qty` over the given OPEN tranches -- what is still held. `Holding.qty` (P5) is
     defined as exactly this, and a test pins the two equal."""
     return sum((Decimal(p["qty"]) for p in positions), Decimal("0"))
+
+
+def orders_qty(repo: Repository, product_id: str, mode: str) -> Decimal:
+    """Net filled BUY - SELL qty for `product_id`, from `orders` tagged `mode` (#881).
+
+    Mirrors `executor._held_position`'s arithmetic, but is NOT `_held_position`: that function
+    hardcodes `mode="live"` deliberately (`agent._book_paper_exit`'s docstring -- the live exit
+    path is unreachable from paper BY CONSTRUCTION, not by accident). `ledger.drift` is a
+    read-only doctor comparison, not a placement path, and it must compare the ledger against
+    the SAME mode's orders: on a paper profile every fill is `mode="paper"`, and comparing it
+    against `_held_position`'s always-empty `mode="live"` total would WARN on every open paper
+    tranche as though it were #799's stranded fill.
+    """
+    buy_qty = Decimal("0")
+    sell_qty = Decimal("0")
+    for order in repo.get_orders(mode=mode, product_id=product_id, status="filled"):
+        qty = order["qty"] or Decimal("0")
+        if order["side"] == Side.BUY.value:
+            buy_qty += qty
+        elif order["side"] == Side.SELL.value:
+            sell_qty += qty
+    net = buy_qty - sell_qty
+    return net if net > 0 else Decimal("0")
 ```
 
   In `doctor.py`:
@@ -1013,13 +1217,15 @@ def ledger_drift_findings(
 
   Wire it into `gather_findings`. Iterate the products in `repo.held_products()` ∪ the open-tranche products:
   - `ledger` is `sleeve.ledger_qty(repo.get_open_positions(p))`;
-  - `orders` is `executor_mod._held_position(repo, p)[0]`;
+  - `order_mode = "paper" if config.auto_trade.mode == "paper" else "live"` (the same derivation as P2's `managed_status`), and `orders` is `sleeve.orders_qty(repo, p, order_mode)` -- **not** `executor_mod._held_position(repo, p)[0]`, which hardcodes `mode="live"` and would read as zero orders for every product on a paper profile (#881);
   - the increment comes from the cached `base_increment:<p>` state record (`record["increment"]`), and is `None` when the record is absent. **Never call the broker.**
+
+  **Add a paper-profile test** to `tests/commands/test_doctor.py`, beside P2's: seed a repo with an open paper-mode tranche whose backing order is inserted with `mode="paper"` (not `"live"`), take a paper `config` the same way P2's test does (`dataclasses.replace(config, auto_trade=dataclasses.replace(config.auto_trade, mode="paper"))`), and assert `gather_findings` reports `ledger.drift` as `OK`. Before this fix, `orders_by_product` built from `_held_position` (always `mode="live"`) sees zero orders against a non-zero ledger and WARNs; the test must fail red for that reason first.
 
 - [ ] **Step 4: Run the tests, then commit.** Run: `uv run pytest tests/execution/test_sleeve.py tests/commands/test_doctor_ledger_drift.py tests/commands/test_doctor.py -q`. Expected: PASS.
 
 ```bash
-git add keel/execution/sleeve.py keel/commands/doctor.py tests/execution/test_sleeve.py tests/commands/test_doctor_ledger_drift.py
+git add keel/execution/sleeve.py keel/commands/doctor.py tests/execution/test_sleeve.py tests/commands/test_doctor_ledger_drift.py tests/commands/test_doctor.py
 git commit -m "feat(doctor): ledger.drift -- the positions ledger against the orders log (#799)
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
@@ -1029,7 +1235,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 
 **Files:**
 - Modify: `keel/execution/reconcile.py`, `keel/agent.py` (call it after `sweep_orphan_brackets`, live cycles only), `keel/commands/doctor.py`
-- Test: `tests/execution/test_reconcile.py` (append), `tests/commands/test_doctor_ledger_drift.py` (append), `tests/test_agent.py` (one test)
+- Test: `tests/execution/test_reconcile.py` (append), `tests/commands/test_doctor_ledger_drift.py` (append), `tests/test_agent.py` (one test), `tests/commands/test_doctor.py` (append, one paper-profile wiring test)
 
 **Interfaces:**
 - Produces: `reconcile.VENUE_HOLDING_PREFIX = "venue_holding:"`.
@@ -1038,24 +1244,42 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 
 - [ ] **Step 1: Write the failing tests.**
 
+  This module has no `HeldBroker`, `NOW_TS` or `_BalancesRaise` today. `HeldBroker` lives in
+  `tests/execution/test_sell_clamp.py` (itself a `FakeBroker` subclass imported from
+  `tests/execution/test_executor.py`, the precedent for reusing a broker fake across test
+  modules) -- import it from there rather than redefining it. This file's own clock constant is
+  `NOW = 1_800_000_000` (not `NOW_TS`); the new tests use that. `_BalancesRaise` does not exist
+  anywhere and is defined fresh, right beside `_Broker`.
+
 ```python
+# appended to tests/execution/test_reconcile.py imports
+from tests.execution.test_sell_clamp import HeldBroker
+
+
+class _BalancesRaise:
+    """`get_balances()` raises -- the venue is unreachable when `record_venue_holdings` polls."""
+
+    def get_balances(self) -> list[Balance]:
+        raise RuntimeError("network error")
+
+
 # appended to tests/execution/test_reconcile.py
 def test_record_venue_holdings_writes_the_venue_total_for_each_held_product(repo):
     repo.open_position(product_id="BTC-USD", rule_name="dca", opened_at=1, qty=Decimal("0.001"),
                        entry_fill=Decimal("100000"), entry_fee=Decimal("0.3"))
     broker = HeldBroker("BTC", available=Decimal("0.0007"), total=Decimal("0.0009"))
 
-    recorded = reconcile.record_venue_holdings(broker, repo, NOW_TS)
+    recorded = reconcile.record_venue_holdings(broker, repo, NOW)
 
     assert recorded == {"BTC-USD": Decimal("0.0009")}, "TOTAL, never available (#667)"
-    assert repo.get_state("venue_holding:BTC-USD") == {"total": "0.0009", "observed_at": NOW_TS}
+    assert repo.get_state("venue_holding:BTC-USD") == {"total": "0.0009", "observed_at": NOW}
     assert broker.get_balances_calls == 1, "one balance read per cycle, not one per product"
 
 
 def test_an_unreadable_balance_writes_nothing_rather_than_zero(repo):
     repo.open_position(product_id="BTC-USD", rule_name="dca", opened_at=1, qty=Decimal("0.001"),
                        entry_fill=Decimal("100000"), entry_fee=Decimal("0"))
-    assert reconcile.record_venue_holdings(_BalancesRaise(), repo, NOW_TS) == {}
+    assert reconcile.record_venue_holdings(_BalancesRaise(), repo, NOW) == {}
     assert repo.get_state("venue_holding:BTC-USD") is None
 ```
 
@@ -1094,7 +1318,9 @@ def test_no_observation_reports_unknown_not_ok() -> None:
   - It writes the record only when a matching row exists. Its docstring states R3 and the `total`-not-`available` rule (#667).
   - Call it in `run_once` after `reconcile.sweep_orphan_brackets(...)`, guarded by `if paper_trader is None:` (the live cycle), and wrap it so an exception is logged and swallowed. A diagnostic write must never cost a cycle, which is the `notify_after_cycle` precedent.
   - `venue_drift_findings` warns when `ledger > Decimal(record["total"])`, or when there is no record for a held product. Wire it into `gather_findings` from `repo.get_state_keys(reconcile_mod.VENUE_HOLDING_PREFIX)`.
+  - **On a paper profile** (`config.auto_trade.mode == "paper"`), `record_venue_holdings` never runs (the `if paper_trader is None:` guard two bullets up), so `venue_holding:` state is permanently empty BY DESIGN, not by omission -- there is no real venue holding to reconcile a paper tranche against. Without a guard, every open paper tranche would WARN `ledger.venue_drift` "no venue observation" on every cycle (#881). Pass an empty `ledger_by_product` (`{}`) to `venue_drift_findings` when `config.auto_trade.mode == "paper"`, so it returns its `OK` sentinel instead of iterating products it can never have an observation for.
   - Add a `tests/test_agent.py` test that a live `run_once` with an open tranche writes `venue_holding:<product>`, and that a paper `run_once` writes none.
+  - **Add a paper-profile wiring test** to `tests/commands/test_doctor.py`, beside P2's and Task 3.1's: seed a repo with an open tranche and NO `venue_holding:` state record, take a paper `config` the same way (`auto_trade.mode="paper"`), and assert `gather_findings` reports `ledger.venue_drift` as `OK`. Before this fix, the empty `venue` dict plus a non-empty `ledger_by_product` WARNs "no venue observation"; the test must fail red for that reason first.
 
 - [ ] **Step 4: Run the tests, the suite, then commit.**
 
@@ -1119,7 +1345,148 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 - S1: nothing reaches the venue. The test runs with `NoNetworkBroker`, and the command builds no broker at all.
 - S4: `close_declared_position` joins `WEB_FORBIDDEN_NAMES`.
 - It adds one capability row.
-- Closes #798. Together with P3, all three of #798's proposals are delivered.
+- Task 4.0 fixes `guards._open_exposure_by_asset` so a product closed in full releases all of its exposure, whatever price the close happened at -- without it, a declared close at a loss (or the guard's very next real caller, any ordinary loss-making exit) leaves a phantom notional residual and #798 is not actually closed.
+- Closes #798. Together with P3 and Task 4.0, all three of #798's proposals are delivered.
+
+### Task 4.0: `guards._open_exposure_by_asset` releases a fully closed product at ANY exit price
+
+**Why this has to come before Task 4.1.** `_open_exposure_by_asset` nets BUY and SELL
+**notional**: `exposure[asset] += amount` for a BUY, `-= amount` for a SELL, each `amount` at
+the row's OWN price (`_order_notional`). That is the right figure for a position that is only
+PARTLY closed -- the existing dust/partial-fill tests below pin exactly that. It is the WRONG
+figure for a position closed IN FULL at a price other than its entry: PAXG tranche 3 bought
+0.0132 at 4673.23 (notional \$61.69) and a declared close at 4400 (notional \$58.08, a REAL
+loss, not fee dust) nets to \$3.61 of "exposure" the ledger no longer holds a single unit of.
+Task 4.1's own acceptance test, `test_a_declared_close_releases_the_exposure_rails_4_5_6_read`,
+closes PAXG at exactly that loss and asserts the exposure guard reads zero afterward -- it
+cannot pass against today's `_open_exposure_by_asset`, and #798's phantom exposure survives.
+
+**Files:**
+- Modify: `keel/execution/guards.py`
+- Test: `tests/execution/test_guards.py` (append)
+
+**Interfaces:**
+- `_open_exposure_by_asset` keeps its signature and its return type. The only change is that a
+  PRODUCT whose net filled quantity (BUY qty − SELL qty, at each row's `filled_quantity` or
+  `qty`) is `<= 0` contributes **zero** notional to its asset bucket, instead of its net
+  notional. A product still net-long (qty `> 0`) contributes its net notional exactly as today.
+
+- [ ] **Step 1: Write the failing tests.**
+
+```python
+# appended to tests/execution/test_guards.py
+
+def test_a_fully_closed_position_reads_zero_exposure_even_at_a_loss(repo) -> None:
+    """#798/#882: a close that exits the FULL held quantity releases all of it, whatever price
+    the exit happened at. Net NOTIONAL (BUY $61.69 - SELL $58.08 = $3.61) is not zero when the
+    exit priced below the entry -- but net QUANTITY is exactly zero, and a fully closed product
+    carries no exposure left to measure. These are PAXG tranche 3's own numbers (#811)."""
+    _seed_filled_order(
+        repo, product_id="PAXG-USD", side=Side.BUY, qty=Decimal("0.0132"),
+        price=Decimal("4673.23"), created_at=NOW_TS - 86_400,
+    )
+    _seed_filled_order(
+        repo, product_id="PAXG-USD", side=Side.SELL, qty=Decimal("0.0132"),
+        price=Decimal("4400"), created_at=NOW_TS,
+    )
+    assert "PAXG" not in guards._open_exposure_by_asset(repo)
+
+
+def test_a_partial_close_still_nets_by_notional(repo) -> None:
+    """Pinned so the fix above cannot regress the existing behaviour: a position only PARTLY
+    closed (net qty still > 0) keeps netting by notional, dust and all."""
+    _seed_filled_order(
+        repo, product_id="PAXG-USD", side=Side.BUY, qty=Decimal("0.02"),
+        price=Decimal("4673.23"), created_at=NOW_TS - 86_400,
+    )
+    _seed_filled_order(
+        repo, product_id="PAXG-USD", side=Side.SELL, qty=Decimal("0.0132"),
+        price=Decimal("4400"), created_at=NOW_TS,
+    )
+    exposure = guards._open_exposure_by_asset(repo)
+    assert exposure["PAXG"] == Decimal("0.02") * Decimal("4673.23") - Decimal("0.0132") * Decimal("4400")
+```
+
+- [ ] **Step 2: Run the tests to see them fail.** Run: `uv run pytest tests/execution/test_guards.py -k "fully_closed_position or partial_close_still" -v`. Expected: the first FAILs (`"PAXG" in {"PAXG": Decimal("3.6066...")}`); the second already PASSes against today's code -- it exists to prove Step 3 does not change it.
+
+- [ ] **Step 3: Implement.** Replace the function body (the docstring keeps every existing paragraph -- this appends one, per "rules live in neighbouring docstrings" -- and the malformed-row branch's WARNING/counted-vs-skipped decision is untouched):
+
+```python
+    """... (existing docstring, unchanged) ...
+
+    **A fully (or over-) closed PRODUCT contributes zero, not its net notional (#798, #882).**
+    Both sides above count at each row's OWN price, which is right for a position still partly held --
+    the remaining notional really is what is still at risk. It is wrong once the position is
+    FULLY closed: a close at any price other than the entry leaves a notional residual (a real
+    gain or loss) that is not exposure, because zero units are held. Net QUANTITY, not notional,
+    is what decides "closed": tracked per PRODUCT (never mixed across a futures/spot pair in the
+    same asset bucket -- their units are not comparable), a product whose BUY qty minus SELL qty
+    is `<= 0` contributes nothing to its asset bucket, whatever its net notional says.
+    """
+    exposure: dict[str, Decimal] = {}
+    per_product: dict[str, dict[str, Any]] = {}
+    rows: list[dict[str, Any]] = []
+    for status in _OBSERVED_FILL_STATUSES:
+        rows.extend(repo.get_orders(mode="live", status=status))
+    for order in rows:
+        product_id = order["product_id"]
+        side = order["side"]
+        if parse_spot_product_id(product_id) is None:
+            # `action` is in the log line because "we saw a bad row" and "we let it release a
+            # cap" are different events to the operator reading this at 3am.
+            counted = side == Side.BUY.value
+            log_event(
+                logger,
+                logging.WARNING,
+                "guards.exposure_row_unparseable",
+                product=str(product_id),
+                order_id=order.get("id"),
+                side=side,
+                action="counted" if counted else "skipped",
+            )
+            if not counted:
+                continue
+        asset = _asset(product_id)
+        amount = _order_notional(order)
+        qty = order.get("filled_quantity") or order.get("qty") or Decimal("0")
+        bucket = per_product.setdefault(
+            product_id, {"asset": asset, "notional": Decimal("0"), "qty": Decimal("0")}
+        )
+        if side == Side.BUY.value:
+            bucket["notional"] += amount
+            bucket["qty"] += qty
+        elif side == Side.SELL.value:
+            bucket["notional"] -= amount
+            bucket["qty"] -= qty
+    for bucket in per_product.values():
+        if bucket["qty"] > 0:
+            asset = bucket["asset"]
+            exposure[asset] = exposure.get(asset, Decimal("0")) + bucket["notional"]
+    return {asset: amt for asset, amt in exposure.items() if amt > 0}
+```
+
+  This is mathematically identical to today's flat accumulation for every product that stays
+  net-long (addition is associative; grouping by product first changes nothing when every
+  group's own sign matches its contribution), so every existing exposure test -- partial fills,
+  the malformed-row tests, rails 4/5/6 -- keeps passing unchanged. It differs ONLY where a
+  product's net qty is `<= 0`, which is exactly the case this task fixes.
+
+- [ ] **Step 4: Run the guard suite, then the full suite, then commit.**
+
+```bash
+uv run pytest tests/execution/test_guards.py -q
+uv run pytest -q && uv run ruff check keel tests && uv run ruff format --check keel tests && uv run mypy
+git add keel/execution/guards.py tests/execution/test_guards.py
+git commit -m "fix(guards): a fully closed product releases all its exposure, not its net notional (#798)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
+```
+
+**Acceptance (Task 4.0):** a product whose filled BUY and SELL quantities net to zero or less
+contributes zero exposure regardless of the prices involved; a partly-closed product's exposure
+is unchanged from today.
+
+---
 
 ### Task 4.1: The service, `close_declared_position`
 
@@ -1790,7 +2157,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 
 **Files:**
 - Modify: `keel/data/db.py`: add the DDL after `positions`, `_migrate_v22_sell_proposals`, `_MIGRATIONS[22]`, and `SCHEMA_VERSION = 22`. Add `sell_proposals` to the module docstring's table list.
-- Test: `tests/data/test_migrations.py`. Append the v22 tests, and relax the v21 test's `== 21` as the Global Constraints say.
+- Test: `tests/data/test_migrations.py`. Append the v22 tests, and relax **all eight** `== 21` assertions (lines 52, 627, 788, 890, 1050, 1097, 1168, 1316 — see Global Constraints). All eight share the exact literal `== db.SCHEMA_VERSION == 21` (`assert version == db.SCHEMA_VERSION == 21` at line 52, `assert stamped == db.SCHEMA_VERSION == 21` at the other seven), so `sed -i '' 's/== db\.SCHEMA_VERSION == 21/== db.SCHEMA_VERSION/' tests/data/test_migrations.py` fixes all eight in one pass. Confirm with `grep -n '== 21' tests/data/test_migrations.py` that no hit remains.
 
 **Interfaces:**
 - Produces: the `sell_proposals` columns `id, ts, product_id, rule_id, rule_kind, rule_status, qty, expected_price, vwae, cost_basis, expected_gross, expected_fee, fee_source, expected_net_pnl, legs, trigger, rails, decision, superseded_by, order_id, reviewed_ts`.
@@ -1812,7 +2179,7 @@ def test_migration_to_v22_creates_sell_proposals() -> None:
     db.migrate(conn)
     columns = {row["name"] for row in conn.execute("PRAGMA table_info(sell_proposals)")}
     assert columns == _V22_COLUMNS
-    assert db.SCHEMA_VERSION == 22
+    assert db.SCHEMA_VERSION >= 22
 
 
 def test_a_v21_database_gains_an_empty_sell_proposals_table() -> None:
@@ -1822,7 +2189,7 @@ def test_a_v21_database_gains_an_empty_sell_proposals_table() -> None:
     conn.commit()
     db.migrate(conn)
     assert conn.execute("SELECT COUNT(*) AS n FROM sell_proposals").fetchone()["n"] == 0
-    assert conn.execute("SELECT version FROM schema_version").fetchone()["version"] == 22
+    assert conn.execute("SELECT version FROM schema_version").fetchone()["version"] == db.SCHEMA_VERSION
 
 
 def test_v22_is_idempotent() -> None:
@@ -1832,9 +2199,16 @@ def test_v22_is_idempotent() -> None:
     db.migrate(conn)
 ```
 
-- [ ] **Step 2: Run the tests to see them fail.** Run: `uv run pytest tests/data/test_migrations.py -k v22 -v`. Expected: FAIL. The table is absent, and `SCHEMA_VERSION == 21`.
+- [ ] **Step 2: Run the tests to see them fail.** Run: `uv run pytest tests/data/test_migrations.py -k v22 -v`. Expected: FAIL. The table is absent, and `SCHEMA_VERSION == 21`. Then run the full file, `uv run pytest tests/data/test_migrations.py -q`: the eight tests pinned to the literal `21` (lines 52, 627, 788, 890, 1050, 1097, 1168, 1316) fail too, once `SCHEMA_VERSION` becomes 22 below — that is expected, and Step 3 relaxes them in the same commit.
 
-- [ ] **Step 3: Implement.** The DDL:
+- [ ] **Step 3: Implement.** First relax the eight pre-existing `== 21` pins so the whole file can go green on v22, not just the new tests:
+
+```bash
+sed -i '' 's/== db\.SCHEMA_VERSION == 21/== db.SCHEMA_VERSION/' tests/data/test_migrations.py
+grep -n '== 21' tests/data/test_migrations.py  # expect no output
+```
+
+  Then add the DDL:
 
 ```python
     # One row per `Reduction` a sleeve-sell rule proposed, EXECUTED OR NOT (spec §3.8). The
@@ -2260,7 +2634,8 @@ from decimal import Decimal
 
 from keel_broker_api.port import TradeScopeDenied
 
-from keel.execution import executor, sleeve
+from keel.execution import executor, guards, sleeve
+from keel.execution.guards import OrderIntent
 from keel.strategy.reduction import Holding, Lot, Reduction, SellCosts
 from tests.execution.test_executor import (  # noqa: F401
     NOW_TS, FakeBroker, NoNetworkBroker, _PreviewRefusingBroker, _config, repo,
@@ -2325,12 +2700,30 @@ def test_rail_2_is_sliced_not_vetoed_and_the_legs_are_recorded(repo) -> None:  #
     assert repo.get_sell_proposal(result.proposal_id)["qty"] * D("110000") <= D("50")
 
 
-def test_buy_scoped_rails_13_17_20_22_do_not_veto_a_sell(repo) -> None:  # noqa: F811
-    repo.set_state("withdrawals_enabled", False)           # rail 17
-    broker = FakeBroker(balances={"BTC": D("1")})          # rail 13: no quote balance
+def test_buy_scoped_rails_13_17_20_22_do_not_veto_a_sell(repo, monkeypatch) -> None:  # noqa: F811
+    """Rails 13 and 17 read `intent.available_quote` and `intent.withdrawals_enabled`, and both
+    are `if is_buy` gated in `guards.py` -- neither is even EVALUATED for a SELL, let alone
+    vetoing one. A `repo.set_state("withdrawals_enabled", False)` / no-quote-balance broker
+    setup therefore never reaches either rail: it asserts nothing about them, only that
+    `decision == "preview"` for unrelated reasons. What actually pins "these two are buy-only"
+    is that `reduce`'s SELL intent carries `available_quote`/`withdrawals_enabled` as `None` --
+    their dataclass defaults, since `reduce` never sets either -- which is exactly the value
+    that WOULD veto if a rail wrongly applied to sells read it (both rails fail closed on
+    `None`, per their own comments above)."""
+    captured: dict[str, OrderIntent] = {}
+    real_check = guards.check
+
+    def _spy(intent, *a, **kw):
+        captured["intent"] = intent
+        return real_check(intent, *a, **kw)
+
+    monkeypatch.setattr(guards, "check", _spy)
     repo._conn.execute("DELETE FROM venue_trade_scopes")   # rail 20
     repo._conn.execute("DELETE FROM venue_cash_postures")  # rail 22
-    assert _run(repo, broker).decision == "preview", "spec §3.4: these rails are buy-only"
+    result = _run(repo, FakeBroker())
+    assert result.decision == "preview", "spec §3.4: these rails are buy-only"
+    assert captured["intent"].available_quote is None
+    assert captured["intent"].withdrawals_enabled is None
 
 
 def test_a_preview_that_raises_records_the_proposal_on_the_fallback_fee(repo) -> None:  # noqa: F811
@@ -3089,19 +3482,26 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 - [ ] **Step 1: Write the failing test.**
 
 ```python
-def test_a_sleeve_sell_rule_does_not_count_as_managing_a_position(tmp_path) -> None:
+# added to tests/commands/test_doctor_position_watch.py's imports
+from keel.commands.doctor import gather_findings
+from keel.config import load_config
+from tests.commands.test_doctor import _seeded_repo
+
+
+def test_a_sleeve_sell_rule_does_not_count_as_managing_a_position(tmp_path, valid_config_path) -> None:
     """A live reverse_dca on PAXG can only PROPOSE; #811's finding must still fire."""
-    repo = _migrated_repo(tmp_path)
+    repo = _seeded_repo(tmp_path / "keel.db")
     repo.open_position(product_id="PAXG-USD", rule_name="turtle_breakout", opened_at=1,
                        qty=Decimal("0.0132"), entry_fill=Decimal("4673.23"),
                        entry_fee=Decimal("0.73"), initial_stop=Decimal("4521.76"))
     repo.insert_rule("reverse_dca", {"product_id": "PAXG-USD", "target_usd": "10",
                                      "min_price_floor": "1"}, status="live")
-    found = {f.name: f for f in gather_findings(repo, _config(), [], now_ts=10)}
+    config = load_config(valid_config_path)
+    found = {f.name: f for f in gather_findings(repo, config, [], now_ts=10)}
     assert found["position.unmanaged"].status == WARN
 ```
 
-  `_migrated_repo` and `_config` are the helpers `tests/commands/test_doctor.py` already uses for `gather_findings`. Import them from there.
+  `tests/commands/test_doctor.py` has no `_migrated_repo` or `_config` -- its `gather_findings` tests build the repo with `_seeded_repo(tmp_path / "keel.db")` and the config with `load_config(valid_config_path)` (both already defined/imported at the top of that file; `valid_config_path` is the same fixture parameter its other tests take). Import `_seeded_repo` and `load_config` from there rather than the names this snippet originally assumed.
 
 - [ ] **Step 2: Run the test to see it fail.** Run: `uv run pytest tests/commands/test_doctor_position_watch.py -k sleeve -v`. Expected: FAIL (`OK`).
 
@@ -4352,6 +4752,83 @@ def test_a_declined_typed_gate_places_nothing(repo) -> None:  # noqa: F811
     broker = FakeBroker()
     assert _run(repo, broker, execution="confirm", confirm_fn=lambda p: False).decision == "declined"
     assert broker.place_calls == []
+
+
+def _bracketed(repo, broker, config, *, qty="0.002", stop="95000", target="130000"):
+    """Open a position AND place a REAL resting protective bracket for it, via `place_bracket`
+    itself -- the fixture `_clear_resting_bracket` actually has to cancel, not a hand-rolled
+    row. Returns the `Holding` `reduce` needs."""
+    holding = _held(repo, qty)
+    order_id = executor.place_bracket(broker, repo, config, product_id="BTC-USD", qty=D(qty),
+                                      stop=D(stop), target=D(target), rule_name="turtle_breakout",
+                                      now_ts=NOW_TS - 100)
+    assert order_id is not None, "fixture setup: the bracket must actually be resting"
+    return holding
+
+
+def test_883_a_declined_confirm_leaves_the_resting_bracket_untouched(repo) -> None:  # noqa: F811
+    """#883: `_clear_resting_bracket` used to run BEFORE the typed-yes gate, so a "no" (or no
+    TTY) left a stopped tranche naked with no `unbracketed:` record -- the cancel had already
+    happened and nothing said so. The gate must be asked FIRST; the book is untouched on a no."""
+    config = _config()
+    broker = FakeBroker()
+    _bracketed(repo, broker, config)
+    repo.set_sells_window(True, now_ts=0, expires_ts=NOW_TS + 3600)
+    result = executor.reduce(_red(qty="0.001"), broker=broker, repo=repo, config=config,
+                             holding=sleeve.holding_of(repo, "BTC-USD"), costs=COSTS, rule_id=7,
+                             rule_status="live", now_ts=NOW_TS, execution="confirm",
+                             confirm_fn=lambda preview: False)
+    assert result.decision == "declined"
+    assert broker.cancel_calls == [], "a typed no must never reach the exchange cancel"
+    resting = [o for o in repo.get_orders(mode="live", product_id="BTC-USD", status="pending")
+              if o["side"] == "SELL"]
+    assert len(resting) == 1, "the bracket is still resting -- nothing was cancelled"
+    assert repo.get_state("unbracketed:BTC-USD") is None, "no cancel happened, so nothing to heal"
+
+
+def test_883_a_partial_confirmed_leg_re_brackets_the_remainder_like_scale_out(repo) -> None:  # noqa: F811
+    """A "yes" that sells only part of a bracketed position must leave the remainder protected,
+    exactly as `scale_out` re-brackets after a partial sell (#502) -- a sleeve sale is not
+    exempt from that rule merely because a human, not a rule, triggered it."""
+    config = _config()
+    broker = FakeBroker()
+    _bracketed(repo, broker, config, qty="0.002", stop="95000", target="130000")  # holds 0.002
+    repo.set_sells_window(True, now_ts=0, expires_ts=NOW_TS + 3600)
+    result = executor.reduce(_red(qty="0.001"), broker=broker, repo=repo, config=config,
+                             holding=sleeve.holding_of(repo, "BTC-USD"), costs=COSTS, rule_id=7,
+                             rule_status="live", now_ts=NOW_TS, execution="confirm",
+                             confirm_fn=lambda preview: True)
+    assert result.decision == "placed"
+    assert broker.cancel_calls, "the original bracket had to be cancelled to sell against it"
+    # A NEW bracket for the remainder (0.001), at the SAME stop/target -- two `place_order`
+    # calls total: the original bracket (fixture setup) and the remainder's.
+    assert len(broker.place_calls) == 2
+    assert repo.get_state("open_stop:BTC-USD") == D("95000")
+    assert repo.get_state("open_target:BTC-USD") == D("130000")
+    assert repo.get_state("unbracketed:BTC-USD") is None, "place_bracket clears it on success"
+    resting = [o for o in repo.get_orders(mode="live", product_id="BTC-USD", status="pending")
+              if o["side"] == "SELL"]
+    assert len(resting) == 1, "the old bracket is gone; exactly the new, smaller one rests"
+
+
+def test_883_a_full_close_does_not_attempt_to_re_bracket(repo) -> None:  # noqa: F811
+    """The complement: a leg that closes the WHOLE bracketed position leaves nothing to
+    re-protect, and must not try -- `place_bracket` for qty 0 has no meaning."""
+    config = _config()
+    broker = FakeBroker()
+    _bracketed(repo, broker, config, qty="0.002", stop="95000", target="130000")
+    repo.set_sells_window(True, now_ts=0, expires_ts=NOW_TS + 3600)
+    result = executor.reduce(_red(qty="0.002"), broker=broker, repo=repo, config=config,
+                             holding=sleeve.holding_of(repo, "BTC-USD"), costs=COSTS, rule_id=7,
+                             rule_status="live", now_ts=NOW_TS, execution="confirm",
+                             confirm_fn=lambda preview: True)
+    assert result.decision == "placed"
+    # One `place_order` call total: the original bracket (fixture setup). No remainder, no
+    # second bracket.
+    assert len(broker.place_calls) == 1
+    resting = [o for o in repo.get_orders(mode="live", product_id="BTC-USD", status="pending")
+              if o["side"] == "SELL"]
+    assert resting == []
 ```
 
 ```python
@@ -4382,16 +4859,95 @@ def test_the_cycle_never_asks_reduce_to_confirm() -> None:
 
   Keep the pre-P18 set under a new name, `RUN_ORDER_CALLERS_BEFORE_P18`. The P1 test keeps using `RUN_ORDER_CALLERS`.
 
-- [ ] **Step 2: Run the tests to see them fail.**
+- [ ] **Step 2: Run the tests to see them fail.** The three `test_883_*` tests fail against the ORIGINAL ordering below with the fixture's bracket already cancelled (`broker.cancel_calls` non-empty) before `confirm_fn` is even consulted -- confirm that first, then implement the fix.
+
 - [ ] **Step 3: Implement the confirm branch.** After a clean `guards.check`:
   - If `execution == "confirm"` and not `sleeve.sells_released(repo, now_ts)`, record `declined` and return.
   - Else refuse unless `rule_status == "live"` (R16).
-  - `if not _clear_resting_bracket(...)`, record `declined` with its reason. This cancels a resting bracket, as every SELL path does.
-  - `if sleeve.sells_released(repo, now_ts): result = _run_order(intent, broker, repo, config, "confirm", confirm_fn, now_ts, spec=spec)`.
+  - **#883: the typed-yes gate must be asked BEFORE the bracket is cancelled, not after.** The
+    original draft called `_clear_resting_bracket` here, unconditionally, before ever calling
+    `_run_order` -- so a decline (or no TTY) left the bracket already cancelled, with no
+    `unbracketed:` record, because nothing about a decline resembles the crash `place_bracket`'s
+    own failure paths record for. Do not call `_clear_resting_bracket` directly. Instead, wrap
+    the caller's `confirm_fn` so the cancel happens ONLY once the operator has said yes, inside
+    the same gate `_run_order` already calls at the right moment (after its own fresh preview,
+    before `insert_order`):
+
+    ```python
+    # NOT `held` -- that name is already this function's venue-observed available base from
+    # `_clamped_sell_qty` above. `ledger_held` is the LEDGER's total (`_held_position`, the same
+    # source `scale_out` uses), and `qty` here is the CLAMPED amount this leg will actually sell.
+    ledger_held, _avg_cost = _held_position(repo, reduction.product_id)
+    remainder = ledger_held - qty
+    stop = repo.get_state(f"open_stop:{reduction.product_id}")
+    target = repo.get_state(f"open_target:{reduction.product_id}")
+    protecting_remainder = remainder > 0 and stop is not None and target is not None
+
+    # The crash ledger, BEFORE anything touches the exchange -- same key, same reason as
+    # `scale_out`/`_roll_stop` (#519's pattern). Written even before the confirm decision:
+    # if the process dies between a "yes" and the re-bracket below, the next cycle's sweep
+    # must still be able to heal the remainder. A decline or a failed cancel leaves the
+    # bracket resting, and the sweep's own `if not intent: continue` guard (#195) already
+    # skips any product whose bracket is still there, so a stale record here is harmless.
+    if protecting_remainder:
+        repo.set_state(f"{UNBRACKETED_PREFIX}{reduction.product_id}",
+                       {"stop": stop, "target": target, "qty": remainder})
+
+    cancel_failed = False
+
+    def _confirm_then_cancel(preview: Preview) -> bool:
+        nonlocal cancel_failed
+        if confirm_fn is None or not confirm_fn(preview):
+            return False
+        if not _clear_resting_bracket(broker, repo, reduction.product_id, now_ts):
+            cancel_failed = True
+            return False
+        return True
+
+    # The `_run_order` call stays TEXTUALLY inside `if sleeve.sells_released(...):`, matching
+    # the S1 AST pin (`test_reduces_only_run_order_call_sits_behind_sells_released`) exactly as
+    # the original draft did -- the early `not sleeve.sells_released(...)` return above already
+    # makes this redundant at runtime, and that redundancy is the point: the mechanical scan
+    # checks the SOURCE SHAPE, not the logical flow, so the call must visibly sit behind the
+    # gate even though it is unreachable any other way.
+    if sleeve.sells_released(repo, now_ts):
+        result = _run_order(intent, broker, repo, config, "confirm", _confirm_then_cancel,
+                            now_ts, spec=spec)
+    else:
+        # Unreachable -- the early `not sleeve.sells_released(...)` return above already
+        # guarantees this branch is never taken. Kept only so `_run_order`'s call sits behind
+        # the gate for the AST pin, and so `result` (an `ExecutionResult`, like `_run_order`'s
+        # own return) is never possibly-unbound under mypy.
+        result = ExecutionResult(placed=False, order_id=None, vetoed_by=[], preview=None,
+                                 reason="sells window closed between the two checks")
+    if not result.placed:
+        reason = (
+            f"could not cancel the resting exit bracket for {reduction.product_id}"
+            if cancel_failed else "declined at the confirm gate"
+        )
+        pid = sleeve.record_proposal(repo, reduction=leg, rule_id=rule_id,
+                                     rule_status=rule_status, holding=holding, costs=costs,
+                                     decision="declined", rails=rails, expected_fee=fallback_fee,
+                                     fee_source=costs.fee_source, legs=legs, now_ts=now_ts)
+        return ReduceResult(reduction.product_id, reduction.reason, pid, "declined", [], legs,
+                            reason)
+    ```
+
   - On `placed`:
     - update the proposal: `decision="placed"`, `order_id`;
     - stamp `orders.confirmation = "confirm_sells"` with `repo.update_order(order_id, confirmation="confirm_sells")`, so a reader can tell which gate released it (spec §3.8);
     - when the order is `filled`, call `streak.book_exit(repo, config, product_id=..., exit_order=repo.get_order(order_id), sold_qty=streak.observed_sold_qty(order) or intent.qty, is_dca=None, now_ts=now_ts)`.
+    - **Re-bracket the remainder, exactly as `scale_out` does (#883).** `if protecting_remainder:`
+      call `place_bracket(broker, repo, config, product_id=reduction.product_id, qty=remainder,
+      stop=stop, target=target, rule_name=reduction.reason, now_ts=now_ts, rule_id=rule_id)`
+      AFTER `book_exit`, for the same reason `scale_out` books before it re-places: the sweep
+      that would otherwise heal from the crash-ledger record sizes a healing bracket off the
+      `positions` ledger, which `book_exit` is what shrinks. `place_bracket` clears
+      `unbracketed:<product>` on success and re-writes it (unchanged) on failure or veto,
+      logging CRITICAL either way (its own existing contract; nothing new needed here). When
+      `not protecting_remainder` (a full close, or a DCA tranche that was never bracketed),
+      skip this entirely -- there is nothing to re-place, and `place_bracket` for a zero or
+      unprotected remainder has no meaning.
 - [ ] **Step 4: Run the tests, the invariants and the suite, then commit.**
 
 ### Task 18.2: `keel dca {distribute,trim,exit} --confirm <proposal-id>`, one gate function and one capability row
