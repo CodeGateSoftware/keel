@@ -758,20 +758,76 @@ def test_no_positive_value_passes_when_existing_commitments_alone_exceed_the_cap
     assert "no --buffer-pct below 1 would pass" in blocker
 
 
-def test_no_buffer_below_one_passes_at_a_zero_cap_for_a_large_enough_budget(
+def test_nothing_is_suggested_at_a_zero_cap(valid_config_path: Path) -> None:
+    """Requirement 3's first named case, corrected by #872: cap $0 (no subscription attested).
+    The only budgets or buffer-pcts whose worst month fits $0.00 are those whose per-buys ALL
+    round to $0.00 -- and re-running at one of those is blocked by the "$0.00" blocker it
+    creates. So neither search may name a value; the blocker says so in words. (Before #872 this
+    suggested `--budget 0.12` / `--buffer-pct 0.9998`, both blocked when re-run.)"""
+    plan = _plan(valid_config_path, cap=None)
+    assert not plan.approvable
+    assert plan.max_passing_budget_usd is None
+    assert plan.min_passing_buffer_pct is None
+    (blocker,) = [b for b in plan.blockers if "rail 14" in b]
+    assert blocker.endswith(
+        dca_mod._passing_suggestion_text(
+            None,
+            None,
+            buffer_pct=plan.inputs.buffer_pct,
+            budget_usd=plan.inputs.budget_usd,
+            live_worst_month_usd=Decimal("0"),
+        )
+    )
+
+
+def test_nothing_is_suggested_when_live_commitments_exactly_fill_the_cap(
     valid_config_path: Path,
 ) -> None:
-    """Requirement 3's first named case: cap $0 (no subscription attested). At a large enough
-    budget, even the largest legal buffer-pct (0.9999) leaves more than $0.00 spend, so no
-    buffer-pct below 1 passes -- while a much smaller budget still could (the budget side is not
-    vacuously `None` here, proving the two searches fail independently)."""
-    plan = _plan(valid_config_path, budget="5000", buffer="0.1", cap=None)
+    """#872's second reproduction: SOL's own worst month ($10 x 5 = $50) exactly equals the $50
+    cap, so the headroom left for this plan is $0.00 -- the same trap as a zero cap."""
+    repo = _repo()
+    _insert_dca(repo, "SOL-USD", "live", budget="10")
+    plan = _plan(valid_config_path, repo, cap="50")
     assert not plan.approvable
+    assert plan.max_passing_budget_usd is None
     assert plan.min_passing_buffer_pct is None
+
+
+def test_nothing_is_suggested_when_the_headroom_is_below_one_cent_per_asset(
+    valid_config_path: Path,
+) -> None:
+    """#872, the general case: three assets over a 7-day cadence need at least $0.03 per cycle x
+    5 worst-month buy days = $0.15 for every per-buy to be at least $0.01. A $0.10 cap is
+    positive but below that floor, so every value fitting it rounds some per-buy to $0.00."""
+    plan = _plan(valid_config_path, cap="0.10")
+    assert not plan.approvable
+    assert plan.max_passing_budget_usd is None
+    assert plan.min_passing_buffer_pct is None
+
+
+def test_a_suggestion_near_the_per_asset_floor_is_approvable_when_rerun(
+    valid_config_path: Path,
+) -> None:
+    """#872's positive side: a $0.20 cap clears the $0.15 floor above, so both searches name a
+    value -- and re-running `build_dca_plan` at each is approvable outright, with no "$0.00"
+    blocker, not merely free of the rail-14 one."""
+    plan = _plan(valid_config_path, cap="0.20")
     assert plan.max_passing_budget_usd is not None
-    (blocker,) = [b for b in plan.blockers if "rail 14" in b]
-    assert "no --buffer-pct below 1 would pass" in blocker
-    assert "the largest --budget that would pass is" in blocker
+    assert plan.min_passing_buffer_pct is not None
+
+    at_budget = _plan(
+        valid_config_path, cap="0.20", budget=format(plan.max_passing_budget_usd, "f")
+    )
+    assert at_budget.blockers == ()
+    assert all(b.per_buy_usd > 0 for b in at_budget.buys)
+    assert len(at_budget.buys) == 3
+
+    at_buffer = _plan(
+        valid_config_path, cap="0.20", buffer=format(plan.min_passing_buffer_pct, "f")
+    )
+    assert at_buffer.blockers == ()
+    assert all(b.per_buy_usd > 0 for b in at_buffer.buys)
+    assert len(at_buffer.buys) == 3
 
 
 def test_suggested_values_never_use_exponent_notation() -> None:

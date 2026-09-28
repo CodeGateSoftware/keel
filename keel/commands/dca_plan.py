@@ -483,8 +483,9 @@ class DcaPlan:
     #: plan's OWN `--buffer-pct`) that would clear it -- reserving headroom for the existing
     #: `live` DCA rules' own worst-case commitment too (R7), computed by
     #: `_max_passing_budget_usd`'s binary search over `_worst_month_spend_for`, the SAME rounding
-    #: `build_dca_plan` uses. `None` when the blocker did not fire, or when no positive budget
-    #: clears it (the reservation alone already meets or exceeds the cap).
+    #: `build_dca_plan` uses, and never at a value that rounds any per-buy to $0.00 (#872).
+    #: `None` when the blocker did not fire, or when no such budget clears it (the headroom left
+    #: after the reservation cannot fund a cent per asset per buy).
     max_passing_budget_usd: Decimal | None
     #: #854's other half: the smallest `--buffer-pct` (to 0.0001, at this plan's OWN `--budget`)
     #: that would clear the same blocker, by the same search and the same reservation. `None`
@@ -595,6 +596,22 @@ def _worst_month_spend_for(
     return cycle * worst_days
 
 
+def _every_per_buy_nonzero(
+    budget_usd: Decimal,
+    buffer_pct: Decimal,
+    weights: tuple[Decimal, ...],
+    cadence_days: int,
+) -> bool:
+    """#872: whether re-running `build_dca_plan` at `budget_usd` / `buffer_pct` would leave every
+    per-buy at $0.01 or more -- i.e. raise no "per-buy rounds to $0.00" blocker. A suggested value
+    must satisfy this as well as fit the headroom: at a $0.00 headroom, only all-zero per-buys fit,
+    and naming one would hand the operator a value that is itself blocked. Same R5 pipeline as
+    `_worst_month_spend_for`, so it is monotone non-decreasing in the budget and non-increasing in
+    the buffer."""
+    spend = _cents_down(budget_usd * (Decimal("1") - buffer_pct))
+    return all(_per_buy_usd(spend, w, cadence_days) > 0 for w in weights)
+
+
 #: `--buffer-pct` is a fraction in [0, 1) (R11). #854 searches it at 0.0001 resolution: steps
 #: 0..9999 cover [0, 0.9999], the highest buffer strictly below 1.
 _BUFFER_STEP = Decimal("0.0001")
@@ -618,23 +635,55 @@ def _max_passing_budget_usd(
     boundary is verified by a direct check on both sides of it rather than merely assumed (a
     defence against a rounding surprise the monotonicity argument missed).
 
-    `None` when no positive budget clears `headroom_usd` -- it is already at or below zero.
+    A passing budget must ALSO leave every per-buy at $0.01 or more (#872,
+    `_every_per_buy_nonzero`): that condition holds from some smallest budget upward, the headroom
+    condition up to some largest one, so the passing budgets form one interval. The search first
+    finds its lower end (the smallest budget with no $0.00 per-buy), then the upper end from there.
+
+    `None` when no budget satisfies both -- the headroom is too small to fund a cent per asset per
+    buy (at worst it is already at or below zero).
     """
 
-    def passes(cents: int) -> bool:
+    def fits(cents: int) -> bool:
         budget = Decimal(cents) / _HUNDRED
         spend_value = _worst_month_spend_for(budget, buffer_pct, weights, cadence_days, worst_days)
         return spend_value <= headroom_usd
 
-    if not passes(1):
+    def nonzero(cents: int) -> bool:
+        return _every_per_buy_nonzero(Decimal(cents) / _HUNDRED, buffer_pct, weights, cadence_days)
+
+    # The smallest budget whose per-buys are all nonzero: double until one is, then bisect down.
+    # Each weight is positive, so the doubling ends; bounded anyway, since a budget that has
+    # already outgrown the headroom cannot come back inside it by growing further.
+    floor_hi = 1
+    while not nonzero(floor_hi):
+        if not fits(floor_hi):
+            return None
+        floor_hi *= 2
+    floor_lo = floor_hi // 2  # 0, or a budget known to have a $0.00 per-buy
+    while floor_hi - floor_lo > 1:
+        mid = (floor_lo + floor_hi) // 2
+        if nonzero(mid):
+            floor_hi = mid
+        else:
+            floor_lo = mid
+    lo_cents = floor_hi
+
+    def passes(cents: int) -> bool:
+        return fits(cents) and nonzero(cents)
+
+    if not passes(lo_cents):
         return None
-    hi_cents = max(int((current_budget_usd * _HUNDRED).to_integral_value(rounding=ROUND_UP)), 1)
+    hi_cents = max(
+        int((current_budget_usd * _HUNDRED).to_integral_value(rounding=ROUND_UP)), lo_cents + 1
+    )
     # `current_budget_usd` is the input that triggered the blocker this is computed for, so it
     # must already fail (its worst month exceeds the cap outright, and `headroom_usd` only
     # subtracts more from the cap) -- widened defensively rather than trusted blindly.
     while passes(hi_cents):
         hi_cents *= 2
-    lo_cents, hi_cents = 1, hi_cents  # invariant: passes(lo_cents) and not passes(hi_cents)
+    # invariant: passes(lo_cents) and not passes(hi_cents); every budget >= lo_cents is nonzero,
+    # so only `fits` can change across [lo_cents, hi_cents] and the bisection below is exact.
     while hi_cents - lo_cents > 1:
         mid = (lo_cents + hi_cents) // 2
         if passes(mid):
@@ -656,7 +705,10 @@ def _min_passing_buffer_pct(
     """#854's other half: the smallest `--buffer-pct`, to 0.0001, that keeps this plan's own
     worst calendar month at or under `headroom_usd` at `budget_usd`. Binary search over 0.0001
     steps in [0, 1), the same `_worst_month_spend_for` call, which is monotone non-increasing in
-    the buffer (more held back can only shrink spend). `None` when no buffer below 1 clears it.
+    the buffer (more held back can only shrink spend). A passing buffer must ALSO leave every
+    per-buy at $0.01 or more (#872, `_every_per_buy_nonzero`), which holds from buffer 0 up to
+    some largest step; the search runs below that step only. `None` when no buffer below 1
+    satisfies both.
     """
 
     def passes(step: int) -> bool:
@@ -664,9 +716,26 @@ def _min_passing_buffer_pct(
         spend_value = _worst_month_spend_for(
             budget_usd, buffer_pct, weights, cadence_days, worst_days
         )
-        return spend_value <= headroom_usd
+        return spend_value <= headroom_usd and _every_per_buy_nonzero(
+            budget_usd, buffer_pct, weights, cadence_days
+        )
 
-    hi = _BUFFER_STEPS - 1
+    def nonzero(step: int) -> bool:
+        return _every_per_buy_nonzero(
+            budget_usd, Decimal(step) * _BUFFER_STEP, weights, cadence_days
+        )
+
+    # The largest step whose per-buys are all nonzero (monotone: more buffer, smaller per-buys).
+    if not nonzero(0):
+        return None
+    top, past = 0, _BUFFER_STEPS  # nonzero(top); `past` is out of range or has a $0.00 per-buy
+    while past - top > 1:
+        mid = (top + past) // 2
+        if nonzero(mid):
+            top = mid
+        else:
+            past = mid
+    hi = top
     if not passes(hi):
         return None
     lo = 0
