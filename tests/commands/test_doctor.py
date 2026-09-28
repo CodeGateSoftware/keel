@@ -1268,6 +1268,39 @@ def test_gather_findings_on_a_paper_profile_compares_against_paper_fills(
     assert (on_live.status, on_live.products) == ("warn", ("BTC-USD",))
 
 
+def test_gather_findings_feeds_the_open_tranches_fees_to_venue_drift(
+    tmp_path, valid_config_path
+) -> None:
+    """#900: PAXG tranche 3 paid $0.73 at 4673.23 -- 0.000156 PAXG a fee-in-quote venue
+    withheld. A venue short by less than that is named as #900. The control (the same gap with
+    a zero-fee tranche) takes the sale clause, which proves the fee reached the finding from the
+    ledger and was not assumed."""
+    config = _live(load_config(valid_config_path))
+    clauses = {}
+    for label, fee in (("paid", "0.73"), ("free", "0")):
+        repo = _seeded_repo(tmp_path / f"{label}.db")
+        repo.open_position(
+            product_id="PAXG-USD",
+            rule_name="dca",
+            opened_at=NOW - 30 * DAY,
+            qty=Decimal("0.0132"),
+            entry_fill=Decimal("4673.23"),
+            entry_fee=Decimal(fee),
+        )
+        repo.set_state("venue_holding:PAXG-USD", {"total": "0.01306", "observed_at": NOW})
+        finding = _named(gather_findings(repo, config, [], NOW), "ledger.venue_drift")
+        assert (finding.status, finding.products) == ("warn", ("PAXG-USD",))
+        clauses[label] = finding.detail.split(" -- ")[0]
+    from keel.commands.doctor import _utc_date
+
+    fee_base = Decimal("0.73") / Decimal("4673.23")
+    assert clauses == {
+        "paid": "PAXG-USD: ledger 0.0132 > venue 0.01306 (observed "
+        f"{_utc_date(NOW)}), no more than the {fee_base} its open tranches paid in fees (#900)",
+        "free": f"PAXG-USD: ledger 0.0132 > venue 0.01306 (observed {_utc_date(NOW)})",
+    }
+
+
 def test_gather_findings_stays_read_only_with_ledger_drift_to_report(
     tmp_path, valid_config_path
 ) -> None:

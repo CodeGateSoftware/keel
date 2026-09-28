@@ -1578,11 +1578,31 @@ def _venue_total(record: Any) -> Decimal | None:
     return total if total.is_finite() else None
 
 
+def open_tranche_fee_base(open_positions: list[dict[str, Any]]) -> dict[str, Decimal]:
+    """Per product, the entry fees of its open tranches expressed in BASE (`entry_fee /
+    entry_fill`, summed) -- what a fee-in-quote venue withheld from those BUYs (#900).
+
+    A quote-sized market BUY on Coinbase Advanced pays its fee out of the quote, so it delivers
+    `(quote - fee) / price` of base; a tranche booked at `quote / price` overstates the holding
+    by exactly `fee / price`. A tranche with no recorded fee or entry price adds nothing: NULL
+    is "not recorded", and a guessed fee would make a real sale look like a booking error."""
+    fee_base: dict[str, Decimal] = {}
+    for position in open_positions:
+        fee = position.get("entry_fee")
+        fill = position.get("entry_fill")
+        if fee is None or fill is None or fee <= 0 or fill <= 0:
+            continue
+        product = position["product_id"]
+        fee_base[product] = fee_base.get(product, Decimal("0")) + fee / fill
+    return fee_base
+
+
 def venue_drift_findings(
     ledger_by_product: dict[str, Decimal],
     venue: dict[str, Any],
     *,
     increments: dict[str, Decimal | None] | None = None,
+    fee_base: dict[str, Decimal] | None = None,
 ) -> list[Finding]:
     """The positions ledger against what the VENUE says it holds, per product (#798; plan R3).
 
@@ -1604,9 +1624,22 @@ def venue_drift_findings(
 
     WARN, not FAIL, for `balance.drift`'s reason: every cause (a transfer, a sale, a fee) may be
     legitimate; what is wrong is that the books disagree with the account.
+
+    **A gap no larger than the fees is named as #900, not as a sale.** Every live BUY before
+    #900 was booked at its ORDERED size (quote / price) while Coinbase took the fee out of the
+    quote, so the ledger overstates each tranche by `fee / price` -- `fee_base`, from
+    `open_tranche_fee_base`. When a product's gap is above the tolerance but no larger than
+    `tolerance + fee_base`, its clause says so and the fix does NOT send the operator to
+    `keel positions close`: that would book a sale nobody made and close a tranche still held.
+    This changes WORDING only. The tolerance is still one increment and the status still WARN --
+    the books still disagree with the account, and widening the tolerance by the fee would hide
+    a real sale of that size. A gap a little past the fees (the fill came in off the expected
+    price) takes the general clause, whose explanation also lists #900 among the causes.
     """
     tolerances = increments or {}
+    fees = fee_base or {}
     drifted: list[tuple[str, str]] = []
+    fee_sized: list[str] = []
     for product in sorted(ledger_by_product):
         ledger = ledger_by_product[product]
         record = venue.get(product)
@@ -1614,12 +1647,17 @@ def venue_drift_findings(
         if total is None:
             drifted.append((product, f"{product}: no venue observation"))
             continue
-        if ledger - total > (tolerances.get(product) or Decimal("0")):
+        tolerance = tolerances.get(product) or Decimal("0")
+        gap = ledger - total
+        if gap > tolerance:
             observed = record.get("observed_at") if isinstance(record, dict) else None
             when = _utc_date(int(observed)) if isinstance(observed, int) else "unknown"
-            drifted.append(
-                (product, f"{product}: ledger {ledger} > venue {total} (observed {when})")
-            )
+            clause = f"{product}: ledger {ledger} > venue {total} (observed {when})"
+            product_fees = fees.get(product) or Decimal("0")
+            if product_fees > 0 and gap <= tolerance + product_fees:
+                fee_sized.append(product)
+                clause += f", no more than the {product_fees} its open tranches paid in fees (#900)"
+            drifted.append((product, clause))
     if not drifted:
         return [
             Finding(
@@ -1636,14 +1674,33 @@ def venue_drift_findings(
             WARN,
             f"{len(drifted)} product(s) where the ledger holds more than the venue confirms",
             "; ".join(text for _, text in drifted)
-            + " -- an out-of-band sale or transfer (#798), or a venue holding never observed; "
-            "the rails still count what the ledger says",
-            "check the venue's holding; if a tranche was sold on the venue by hand, record it "
-            "with `keel positions close <id> --price P`; if no holding is observed, let a live "
-            "cycle record one",
+            + " -- an out-of-band sale or transfer (#798), a BUY booked at its ordered size "
+            "though the venue took its fee out of the quote (#900), or a venue holding never "
+            "observed; the rails still count what the ledger says",
+            _venue_drift_fix(fee_sized, len(fee_sized) < len(drifted)),
             products=tuple(product for product, _ in drifted),
         )
     ]
+
+
+def _venue_drift_fix(fee_sized: list[str], others: bool) -> str:
+    """`ledger.venue_drift`'s fix line: the #900 advice for the fee-sized products, the #798
+    advice when any other product drifted. The close command is named only in the second --
+    for a fee-sized gap it would declare a sale that never happened."""
+    parts: list[str] = []
+    if fee_sized:
+        parts.append(
+            f"{', '.join(fee_sized)}: a gap no larger than the fees paid is a BUY booked at its "
+            "ordered size (#900), not a sale -- compare the venue's fills with the tranches and "
+            "correct the tranche quantities; do not declare a close for it"
+        )
+    if others:
+        parts.append(
+            "check the venue's holding; if a tranche was sold on the venue by hand, record it "
+            "with `keel positions close <id> --price P`; if no holding is observed, let a live "
+            "cycle record one"
+        )
+    return ". ".join(parts)
 
 
 def position_watch_findings(
@@ -2143,6 +2200,7 @@ def gather_findings(repo: Any, config: Any, log_lines: Iterable[str], now_ts: in
             for key in repo.get_state_keys(reconcile_mod.VENUE_HOLDING_PREFIX)
         },
         increments=increments,
+        fee_base=open_tranche_fee_base(repo.get_open_positions()),
     )
 
     from keel.data import freshness as freshness_mod

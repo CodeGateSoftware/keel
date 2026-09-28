@@ -314,7 +314,8 @@ def _held_position(repo: Repository, product_id: str) -> tuple[Decimal, Decimal]
     sell_qty = Decimal("0")
     for order in repo.get_orders(mode="live", product_id=product_id, status="filled"):
         price = order.get("actual_fill") or order.get("limit_price") or order.get("expected_fill")
-        qty = order["qty"] or Decimal("0")
+        # #900: what the venue delivered, when it said -- `executor._held_position`'s reading.
+        qty = order.get("filled_quantity") or order["qty"] or Decimal("0")
         if order["side"] == Side.BUY.value:
             buy_qty += qty
             buy_cost += qty * (price or Decimal("0"))
@@ -361,7 +362,27 @@ def _open_tranche(
         entry_fill = qty = None
     else:
         entry_fill = order["actual_fill"]
-        qty = order["qty"]
+        qty = executor.delivered_qty(order) or order["qty"]
+        if qty is not None and order.get("filled_quantity") is None and order.get("mode") == "live":
+            # #900: the ledger is what the sell side sizes from (`sleeve.ledger_qty`, P5's
+            # `Holding`), so a tranche booked at the ORDERED size of a quote-sized BUY states
+            # the fee's worth of base the venue never delivered. The ordered size is the only
+            # number there is, so it stands -- loudly. Live only: a paper fill charges its fee on
+            # top of the notional, so its `qty` IS what it delivered and there is no venue.
+            log_event(
+                logger,
+                logging.WARNING,
+                "agent.tranche_qty_unobserved",
+                product=product_id,
+                rule=rule_name,
+                order_id=order.get("id"),
+                qty=str(qty),
+                detail=(
+                    "the venue reported no filled size for this entry, so its tranche is booked "
+                    "at the ORDERED quantity -- which overstates what is held by the fee if the "
+                    "venue took it out of the quote (#900). Compare with the venue's fill"
+                ),
+            )
     if order is None or entry_fill is None or qty is None:
         log_event(
             logger,

@@ -172,3 +172,67 @@ def test_nothing_held_is_one_ok_venue_finding() -> None:
 
     [f] = venue_drift_findings({}, {"BTC-USD": {"total": "1", "observed_at": 1}})
     assert (f.name, f.status, f.products) == ("ledger.venue_drift", OK, ())
+
+
+# -- #900: a fee-sized gap is a BUY booked at its ordered size, not a sale ----------------------
+
+#: The three live BTC tranches #900 found: $50 each, fees $0.59/$0.59/$0.45, each booked at
+#: quote / price. Summed in base, their fees are the gap a fee-in-quote venue leaves.
+_BTC_FEE_BASE = Decimal("0.0000253")
+
+
+def test_a_gap_within_the_open_tranches_fees_names_900_and_stays_a_warn() -> None:
+    """#900's shape: the ledger holds quote / price per tranche, the venue delivered
+    (quote - fee) / price. The gap is the fees' worth of base -- a booking error, not a sale
+    made by hand, and the finding must not say "sale" alone. The TOLERANCE is untouched: still
+    one increment, so this is still a WARN naming the product."""
+    from keel.commands.doctor import venue_drift_findings
+
+    [f] = venue_drift_findings(
+        {"BTC-USD": Decimal("0.0021177")},
+        {"BTC-USD": {"total": "0.0020930", "observed_at": 1_700_000_000}},
+        increments={"BTC-USD": Decimal("0.00000001")},
+        fee_base={"BTC-USD": _BTC_FEE_BASE},
+    )
+    assert (f.name, f.status, f.products) == ("ledger.venue_drift", WARN, ("BTC-USD",))
+    assert _venue_parts(f.detail) == [
+        "BTC-USD: ledger 0.0021177 > venue 0.0020930 (observed 2023-11-14), no more than the "
+        "0.0000253 its open tranches paid in fees (#900)"
+    ]
+
+
+def test_a_gap_beyond_the_fees_keeps_the_sale_clause_and_still_names_900() -> None:
+    """A gap larger than every fee paid is not explained by #900 alone, so its clause is the
+    #798 one -- but the explanation lists fee-in-quote overstatement among the causes, because
+    a sale on top of it is not the only possibility."""
+    from keel.commands.doctor import venue_drift_findings
+
+    [f] = venue_drift_findings(
+        {"BTC-USD": Decimal("0.0021177")},
+        {"BTC-USD": {"total": "0.0010000", "observed_at": 1_700_000_000}},
+        fee_base={"BTC-USD": _BTC_FEE_BASE},
+    )
+    assert _venue_parts(f.detail) == [
+        "BTC-USD: ledger 0.0021177 > venue 0.0010000 (observed 2023-11-14)"
+    ]
+    assert f.detail.split(" -- ", 1)[1] == (
+        "an out-of-band sale or transfer (#798), a BUY booked at its ordered size though the "
+        "venue took its fee out of the quote (#900), or a venue holding never observed; the "
+        "rails still count what the ledger says"
+    )
+
+
+def test_fee_base_is_each_open_tranches_entry_fee_in_base() -> None:
+    """`entry_fee / entry_fill` per open tranche, summed per product: the base a fee-in-quote
+    venue withheld from each BUY. A tranche with no recorded fee or price adds nothing -- NULL
+    is "not recorded", never zero, and never a guess."""
+    from keel.commands.doctor import open_tranche_fee_base
+
+    assert open_tranche_fee_base(
+        [
+            {"product_id": "BTC-USD", "entry_fee": Decimal("0.45"), "entry_fill": Decimal("45000")},
+            {"product_id": "BTC-USD", "entry_fee": Decimal("0.9"), "entry_fill": Decimal("90000")},
+            {"product_id": "PAXG-USD", "entry_fee": None, "entry_fill": Decimal("4673.23")},
+            {"product_id": "ETH-USD", "entry_fee": Decimal("0.5"), "entry_fill": None},
+        ]
+    ) == {"BTC-USD": Decimal("0.00002")}

@@ -268,7 +268,13 @@ def execute(
             repo,
             config,
             product_id=intent.product_id,
-            qty=intent.qty,
+            # #900: what the venue DELIVERED, when it said. A quote-sized BUY receives less base
+            # than `intent.qty` whenever the fee comes out of the quote, and a bracket SELL for
+            # more than was received is #446's oversized-bracket condition. The ordered size is
+            # the fallback only when no terminal fill was observed, which
+            # `executor.fill_quantity_unobserved` has already logged.
+            qty=delivered_qty(repo.get_order(result.order_id) if result.order_id else None)
+            or intent.qty,
             stop=intent.stop,
             target=signal.setup.target,
             rule_name=signal.rule_name,
@@ -904,13 +910,18 @@ def _build_intent(
 
 
 def _held_position(repo: Repository, product_id: str) -> tuple[Decimal, Decimal]:
-    """Net held qty + average cost basis for `product_id`, from filled live orders."""
+    """Net held qty + average cost basis for `product_id`, from filled live orders.
+
+    Each row counts what the venue DELIVERED (`filled_quantity`) when it said, the ordered `qty`
+    otherwise (#900) -- the reading `sleeve.orders_qty` and `guards._open_exposure_by_asset`
+    share. A quote-sized BUY receives the fee's worth of base less than it ordered, and an exit
+    sized from the ordered figure would ask the venue for base it never delivered."""
     buy_qty = Decimal("0")
     buy_cost = Decimal("0")
     sell_qty = Decimal("0")
     for order in repo.get_orders(mode="live", product_id=product_id, status="filled"):
         price = order.get("actual_fill") or order.get("limit_price") or order.get("expected_fill")
-        qty = order["qty"] or Decimal("0")
+        qty = order.get("filled_quantity") or order["qty"] or Decimal("0")
         if order["side"] == Side.BUY.value:
             buy_qty += qty
             buy_cost += qty * (price or Decimal("0"))
@@ -1370,6 +1381,57 @@ def _run_order(
     )
 
 
+#: The venue's statuses for an order it is DONE with (#900): `FILLED`, or dead. A dead market
+#: IOC may still have filled part of itself -- its remainder is what was cancelled -- so a dead
+#: status with `filled_size > 0` is a final, partial fill, not a failure to observe one. The same
+#: pair `execution.reconcile` sweeps by (`_FILLED`, `_DEAD`); reconcile imports this module, so it
+#: is restated here and a test pins the two equal.
+TERMINAL_ORDER_STATUSES = frozenset({"FILLED", "CANCELLED", "CANCELED", "EXPIRED", "FAILED"})
+
+#: Seconds between re-reads of an immediately-filled market order's status (#900) -- at most
+#: 3.5s in all, once per market order, on a loop that trades once a day.
+#:
+#: WHY THE EXECUTOR RE-READS AT ALL, when `CancelPending` says the next cycle's reconcile "is
+#: where establishing [a settled state] belongs -- not on an exit path that would have to
+#: sleep": that reasoning holds because a cancel's outcome can wait a cycle. This one cannot.
+#: A market order is written `filled` at placement, so `reconcile` (which polls only
+#: `RESTING_STATUSES`) never reads it again -- and the two things sized from its quantity, the
+#: protective bracket and the ledger tranche, are both written within this same call. The one
+#: status read that existed happened in the same instant as the placement; Coinbase answered
+#: it `PENDING` with nothing filled, the observation was dropped without a word, and every live
+#: BUY kept `filled_quantity` NULL and a tranche at the ORDERED size (#900). Bounded, because
+#: an answer that never settles must not hold the cycle; after the last pause the ordered size
+#: stands, as it always did, and the gap is logged.
+FILL_OBSERVATION_PAUSES: tuple[float, ...] = (0.5, 1.0, 2.0)
+
+#: The sleep between re-reads, a module attribute so tests record the pauses instead of taking
+#: them.
+_pause = time.sleep
+
+
+def _observe_until_terminal(
+    get_order: Any, native_id: str, order_id: int
+) -> tuple[OrderStatus | None, bool]:
+    """`(last observation, whether it is terminal)` -- re-reading on `FILL_OBSERVATION_PAUSES`.
+
+    Fails soft like its caller: a read that raises ends the polling and keeps whatever the last
+    successful read said (`None` when there was none), because the order is already placed and
+    this only refines numbers about it.
+    """
+    observed: OrderStatus | None = None
+    for pause in (None, *FILL_OBSERVATION_PAUSES):
+        if pause is not None:
+            _pause(pause)
+        try:
+            observed = get_order(native_id)
+        except Exception:
+            log_exception(logger, "executor.observed_economics_unavailable", order_id=order_id)
+            return observed, False
+        if (observed.status or "").upper() in TERMINAL_ORDER_STATUSES:
+            return observed, True
+    return observed, False
+
+
 def _upgrade_to_observed_economics(
     broker: Any,
     repo: Repository,
@@ -1390,18 +1452,21 @@ def _upgrade_to_observed_economics(
     Fails SOFT, unlike the cancel path: the order is already placed and we already hold a usable
     estimate, so a missing or broken status endpoint keeps the estimate rather than aborting the
     cycle. This is a refinement of a number, not a safety gate.
+
+    The status is re-read until the venue says it is done with the order (#900,
+    `FILL_OBSERVATION_PAUSES`). The QUANTITY is recorded only from that terminal answer: a
+    snapshot of an order still executing is not what was delivered, and the bracket and tranche
+    sized from `filled_quantity` next must never be sized from a number the venue may still
+    grow. When no terminal answer arrives, `filled_quantity` stays NULL -- "not observed", never
+    a guess -- and `executor.fill_quantity_unobserved` says so once.
     """
     get_order = getattr(broker, "get_order", None)
-    if get_order is None:
-        return
     native_id = place_result.broker_order_id
-    if not native_id:
-        return
-    try:
-        observed = get_order(native_id)
-    except Exception:
-        log_exception(logger, "executor.observed_economics_unavailable", order_id=order_id)
-        return
+    observed, terminal = (
+        _observe_until_terminal(get_order, native_id, order_id)
+        if get_order is not None and native_id
+        else (None, False)
+    )
 
     # #667: the QUANTITY observation goes first, and no longer sits behind the price guard.
     # `filled_quantity` and `average_filled_price` are two independent facts the venue may
@@ -1410,7 +1475,28 @@ def _upgrade_to_observed_economics(
     # venue that answered with a filled size and no average price lost the size too, and the
     # size is the one that tells `_clamp_to_held` how far the ledger has drifted. Recording it
     # first costs nothing when both are present and keeps the more useful half when they are not.
-    _record_observed_fill_quantity(repo, order_id, observed, intent, now_ts)
+    recorded = (
+        terminal
+        and observed is not None
+        and _record_observed_fill_quantity(repo, order_id, observed, intent, now_ts)
+    )
+    if not recorded:
+        log_event(
+            logger,
+            logging.WARNING,
+            "executor.fill_quantity_unobserved",
+            order_id=order_id,
+            product=intent.product_id if intent is not None else None,
+            status=observed.status if observed is not None else None,
+            detail=(
+                "the venue never reported this filled order's delivered size, so its bracket "
+                "and tranche are sized from the ORDERED quantity -- which overstates what is "
+                "held by the fee when the venue took it out of the quote (#900). Check the "
+                "venue's fill for this order"
+            ),
+        )
+    if observed is None:
+        return
     fill = observed.average_filled_price
     fees = observed.total_fees
     if not fill or fill <= 0:
@@ -1419,64 +1505,83 @@ def _upgrade_to_observed_economics(
     _log_intent_divergence(order_id, intent, fill)
 
 
+def delivered_qty(order: dict[str, Any] | None) -> Decimal | None:
+    """The base quantity the venue reported delivering on `order`, or `None` when it reported
+    none (#900) -- the one reading of `filled_quantity` the bracket and the tranche share.
+
+    `None`, never a substitute: the caller chooses its own fallback and owns saying so, because
+    a fallback here would be indistinguishable from an observation."""
+    if order is None:
+        return None
+    filled = order.get("filled_quantity")
+    return filled if filled is not None and filled > 0 else None
+
+
 def _record_observed_fill_quantity(
     repo: Repository,
     order_id: int,
     observed: OrderStatus,
     intent: OrderIntent | None,
     now_ts: int,
-) -> None:
-    """Record the venue-observed `filled_size` on an immediately-filled order (#446).
+) -> bool:
+    """Record the venue-observed `filled_size` on an immediately-filled order (#446, #900);
+    return whether one was recorded.
 
-    A market IOC that only partly filled has its remainder cancelled at the venue, so this
-    observation IS final -- but `qty` still says the ordered size, and everything sized from the
-    order (the exit bracket placed next, the tranche the ledger opens) assumes it all filled.
-    That mismatch is the oversized-bracket condition: a bracket able to sell more than is held.
+    Called only with a TERMINAL observation (`_observe_until_terminal`). A market IOC that only
+    partly filled has its remainder cancelled at the venue, so this observation IS final -- but
+    `qty` still says the ordered size.
 
-    The WARNING is entry-only: its advice is about the ENTRY's exit bracket being placed for
-    the ordered size, and an immediately-filled market SELL exit takes this same path. Firing
-    entry wording on an exit would point an operator at a bracket this side never places --
-    the exit-side over-booking is #502's to flag. The observation itself is recorded for
-    BOTH sides: `filled_quantity` is what actually executed, whatever the order's direction.
+    **What sizes from it since #900.** The protective bracket `execute` places next, and the
+    ledger tranche `agent._open_tranche` books, both read `filled_quantity` in preference to
+    `qty`. For a quote-sized BUY the two differ on EVERY fill, not only a partial one: `qty` is
+    `quote / expected price`, and Coinbase Advanced takes the fee out of the quote, so a complete
+    fill delivers about `(quote - fee) / fill price`. A bracket for `qty` would be a SELL for more
+    base than was received -- #446's oversized-bracket condition, on every entry.
 
-    DELIBERATELY detect-and-surface only, and it stays that way even now that a resize EXISTS
-    (`scale_out` re-places a bracket at a smaller size since #502). The two are not the same
-    decision: a scale-out resizes because a RULE asked to sell a fraction, so the quantity is
-    known before the venue is touched. Here the only evidence is a post-placement snapshot of
-    an ENTRY, and auto-cancelling a protective order on the strength of a snapshot that may
-    still be settling is a wrong auto-action on live money. The loud warning is the safe half,
-    and the entry-side policy is still nobody's.
+    **The partial-fill WARNING is read off the STATUS, not off `filled < qty`.** For the reason
+    just given, `filled < qty` is the ordinary case for a quote-sized BUY, and a warning on every
+    entry trains the alert to be ignored. The venue says "only part" by ending the order dead
+    (`CANCELLED`/`EXPIRED`/`FAILED`) with `filled_size > 0`; `FILLED` is the venue saying "all of
+    it", whatever `qty` estimated. Entry-only, as before: an immediately-filled market SELL exit
+    takes this same path, and the exit-side over-booking is #502's to flag. The observation
+    itself is recorded for BOTH sides.
+
+    **Still no auto-resize of a protective order that EXISTS** -- that ruling stands. Auto-
+    cancelling a resting bracket on the strength of a snapshot is a wrong auto-action on live
+    money, and nothing here does it: the terminal observation arrives BEFORE the entry's bracket
+    is placed, so sizing that bracket from it cancels nothing and resizes nothing. It is the
+    same decision `scale_out` makes (#502) -- the quantity is known before the venue is touched.
     """
     filled = observed.filled_size
     if not filled or filled <= 0:
-        return
+        return False
     row = repo.get_order(order_id) or {}
     ordered = intent.qty if intent is not None else row.get("qty")
     if ordered is None or ordered <= 0:
-        return
+        return False
     repo.update_order(order_id, filled_quantity=filled, updated_at=now_ts)
     side_value = (intent.side.value if intent is not None else row.get("side")) or ""
     if side_value.upper() != Side.BUY.value:
         # An exit partial stays silent (above); a side we cannot determine at all cannot
         # claim to be an entry either, so it stays silent too.
-        return
-    if filled < ordered:
+        return True
+    if (observed.status or "").upper() != "FILLED":
         log_event(
             logger,
             logging.WARNING,
             "executor.entry_partially_filled",
             order_id=order_id,
             product=intent.product_id if intent is not None else None,
+            status=observed.status,
             filled=str(filled),
             ordered=str(ordered),
-            shortfall=str(ordered - filled),
             detail=(
-                "the venue executed only part of this order -- its bracket is placed for the "
-                "ordered size and may be rejected or oversized for what is actually held. "
-                "Cancel and re-place the bracket at the filled size, or verify the remainder "
-                "at the venue; the automated resize policy is #502"
+                "the venue executed only part of this order and cancelled the rest -- the "
+                "bracket and the tranche are sized to the filled quantity. Verify the "
+                "remainder at the venue; nothing re-attempts it"
             ),
         )
+    return True
 
 
 def _log_intent_divergence(order_id: int, intent: OrderIntent | None, realized: Any) -> None:
