@@ -1500,6 +1500,149 @@ def unbooked_exit_findings(
     ]
 
 
+def position_watch_findings(
+    open_positions: list[dict[str, Any]],
+    all_rules: list[dict[str, Any]],
+    resting: Callable[[dict[str, Any]], bool],
+    retry_products: set[str],
+    *,
+    managed_status: str = "live",
+) -> list[Finding]:
+    """Is anything still WATCHING each held tranche (#811)?
+
+    `reconcile.position_unprotected` was the only channel that ever reported PAXG tranche 3,
+    and it was driven off the `unbracketed:` retry record: clearing the record silenced the
+    channel without closing the exposure. These two are stated over the `positions` ledger,
+    which cannot be silenced that way -- the table that knows a tranche is held still says open.
+
+    * `position.unmanaged` -- an open tranche whose PRODUCT has no `live` rule. Matched on
+      product, not `rule_id`, because every tranche before #803 has NULL there. A DCA tranche
+      whose rule was demoted is unmanaged too: unmanaged inventory is unmanaged with or without
+      a stop. Only ENTRY/EXIT rule kinds count: a `sleeve_sell` rule proposes and cannot exit,
+      so it manages nothing (plan Review Focus 5; P9 adds the exclusion and its test).
+    * `position.unprotected` -- an open tranche with a recorded `initial_stop > 0`, no resting
+      bracket (`reconcile._has_resting_bracket`, passed in as `resting`), and no retry record.
+      The third clause makes it the complement of the reconcile sweep, not a duplicate. DCA
+      (`initial_stop` absent) is excluded for the reason the sweep skips it silently. SKIPPED
+      ENTIRELY (reported `OK`) when `managed_status == "paper"` (#881): a paper fill never gets
+      a bracket (`_paper_enter` places none), so `resting` is always False, and paper never
+      writes an `unbracketed:` retry record either (`reconcile_unbracketed_positions` only runs
+      on live cycles) -- every clause here is unconditionally true for every stopped paper
+      tranche, so without the skip this finding WARNs on every one of them, always.
+
+    WARN, never FAIL: holding spot without a stop can be a human's choice (PAXG since
+    2026-09-22). What was wrong is that nobody was told, and FAIL would halt cycles over a state
+    the operator already accepted.
+
+    `all_rules` is every rule row, of any status -- not just `live` ones. Membership in
+    `managed` is decided by `status == managed_status` alone, but #811's first acceptance bullet
+    requires the `position.unmanaged` WARN to name the owning rule's CURRENT status (e.g.
+    `paper`), and a rule moved out of `managed_status` is exactly the row that produced the WARN
+    in the first place. Filtering the input to that status before it arrives here would throw
+    that row away before its status could be read. `status_by_product` resolves it from the full
+    set instead, taking the highest `id` when more than one rule has ever named a product, and
+    reporting `"no rule"` when none has.
+
+    `managed_status` defaults to `"live"`, the status a live profile promotes to. A PAPER
+    profile promotes to `status="paper"` instead (`agent.py`'s own
+    `rule_status = "paper" if config.auto_trade.mode == "paper" else "live"`), and never writes
+    a `"live"` row, so a paper deployment calling this with the default would find `managed`
+    permanently empty and WARN `position.unmanaged` on every open tranche it holds -- correctly
+    managed rules and all. The caller passes `managed_status="paper"` there. The same value is
+    the paper-profile signal `position.unprotected` reads (#881): `managed_status == "paper"`
+    means the caller is looking at a paper deployment, and that is reason enough on its own to
+    skip a finding whose every input clause a paper tranche satisfies unconditionally.
+    """
+    managed = {
+        str((row.get("params") or {}).get("product_id"))
+        for row in all_rules
+        if row.get("status") == managed_status
+    }
+    status_by_product: dict[str, str] = {}
+    for row in sorted(all_rules, key=lambda r: r.get("id") or 0):
+        status_by_product[str((row.get("params") or {}).get("product_id"))] = str(row.get("status"))
+
+    unmanaged = [p for p in open_positions if str(p["product_id"]) not in managed]
+    unprotected = (
+        []
+        if managed_status == "paper"
+        else [
+            p
+            for p in open_positions
+            if (p.get("initial_stop") or 0) > 0
+            and not resting(p)
+            and str(p["product_id"]) not in retry_products
+        ]
+    )
+
+    def _describe(rows: list[dict[str, Any]], *, levels: bool) -> str:
+        parts = []
+        for p in rows:
+            status = status_by_product.get(str(p["product_id"]), "no rule")
+            text = (
+                f"{p['product_id']} tranche {p['id']} ({p['rule_name']}, {status}, qty {p['qty']})"
+            )
+            if levels:
+                text += f", stop {p['initial_stop']}, no resting bracket, no retry record"
+            parts.append(text)
+        return "; ".join(parts)
+
+    def _products(rows: list[dict[str, Any]]) -> tuple[str, ...]:
+        return tuple(dict.fromkeys(str(p["product_id"]) for p in rows))
+
+    out: list[Finding] = []
+    if unmanaged:
+        out.append(
+            Finding(
+                "position.unmanaged",
+                WARN,
+                f"{len(unmanaged)} open tranche(s) on a product with no live rule",
+                _describe(unmanaged, levels=False)
+                + " -- no live rule evaluates these products, so no exit can fire",
+                "re-promote the owning rule, or close the tranche by hand "
+                "(`keel positions close <id>` once #798 ships)",
+                products=_products(unmanaged),
+            )
+        )
+    else:
+        out.append(
+            Finding("position.unmanaged", OK, "every open tranche has a live rule", "-", "-")
+        )
+    if unprotected:
+        out.append(
+            Finding(
+                "position.unprotected",
+                WARN,
+                f"{len(unprotected)} tranche(s) hold a stop level and nothing resting",
+                _describe(unprotected, levels=True)
+                + " -- the next cycle will NOT retry: the retry record is gone",
+                "doctor cannot re-place a bracket; place one at the venue or close the tranche",
+                products=_products(unprotected),
+            )
+        )
+    elif managed_status == "paper":
+        out.append(
+            Finding(
+                "position.unprotected",
+                OK,
+                "paper fills place no exchange bracket by design; skipped (#881)",
+                "-",
+                "-",
+            )
+        )
+    else:
+        out.append(
+            Finding(
+                "position.unprotected",
+                OK,
+                "every stopped tranche is protected or being retried",
+                "-",
+                "-",
+            )
+        )
+    return out
+
+
 def doctor_exit_code(findings: list[Finding]) -> int:
     """Faults fail the run; deliberate halts and warnings do not."""
     return 1 if any(f.status == FAIL for f in findings) else 0
@@ -1690,6 +1833,24 @@ def gather_findings(repo: Any, config: Any, log_lines: Iterable[str], now_ts: in
     # #639: modes are POOLED here, unlike the partial-fill sweep above -- the ledger
     # invariant belongs to `agent._open_tranche`, which writes it for paper and live alike.
     findings += unbooked_exit_findings(repo.get_open_positions(), repo.get_orders())
+    # #811. `get_rules()` -- every status, not just "live" -- so `position.unmanaged` can name a
+    # demoted rule's current status. `managed_status` mirrors `agent.py`'s own
+    # `rule_status = "paper" if config.auto_trade.mode == "paper" else "live"`: a paper profile
+    # promotes to `status="paper"`, never `"live"`, so the default here would WARN on every open
+    # paper tranche (#881). A retry record counts only while it holds an intent: the sweep skips
+    # a falsy one (`if not intent: continue`), and a record cleared to None is exactly the state
+    # that silenced #811's only channel.
+    findings += position_watch_findings(
+        repo.get_open_positions(),
+        repo.get_rules(),
+        lambda position: reconcile_mod._has_resting_bracket(repo, position),
+        {
+            key[len(executor_mod.UNBRACKETED_PREFIX) :]
+            for key in repo.get_state_keys(executor_mod.UNBRACKETED_PREFIX)
+            if repo.get_state(key)
+        },
+        managed_status="paper" if config.auto_trade.mode == "paper" else "live",
+    )
 
     from keel.data import freshness as freshness_mod
 

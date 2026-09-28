@@ -619,6 +619,8 @@ def test_gather_findings_covers_every_check_over_a_seeded_db(tmp_path, valid_con
         "bracket.orphan",
         "backups.footprint",
         "ledger.unbooked_exit",
+        "position.unmanaged",
+        "position.unprotected",
         "data.missing",
         "data.stale",
         "data.gaps",
@@ -914,6 +916,166 @@ def test_gather_findings_surfaces_a_swept_orphan(tmp_path, valid_config_path) ->
     (orphan,) = [f for f in findings if f.name == "bracket.orphan"]
     assert orphan.status == "warn"
     assert "BTC-USD" in orphan.detail
+
+
+# -- position watch: is anything still watching a held tranche? (#811) ---------------------------
+
+
+def _live(config):
+    """The same config, as a LIVE profile -- `valid_config_path` is a paper one."""
+    import dataclasses
+
+    return dataclasses.replace(
+        config, auto_trade=dataclasses.replace(config.auto_trade, mode="live")
+    )
+
+
+def _paper(config):
+    import dataclasses
+
+    return dataclasses.replace(
+        config, auto_trade=dataclasses.replace(config.auto_trade, mode="paper")
+    )
+
+
+def _paxg_tranche_3(repo, *, bracket_order_id: int | None = None) -> int:
+    """#811's PAXG tranche 3 as the live database held it, with its demoted owning rule."""
+    repo.insert_rule("turtle_breakout", {"product_id": "PAXG-USD"}, status="paper", now_ts=NOW)
+    return repo.open_position(
+        product_id="PAXG-USD",
+        rule_name="turtle_breakout",
+        opened_at=NOW - 30 * DAY,
+        qty=Decimal("0.01320427494019137563114227965"),
+        entry_fill=Decimal("4673.23"),
+        entry_fee=Decimal("0"),
+        initial_stop=Decimal("4521.76390215979454"),
+        bracket_order_id=bracket_order_id,
+    )
+
+
+def _watch(findings):
+    return {f.name: f for f in findings if f.name.startswith("position.")}
+
+
+def test_gather_findings_reports_paxg_tranche_3_under_both_findings(
+    tmp_path, valid_config_path
+) -> None:
+    """#811's acceptance line, on a fixture of the deployment's shape instead of `~/keel`."""
+    repo = _seeded_repo(tmp_path / "keel.db")
+    _paxg_tranche_3(repo)
+    config = _live(load_config(valid_config_path))
+
+    findings = gather_findings(repo, config, [], NOW)
+
+    watch = _watch(findings)
+    assert [watch[n].status for n in ("position.unmanaged", "position.unprotected")] == [
+        "warn",
+        "warn",
+    ]
+    assert "paper" in watch["position.unmanaged"].detail
+    parsed = {row["name"]: row for row in json.loads(render_json(findings))}
+    assert parsed["position.unmanaged"]["products"] == ["PAXG-USD"]
+    assert parsed["position.unprotected"]["products"] == ["PAXG-USD"]
+
+
+def test_gather_findings_stays_read_only_with_a_tranche_to_watch(
+    tmp_path, valid_config_path
+) -> None:
+    """The change-counter pin again, with rows on the new reads' path so they actually run."""
+    repo = _seeded_repo(tmp_path / "keel.db")
+    _paxg_tranche_3(repo)
+    repo.set_state("unbracketed:PAXG-USD", {"stop": "4521.76"})
+    conn = repo._conn  # noqa: SLF001 -- total_changes IS the read-only proof
+    config = _live(load_config(valid_config_path))
+    before = conn.total_changes
+
+    findings = gather_findings(repo, config, [], NOW)
+
+    assert conn.total_changes == before, "gather_findings wrote to the database"
+    assert {"position.unmanaged", "position.unprotected"} <= {f.name for f in findings}
+
+
+def test_gather_findings_reads_the_retry_record_the_sweep_writes(
+    tmp_path, valid_config_path
+) -> None:
+    """The wiring, keyed on `executor.UNBRACKETED_PREFIX`: a live record clears the finding, and
+    a CLEARED one (the value `set_state(key, None)` leaves) does not -- that clear is exactly
+    what silenced #811's only channel."""
+    from keel.execution.executor import UNBRACKETED_PREFIX
+
+    config = _live(load_config(valid_config_path))
+    statuses = {}
+    for label, record in (("live", {"stop": "4521.76"}), ("cleared", None)):
+        repo = _seeded_repo(tmp_path / f"{label}.db")
+        _paxg_tranche_3(repo)
+        repo.set_state(f"{UNBRACKETED_PREFIX}PAXG-USD", record)
+        statuses[label] = _watch(gather_findings(repo, config, [], NOW))[
+            "position.unprotected"
+        ].status
+    assert statuses == {"live": "ok", "cleared": "warn"}
+
+
+def test_gather_findings_reads_the_resting_bracket(tmp_path, valid_config_path) -> None:
+    """`reconcile._has_resting_bracket` reaches the finding: a pending bracket protects the
+    tranche, a cancelled one does not."""
+    config = _live(load_config(valid_config_path))
+    statuses = {}
+    for bracket_status in ("pending", "cancelled"):
+        repo = _seeded_repo(tmp_path / f"{bracket_status}.db")
+        order_id = repo.insert_order(
+            dict(
+                mode="live",
+                product_id="PAXG-USD",
+                side="SELL",
+                order_type="market",
+                qty=Decimal("0.0132"),
+                limit_price=None,
+                status=bracket_status,
+                fee=None,
+                expected_fill=Decimal("4521.76"),
+                actual_fill=None,
+                raw_response='{"order_id": "cb-bracket-3"}',
+                created_at=NOW - 29 * DAY,
+                updated_at=NOW - 29 * DAY,
+            )
+        )
+        _paxg_tranche_3(repo, bracket_order_id=order_id)
+        statuses[bracket_status] = _watch(gather_findings(repo, config, [], NOW))[
+            "position.unprotected"
+        ].status
+    assert statuses == {"pending": "ok", "cancelled": "warn"}
+
+
+def test_gather_findings_on_a_paper_profile_reports_neither(tmp_path, valid_config_path) -> None:
+    """#881: a paper engine promotes to `status="paper"` and never places a bracket. The same
+    tranche that warns twice on a live profile is ordinary on a paper one."""
+    repo = _seeded_repo(tmp_path / "keel.db")
+    repo.insert_rule("turtle_breakout", {"product_id": "BTC-USD"}, status="paper", now_ts=NOW)
+    repo.open_position(
+        product_id="BTC-USD",
+        rule_name="turtle_breakout",
+        opened_at=NOW - DAY,
+        qty=Decimal("0.001"),
+        entry_fill=Decimal("100000"),
+        entry_fee=Decimal("0"),
+        initial_stop=Decimal("90000"),
+        bracket_order_id=None,
+    )
+    paper = _paper(load_config(valid_config_path))
+    live = _live(load_config(valid_config_path))
+
+    on_paper = _watch(gather_findings(repo, paper, [], NOW))
+    on_live = _watch(gather_findings(repo, live, [], NOW))
+
+    assert [on_paper[n].status for n in ("position.unmanaged", "position.unprotected")] == [
+        "ok",
+        "ok",
+    ]
+    # the control: the same rows DO warn on a live profile, so the fixture reached the finding
+    assert [on_live[n].status for n in ("position.unmanaged", "position.unprotected")] == [
+        "warn",
+        "warn",
+    ]
 
 
 # -- update backups: counted, never deleted (#681) ------------------------------------------------
