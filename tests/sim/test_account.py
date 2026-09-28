@@ -242,13 +242,32 @@ def test_a_rule_buy_over_max_exposure_is_still_vetoed_by_the_exposure_cap():
     assert [r.split(":", 1)[0] for r in reasons] == ["total_exposure_cap"]
 
 
-def test_a_dca_buy_over_the_per_asset_cap_is_vetoed_by_concentration_only():
-    """Concentration still binds DCA (#841), and it is the ONLY veto though the buy also
-    crosses `max_exposure_usd` (BTC 960 + 45 = 1005 > 1000 and > 0.6 * 1000)."""
+def test_a_dca_buy_over_the_per_asset_cap_is_not_vetoed_by_concentration():
+    """The operator's decision (#853): DCA is exempt from the per-asset cap too, mirroring the
+    #841 total-exposure exemption. BTC 960 + 45 = 1005 > 1000 (0.1 * 10000, the per-asset limit);
+    max_exposure_usd is raised out of the way so the exposure cap cannot also fire."""
     acc = _account_with_open_exposure("BTC", Decimal("960"))
-    config = _config(max_exposure_usd=Decimal("1000"), max_per_asset_pct=Decimal("0.6"))
+    config = _config(max_exposure_usd=Decimal("10000"), max_per_asset_pct=Decimal("0.1"))
 
     ok, reasons = acc.can_open(_intent(asset="BTC", notional=Decimal("45")), config, DAY0)
+
+    assert reasons == []
+    assert ok is True
+
+
+def test_a_rule_buy_over_the_per_asset_cap_is_still_vetoed_by_concentration():
+    """The pairing to the test above: the same buy as a RULE entry still trips the cap. This
+    also proves DCA holdings still count toward the concentration figure a RULE entry sees --
+    the 960 already open here was accumulated exactly as the DCA-exempt test above accumulates
+    it; the exemption is FROM being gated by the cap, not a blind spot in what it measures."""
+    acc = _account_with_open_exposure("BTC", Decimal("960"))
+    config = _config(max_exposure_usd=Decimal("10000"), max_per_asset_pct=Decimal("0.1"))
+
+    ok, reasons = acc.can_open(
+        _intent(asset="BTC", notional=Decimal("45"), is_dca=False, rule_kind="pullback"),
+        config,
+        DAY0,
+    )
 
     assert ok is False
     assert [r.split(":", 1)[0] for r in reasons] == ["per_asset_concentration_cap"]
@@ -263,8 +282,11 @@ def test_per_asset_cap_rejects_over_cap_even_when_total_exposure_has_room():
     config = _config(max_exposure_usd=Decimal("1000"), max_per_asset_pct=Decimal("0.1"))
 
     # per-asset limit = 0.1 * 1000 = 100; notional 150 exceeds it even though total exposure (0)
-    # has plenty of room against max_exposure_usd (1000).
-    ok, reasons = acc.can_open(_intent(notional=Decimal("150")), config, DAY0)
+    # has plenty of room against max_exposure_usd (1000). A RULE entry: DCA is exempt from this
+    # cap too (#853), see the tests above.
+    ok, reasons = acc.can_open(
+        _intent(notional=Decimal("150"), is_dca=False, rule_kind="pullback"), config, DAY0
+    )
 
     assert ok is False
     assert any("per_asset_concentration_cap" in r for r in reasons)
@@ -556,7 +578,8 @@ def test_max_affordable_notional_never_goes_negative():
     assert headroom >= Decimal("0")
 
 
-# -- DCA is NOT exempt from any spend cap (matches rail 14) ----------------------------------------
+# -- DCA is NOT exempt from the per-order/per-day/USDC-funding/monthly-allowance caps (only the
+# total-exposure (#841) and per-asset concentration (#853) caps exempt it) -------------------------
 
 
 def test_dca_is_not_exempt_from_the_per_order_cap():
@@ -771,6 +794,9 @@ def test_dca_position_and_rule_position_coexist_on_the_same_asset():
 
 
 def test_dca_and_rule_notional_both_count_toward_the_same_per_asset_concentration_cap():
+    """DCA holdings still count toward the SAME per-asset cap a RULE-trading entry sees (#853):
+    the exemption is FROM being gated by rail 6 for a DCA candidate, not a blind spot in what it
+    measures -- so both `can_open` calls here are RULE entries (is_dca=False)."""
     acc = SimAccount(Decimal("0"), Decimal("0"))
     acc.deposit(Decimal("100000"), DAY0)
     config = _config(max_exposure_usd=Decimal("1000"), max_per_asset_pct=Decimal("0.5"))
@@ -779,11 +805,19 @@ def test_dca_and_rule_notional_both_count_toward_the_same_per_asset_concentratio
     )  # dca=400
 
     # 400 (dca) + 150 (rule) = 550 > 500 (0.5*1000)
-    blocked, reasons = acc.can_open(_intent(asset="BTC", notional=Decimal("150")), config, DAY0)
+    blocked, reasons = acc.can_open(
+        _intent(asset="BTC", notional=Decimal("150"), is_dca=False, rule_kind="pullback"),
+        config,
+        DAY0,
+    )
     assert blocked is False
     assert any("per_asset_concentration_cap" in r for r in reasons)
 
-    allowed, reasons = acc.can_open(_intent(asset="BTC", notional=Decimal("100")), config, DAY0)
+    allowed, reasons = acc.can_open(
+        _intent(asset="BTC", notional=Decimal("100"), is_dca=False, rule_kind="pullback"),
+        config,
+        DAY0,
+    )
     assert allowed is True
     assert reasons == []
 
@@ -1043,8 +1077,10 @@ def test_parity_with_guards_check_opportunistic_pacing():
     )
 
     # boundaries: per_order=120, per_day=130 (280-150), monthly=150 (500-350) -- coincides with
-    # usdc=150 (cash=150) here, per_asset=350 (0.55*1000-200), exposure=650 (1000-350, since ETH
-    # (150) is left open in this BUY-only scenario -- see `_parity_scenario`'s docstring).
+    # usdc=150 (cash=150) here, per_asset=350 (0.55*1000-200, moot for this DCA intent since #853
+    # exempts it too, but kept in the grid -- per_order=120 already rejects everything past it so
+    # parity still holds), exposure=650 (1000-350, since ETH (150) is left open in this BUY-only
+    # scenario -- see `_parity_scenario`'s docstring).
     boundaries = (120, 130, 150, 350, 650)
     notionals = sorted(
         {1, 2000}
