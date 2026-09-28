@@ -1864,6 +1864,55 @@ def test_screen_cache_age_is_never_negative_for_a_request_stamped_before_the_bui
     assert earlier is built and earlier_age == 0
 
 
+def test_screen_cache_treats_a_clock_stepped_back_past_the_ttl_as_a_miss() -> None:
+    """#856 review: the wall clock can step BACKWARDS (an NTP correction). A lock-wait makes an
+    age of a second or two negative legitimately (the test above), but an entry "built" a full
+    TTL or more in this request's future is a clock that moved, and serving it would keep a stale
+    screen up for the step plus the TTL while the card read "0s ago". It is a MISS."""
+    cache = web_api.ScreenCache()
+    calls = {"n": 0}
+
+    def build() -> object:
+        calls["n"] += 1
+        return object()
+
+    built, _ = cache.get_or_build(("c", "d"), 10_000, build)
+    within, within_age = cache.get_or_build(("c", "d"), 10_000 - 299, build)
+    assert calls["n"] == 1, "a step back of less than the TTL is still a HIT"
+    assert within is built and within_age == 0
+
+    rebuilt, rebuilt_age = cache.get_or_build(("c", "d"), 10_000 - 300, build)
+    assert calls["n"] == 2, "a step back of the whole TTL or more must rebuild"
+    assert rebuilt is not built and rebuilt_age == 0
+
+
+def test_dca_plan_screen_age_states_the_caches_own_ttl(
+    deployment: tuple[str, str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#856 review: the card's "refreshes every ..." is the TTL the cache actually applies, handed
+    through by `read_dca_plan` -- change the TTL and both the expiry and the sentence move."""
+    db_path, config_path = deployment
+    cfg = _screen_cache_cfg(db_path, config_path)
+    monkeypatch.setattr(cfg.screen_cache, "TTL_SECONDS", 600)
+    _admit_everything(monkeypatch)
+    builds = _counting_build_screen_report(monkeypatch)
+    query: web_api.Query = {"budget": ["1e3"], "buffer": ["0.1"]}
+
+    first = web_api.read_dca_plan(cfg, query, None, 1_700_000_000)
+    later = web_api.read_dca_plan(cfg, query, None, 1_700_000_000 + 599)
+    assert builds["n"] == 1, "the 600s TTL set on the cache is the one that governs expiry"
+    assert first["screen_age"] == {
+        "value": "0",
+        "display": "Asset screen from 0s ago; refreshes every 10m.",
+        "state": "neutral",
+    }
+    assert later["screen_age"] == {
+        "value": "599",
+        "display": "Asset screen from 9m ago; refreshes every 10m.",
+        "state": "neutral",
+    }
+
+
 def test_screen_cache_is_thread_safe_under_concurrent_misses(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

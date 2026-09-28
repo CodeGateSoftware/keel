@@ -852,10 +852,15 @@ class ScreenCache:
         `attest_due_ts <= now_ts` (equality already means due, not "an instant of grace left").
         A MISS calls `build()` while the lock is held (see the class docstring), so `build` must
         stay a plain, synchronous read -- exactly what `build_screen_report` is.
+
+        The window is symmetric: an entry built `TTL_SECONDS` or more AFTER `now_ts` is a MISS
+        too. A lock-wait legitimately makes the age a second or two negative (read as 0 below),
+        but an entry a whole TTL in this request's future means the wall clock stepped back, and
+        serving it would keep a stale screen up for the step plus the TTL under "0s ago".
         """
         with self._lock:
             entry = self._entries.get(key)
-            if entry is not None and now_ts - entry.built_at_ts < self.TTL_SECONDS:
+            if entry is not None and abs(now_ts - entry.built_at_ts) < self.TTL_SECONDS:
                 # A request stamped before a later-stamped one built this entry (it waited on the
                 # lock) reads age 0, never a negative age.
                 return entry.report, max(0, now_ts - entry.built_at_ts)
@@ -934,6 +939,7 @@ def read_dca_plan(cfg: ServeConfig, query: Query, _state: Any, now_ts: int) -> d
         plan,
         command=apply_command(inputs, config_path=cfg.config_path, db_path=cfg.db_path),
         screen_age_seconds=screen_age_seconds,
+        screen_ttl_seconds=cfg.screen_cache.TTL_SECONDS,
     )
 
 

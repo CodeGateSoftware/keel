@@ -3712,29 +3712,51 @@ def dca_plan_awaiting_payload(*, command: str) -> dict[str, Any]:
         "blockers": [],
         "warnings": [],
         # #856: nothing was screened for THIS response (no budget was asked for, so
-        # `read_dca_plan` never reached the cache) -- `absent()`, never a manufactured "0s ago"
-        # that would claim a screen that did not happen.
-        "screen_age": absent(),
+        # `read_dca_plan` never reached the cache) -- said in words, never a manufactured "0s
+        # ago" that would claim a screen that did not happen, and never `absent()`'s bare "—",
+        # which the card would place as an unlabeled line of its own.
+        "screen_age": _dca_not_screened(),
     }
 
 
-def _dca_screen_age(age_seconds: int) -> Field:
+def _dca_not_screened() -> Field:
+    """#856: `screen_age` when no admission screen stands behind the response -- the awaiting
+    card (no budget asked for) or a caller that measured no screen age. A judged field in words,
+    `unknown` like every other figure the awaiting card lacks."""
+    return label(
+        "not_screened",
+        display="Asset screen: not run yet -- it runs once a budget is entered.",
+        state=UNKNOWN,
+    )
+
+
+def _dca_screen_age(age_seconds: int, ttl_seconds: int) -> Field:
     """#856's staleness note for the cached admission screen behind `/rules?budget=`.
 
-    `ScreenCache` (`keel/web/api.py`) holds one screen for up to 5 minutes so the page's 15s poll
+    `ScreenCache` (`keel/web/api.py`) holds one screen for `ttl_seconds` so the page's 15s poll
     does not re-screen the whole allowlist against the database on every reload; this is the one
-    sentence that tells the operator the trade-off exists. `_human_age`, not a fresh formatter,
-    for the same reason `duration()` above uses it: the browser and the CLI must never be able to
-    disagree about how old the same instant is.
+    sentence that tells the operator the trade-off exists. `_human_age` / `_human_remaining`, not
+    fresh formatters, for the same reason `duration()` above uses them: the browser and the CLI
+    must never be able to disagree about how long the same span is. The interval is the TTL the
+    cache applies, handed in by the caller -- never a second copy of it written as prose here.
     """
     return label(
         str(age_seconds),
-        display=f"Asset screen from {_human_age(age_seconds)}; refreshes every 5 min.",
+        display=(
+            f"Asset screen from {_human_age(age_seconds)}; "
+            f"refreshes every {_human_remaining(ttl_seconds)}."
+        ),
         state=NEUTRAL,
     )
 
 
-def dca_plan_payload(plan: DcaPlan, *, command: str, screen_age_seconds: int = 0) -> dict[str, Any]:
+def dca_plan_payload(
+    plan: DcaPlan,
+    *,
+    command: str,
+    screen_age_seconds: int | None = None,
+    screen_ttl_seconds: int | None = None,
+) -> dict[str, Any]:
     """`keel.commands.dca_plan.DcaPlan`, as JSON. Every figure was computed by the service --
     `weight_pct`, `taker_pct_display`, `buy_count` and the `worst_month_*` fields exist so nothing
     here multiplies or counts (Rules 2 and 6). READ-ONLY: the card carries the CLI command, and
@@ -3806,7 +3828,11 @@ def dca_plan_payload(plan: DcaPlan, *, command: str, screen_age_seconds: int = 0
         ],
         "blockers": list(plan.blockers),
         "warnings": list(plan.warnings),
-        "screen_age": _dca_screen_age(screen_age_seconds),
+        "screen_age": (
+            _dca_not_screened()
+            if screen_age_seconds is None or screen_ttl_seconds is None
+            else _dca_screen_age(screen_age_seconds, screen_ttl_seconds)
+        ),
     }
 
 
