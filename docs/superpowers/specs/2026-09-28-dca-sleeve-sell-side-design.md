@@ -73,8 +73,11 @@ BUY cap only** (#836 retitled it; `guards.py` rail 14 is under `if is_buy`). It 
 sell. It *does* touch the redeploy leg of a rebalance or a rotation, which is a BUY (§2.5).
 
 A round trip (trim, then redeploy or rebuy) costs two legs: at live rates about 1.8% plus two
-slippages; at sim rates 2.4%. #831's D arm paid $462 of buy fees and $468 of sell fees over five
-years to end ahead on one path and behind on most.
+slippages; at sim rates 2.4%. In the flat-taker run that #836 says matches live fees, #831's D arm
+paid $822.80 of buy fees and $462.35 of sell fees over five years (about $1,285, 4.2% of the
+$30,500 deposited) to end ahead on one path and behind on most. (The headline table's allowance-
+aware run — buys fee-free up to $500/month, a model #836 says does not match live — gives $462.35
+buy / $467.97 sell, about $930, 3.0% of deposits.)
 
 ### 2.3 What the sleeve is, and what protects it
 
@@ -253,25 +256,35 @@ most one `Reduction` to `executor.reduce`.
 
 This step therefore sees the same mixed-ownership products as `_handle_exits` does (§2.4): a
 product can hold both `dca` tranches and tranches opened by whichever rule currently owns
-`position_rule:<product>`. That is not a new problem `_handle_reductions` creates — `Holding`
-(§3.3) sums every open tranche on the product regardless of which rule opened it, and
-`executor.reduce`'s `is_dca` is derived from the specific tranches a `Reduction` actually
-consumed, so a `Reduction`'s booking is correct even on a mixed sleeve. It is `_handle_exits`'s
-existing path that is not: `_close_tranches` takes one `is_dca` flag for the whole exit
-(`agent.py:926`), not one per tranche FIFO consumes, so a non-`dca` rule's exit on a mixed
-product mis-books any DCA tranches it closes as non-DCA (#860). This design does not fix that
-pre-existing path; it is named here so a sell-side rule promoted onto a product is not read as
-introducing the hazard.
+`position_rule:<product>`. `Holding` (§3.3) sums every open tranche on the product regardless of
+which rule opened it, so a `Reduction`'s FIFO consumption can span a `dca` tranche and a
+non-`dca` one — on PAXG, for example, tranche 3 (turtle, §2.3) is the oldest row, so a
+`Reduction` that also reaches a DCA tranche consumes both. `streak.book_exit` as it exists today
+takes **one** `is_dca` bool for the whole call (`streak.py:179-259`), the same shape
+`_handle_exits` and `_book_paper_exit` use, deriving it from `positions[0]["rule_name"]` only
+(`agent.py:752`) — so calling it unchanged from `_handle_reductions` would book a mixed-tranche
+Reduction with a single flag, wrong for whichever tranche it does not match. **This design
+therefore extends `book_exit`'s `is_dca` parameter to accept `None`**, meaning "derive per leg
+from each consumed row's own `rule_name`" (each `position.get("rule_name") == "dca"`, the same
+field `record_closed_trade` already reads per leg, `streak.py:101`) instead of the caller-supplied
+flag — a required change, named in §11 PR 2 alongside `executor.reduce`. `executor.reduce` calls
+`book_exit(..., is_dca=None)`, so each leg of a Reduction books against its own tranche's DCA
+status even on a mixed sleeve. `_handle_exits`'s existing whole-position EXIT path is
+**untouched** by this: `_close_tranches` still passes one caller-supplied flag for the whole exit
+(`agent.py:926`), so a non-`dca` rule's exit on a mixed product still mis-books any DCA tranches
+it closes as non-DCA (#860). This design does not fix that pre-existing path; it is named here so
+a sell-side rule promoted onto a product is not read as introducing the hazard.
 
 `executor.reduce` is `scale_out` without the bracket half: it builds a SELL `OrderIntent` with
 `rule_kind=reduction.reason`, `rule_id` threaded (#803), `is_dca=False` on the **intent** (no rail
 reads `is_dca` on a sell, so the flag is irrelevant there), sizes through `_clamped_sell_qty`
 (#667), runs `guards.check`, previews, passes the mode gate (§3.5), places, logs, and on fill calls
-`streak.book_exit(sold_qty=reduction.qty, is_dca=<derived>)`. `is_dca` for the **outcome** is
-derived from the tranches consumed, exactly as `_book_paper_exit` derives it: a sale from `dca`
-tranches writes `trade_outcomes.is_dca = 1`, so rail 16's streak counter never sees a sleeve
-sale as a losing trade. If a DCA tranche still had a resting bracket (none does, but #799's fix
-may leave one), `_clear_resting_bracket` runs first, as it does for every SELL.
+`streak.book_exit(sold_qty=reduction.qty, is_dca=None)` — the per-leg derivation this design adds
+to `book_exit` (above), not the single-flag derivation `_book_paper_exit` uses. Each leg's
+`trade_outcomes.is_dca` is set from that leg's own tranche, so a Reduction spanning a `dca` and a
+non-`dca` tranche books each correctly, and a sale of `dca` units never reaches rail 16's streak
+counter as a loss. If a DCA tranche still had a resting bracket (none does, but #799's fix may
+leave one), `_clear_resting_bracket` runs first, as it does for every SELL.
 
 A `Reduction` that is **not** executed (preview-only, vetoed, declined at the gate) is still
 recorded (§3.8). The proposal is the product; the fill is optional.
@@ -442,12 +455,20 @@ previewed fee and per-product slippage, default 5), `cooldown_days` (default 30)
 min_net_usd`, where `vwae` includes entry fees (§3.3) so "net profit" means net of both legs'
 fees. Below the gate: no proposal, and the reason is logged once per product per day.
 
-**CLI.** `keel dca trim --preview [--product BTC-USD] [--gain-pct 25] [--trim-pct 15]`: a
-**read-only** report, no rule row needed, that prints for each sleeve product the `Holding`
-(qty, vwae, cost, mark, unrealised), whether the trigger is met, the tranche a FIFO trim would
-hit, the venue-previewed fee, the net, the verdict, and the days a sale above the per-order cap
-would take. Off a TTY it prints and writes nothing, as `keel dca plan` does.
-`keel dca trim --confirm <proposal-id>` places one, gated (§3.5).
+**CLI.** `keel dca trim --preview [--product BTC-USD] [--gain-pct 25] [--trim-pct 15] [--view
+{gain,bands,lots}]`. `--view` picks the report: **`gain`** (default once it exists — see below)
+is this section's trigger report; **`bands`** is §5's weight-drift/band-rebalance report;
+**`lots`** is §8.1's per-tranche unrealised/realised-P&L report. The three views do not ship
+together: `--view lots` ships first, alone, in §11 PR 1, before `profit_take` (this section) or
+`band_rebalance` (§5) exist to have a trigger to report on; `--view gain` and `--view bands`, and
+`--view`'s default of `gain`, ship together in PR 5. **Between PR 1 and PR 5**, `keel dca trim
+--preview` accepts only `--view lots`; a bare `--preview` or `--view gain`/`--view bands` in that
+window is a CLI usage error naming `--view lots` as the only value implemented so far. **From PR
+5 on**, this section's report is what bare `keel dca trim --preview` prints: for each sleeve
+product the `Holding` (qty, vwae, cost, mark, unrealised), whether the `gain_pct` trigger is met,
+the tranche a FIFO trim would hit, the venue-previewed fee, the net, the verdict, and the days a
+sale above the per-order cap would take. Off a TTY it prints and writes nothing, as `keel dca
+plan` does. `keel dca trim --confirm <proposal-id>` places one, gated (§3.5).
 
 **Rails.** §3.4 sell leg. No buy leg.
 
@@ -499,8 +520,11 @@ next cycle as a non-DCA BUY to the underweights by shortfall, meeting rails 4, 5
 
 **Fee drag, quantified.** Per rebalance event: sell leg fee (0.9% live, 1.2% sim) plus sell
 slippage, plus buy leg fee plus buy slippage, plus the buy's consumption of the month's rail-14
-cap. #831 measured $930 of fees over five years on the D arm at $500 a month (3.0% of deposits),
-for a lead that held on one path. At the live DCA sleeve's scale ($151.81 at cost, all BTC,
+cap. In the flat-taker run that #836 says matches live fees, #831 measured $822.80 buy + $462.35
+sell ≈ **$1,285** of fees over five years on the D arm at $500 a month (**about 4.2%** of
+deposits), for a lead that held on one path. (The headline table's allowance-aware run — buys
+fee-free up to $500/month, a model #836 says does not match live — gives $462.35 buy / $467.97
+sell ≈ $930, about 3.0%.) At the live DCA sleeve's scale ($151.81 at cost, all BTC,
 §2.3 — not the account's $213 total exposure), one full rebalance of a $30 overweight costs
 about $0.55 in fees (two legs at 0.9%) and, from #831's per-product `slippage_pct` rows (BTC
 0.05%, ETH 0.06%, SOL about 0.10%, XLM/LTC/ADA/LINK 0.25–0.38%, PAXG about 1.0%), about
@@ -698,8 +722,8 @@ neither `positions` nor `orders`. A per-tranche lots view over the `positions` l
 names `positions` as the sleeve's truth, distinct from the `orders`-derived average `executor`
 keeps. The honest path is to keep the two sources apart rather than reconcile them under one
 flag: the lots view is added as **`keel dca trim --preview --view lots`**, over the same
-`sleeve.holding_of` (§3.3) that §4's gain view and §5's bands view already extend, not as
-`keel pnl --lots`.
+`sleeve.holding_of` (§3.3) that this PR (§11 PR 1) introduces first; §4's `--view gain` and §5's
+`--view bands` are added later, in PR 5, extending the same function — not as `keel pnl --lots`.
 
 ### 8.2 What keel cannot compute
 
@@ -769,7 +793,7 @@ keel's ledger drifts until `positions close` exists; the fee cost is the same ei
 | Sell released from a browser | no verb exists; `test_capabilities` scans `keel/web/` | nothing |
 | Sell placed unattended without a sells window | `Profile.is_autonomous_for_sells` | proposal `preview`, notification |
 | A monitor silenced by clearing a retry key (#811) | monitor reads `positions` only | unchanged alert |
-| **A non-`dca` rule owns a product that also holds `dca` tranches; its EXIT sells them too, booked non-DCA** (#860) | **Nowhere — a present-day gap this design does not fix**, not introduced by it | rail 16's streak counter sees the DCA units as a rule outcome |
+| **A non-`dca` rule owns a product that also holds `dca` tranches; its `_handle_exits` EXIT sells them too, booked non-DCA** (#860) | **Nowhere for this path — a present-day gap this design does not fix**, not introduced by it. (A `Reduction`'s own booking on the same mixed product is per-leg and correct, once §3.2/§11 PR 2's `book_exit` change ships.) | rail 16's streak counter sees the DCA units as a rule outcome |
 
 ## 10. Recommendations, in one table
 
@@ -795,13 +819,20 @@ encodes (this repository keeps its rules in neighbouring docstrings).
    `keel/execution/sleeve.py`: `Holding`, `holding_of`, `net_proceeds`, `fee_drag`; the two
    doctor findings `sleeve.ledger_drift`, `sleeve.venue_drift`; `keel dca trim --preview --view
    lots` (over `positions`, kept separate from `keel pnl`'s FIFO-over-`transactions` report,
-   §8.1). No sell path. Tests over
+   §8.1). `--view lots` is the only `--view` value this PR implements: `--view gain`/`bands` and
+   the `gain` default don't exist until PR 5 (§4, §8.1), so a bare `--preview` or `--view
+   gain`/`bands` is a usage error until then. No sell path. Tests over
    hand-built ledgers, including entry fees in the basis and the FIFO tranche a sale would hit.
 2. **`Action.REDUCE`, `Reduction`, `Rule.reduce_signal`, `executor.reduce`,
-   `agent._handle_reductions`, `sell_proposals`.** The pipeline with arbitration, the sleeve
-   caps, rail 2 slicing, `preview` as the only execution, the proposal table and its
-   `audit_events`, `keel dca proposals`. No rule kind uses it except a test double. Tests: every
-   row of §9's table that the pipeline owns; `test_capabilities` unchanged (no gate yet).
+   `agent._handle_reductions`, `sell_proposals`, and `streak.book_exit`'s `is_dca: bool | None`.**
+   The pipeline with arbitration, the sleeve caps, rail 2 slicing, `preview` as the only
+   execution, the proposal table and its `audit_events`, `keel dca proposals`. **Required in this
+   PR:** `book_exit` gains a per-leg `is_dca` derivation for `is_dca=None` (§3.2) — each consumed
+   tranche's own `rule_name` decides its outcome row, instead of the single caller-supplied flag
+   `_handle_exits`/`_book_paper_exit` keep passing unchanged — so a `Reduction` on a mixed-ownership
+   product books each leg correctly (#860, Q10). No rule kind uses `executor.reduce` yet except a
+   test double. Tests: every row of §9's table that the pipeline owns, including a mixed-tranche
+   `book_exit(is_dca=None)` case; `test_capabilities` unchanged (no gate yet).
 3. **`reverse_dca`.** The rule kind, registry, `PARAM_DOCS`, conformance, `rules add`, the sim's
    reverse path and `DcaSleeve` columns, `keel dca distribute --preview`, the concurrent-DCA
    promotion refusal and doctor finding. Tests per §6.
@@ -810,9 +841,10 @@ encodes (this repository keeps its rules in neighbouring docstrings).
    `promotion_class = "sleeve_sell"` gate and `keel dca proposals review`. Tests:
    `test_capabilities` in both directions; `preview` still places nothing under `autonomous`;
    the sells window expires; `autonomy off` clears it; the browser scan.
-5. **`keel dca trim --preview`** with `--view gain` and `--view bands`, read-only, over PR 1.
-   The `profit_take` kind is added in `preview` with `reduce_signal`, but no promotion of one is
-   part of the plan.
+5. **`keel dca trim --preview`** with `--view gain` and `--view bands`, read-only, over PR 1's
+   `sleeve.holding_of`. `--view` gains a default of `gain`, so a bare `--preview` (no flag) now
+   prints §4's gain report instead of erroring. The `profit_take` kind is added in `preview` with
+   `reduce_signal`, but no promotion of one is part of the plan.
 6. **The exit monitor and `sleeve_exit`.** Pure `sleeve_exit.py`, the per-cycle step, transition
    events through `notifications.py`, `keel dca exit --preview`, the kind in `preview`. Lands
    only after #811 and #799 are merged.
@@ -834,6 +866,6 @@ encodes (this repository keeps its rules in neighbouring docstrings).
 | Q7 | Does the exit monitor cover PAXG tranche 3? | **Yes, on transitions only.** The 2026-09-22 decision holds the position; it does not stop the level being reported when it changes state. No automatic sell. |
 | Q8 | Is a rebalancing trim a permitted sale kind under rail 10? | **Yes, as `band_rebalance`**, if it is ever built; not built now (§5). |
 | Q9 | Spend accumulation policy's 4th trial on a profit-take arm now? | **Not now.** The design is written so it can be pre-registered the day the operator wants it. |
-| Q10 | Is a sleeve sale a DCA outcome for rail 16? | **Yes, for a `Reduction`**, derived per-tranche from the tranches it consumed (`is_dca=1`), so a distribution can never trip the streak breaker. Not yet true for `_handle_exits`'s pre-existing whole-position EXIT on a mixed-ownership product: it books one `is_dca` flag for the whole exit (§2.4, §3.2, #860), so a non-`dca` rule's exit on a product that also holds DCA tranches can still book those units as a non-DCA outcome. Fixing that is out of this design's scope but is a present-day gap, not one this design creates. |
+| Q10 | Is a sleeve sale a DCA outcome for rail 16? | **Yes, for a `Reduction`**, once `book_exit`'s per-leg `is_dca` derivation (§3.2, a required change in §11 PR 2) ships: each tranche a Reduction consumes is booked from its own `rule_name`, so a distribution can never trip the streak breaker even on a mixed sleeve. Before that change, `book_exit` has only the single-flag derivation `_handle_exits`/`_book_paper_exit` use, and a Reduction spanning a `dca` and a non-`dca` tranche would mis-book the mismatched leg the same way. Not true, and out of this design's scope, for `_handle_exits`'s pre-existing whole-position EXIT on a mixed-ownership product: it keeps one `is_dca` flag for the whole exit (§2.4, §3.2, #860), so a non-`dca` rule's exit on a product that also holds DCA tranches still books those units as a non-DCA outcome. Fixing that path is out of this design's scope but is a present-day gap, not one this design creates. |
 | Q11 | Record a tax jurisdiction in config? | **Operator's call.** Without one, §8 stays a fee report; with one, lots are labelled and still nothing is advised. |
 | Q12 | Should a same-asset harvest (sell and buy back) ever be offered? | **No**, pending the fiqh finding in §8.3 being answered by someone entitled to answer it. |
