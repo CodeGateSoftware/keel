@@ -2531,6 +2531,21 @@ def test_the_dca_card_labels_the_worst_month_check_as_what_the_cap_was_checked_a
     assert checks == ["checked against the cap"], figures
 
 
+def test_the_dca_card_places_the_screen_age_as_a_note_exactly_once() -> None:
+    """#856: the staleness note is built and filled by ONE statement pair -- a `<p class="note">`
+    immediately appended to the card, filled from `field(plan.screen_age)` (a judged `Field`, not
+    a bare string: Rule 3). Paired, not just present twice somewhere in the card's source."""
+    body = _dca_card_bodies()
+    assert body.count("field(plan.screen_age)") == 1
+    pair = re.search(
+        r'const (\w+) = el\("p", "note"\);\s*'
+        r"\1\.append\(field\(plan\.screen_age\)\);\s*"
+        r"card\.append\(\1\)",
+        body,
+    )
+    assert pair is not None, body
+
+
 def test_the_dca_card_states_a_failed_read_with_the_servers_reason() -> None:
     """A 400 (a bad `?budget=`, a config refusal) leaves the rules table standing and says why:
     the card is handed the reading's `error` and places its `detail`, the service's own words."""

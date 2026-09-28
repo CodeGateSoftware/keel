@@ -3307,6 +3307,12 @@ export function dcaPlanCard(plan, error) {
   const stateLine = el("p");
   stateLine.append(field(plan.state));
   card.append(stateLine);
+  // #856: the admission screen behind this plan is cached for up to 5 minutes, so this figure
+  // can lag a fix (a re-fetched candle, a fresh attestation) by that long -- said here, in the
+  // server's own words, rather than left for the operator to notice on their own.
+  const screenAgeLine = el("p", "note");
+  screenAgeLine.append(field(plan.screen_age));
+  card.append(screenAgeLine);
   card.append(
     dcaPlanFigure("spend / month", plan.summary.spend),
     dcaPlanFigure("budget", plan.summary.budget),

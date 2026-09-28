@@ -1686,3 +1686,198 @@ def test_dca_plan_answers_no_post(running: web_server.ServeConfig) -> None:
         headers={"X-Keel-Client": "1"},
     )
     assert status == 404
+
+
+# -- #856: the admission screen behind /api/dca-plan is cached ------------------------------------
+
+
+def _counting_build_screen_report(monkeypatch: pytest.MonkeyPatch) -> dict[str, int]:
+    """Wraps `keel.commands.admission.build_screen_report` with a call counter, patched at ITS OWN
+    module so `read_dca_plan`'s per-call `from keel.commands.admission import build_screen_report`
+    (resolved fresh on every call, the same reason `screen_product` is) picks up the wrapper."""
+    from keel.commands import admission
+
+    calls = {"n": 0}
+    original = admission.build_screen_report
+
+    def counting(repo: Any, config: Any, screen_fn: Any) -> Any:
+        calls["n"] += 1
+        return original(repo, config, screen_fn)
+
+    monkeypatch.setattr(admission, "build_screen_report", counting)
+    return calls
+
+
+def _screen_cache_cfg(db_path: str, config_path: str) -> web_server.ServeConfig:
+    """A `ServeConfig` built but never bound to a socket -- `read_dca_plan` needs only its paths
+    and its `screen_cache`, so a real `keel serve` process is not needed to exercise it."""
+    return web_server.ServeConfig(
+        host="127.0.0.1",
+        port=0,
+        token=new_session_token(),
+        db_path=db_path,
+        config_path=config_path,
+    )
+
+
+def test_dca_plan_screen_cache_is_a_hit_on_a_second_read_within_the_ttl(
+    deployment: tuple[str, str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#856: two reads of the same deployment, close together, re-screen the allowlist only once.
+
+    Driven directly against `read_dca_plan` (not over HTTP) so `now_ts` -- the reader's own
+    injected clock, already threaded through every reader in this file -- can be moved without a
+    real `time.sleep`."""
+    db_path, config_path = deployment
+    cfg = _screen_cache_cfg(db_path, config_path)
+    asked = _admit_everything(monkeypatch)
+    builds = _counting_build_screen_report(monkeypatch)
+    query: web_api.Query = {"budget": ["1e3"], "buffer": ["0.1"]}
+
+    first = web_api.read_dca_plan(cfg, query, None, 1_700_000_000)
+    assert builds["n"] == 1
+    assert asked, "the first read never reached the per-product screen at all"
+    assert first["screen_age"]["value"] == "0"
+
+    asked.clear()
+    second = web_api.read_dca_plan(cfg, query, None, 1_700_000_000 + 299)
+    assert builds["n"] == 1, "a read inside the 5-minute TTL re-screened the allowlist"
+    assert asked == [], "a cache HIT must not call the per-product screen at all"
+    assert second["screen_age"]["value"] == "299"
+
+
+def test_dca_plan_screen_cache_expires_exactly_at_the_ttl_boundary(
+    deployment: tuple[str, str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The boundary ruling: an entry exactly 300s old is STALE (`<`, not `<=`, is freshness),
+    matching `keel/execution/guards.py`'s own `attest_due_ts <= now_ts` (equality means due)."""
+    db_path, config_path = deployment
+    cfg = _screen_cache_cfg(db_path, config_path)
+    _admit_everything(monkeypatch)
+    builds = _counting_build_screen_report(monkeypatch)
+    query: web_api.Query = {"budget": ["1e3"], "buffer": ["0.1"]}
+
+    web_api.read_dca_plan(cfg, query, None, 1_700_000_000)
+    web_api.read_dca_plan(cfg, query, None, 1_700_000_000 + 300)
+    assert builds["n"] == 2, "an entry exactly 300s old must be treated as stale, not fresh"
+
+
+def test_dca_plan_screen_cache_rebuilds_well_past_the_ttl(
+    deployment: tuple[str, str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    db_path, config_path = deployment
+    cfg = _screen_cache_cfg(db_path, config_path)
+    _admit_everything(monkeypatch)
+    builds = _counting_build_screen_report(monkeypatch)
+    query: web_api.Query = {"budget": ["1e3"], "buffer": ["0.1"]}
+
+    web_api.read_dca_plan(cfg, query, None, 1_700_000_000)
+    web_api.read_dca_plan(cfg, query, None, 1_700_000_600)
+    assert builds["n"] == 2
+
+
+def test_dca_plan_screen_cache_keys_on_both_config_and_db_path(
+    deployment: tuple[str, str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A different config path (a second deployment on the same machine) must not read the first
+    deployment's cached screen, even if both are asked about at the same instant."""
+    db_path, config_path = deployment
+    other_config_path = str(Path(config_path).with_name("other-config.yaml"))
+    Path(other_config_path).write_text(Path(config_path).read_text())
+    cfg = _screen_cache_cfg(db_path, config_path)
+    other_cfg = web_server.ServeConfig(
+        host=cfg.host,
+        port=cfg.port,
+        token=cfg.token,
+        db_path=cfg.db_path,
+        config_path=other_config_path,
+        screen_cache=cfg.screen_cache,
+    )
+    _admit_everything(monkeypatch)
+    builds = _counting_build_screen_report(monkeypatch)
+    query: web_api.Query = {"budget": ["1e3"], "buffer": ["0.1"]}
+
+    web_api.read_dca_plan(cfg, query, None, 1_700_000_000)
+    web_api.read_dca_plan(other_cfg, query, None, 1_700_000_000)
+    assert builds["n"] == 2, "a different config_path sharing a cache must still be a MISS"
+
+
+def test_screen_cache_key_isolation() -> None:
+    """`ScreenCache` itself, isolated from the DCA plan entirely: a different key -- either half
+    of it -- is a separate entry, and the SAME key at the SAME instant never rebuilds."""
+    cache = web_api.ScreenCache()
+    calls = {"a": 0, "b": 0}
+
+    def build_a() -> str:
+        calls["a"] += 1
+        return "report-a"
+
+    def build_b() -> str:
+        calls["b"] += 1
+        return "report-b"
+
+    report_a1, age_a1 = cache.get_or_build(("config-a", "db-x"), 1000, build_a)
+    report_b1, _age_b1 = cache.get_or_build(("config-b", "db-x"), 1000, build_b)
+    report_a2, age_a2 = cache.get_or_build(("config-a", "db-x"), 1000, build_a)
+    report_c1, _age_c1 = cache.get_or_build(("config-a", "db-y"), 1000, build_b)
+
+    assert calls == {"a": 1, "b": 2}, "a different config path OR db path is a separate entry"
+    assert (report_a1, age_a1) == ("report-a", 0)
+    assert (report_a2, age_a2) == ("report-a", 0), "the same key at the same instant is a HIT"
+    assert report_b1 == "report-b" and report_c1 == "report-b"
+
+
+def test_screen_cache_hit_and_miss_boundary() -> None:
+    """The TTL arithmetic on its own, with no DCA plan involved at all."""
+    cache = web_api.ScreenCache()
+    calls = {"n": 0}
+
+    def build() -> object:
+        calls["n"] += 1
+        return object()
+
+    first, first_age = cache.get_or_build(("c", "d"), 1_000, build)
+    assert calls["n"] == 1 and first_age == 0
+
+    hit, hit_age = cache.get_or_build(("c", "d"), 1_000 + 299, build)
+    assert calls["n"] == 1, "an entry 299s old is still a HIT"
+    assert hit is first and hit_age == 299
+
+    miss, miss_age = cache.get_or_build(("c", "d"), 1_000 + 300, build)
+    assert calls["n"] == 2, "an entry exactly TTL_SECONDS old is a MISS"
+    assert miss is not first and miss_age == 0
+
+
+def test_screen_cache_is_thread_safe_under_concurrent_misses(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Two threads racing a cold cache must not corrupt `_entries`, and the lock held across a
+    MISS's rebuild (a deliberate choice -- see `ScreenCache`'s docstring) means exactly one of
+    them actually builds while the other waits for and then reads that same result."""
+    import threading
+    import time as time_mod
+
+    cache = web_api.ScreenCache()
+    calls = {"n": 0}
+    calls_lock = threading.Lock()
+
+    def build() -> str:
+        with calls_lock:
+            calls["n"] += 1
+        time_mod.sleep(0.05)
+        return "report"
+
+    results: list[str] = []
+
+    def worker() -> None:
+        report, _age = cache.get_or_build(("c", "d"), 1_000, build)
+        results.append(report)
+
+    threads = [threading.Thread(target=worker) for _ in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=5)
+
+    assert calls["n"] == 1, "concurrent misses on the same key must build exactly once"
+    assert results == ["report"] * 8

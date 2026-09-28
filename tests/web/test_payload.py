@@ -1957,6 +1957,7 @@ _DCA_KEYS = {
     "existing",
     "blockers",
     "warnings",
+    "screen_age",
 }
 
 
@@ -1998,6 +1999,31 @@ def test_the_dca_payload_has_one_shape_in_both_states(valid_config_path: Path) -
     assert awaiting["state"]["state"] == "unknown"
     assert awaiting["buys"] == [] and awaiting["summary"]["spend"]["state"] == "unknown"
     assert awaiting["cap_check"]["state"] == "unknown"
+
+
+def test_the_dca_payload_awaiting_state_has_no_screen_age(valid_config_path: Path) -> None:
+    """#856: no budget means `read_dca_plan` never reaches the screen cache, so `screen_age` is
+    `absent()` -- never a manufactured age for a screen that was not built."""
+    from keel.commands.dca_plan import apply_command
+
+    awaiting = payload.dca_plan_awaiting_payload(command=apply_command(None))
+    assert awaiting["screen_age"] == payload.absent()
+
+
+def test_the_dca_payload_carries_the_screen_age_as_structure(valid_config_path: Path) -> None:
+    """#856: the exact field shape a stale-but-cached screen sends -- checked field by field, not
+    by scanning the rendered sentence for a substring."""
+    plan = _dca_plan(valid_config_path)
+    body = payload.dca_plan_payload(plan, command="x", screen_age_seconds=125)
+    assert body["screen_age"] == {
+        "value": "125",
+        "display": "Asset screen from 2m ago; refreshes every 5 min.",
+        "state": "neutral",
+    }
+    # A freshly-built screen (age 0) is phrased the same way `_human_age(0)` phrases any instant.
+    fresh = payload.dca_plan_payload(plan, command="x", screen_age_seconds=0)
+    assert fresh["screen_age"]["value"] == "0"
+    assert fresh["screen_age"]["display"] == "Asset screen from 0s ago; refreshes every 5 min."
 
 
 def test_the_dca_payload_places_every_figure_the_plan_computed(valid_config_path: Path) -> None:
