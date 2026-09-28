@@ -658,22 +658,26 @@ def test_the_suggested_budget_and_buffer_actually_pass_when_rerun(valid_config_p
     assert plan.min_passing_buffer_pct is not None
 
     at_budget = _plan(valid_config_path, cap="500", budget=format(plan.max_passing_budget_usd, "f"))
-    assert not [b for b in at_budget.blockers if "rail 14" in b], at_budget.blockers
+    assert at_budget.approvable, at_budget.blockers
     over_budget = _plan(
         valid_config_path,
         cap="500",
         budget=format(plan.max_passing_budget_usd + Decimal("0.01"), "f"),
     )
-    assert any("rail 14" in b for b in over_budget.blockers)
+    # Blocked by rail 14 and nothing else: the suggestion fields are set only when that blocker
+    # fires, so a single blocker plus a suggestion pins which rule refused it.
+    assert len(over_budget.blockers) == 1, over_budget.blockers
+    assert over_budget.max_passing_budget_usd == plan.max_passing_budget_usd
 
     at_buffer = _plan(valid_config_path, cap="500", buffer=format(plan.min_passing_buffer_pct, "f"))
-    assert not [b for b in at_buffer.blockers if "rail 14" in b], at_buffer.blockers
+    assert at_buffer.approvable, at_buffer.blockers
     under_buffer = _plan(
         valid_config_path,
         cap="500",
         buffer=format(plan.min_passing_buffer_pct - Decimal("0.0001"), "f"),
     )
-    assert any("rail 14" in b for b in under_buffer.blockers)
+    assert len(under_buffer.blockers) == 1, under_buffer.blockers
+    assert under_buffer.min_passing_buffer_pct == plan.min_passing_buffer_pct
 
 
 def test_the_suggestion_reserves_headroom_for_existing_live_commitments(
@@ -712,7 +716,7 @@ def test_the_suggestion_reserves_headroom_for_existing_live_commitments(
         cap="500",
         budget=format(plan_with_live.max_passing_budget_usd, "f"),
     )
-    assert not [b for b in at_budget.blockers if "rail 14" in b], at_budget.blockers
+    assert at_budget.approvable, at_budget.blockers
     combined_warnings = [w for w in at_budget.warnings if "worst-case combined total" in w]
     assert not combined_warnings, combined_warnings
 
