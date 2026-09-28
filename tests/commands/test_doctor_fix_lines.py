@@ -163,6 +163,59 @@ def test_the_out_of_band_sale_findings_name_the_shipped_close_command() -> None:
         assert "#798" not in finding.fix, "the command shipped; the pointer at its issue is stale"
 
 
+def test_the_unmanaged_fix_names_no_close_command_on_a_paper_profile() -> None:
+    """`declared_close_target` refuses EVERY paper profile (`config.auto_trade.mode == "paper"`
+    is checked before the tranche is even looked up, #902), so `position.unmanaged`'s fix on a
+    paper profile must not send the operator to a command that can never succeed there. Only
+    the re-promote path applies when `managed_status == "paper"`."""
+    [finding] = [
+        f
+        for f in position_watch_findings(
+            [
+                {
+                    "id": 3,
+                    "product_id": "PAXG-USD",
+                    "rule_name": "turtle_breakout",
+                    "qty": Decimal("0.0132"),
+                    "initial_stop": None,
+                }
+            ],
+            [],
+            lambda p: True,
+            set(),
+            managed_status="paper",
+        )
+        if f.name == "position.unmanaged"
+    ]
+    assert finding.status == "warn"
+    assert _fix_invocations(finding.fix) == [], finding.fix
+
+
+def test_the_unmanaged_fix_still_names_the_close_command_on_a_live_profile() -> None:
+    """Control for the test above: the live-profile fix (the default `managed_status`) must keep
+    naming `keel positions close`, since a live declared close is the real way out (#811)."""
+    [finding] = [
+        f
+        for f in position_watch_findings(
+            [
+                {
+                    "id": 3,
+                    "product_id": "PAXG-USD",
+                    "rule_name": "turtle_breakout",
+                    "qty": Decimal("0.0132"),
+                    "initial_stop": None,
+                }
+            ],
+            [],
+            lambda p: True,
+            set(),
+        )
+        if f.name == "position.unmanaged"
+    ]
+    assert finding.status == "warn"
+    assert "positions close" in _fix_invocations(finding.fix)
+
+
 def test_ledger_drift_does_not_send_a_booked_sale_to_the_close_command() -> None:
     """`ledger.drift` is the orders log against the ledger -- a disagreement between two keel
     tables, which an out-of-band sale (invisible to BOTH) never causes. Its two shapes are a
@@ -176,3 +229,13 @@ def test_ledger_drift_does_not_send_a_booked_sale_to_the_close_command() -> None
     assert _fix_invocations(finding.fix) == ["orders list", "positions close"]
     assert all(_resolves(path) for path in _fix_invocations(finding.fix))
     assert "#798" not in finding.fix
+
+    # The invocation list alone would pass even if the fix said "use `keel positions close`" --
+    # naming the command is not the same as negating it. The clause immediately before the
+    # backtick-quoted invocation must be the negation, not just co-occur with it somewhere in
+    # the sentence.
+    before_backtick = finding.fix.split("`keel positions close`", 1)[0]
+    assert before_backtick.endswith("not "), (
+        f"the text right before `keel positions close` is {before_backtick!r}, which does not "
+        "negate it -- an operator reading only the invocation would think this is the fix"
+    )

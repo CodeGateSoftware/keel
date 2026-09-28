@@ -38,6 +38,15 @@ put a write one import away from a browser surface. There is no `keel positions`
 
 **LIVE profiles only.** A paper profile has no venue to have sold on, and a `mode='live'` SELL in
 a paper database would sit in front of rails that never saw its BUY. Refused, not translated.
+
+**The tranche's product needs a live BUY behind it too (H1).** `positions` has no `mode` column,
+so a tranche opened while the profile was `paper` can still be sitting open, `qty > 0`, in a LIVE
+database -- nothing on the row says which era opened it. `declared_close_target` refuses to book
+a SELL when the product's LIVE net filled quantity (`sleeve.orders_qty`) is less than the
+tranche's own `qty`: writing the SELL anyway would drive that net negative, and a negative net
+reads the same as "nothing held" to `guards._open_exposure_by_asset` and
+`executor._held_position` alike, hiding a LATER real live BUY on the same product from rails
+4/5/6.
 """
 
 from __future__ import annotations
@@ -56,7 +65,7 @@ from keel.commands._common import (
 )
 from keel.config import Config
 from keel.data.repository import Repository
-from keel.execution import executor, streak
+from keel.execution import executor, sleeve, streak
 from keel.types import Side
 
 #: `orders.order_type` of a declared close. No placement path writes it, so a reader can tell a
@@ -84,7 +93,15 @@ def declared_close_target(repo: Repository, config: Config, position_id: int) ->
     """The OPEN tranche a declared close would book, or `PositionCloseRefused`.
 
     Split out so the CLI can show the operator the tranche they are about to close BEFORE the
-    typed gate asks -- the gate's detail line is only worth reading if it names the real row."""
+    typed gate asks -- the gate's detail line is only worth reading if it names the real row.
+
+    Also refuses (H1) when the product's LIVE net filled quantity in the orders log is less than
+    this tranche's own `qty`. `positions` has no `mode` column: a tranche opened while the
+    profile was `paper` can still sit `qty > 0` in a LIVE database, and nothing on the row itself
+    says so. Booking a `mode='live'` SELL against it anyway would have no live BUY behind it,
+    driving the product's live net negative -- and both `guards._open_exposure_by_asset` (nets
+    per product, drops qty <= 0) and `executor._held_position` treat a non-positive net as no
+    holding at all, hiding a LATER real live BUY on the same product from rails 4/5/6."""
     if config.auto_trade.mode == "paper":
         raise PositionCloseRefused(
             "a declared close records a sale made on the venue; this is a paper profile "
@@ -94,6 +111,16 @@ def declared_close_target(repo: Repository, config: Config, position_id: int) ->
     if position is None:
         raise PositionCloseRefused(
             f"tranche {position_id} is not open (see the console's Positions view)"
+        )
+    product_id = position["product_id"]
+    tranche_qty = position["qty"]
+    live_qty = sleeve.orders_qty(repo, product_id, "live")
+    if live_qty < tranche_qty:
+        raise PositionCloseRefused(
+            f"the live orders log holds only {live_qty} of {product_id}, less than the "
+            f"tranche's {tranche_qty} -- recording this SELL would push the live net below "
+            "zero and hide later buys from the exposure rails; check `keel doctor`'s "
+            "`ledger.drift`"
         )
     return position
 

@@ -1672,7 +1672,11 @@ def position_watch_findings(
       as well as product. A DCA tranche whose rule was demoted is unmanaged too: unmanaged
       inventory is unmanaged with or without a stop. Only ENTRY/EXIT rule kinds count: a
       `sleeve_sell` rule proposes and cannot exit, so it manages nothing (plan Review Focus 5; P9
-      adds the exclusion and its test).
+      adds the exclusion and its test). Its fix line names `keel positions close` only when
+      `managed_status != "paper"` (#902): `declared_close_target` refuses a declared close on
+      EVERY paper profile outright, so pointing a paper operator at that command sends them to a
+      write that can never succeed there -- the only real way out on paper is re-promoting the
+      rule.
     * `position.unprotected` -- an open tranche with a recorded `initial_stop > 0`, no resting
       bracket (`reconcile._has_resting_bracket`, passed in as `resting`), and no retry record.
       The third clause makes it the complement of the reconcile sweep, not a duplicate. DCA
@@ -1758,6 +1762,15 @@ def position_watch_findings(
 
     out: list[Finding] = []
     if unmanaged:
+        # `declared_close_target` refuses EVERY paper profile (#902): `keel positions close`
+        # cannot ever record a sale there, so a paper-profile fix line must not name it -- only
+        # the re-promote path applies when `managed_status == "paper"`.
+        unmanaged_fix = (
+            "re-promote the owning rule"
+            if managed_status == "paper"
+            else "re-promote the owning rule, or sell it on the venue and record that with "
+            "`keel positions close <id> --price P`"
+        )
         out.append(
             Finding(
                 "position.unmanaged",
@@ -1765,8 +1778,7 @@ def position_watch_findings(
                 f"{len(unmanaged)} open tranche(s) on a product with no {managed_status} rule",
                 _describe(unmanaged, levels=False)
                 + f" -- no {managed_status} rule evaluates these products, so no exit can fire",
-                "re-promote the owning rule, or sell it on the venue and record that with "
-                "`keel positions close <id> --price P`",
+                unmanaged_fix,
                 products=_products(unmanaged),
             )
         )

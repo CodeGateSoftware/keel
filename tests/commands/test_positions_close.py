@@ -327,6 +327,76 @@ def test_a_paper_profile_is_refused(repo: Repository) -> None:
     assert _written(repo) == before
 
 
+def _bare_tranche(
+    repo: Repository, rule_id: int, *, qty: str, opened_at: int, fee: str = "0"
+) -> int:
+    """An open tranche with NO order row of its own -- for H1's guard tests, where what matters
+    is the PRODUCT's pooled live orders, not a 1:1 per-tranche match."""
+    return repo.open_position(
+        product_id="PAXG-USD",
+        rule_name="turtle_breakout",
+        opened_at=opened_at,
+        qty=Decimal(qty),
+        entry_fill=Decimal("4673.23"),
+        entry_fee=Decimal(fee),
+        rule_id=rule_id,
+    )
+
+
+def _buy(repo: Repository, rule_id: int, *, mode: str, qty: str, created_at: int = 1) -> None:
+    repo.insert_order(
+        dict(
+            mode=mode,
+            product_id="PAXG-USD",
+            side="BUY",
+            order_type="market",
+            qty=Decimal(qty),
+            status="filled",
+            fee=Decimal("0"),
+            expected_fill=Decimal("4673.23"),
+            actual_fill=Decimal("4673.23"),
+            confirmation="autonomous",
+            rule_id=rule_id,
+            created_at=created_at,
+            updated_at=created_at,
+        )
+    )
+
+
+def test_a_tranche_whose_product_has_no_live_buy_is_refused(repo: Repository) -> None:
+    """H1: `positions` has no mode column, so a tranche opened by PAPER-era trading can still sit
+    in a LIVE database with `qty > 0`. Declaring it closed would write a `mode='live'` SELL with
+    no live BUY behind it, driving the product's live net negative -- which hides a LATER real
+    live BUY from rails 4/5/6 (`guards._open_exposure_by_asset` drops net qty <= 0) and from
+    `executor._held_position`. The guard refuses before anything is written."""
+    rule_id = repo.insert_rule("turtle_breakout", {"product_id": "PAXG-USD"}, status="live")
+    _buy(repo, rule_id, mode="paper", qty="0.0132")
+    pid = _bare_tranche(repo, rule_id, qty="0.0132", opened_at=1)
+    before = _written(repo)
+
+    with pytest.raises(PositionCloseRefused, match="ledger.drift"):
+        _close(repo, pid)
+
+    assert _written(repo) == before
+
+
+def test_two_tranches_with_live_buys_covering_both_close_one_each_in_sequence(
+    repo: Repository,
+) -> None:
+    """The guard reads the PRODUCT's pooled live net, not a per-tranche match: one live BUY
+    covering both tranches lets each close in turn, and the SELL the first close writes is
+    already accounted for when the second is checked."""
+    rule_id = repo.insert_rule("turtle_breakout", {"product_id": "PAXG-USD"}, status="live")
+    _buy(repo, rule_id, mode="live", qty="0.03")
+    older = _bare_tranche(repo, rule_id, qty="0.01", opened_at=1)
+    newer = _bare_tranche(repo, rule_id, qty="0.02", opened_at=2)
+
+    _close(repo, older)
+    _close(repo, newer)
+
+    assert repo.get_open_positions("PAXG-USD") == []
+
+
 # -- the gated CLI verb (Task 4.2) ---------------------------------------------------------------
 
 
@@ -481,6 +551,36 @@ def test_nonsense_is_refused_before_the_gate_asks(
     assert _written(_file_repo(db)) == before
 
 
+@pytest.mark.parametrize(
+    "option,args",
+    [
+        ("--price", ("--price", "abc")),
+        ("--fee", ("--price", "4400", "--fee", "abc")),
+    ],
+)
+def test_a_non_numeric_amount_is_refused_at_the_cli_before_anything_is_written(
+    tmp_path: Path,
+    live_config_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    option: str,
+    args: tuple[str, ...],
+) -> None:
+    """`_decimal` is a click parameter callback: a value that is not a `Decimal` must fail click's
+    own parameter validation (exit code 2, `click.BadParameter`), before the command body -- and
+    therefore the typed gate and the write -- ever runs."""
+    asked: list[bool] = []
+    monkeypatch.setattr(_common, "_is_interactive", lambda: asked.append(True) or True)
+    db, pid = _seeded(tmp_path)
+    before = _written(_file_repo(db))
+
+    result = _invoke(db, live_config_path, pid, *args, input="yes\n")
+
+    assert result.exit_code == 2, result.output
+    assert f"Error: Invalid value for '{option}': not a number: 'abc'" in result.output.splitlines()
+    assert asked == []
+    assert _written(_file_repo(db)) == before
+
+
 def test_an_unknown_tranche_is_refused_before_the_gate_asks(
     tmp_path: Path, live_config_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -493,3 +593,25 @@ def test_an_unknown_tranche_is_refused_before_the_gate_asks(
     assert result.exit_code != 0
     assert asked == []
     assert _declared(db) == []
+
+
+def test_a_tranche_with_no_live_buy_is_refused_before_the_gate_asks(
+    tmp_path: Path, live_config_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """H1's guard lives in `declared_close_target`, which the CLI calls BEFORE the typed gate
+    (`positions_close_gate`'s own ordering) -- so an operator is never asked to confirm a row
+    the guard would refuse anyway."""
+    asked: list[bool] = []
+    monkeypatch.setattr(_common, "_is_interactive", lambda: asked.append(True) or True)
+    db = tmp_path / "t.db"
+    repo = _file_repo(db)
+    rule_id = repo.insert_rule("turtle_breakout", {"product_id": "PAXG-USD"}, status="live")
+    _buy(repo, rule_id, mode="paper", qty="0.0132")
+    pid = _bare_tranche(repo, rule_id, qty="0.0132", opened_at=1)
+    before = _written(_file_repo(db))
+
+    result = _invoke(db, live_config_path, pid, "--price", "4400", input="yes\n")
+
+    assert result.exit_code != 0
+    assert asked == []
+    assert _written(_file_repo(db)) == before
