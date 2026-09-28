@@ -24,6 +24,12 @@ the tranche and the BUY that opened it agree on a quantity, whichever of the two
 corrects: a close that sold the orders log's figure instead would carry any ledger/orders
 disagreement into the SELL row where no doctor check compares it.
 
+Since #900 the two DO agree going forward: a tranche is booked at the venue-delivered
+`filled_quantity` of the BUY that opened it, and `sleeve.orders_qty` (R-f below), R33 and
+`executor._held_position` all read `filled_quantity` before `qty`. Closing every tranche of a
+product therefore nets it to exactly zero on every reader. A future backfill of the pre-#900
+rows must correct the BUY's `filled_quantity` and the tranche's `qty` together, or R-f refuses.
+
 **It places NOTHING, and it builds no broker.** It is bookkeeping of a sale that already
 happened elsewhere; the venue is never asked, and the sell-side invariants
 (`tests/execution/test_sell_side_invariants.py`) pin that no new placement path exists. Because

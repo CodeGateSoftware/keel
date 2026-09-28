@@ -5166,3 +5166,99 @@ def test_899_a_live_cycle_records_venue_holdings_after_this_cycles_entries(repo,
     [finding] = doctor.venue_drift_findings(ledger, venue)
     assert finding.status == doctor.OK, finding.detail
     assert Decimal(venue[PRODUCT]["total"]) == ledger[PRODUCT]
+
+
+# -- #900: a tranche is booked at what the venue delivered ------------------------------------
+
+TRANCHE_UNOBSERVED_EVENT = "agent.tranche_qty_unobserved"
+
+
+def _filled_buy(repo: Repository, *, mode: str, filled: str | None) -> dict[str, Any]:
+    """A filled BUY as the executor leaves it: `qty` the ordered size (quote / expected price),
+    `filled_quantity` the venue's delivered size, or NULL when the venue never said."""
+    order_id = repo.insert_order(
+        dict(
+            mode=mode,
+            product_id="BTC-USD",
+            side="BUY",
+            order_type="market",
+            qty=Decimal("0.00077800063"),
+            filled_quantity=None if filled is None else Decimal(filled),
+            status="filled",
+            fee=Decimal("0.45"),
+            expected_fill=Decimal("64267.30"),
+            actual_fill=Decimal("64267.30"),
+            confirmation="autonomous",
+            created_at=1,
+            updated_at=1,
+        )
+    )
+    order = repo.get_order(order_id)
+    assert order is not None
+    return order
+
+
+def _placed(order: dict[str, Any]) -> executor.ExecutionResult:
+    return executor.ExecutionResult(
+        placed=True, order_id=order["id"], vetoed_by=[], preview=None, reason="placed"
+    )
+
+
+def _tranche_events(caplog: pytest.LogCaptureFixture) -> list[logging.LogRecord]:
+    return [r for r in caplog.records if r.getMessage() == TRANCHE_UNOBSERVED_EVENT]
+
+
+def test_900_a_tranche_is_booked_at_the_venue_filled_size(repo, caplog) -> None:
+    """Tranche 1's own numbers: $50 at 64,267.30 ordered 0.00077800063 BTC, but a quote-sized
+    BUY pays its fee out of the quote, so the venue delivers about (50 - 0.45) / 64,267.30. The
+    ledger holds what was delivered -- `Holding` (P5) sizes sells from it."""
+    order = _filled_buy(repo, mode="live", filled="0.00077099")
+
+    with caplog.at_level(logging.WARNING):
+        agent._open_tranche(repo, "BTC-USD", "dca", order, _placed(order), now_ts=2)
+
+    [tranche] = repo.get_open_positions("BTC-USD")
+    assert tranche["qty"] == Decimal("0.00077099")
+    assert _tranche_events(caplog) == []
+
+
+def test_900_a_live_tranche_the_venue_never_sized_falls_back_to_the_ordered_qty_loudly(
+    repo, caplog
+) -> None:
+    """No observation is not an observation: the ordered size stands -- the only number there
+    is -- and a WARNING says the ledger may overstate what is held by the fee."""
+    order = _filled_buy(repo, mode="live", filled=None)
+
+    with caplog.at_level(logging.WARNING):
+        agent._open_tranche(repo, "BTC-USD", "dca", order, _placed(order), now_ts=2)
+
+    [tranche] = repo.get_open_positions("BTC-USD")
+    assert tranche["qty"] == Decimal("0.00077800063")
+    [warning] = _tranche_events(caplog)
+    assert warning.levelno == logging.WARNING
+    assert getattr(warning, _FIELDS_ATTR)["order_id"] == order["id"]
+
+
+def test_900_a_paper_tranche_is_its_own_fill_and_does_not_warn(repo, caplog) -> None:
+    """Paper fills are synthetic: `PaperTrader` charges its fee ON TOP of the notional, so the
+    ordered qty IS the delivered qty and there is no venue to have said otherwise."""
+    order = _filled_buy(repo, mode="paper", filled=None)
+
+    with caplog.at_level(logging.WARNING):
+        agent._open_tranche(repo, "BTC-USD", "dca", order, _placed(order), now_ts=2)
+
+    [tranche] = repo.get_open_positions("BTC-USD")
+    assert tranche["qty"] == Decimal("0.00077800063")
+    assert _tranche_events(caplog) == []
+
+
+@pytest.mark.parametrize("held_position", [agent._held_position, executor._held_position])
+def test_900_held_position_counts_the_venue_filled_size(repo, held_position) -> None:
+    """Both `_held_position`s read `filled_quantity` before `qty`, as `sleeve.orders_qty` and
+    `guards._open_exposure_by_asset` do -- an exit sized from the ordered size would ask the venue
+    for the fee's worth of base it never delivered."""
+    _filled_buy(repo, mode="live", filled="0.00077099")
+
+    qty, _ = held_position(repo, "BTC-USD")
+
+    assert qty == Decimal("0.00077099")

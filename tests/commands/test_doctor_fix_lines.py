@@ -239,3 +239,31 @@ def test_ledger_drift_does_not_send_a_booked_sale_to_the_close_command() -> None
         f"the text right before `keel positions close` is {before_backtick!r}, which does not "
         "negate it -- an operator reading only the invocation would think this is the fix"
     )
+
+
+def test_a_fee_sized_venue_gap_does_not_send_the_operator_to_declare_a_sale() -> None:
+    """#900: a gap no larger than the fees the open tranches paid is a BUY booked at its ordered
+    size while the venue took the fee out of the quote. `keel positions close` would book a SALE
+    that never happened and close a tranche that is still held, so the fix names no close."""
+    [finding] = venue_drift_findings(
+        {"BTC-USD": Decimal("0.0021177")},
+        {"BTC-USD": {"total": "0.0020930", "observed_at": 1_700_000_000}},
+        fee_base={"BTC-USD": Decimal("0.0000253")},
+    )
+    assert finding.status == "warn"
+    assert _fix_invocations(finding.fix) == [], finding.fix
+
+
+def test_a_sale_sized_gap_beside_a_fee_sized_one_still_names_the_close_command() -> None:
+    """Control: the fee-sized product must not silence the close advice for a product whose gap
+    no fee explains (#798's shape)."""
+    [finding] = venue_drift_findings(
+        {"BTC-USD": Decimal("0.0021177"), "PAXG-USD": Decimal("0.0132")},
+        {
+            "BTC-USD": {"total": "0.0020930", "observed_at": 1_700_000_000},
+            "PAXG-USD": {"total": "0", "observed_at": 1_700_000_000},
+        },
+        fee_base={"BTC-USD": Decimal("0.0000253"), "PAXG-USD": Decimal("0.000156")},
+    )
+    assert finding.products == ("BTC-USD", "PAXG-USD")
+    assert _fix_invocations(finding.fix) == ["positions close"], finding.fix

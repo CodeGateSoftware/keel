@@ -136,6 +136,7 @@ def _seed_filled_order(
     qty: Decimal,
     price: Decimal,
     created_at: int,
+    fee: Decimal = Decimal("0"),
 ) -> None:
     repo.insert_order(
         dict(
@@ -146,7 +147,7 @@ def _seed_filled_order(
             qty=qty,
             limit_price=price,
             status="filled",
-            fee=Decimal("0"),
+            fee=fee,
             expected_fill=price,
             actual_fill=price,
             raw_response=None,
@@ -2578,3 +2579,118 @@ def test_a_product_closed_at_a_gain_cannot_shrink_a_sibling_product_in_its_bucke
         created_at=NOW_TS,
     )
     assert guards._open_exposure_by_asset(repo) == {"ADA": Decimal("500")}
+
+
+# -- #900: a fee-in-quote BUY counts its full quote, fee included --------------------------------
+
+
+def _seed_fee_in_quote_buy(repo: Repository, *, created_at: int) -> None:
+    """A $50 quote BUY at 50,000 as the executor now records it (#900): `qty` the ordered
+    quote / price (0.001), `filled_quantity` the base the venue delivered after taking its $0.45
+    fee out of the quote ((50 - 0.45) / 50,000 = 0.000991), and the observed fee."""
+    repo.insert_order(
+        dict(
+            mode="live",
+            product_id="BTC-USD",
+            side=Side.BUY.value,
+            order_type="market",
+            qty=Decimal("0.001"),
+            filled_quantity=Decimal("0.000991"),
+            limit_price=None,
+            status="filled",
+            fee=Decimal("0.45"),
+            expected_fill=Decimal("50000"),
+            actual_fill=Decimal("50000"),
+            raw_response=None,
+            confirmation="autonomous",
+            rule_id=None,
+            created_at=created_at,
+            updated_at=created_at,
+        )
+    )
+
+
+def test_900_a_fee_in_quote_buy_counts_its_full_quote_on_every_spend_and_exposure_reader(repo):
+    """The operator spent $50 -- $49.55 of base plus the $0.45 fee the venue took out of the
+    quote. Recording the delivered base (#900) must not shrink what rails 3 and 14 count as
+    spent, nor what rails 4/5/6 count as committed: each read $50 before #900 (the ordered
+    `qty` x price) and each still reads $50."""
+    _seed_fee_in_quote_buy(repo, created_at=NOW_TS - 50)
+
+    assert guards._daily_spend_usd(repo, NOW_TS) == Decimal("50.00")
+    assert guards._monthly_buy_spend_usd(repo, NOW_TS) == Decimal("50.00")
+    assert guards._open_exposure_by_asset(repo) == {"BTC": Decimal("50.00")}
+
+
+def test_900_rail3_vetoes_on_the_full_quote_not_the_base_value(repo):
+    """Rail 3 end to end: $50 already spent today + a $250.01 intent is over a $300 cap. Counted
+    at $49.55 (delivered base x price) the same intent would clear it."""
+    _seed_fee_in_quote_buy(repo, created_at=NOW_TS - 50)
+
+    result = check(
+        _intent(notional=Decimal("250.01")),
+        repo,
+        _config(
+            max_per_order_usd=Decimal("1000"),
+            max_exposure_usd=Decimal("100000"),
+            max_per_asset_pct=Decimal("1"),
+        ),
+        NOW_TS,
+    )
+
+    assert _keys(result) == {"per_day_cap"}
+
+
+def test_900_rail14_vetoes_on_the_full_quote_not_the_base_value(repo):
+    """Rail 14 end to end: a $100 allowance, $50 spent, a $50.01 intent -- over by a cent only
+    if the fee counts."""
+    _attest(repo, free_volume_usd=Decimal("100"))
+    _seed_fee_in_quote_buy(repo, created_at=NOW_TS - 50)
+
+    result = check(_intent(notional=Decimal("50.01")), repo, _roomy_config(), NOW_TS)
+
+    assert _keys(result) == {"monthly_subscription_allowance"}
+
+
+def test_900_an_unsized_buy_counts_its_ordered_quote_once_not_plus_its_fee(repo):
+    """On the fallback -- `filled_quantity` NULL, every pre-#900 live row -- `qty x price` IS the
+    quote, fee included. Adding the fee again would double-count it."""
+    _seed_filled_order(
+        repo,
+        product_id="BTC-USD",
+        side=Side.BUY,
+        qty=Decimal("0.001"),
+        price=Decimal("50000"),
+        created_at=NOW_TS - 50,
+        fee=Decimal("0.45"),
+    )
+
+    assert guards._daily_spend_usd(repo, NOW_TS) == Decimal("50.000")
+
+
+def test_900_a_sells_fee_releases_no_exposure(repo):
+    """A SELL's fee comes out of its proceeds; it hands back no cap. $50 committed by the
+    fee-in-quote BUY, half its base sold at the same price for a $0.10 fee: $25 remains."""
+    _seed_fee_in_quote_buy(repo, created_at=NOW_TS - 50)
+    repo.insert_order(
+        dict(
+            mode="live",
+            product_id="BTC-USD",
+            side=Side.SELL.value,
+            order_type="market",
+            qty=Decimal("0.0005"),
+            filled_quantity=Decimal("0.0005"),
+            limit_price=None,
+            status="filled",
+            fee=Decimal("0.10"),
+            expected_fill=Decimal("50000"),
+            actual_fill=Decimal("50000"),
+            raw_response=None,
+            confirmation="autonomous",
+            rule_id=None,
+            created_at=NOW_TS - 40,
+            updated_at=NOW_TS - 40,
+        )
+    )
+
+    assert guards._open_exposure_by_asset(repo) == {"BTC": Decimal("25.0000")}

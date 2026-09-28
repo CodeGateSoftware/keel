@@ -60,6 +60,24 @@ def test_orders_qty_nets_sells_and_floors_at_zero() -> None:
     assert sleeve.orders_qty(repo, "BTC-USD", mode="paper") == Decimal("0")
 
 
+def test_orders_qty_counts_what_the_venue_delivered_when_it_said() -> None:
+    """#900: `filled_quantity` before `qty`, on both sides -- the reading R33
+    (`guards._open_exposure_by_asset`) and `executor._held_position` use. A quote-sized BUY
+    ordered 0.001 and delivered 0.00099 (fee out of the quote); a row the venue never sized
+    counts its ordered `qty`."""
+    repo = _repo()
+    repo.insert_order(
+        _order(mode="live", side=Side.BUY.value, qty=Decimal("0.001"))
+        | {"filled_quantity": Decimal("0.00099")}
+    )
+    repo.insert_order(_order(mode="live", side=Side.BUY.value, qty=Decimal("0.002")))
+    repo.insert_order(
+        _order(mode="live", side=Side.SELL.value, qty=Decimal("0.0005"))
+        | {"filled_quantity": Decimal("0.0004")}
+    )
+    assert sleeve.orders_qty(repo, "BTC-USD", mode="live") == Decimal("0.00259")
+
+
 def test_orders_qty_counts_filled_rows_only() -> None:
     """A `pending` BUY is not a holding -- the same filter `_held_position` applies."""
     repo = _repo()

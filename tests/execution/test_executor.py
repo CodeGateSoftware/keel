@@ -26,7 +26,7 @@ from keel_broker_api.port import TradeScopeDenied
 from keel_broker_api.results import Balance, OrderStatus, PlaceResult, Preview
 from keel_core.quote_provenance import SYNTHETIC_ESTIMATE, UNPRICED, UNREADABLE, VENUE_QUOTED
 from keel_core.subscription import SubscriptionStatus
-from keel_core.telemetry import bind_venue, unbind_venue
+from keel_core.telemetry import _FIELDS_ATTR, bind_venue, unbind_venue
 from keel_core.trade_scope import READ_ONLY, TRADING, TradeScopeState
 
 from keel.config import (
@@ -1700,17 +1700,21 @@ def test_a_filled_order_records_the_previewed_commission_as_its_fee(repo):
 
 # -- partially filled market entries (#446) -------------------------------------------------------
 
+PARTIAL_EVENT = "executor.entry_partially_filled"
+
 
 class _PartiallyFillingBroker(FakeBroker):
     """The venue's answer for a market IOC that only partly filled: the IOC cancelled the
     remainder at the venue, `filled_size` is what actually executed, and `average_filled_price`
     is the running average over those fills."""
 
-    def __init__(self, filled_size: Decimal, average_price: Decimal) -> None:
+    def __init__(
+        self, filled_size: Decimal, average_price: Decimal, status: str = "FILLED"
+    ) -> None:
         super().__init__()
         self._observed = OrderStatus(
             order_id="broker-order-1",
-            status="FILLED",
+            status=status,
             filled_size=filled_size,
             average_filled_price=average_price,
             total_fees=Decimal("0.18"),
@@ -1722,16 +1726,20 @@ class _PartiallyFillingBroker(FakeBroker):
 
 def test_a_partially_filled_entry_records_the_filled_quantity_and_warns(repo, caplog):
     """The entry-side half of #446. A market IOC entry that only partly filled still leaves a
-    row claiming the FULL ordered size was bought -- and `execute` then places the exit bracket
-    for that ordered size, i.e. for more than is held.
+    row claiming the FULL ordered size was bought.
 
-    The bracket AMEND/cancel-and-replace policy is #502's (the port has no bracket kind), so
-    what this path owes today is DETECTION: record the observed filled quantity on the row and
-    warn loudly enough that a human sizes the bracket to reality. The bracket itself is still
-    placed for the ordered size -- detect-and-surface, not auto-resize."""
+    The venue says "partly" by STATUS: the IOC's unfilled remainder is cancelled, so the order
+    ends `CANCELLED` with `filled_size > 0` (the shape `reconcile` already books for a dead order
+    that sold something). The observed quantity is recorded and the warning fires.
+
+    #900 changed what the BRACKET is sized from: the terminal observation arrives BEFORE the
+    bracket is placed, so the bracket is sized to what was received (0.6), never to the ordered
+    size. That is not the auto-cancel #446 declined -- no protective order exists yet to cancel."""
     # The standard enter signal sizes to qty = 1 (equity 1,000,000 x risk 0.001 / the 1000
     # entry-to-stop distance); the venue reports only 0.6 of it executed.
-    broker = _PartiallyFillingBroker(filled_size=Decimal("0.6"), average_price=Decimal("50010"))
+    broker = _PartiallyFillingBroker(
+        filled_size=Decimal("0.6"), average_price=Decimal("50010"), status="CANCELLED"
+    )
     signal = _enter_signal()
 
     with caplog.at_level(logging.WARNING):
@@ -1746,11 +1754,11 @@ def test_a_partially_filled_entry_records_the_filled_quantity_and_warns(repo, ca
     assert order["filled_quantity"] == Decimal("0.6")  # ...but the observed fill is recorded
     assert order["actual_fill"] == Decimal("50010")
     assert order["fee"] == Decimal("0.18")
-    assert "executor.entry_partially_filled" in caplog.text
-    # Detect-and-surface, NOT auto-resize: the bracket is still placed for the ORDERED size
-    # (resizing it is the amend-vs-replace decision #502 owns).
-    bracket = broker.place_calls[-1]["spec"]
-    assert bracket.base_size == Decimal("1.000")
+    assert [r.levelno for r in caplog.records if r.getMessage() == PARTIAL_EVENT] == [
+        logging.WARNING
+    ]
+    # #900: sized from the observed fill, placed once -- never for the ordered size.
+    assert [call["spec"].base_size for call in broker.place_calls[1:]] == [Decimal("0.6")]
 
 
 def test_a_fully_filled_entry_records_the_filled_quantity_without_warning(repo, caplog):
@@ -1794,6 +1802,177 @@ def test_a_partially_filled_EXIT_records_the_fill_but_does_not_fire_the_entry_wa
     assert order["filled_quantity"] == Decimal("0.006")  # ...and the observed fill is recorded
     assert order["actual_fill"] == Decimal("49980")
     assert "executor.entry_partially_filled" not in caplog.text
+
+
+# -- #900: the venue's filled size, observed to a terminal state, sizes the bracket ---------------
+
+UNOBSERVED_EVENT = "executor.fill_quantity_unobserved"
+
+
+class _SettlingBroker(FakeBroker):
+    """A venue whose status endpoint answers from a scripted sequence of observations -- the
+    shape #900 found live: a market IOC read back in the same instant it was placed is still
+    `PENDING`/`OPEN` with nothing filled, and only a later read says `FILLED`. The last
+    observation repeats once the script runs out."""
+
+    def __init__(self, *observed: OrderStatus) -> None:
+        super().__init__()
+        self._script = list(observed)
+        self.get_order_calls = 0
+
+    def get_order(self, order_id: str) -> OrderStatus:
+        self.get_order_calls += 1
+        return self._script[min(self.get_order_calls, len(self._script)) - 1]
+
+
+def _status(status: str, filled: str, price: str = "50010", fees: str = "0.45") -> OrderStatus:
+    return OrderStatus(
+        order_id="broker-order-1",
+        status=status,
+        filled_size=Decimal(filled),
+        average_filled_price=Decimal(price),
+        total_fees=Decimal(fees),
+    )
+
+
+@pytest.fixture
+def pauses(monkeypatch) -> list[float]:
+    """Every re-poll pause the executor asks for, recorded instead of slept."""
+    asked: list[float] = []
+    monkeypatch.setattr(executor, "_pause", asked.append)
+    return asked
+
+
+def _events(caplog, event: str) -> list[logging.LogRecord]:
+    return [r for r in caplog.records if r.getMessage() == event]
+
+
+def test_an_unsettled_first_read_is_re_polled_until_the_venue_says_filled(repo, pauses):
+    """#900's root cause. The one status read happened in the same instant as the placement, the
+    venue answered `PENDING` with nothing filled, and `filled_quantity` stayed NULL forever: the
+    row was already `filled`, so `reconcile` (which polls only resting statuses) never asked
+    again. The executor now re-reads, on a bounded schedule, until the venue reports a terminal
+    state."""
+    broker = _SettlingBroker(
+        _status("PENDING", "0", price="0", fees="0"),
+        _status("OPEN", "0.4", fees="0.2"),
+        _status("FILLED", "0.99"),
+    )
+
+    result = execute(_enter_signal(), broker, repo, _config(), "autonomous", None, now_ts=NOW_TS)
+
+    order = repo.get_order(result.order_id)
+    assert (order["qty"], order["filled_quantity"]) == (Decimal("1"), Decimal("0.99"))
+    assert (order["actual_fill"], order["fee"]) == (Decimal("50010"), Decimal("0.45"))
+    assert broker.get_order_calls == 3
+    assert pauses == list(executor.FILL_OBSERVATION_PAUSES[:2])
+
+
+def test_a_fee_in_quote_entry_sizes_its_bracket_from_what_the_venue_delivered(repo, caplog, pauses):
+    """A quote-sized market BUY on Coinbase Advanced takes the fee out of the quote, so the venue
+    delivers LESS base than `intent.qty` (quote / price) on a complete fill. The bracket's SELL
+    must never exceed what was received (#446's oversized-bracket condition), so it is sized from
+    the observed fill. `FILLED` is the venue saying "all of it": no partial-fill warning."""
+    broker = _SettlingBroker(_status("FILLED", "0.99"))
+
+    with caplog.at_level(logging.WARNING):
+        result = execute(
+            _enter_signal(), broker, repo, _config(), "autonomous", None, now_ts=NOW_TS
+        )
+
+    assert result.bracket_order_id is not None
+    assert [call["spec"].base_size for call in broker.place_calls[1:]] == [Decimal("0.99")]
+    assert repo.get_order(result.bracket_order_id)["qty"] == Decimal("0.99")
+    assert _events(caplog, PARTIAL_EVENT) == []
+    assert _events(caplog, UNOBSERVED_EVENT) == []
+    assert pauses == []
+
+
+def test_a_fill_never_seen_terminal_records_nothing_and_warns_once(repo, caplog, pauses):
+    """Bounded, and never a guess: a venue still saying `OPEN` after the last re-read leaves
+    `filled_quantity` NULL -- a running snapshot is not what was delivered -- and the bracket
+    falls back to the ordered size, as it always did, with one WARNING naming the gap."""
+    broker = _SettlingBroker(_status("OPEN", "0.4", fees="0.2"))
+
+    with caplog.at_level(logging.WARNING):
+        result = execute(
+            _enter_signal(), broker, repo, _config(), "autonomous", None, now_ts=NOW_TS
+        )
+
+    order = repo.get_order(result.order_id)
+    assert order["filled_quantity"] is None
+    assert broker.get_order_calls == 1 + len(executor.FILL_OBSERVATION_PAUSES)
+    assert pauses == list(executor.FILL_OBSERVATION_PAUSES)
+    assert [call["spec"].base_size for call in broker.place_calls[1:]] == [Decimal("1.000")]
+    [warning] = _events(caplog, UNOBSERVED_EVENT)
+    assert warning.levelno == logging.WARNING
+
+
+def test_a_fill_never_seen_terminal_keeps_the_estimated_price_and_fee(repo, pauses):
+    """Price and fee come from the SAME terminal observation as `filled_quantity`, or not at all
+    (#900 review). A running `OPEN` snapshot's average and fees describe part of an order still
+    executing; writing them would record a partial fee as the entry's whole fee -- the figure a
+    tranche's `entry_fee` and doctor's #900 fee band are then built from. The estimate stands."""
+    broker = _SettlingBroker(_status("OPEN", "0.4", price="50123", fees="0.2"))
+
+    result = execute(_enter_signal(), broker, repo, _config(), "autonomous", None, now_ts=NOW_TS)
+
+    order = repo.get_order(result.order_id)
+    assert (order["filled_quantity"], order["actual_fill"], order["fee"]) == (
+        None,
+        Decimal("50000"),
+        Decimal("0.30"),
+    )
+
+
+def test_an_exit_records_its_venue_filled_size_after_re_polling(repo, pauses):
+    """BOTH sides (#900 S1): a market SELL is observed the same way, so the exit booking's
+    `filled_quantity` preference has something to prefer."""
+    _seed_filled_buy(repo, qty=Decimal("0.01"), price=Decimal("50000"))
+    broker = _SettlingBroker(
+        _status("PENDING", "0", price="0", fees="0"), _status("FILLED", "0.01", price="49980")
+    )
+
+    result = execute(_exit_signal(), broker, repo, _config(), "autonomous", None, now_ts=NOW_TS)
+
+    assert repo.get_order(result.order_id)["filled_quantity"] == Decimal("0.01")
+    assert broker.get_order_calls == 2
+
+
+def test_an_unobservable_exit_logs_exit_wording_with_side_sell(repo, caplog):
+    """#907 review: `fill_quantity_unobserved` also fires on a market SELL exit, but its detail
+    talked only about "bracket and tranche" -- entry-only language, on a sale. The sibling
+    `_record_observed_fill_quantity` docstring's rule is entry-only wording never leaks onto an
+    exit; this event broke it. The exit gets its own wording, and `side` is now a field so a log
+    reader can tell which without parsing the sentence."""
+
+    class _BlindBroker(FakeBroker):
+        def get_order(self, order_id: str) -> OrderStatus:
+            raise RuntimeError("status endpoint down")
+
+    _seed_filled_buy(repo, qty=Decimal("0.01"), price=Decimal("50000"))
+    broker = _BlindBroker()
+
+    with caplog.at_level(logging.WARNING):
+        result = execute(_exit_signal(), broker, repo, _config(), "autonomous", None, now_ts=NOW_TS)
+
+    assert result.placed is True
+    [warning] = _events(caplog, UNOBSERVED_EVENT)
+    fields = getattr(warning, _FIELDS_ATTR)
+    assert fields["side"] == Side.SELL
+    assert fields["detail"] == (
+        "the venue never reported this filled exit's sold size, so it is booked at the ORDERED "
+        "quantity; check the venue's fill for this order"
+    )
+
+
+def test_the_executors_terminal_statuses_are_reconciles() -> None:
+    """One definition of "the venue is done with this order" (#900). `reconcile` imports
+    `executor`, so the executor cannot import reconcile's pair; the two are pinned equal here
+    instead, so a status one side learns cannot be one the other still re-polls or ignores."""
+    from keel.execution import reconcile
+
+    assert executor.TERMINAL_ORDER_STATUSES == frozenset({reconcile._FILLED}) | reconcile._DEAD
 
 
 # -- a cancel that cannot actually reach the exchange must be LOUD ------------------------------

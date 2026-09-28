@@ -667,6 +667,8 @@ def test_gather_findings_reads_the_veto_lines_it_is_handed(tmp_path, valid_confi
 def _live_order(
     *,
     product_id: str = "BTC-USD",
+    side: str = "BUY",
+    order_type: str = "market",
     status: str = "filled",
     qty: Decimal = Decimal("0.01"),
     filled_quantity: Decimal | None = None,
@@ -676,8 +678,8 @@ def _live_order(
         "id": 7,
         "mode": "live",
         "product_id": product_id,
-        "side": "BUY",
-        "order_type": "market",
+        "side": side,
+        "order_type": order_type,
         "qty": qty,
         "limit_price": None,
         "status": status,
@@ -721,6 +723,41 @@ def test_paper_mode_rows_do_not_warn() -> None:
     row["mode"] = "paper"
     (finding,) = partial_fill_findings([row])
     assert finding.status == "ok"
+
+
+def test_a_filled_quote_sized_market_buy_with_a_short_estimate_is_not_partial() -> None:
+    """#906/#900: a quote-sized market BUY's `qty` is `quote / expected price`, an ESTIMATE, and
+    Coinbase takes its fee out of the quote -- so `filled_quantity` reads below `qty` on every
+    COMPLETE entry, not only a partial one. Judging this here would WARN forever on every entry.
+    A genuinely short market BUY is already `executor.entry_partially_filled`'s to flag, keyed on
+    the venue's terminal status rather than this arithmetic, and its bracket and tranche are
+    sized from the delivered quantity -- so this finding's oversized-bracket premise never
+    applies to it."""
+    (finding,) = partial_fill_findings(
+        [_live_order(filled_quantity=Decimal("0.00077099"), qty=Decimal("0.00077800063"))]
+    )
+    assert finding.name == "fill.partial"
+    assert finding.status == "ok"
+
+
+def test_a_filled_market_sell_with_a_short_fill_still_warns() -> None:
+    """The exclusion is BUY-only: a market SELL exit's `qty` IS the ordered base size, so a
+    fill short of it is a real partial, unlike a quote-sized BUY's estimate."""
+    (finding,) = partial_fill_findings(
+        [_live_order(side="SELL", filled_quantity=Decimal("0.005"), qty=Decimal("0.01"))]
+    )
+    assert finding.name == "fill.partial"
+    assert finding.status == "warn"
+
+
+def test_a_partially_filled_market_buy_still_warns() -> None:
+    """The exclusion is `status == "filled"`-only: a still-resting `partially_filled` BUY is
+    exactly the condition this finding exists to catch, unchanged by #906."""
+    (finding,) = partial_fill_findings(
+        [_live_order(status="partially_filled", filled_quantity=Decimal("0.004"))]
+    )
+    assert finding.name == "fill.partial"
+    assert finding.status == "warn"
 
 
 # -- unbooked exits (#639): the ledger invariant doctor was silent about ------------------------
@@ -1266,6 +1303,45 @@ def test_gather_findings_on_a_paper_profile_compares_against_paper_fills(
     # the control: a live profile reads live fills, finds none behind the tranche, and warns --
     # so the tranche did reach the comparison
     assert (on_live.status, on_live.products) == ("warn", ("BTC-USD",))
+
+
+def test_gather_findings_feeds_the_open_tranches_fees_to_venue_drift(
+    tmp_path, valid_config_path
+) -> None:
+    """#900: PAXG tranche 3 paid $0.73 at 4673.23 -- 0.000156 PAXG a fee-in-quote venue
+    withheld. A venue short by less than that is named as #900. The control (the same gap with
+    a zero-fee tranche) takes the sale clause, which proves the fee reached the finding from the
+    ledger and was not assumed. Both labels seed a matching live BUY with `filled_quantity` NULL
+    (#907) -- the tranche was booked at an ORDERED size the venue never sized -- so the only
+    variable between "paid" and "free" is the fee amount, not whether the tranche matches."""
+    config = _live(load_config(valid_config_path))
+    clauses = {}
+    for label, fee in (("paid", "0.73"), ("free", "0")):
+        repo = _seeded_repo(tmp_path / f"{label}.db")
+        _filled_order(repo, mode="live", product="PAXG-USD", side="BUY", qty="0.0132")
+        repo.open_position(
+            product_id="PAXG-USD",
+            rule_name="dca",
+            opened_at=NOW - 30 * DAY,
+            qty=Decimal("0.0132"),
+            entry_fill=Decimal("4673.23"),
+            entry_fee=Decimal(fee),
+        )
+        repo.set_state("venue_holding:PAXG-USD", {"total": "0.01306", "observed_at": NOW})
+        finding = _named(gather_findings(repo, config, [], NOW), "ledger.venue_drift")
+        assert (finding.status, finding.products) == ("warn", ("PAXG-USD",))
+        clauses[label] = finding.detail.split(" -- ")[0]
+    from keel.commands.doctor import _utc_date
+
+    # The clause renders the fee QUANTIZED, rounded up to 8 places (no cached base increment for
+    # PAXG-USD in this config) -- never the raw `fee / fill` quotient.
+    displayed_fee_base = "0.00015621"
+    assert clauses == {
+        "paid": "PAXG-USD: ledger 0.0132 > venue 0.01306 (observed "
+        f"{_utc_date(NOW)}), no more than the {displayed_fee_base} its open tranches paid in "
+        "fees (#900)",
+        "free": f"PAXG-USD: ledger 0.0132 > venue 0.01306 (observed {_utc_date(NOW)})",
+    }
 
 
 def test_gather_findings_stays_read_only_with_ledger_drift_to_report(

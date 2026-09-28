@@ -172,3 +172,242 @@ def test_nothing_held_is_one_ok_venue_finding() -> None:
 
     [f] = venue_drift_findings({}, {"BTC-USD": {"total": "1", "observed_at": 1}})
     assert (f.name, f.status, f.products) == ("ledger.venue_drift", OK, ())
+
+
+# -- #900: a fee-sized gap is a BUY booked at its ordered size, not a sale ----------------------
+
+#: The three live BTC tranches #900 found: $50 each, fees $0.59/$0.59/$0.45, each booked at
+#: quote / price. Summed in base, their fees are the gap a fee-in-quote venue leaves.
+_BTC_FEE_BASE = Decimal("0.0000253")
+
+
+def test_a_gap_within_the_open_tranches_fees_names_900_and_stays_a_warn() -> None:
+    """#900's shape: the ledger holds quote / price per tranche, the venue delivered
+    (quote - fee) / price. The gap is the fees' worth of base -- a booking error, not a sale
+    made by hand, and the finding must not say "sale" alone. The TOLERANCE is untouched: still
+    one increment, so this is still a WARN naming the product."""
+    from keel.commands.doctor import venue_drift_findings
+
+    [f] = venue_drift_findings(
+        {"BTC-USD": Decimal("0.0021177")},
+        {"BTC-USD": {"total": "0.0020930", "observed_at": 1_700_000_000}},
+        increments={"BTC-USD": Decimal("0.00000001")},
+        fee_base={"BTC-USD": _BTC_FEE_BASE},
+    )
+    assert (f.name, f.status, f.products) == ("ledger.venue_drift", WARN, ("BTC-USD",))
+    assert _venue_parts(f.detail) == [
+        "BTC-USD: ledger 0.0021177 > venue 0.0020930 (observed 2023-11-14), no more than the "
+        "0.00002530 its open tranches paid in fees (#900)"
+    ]
+
+
+def test_the_fee_clause_quantizes_up_to_the_base_increment() -> None:
+    """The clause renders a QUANTIZED figure, rounded UP (ROUND_CEILING) to the product's base
+    increment -- never the raw `fee / fill` quotient, which carries far more digits than any
+    base size can hold. The COMPARISON (whether the gap is fee-sized at all) still uses the
+    unquantized value -- rounding it up first would let a gap the raw fee does not cover pass as
+    #900 purely because rounding pushed the displayed figure over it."""
+    from keel.commands.doctor import venue_drift_findings
+
+    raw = Decimal("0.45") / Decimal("64267.30")  # 0.000007002005685628616730436785115...
+    [f] = venue_drift_findings(
+        {"BTC-USD": Decimal("0.00077099")},
+        {"BTC-USD": {"total": "0.00076599", "observed_at": 1_700_000_000}},
+        increments={"BTC-USD": Decimal("0.00000001")},
+        fee_base={"BTC-USD": raw},
+    )
+    assert _venue_parts(f.detail) == [
+        "BTC-USD: ledger 0.00077099 > venue 0.00076599 (observed 2023-11-14), no more than the "
+        "0.00000701 its open tranches paid in fees (#900)"
+    ]
+
+
+def test_the_fee_clause_quantizes_to_eight_places_when_no_increment_is_known() -> None:
+    """An unknown base increment (`increments` omitted or `None` for the product) quantizes to
+    `Decimal("0.00000001")` rather than leaving the raw quotient unrounded."""
+    from keel.commands.doctor import venue_drift_findings
+
+    raw = Decimal("0.73") / Decimal("4673.23")  # 0.0001562088748039364636450591989...
+    [f] = venue_drift_findings(
+        {"PAXG-USD": Decimal("0.0132")},
+        {"PAXG-USD": {"total": "0.01306", "observed_at": 1_700_000_000}},
+        fee_base={"PAXG-USD": raw},
+    )
+    assert _venue_parts(f.detail) == [
+        "PAXG-USD: ledger 0.0132 > venue 0.01306 (observed 2023-11-14), no more than the "
+        "0.00015621 its open tranches paid in fees (#900)"
+    ]
+
+
+def test_a_gap_beyond_the_fees_keeps_the_sale_clause_and_still_names_900() -> None:
+    """A gap larger than every fee paid is not explained by #900 alone, so its clause is the
+    #798 one -- but the explanation lists fee-in-quote overstatement among the causes, because
+    a sale on top of it is not the only possibility."""
+    from keel.commands.doctor import venue_drift_findings
+
+    [f] = venue_drift_findings(
+        {"BTC-USD": Decimal("0.0021177")},
+        {"BTC-USD": {"total": "0.0010000", "observed_at": 1_700_000_000}},
+        fee_base={"BTC-USD": _BTC_FEE_BASE},
+    )
+    assert _venue_parts(f.detail) == [
+        "BTC-USD: ledger 0.0021177 > venue 0.0010000 (observed 2023-11-14)"
+    ]
+    assert f.detail.split(" -- ", 1)[1] == (
+        "an out-of-band sale or transfer (#798), a BUY booked at its ordered size though the "
+        "venue took its fee out of the quote (#900), or a venue holding never observed; the "
+        "rails still count what the ledger says"
+    )
+
+
+def _unsized_buy(*, product_id: str, qty: Decimal, mode: str = "live") -> dict:
+    """A live, filled BUY whose `filled_quantity` the venue never reported -- the #907 match for
+    a tranche booked at an ORDERED size (`qty`, an estimate) rather than a delivered one."""
+    return {
+        "product_id": product_id,
+        "mode": mode,
+        "side": "BUY",
+        "status": "filled",
+        "qty": qty,
+        "filled_quantity": None,
+    }
+
+
+def test_fee_base_is_each_open_tranches_entry_fee_in_base() -> None:
+    """`entry_fee / entry_fill` per open tranche, summed per product: the base a fee-in-quote
+    venue withheld from each BUY. A tranche with no recorded fee or price adds nothing -- NULL
+    is "not recorded", never zero, and never a guess. Each counted tranche has a matching live,
+    filled BUY whose `filled_quantity` is still NULL and whose `qty` equals the tranche's own
+    (#907) -- proof this is not merely summing every open tranche again."""
+    from keel.commands.doctor import open_tranche_fee_base
+
+    orders = [
+        _unsized_buy(product_id="BTC-USD", qty=Decimal("0.00001")),
+        _unsized_buy(product_id="BTC-USD", qty=Decimal("0.00002")),
+    ]
+    assert open_tranche_fee_base(
+        [
+            {
+                "product_id": "BTC-USD",
+                "qty": Decimal("0.00001"),
+                "entry_fee": Decimal("0.45"),
+                "entry_fill": Decimal("45000"),
+            },
+            {
+                "product_id": "BTC-USD",
+                "qty": Decimal("0.00002"),
+                "entry_fee": Decimal("0.9"),
+                "entry_fill": Decimal("90000"),
+            },
+            {
+                "product_id": "PAXG-USD",
+                "qty": Decimal("0.001"),
+                "entry_fee": None,
+                "entry_fill": Decimal("4673.23"),
+            },
+            {
+                "product_id": "ETH-USD",
+                "qty": Decimal("0.0001"),
+                "entry_fee": Decimal("0.5"),
+                "entry_fill": None,
+            },
+        ],
+        orders,
+    ) == {"BTC-USD": Decimal("0.00002")}
+
+
+def test_a_tranche_with_no_matching_unsized_buy_does_not_count() -> None:
+    """#907: a tranche booked AFTER #900, at the venue-delivered size, has no live BUY whose
+    `filled_quantity` is still NULL -- the venue already reported it -- so its fee must not
+    fee-size a later gap. Scaling a tranche out by hand is exactly this shape: a real sale of up
+    to `fee / price` on it must not be labelled #900 and told not to declare a close."""
+    from keel.commands.doctor import open_tranche_fee_base
+
+    orders = [
+        {
+            "product_id": "BTC-USD",
+            "mode": "live",
+            "side": "BUY",
+            "status": "filled",
+            "qty": Decimal("0.00077099"),
+            "filled_quantity": Decimal("0.00077099"),
+        }
+    ]
+    assert (
+        open_tranche_fee_base(
+            [
+                {
+                    "product_id": "BTC-USD",
+                    "qty": Decimal("0.00077099"),
+                    "entry_fee": Decimal("0.45"),
+                    "entry_fill": Decimal("64267.30"),
+                }
+            ],
+            orders,
+        )
+        == {}
+    )
+
+
+def test_a_paper_mode_buy_does_not_count() -> None:
+    """The same live/paper boundary every other doctor check over `orders` draws: a paper fill
+    must never size a live diagnostic, even one that happens to share a product id."""
+    from keel.commands.doctor import open_tranche_fee_base
+
+    orders = [_unsized_buy(product_id="BTC-USD", qty=Decimal("0.00001"), mode="paper")]
+    assert (
+        open_tranche_fee_base(
+            [
+                {
+                    "product_id": "BTC-USD",
+                    "qty": Decimal("0.00001"),
+                    "entry_fee": Decimal("0.45"),
+                    "entry_fill": Decimal("45000"),
+                }
+            ],
+            orders,
+        )
+        == {}
+    )
+
+
+def test_the_907_repro_a_scaled_out_tranche_takes_the_798_clause_not_900() -> None:
+    """#907's own case: a BTC tranche booked 0.00077099 at 64267.30, fee $0.45 -- that fee alone
+    is enough to fee-size a venue short by up to 0.000007002005685628616730436785115 base, MORE
+    than the 0.000005 actually missing here. But this BUY's `filled_quantity` is no longer NULL
+    (the venue already reported it), so #907's match fails, `fee_base` is empty for the product,
+    and the gap must take the plain #798 clause -- with `keel positions close` named in the fix,
+    because THIS gap really may be a sale nobody declared."""
+    from keel.commands.doctor import open_tranche_fee_base, venue_drift_findings
+
+    orders = [
+        {
+            "product_id": "BTC-USD",
+            "mode": "live",
+            "side": "BUY",
+            "status": "filled",
+            "qty": Decimal("0.00077099"),
+            "filled_quantity": Decimal("0.00077099"),
+        }
+    ]
+    positions = [
+        {
+            "product_id": "BTC-USD",
+            "qty": Decimal("0.00077099"),
+            "entry_fee": Decimal("0.45"),
+            "entry_fill": Decimal("64267.30"),
+        }
+    ]
+
+    fee_base = open_tranche_fee_base(positions, orders)
+    assert fee_base == {}
+
+    [f] = venue_drift_findings(
+        {"BTC-USD": Decimal("0.00077099")},
+        {"BTC-USD": {"total": "0.00076599", "observed_at": 1_700_000_000}},
+        fee_base=fee_base,
+    )
+    assert _venue_parts(f.detail) == [
+        "BTC-USD: ledger 0.00077099 > venue 0.00076599 (observed 2023-11-14)"
+    ]
+    assert "keel positions close" in f.fix

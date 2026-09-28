@@ -43,11 +43,19 @@ def orders_qty(repo: Repository, product_id: str, mode: str) -> Decimal:
     tranche as though it were #799's stranded fill.
 
     Floored at zero, as `_held_position` is: a net short is not a holding keel models.
+
+    Each row counts what the venue DELIVERED (`filled_quantity`) when it said, its ordered `qty`
+    otherwise (#900) -- the same reading as `_held_position` and R33
+    (`guards._open_exposure_by_asset`). A tranche is booked at that same delivered figure
+    (`agent._open_tranche`), and `keel positions close` writes `qty == filled_quantity` from the
+    tranche, so a product whose every tranche is closed nets to exactly zero here, and R-f
+    (`declared_close_target`) compares a tranche against the figure it was booked from. Reading
+    `qty` alone would leave the fee's worth of a quote-sized BUY as a phantom holding.
     """
     buy_qty = Decimal("0")
     sell_qty = Decimal("0")
     for order in repo.get_orders(mode=mode, product_id=product_id, status="filled"):
-        qty = order["qty"] or Decimal("0")
+        qty = order.get("filled_quantity") or order["qty"] or Decimal("0")
         if order["side"] == Side.BUY.value:
             buy_qty += qty
         elif order["side"] == Side.SELL.value:

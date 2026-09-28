@@ -152,6 +152,68 @@ def test_the_sell_is_sized_from_the_tranche_not_from_the_order_log(repo: Reposit
     assert (row["qty"], row["filled_quantity"]) == (Decimal("0.0132"), Decimal("0.0132"))
 
 
+def test_closing_every_tranche_nets_to_zero_when_both_sides_read_the_venue_fill(
+    repo: Repository,
+) -> None:
+    """#900 S4: the BUY row says 0.0133 ordered and 0.0132 delivered. `agent._open_tranche`
+    books the tranche at the delivered 0.0132, and `sleeve.orders_qty`, R33 and R-f all read
+    `filled_quantity` before `qty` -- so R-f admits the close, and closing the one tranche nets
+    the product to exactly zero on every reader: no residue, no negative net."""
+    from keel import agent
+    from keel.execution import sleeve
+
+    rule_id = repo.insert_rule("dca", {"product_id": "PAXG-USD"}, status="live")
+    order_id = repo.insert_order(
+        dict(
+            mode="live",
+            product_id="PAXG-USD",
+            side="BUY",
+            order_type="market",
+            qty=Decimal("0.0133"),
+            filled_quantity=Decimal("0.0132"),
+            status="filled",
+            fee=Decimal("0.73"),
+            expected_fill=Decimal("4673.23"),
+            actual_fill=Decimal("4673.23"),
+            confirmation="autonomous",
+            rule_id=rule_id,
+            created_at=1,
+            updated_at=1,
+        )
+    )
+    buy = repo.get_order(order_id)
+    agent._open_tranche(
+        repo,
+        "PAXG-USD",
+        "dca",
+        buy,
+        executor.ExecutionResult(
+            placed=True, order_id=order_id, vetoed_by=[], preview=None, reason="placed"
+        ),
+        now_ts=1,
+    )
+    [tranche] = repo.get_open_positions("PAXG-USD")
+    assert tranche["qty"] == Decimal("0.0132") == sleeve.orders_qty(repo, "PAXG-USD", "live")
+
+    _close(repo, tranche["id"])
+
+    assert repo.get_open_positions("PAXG-USD") == []
+    assert sleeve.orders_qty(repo, "PAXG-USD", "live") == Decimal("0")
+    assert executor._held_position(repo, "PAXG-USD")[0] == Decimal("0")
+    assert "PAXG" not in guards._open_exposure_by_asset(repo)
+    buys = sum(
+        o["filled_quantity"] or o["qty"]
+        for o in repo.get_orders(mode="live", product_id="PAXG-USD")
+        if o["side"] == "BUY"
+    )
+    sells = sum(
+        o["filled_quantity"] or o["qty"]
+        for o in repo.get_orders(mode="live", product_id="PAXG-USD")
+        if o["side"] == "SELL"
+    )
+    assert buys - sells == Decimal("0"), "exactly zero, not merely floored at zero"
+
+
 def test_the_outcome_is_booked_per_the_tranche_own_kind(repo: Repository) -> None:
     pid = _tranche(repo, rule_name="dca")
     _close(repo, pid, fee=Decimal("0"))

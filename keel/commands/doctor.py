@@ -32,7 +32,7 @@ import re
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
-from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
+from decimal import ROUND_CEILING, ROUND_HALF_UP, Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any
 
@@ -1105,6 +1105,16 @@ def partial_fill_findings(orders: list[dict[str, Any]]) -> list[Finding]:
     Rows with no `filled_quantity` (everything written before #446) are not judged: NULL means
     "not observed", and guessing a partial from `status` alone would flag resting orders the
     venue never began executing.
+
+    **A filled market BUY is excluded from the `filled < qty` judgment (#900, #906).** Its `qty`
+    is `quote / expected price` -- an ESTIMATE, not an ordered base size -- and Coinbase takes
+    its fee out of the quote, so `filled_quantity` reads below `qty` on every COMPLETE fill, not
+    only a partial one. Judging it here would WARN on every single entry forever. A genuinely
+    short market BUY is already surfaced by `executor.entry_partially_filled`, keyed on the
+    venue's terminal status rather than this arithmetic, and since #900 its bracket and tranche
+    are sized from the DELIVERED quantity, not the ordered one -- so this finding's premise, "a
+    bracket sized from the ORDERED quantity may be oversized", does not hold for it. SELLs and a
+    still-resting `partially_filled` BUY are judged exactly as before.
     """
     partials = [
         o
@@ -1113,6 +1123,11 @@ def partial_fill_findings(orders: list[dict[str, Any]]) -> list[Finding]:
         and o.get("filled_quantity") is not None
         and o.get("qty") is not None
         and Decimal(str(o["filled_quantity"])) < Decimal(str(o["qty"]))
+        and not (
+            o.get("side") == "BUY"
+            and o.get("order_type") == "market"
+            and o.get("status") == "filled"
+        )
     ]
     if not partials:
         return [
@@ -1578,11 +1593,71 @@ def _venue_total(record: Any) -> Decimal | None:
     return total if total.is_finite() else None
 
 
+def _unsized_ordered_qtys(orders: list[dict[str, Any]]) -> dict[str, set[Decimal]]:
+    """Per product, the `qty` of every live, filled BUY whose `filled_quantity` is still NULL --
+    an order booked at its ORDERED size because the venue never reported what it delivered.
+    `open_tranche_fee_base`'s match set (#907)."""
+    unsized: dict[str, set[Decimal]] = {}
+    for order in orders:
+        if (
+            order.get("mode") == "live"
+            and order.get("side") == "BUY"
+            and order.get("status") == "filled"
+            and order.get("filled_quantity") is None
+            and order.get("qty") is not None
+        ):
+            unsized.setdefault(order["product_id"], set()).add(Decimal(str(order["qty"])))
+    return unsized
+
+
+def open_tranche_fee_base(
+    open_positions: list[dict[str, Any]], orders: list[dict[str, Any]]
+) -> dict[str, Decimal]:
+    """Per product, the entry fees of its open tranches expressed in BASE (`entry_fee /
+    entry_fill`, summed) -- what a fee-in-quote venue withheld from those BUYs (#900).
+
+    A quote-sized market BUY on Coinbase Advanced pays its fee out of the quote, so it delivers
+    `(quote - fee) / price` of base; a tranche booked at `quote / price` overstates the holding
+    by exactly `fee / price`. A tranche with no recorded fee or entry price adds nothing: NULL
+    is "not recorded", and a guessed fee would make a real sale look like a booking error.
+
+    **Only a tranche booked at an ORDERED size the venue never sized counts (#907).** `positions`
+    has no link back to the order that opened it, and adding one is a schema change this fix does
+    not make -- so the match runs against the orders log instead: a tranche counts only when
+    there exists a live, filled BUY for the same `product_id` with `filled_quantity` NULL and
+    `qty` equal to the tranche's own `qty` (`_unsized_ordered_qtys`). Every tranche booked AFTER
+    #900 is sized from the venue's `filled_quantity`, which is by then no longer NULL -- so it
+    never matches, on purpose. Without this, a REAL hand sale of up to `fee / price` on such a
+    tranche would be swallowed by this function's own sum and the drift finding would label it
+    #900 booking noise with "do not declare a close", hiding a sale that actually happened.
+
+    **The conservative consequence:** a tranche scaled out by hand no longer matches once its BUY
+    is corrected to the venue's own size, so a later gap on it takes `venue_drift_findings`'
+    general clause -- which still names #900 among its possible causes, and whose fix still names
+    `keel positions close`. That is the SAFE direction to be wrong in: undercounting the fee
+    tolerance produces one extra WARN clause to read, overcounting it would have hidden a sale.
+    """
+    unsized = _unsized_ordered_qtys(orders)
+    fee_base: dict[str, Decimal] = {}
+    for position in open_positions:
+        fee = position.get("entry_fee")
+        fill = position.get("entry_fill")
+        if fee is None or fill is None or fee <= 0 or fill <= 0:
+            continue
+        product = position["product_id"]
+        qty = position.get("qty")
+        if qty is None or Decimal(str(qty)) not in unsized.get(product, set()):
+            continue
+        fee_base[product] = fee_base.get(product, Decimal("0")) + fee / fill
+    return fee_base
+
+
 def venue_drift_findings(
     ledger_by_product: dict[str, Decimal],
     venue: dict[str, Any],
     *,
     increments: dict[str, Decimal | None] | None = None,
+    fee_base: dict[str, Decimal] | None = None,
 ) -> list[Finding]:
     """The positions ledger against what the VENUE says it holds, per product (#798; plan R3).
 
@@ -1604,9 +1679,30 @@ def venue_drift_findings(
 
     WARN, not FAIL, for `balance.drift`'s reason: every cause (a transfer, a sale, a fee) may be
     legitimate; what is wrong is that the books disagree with the account.
+
+    **A gap no larger than the fees is named as #900, not as a sale.** Every live BUY before
+    #900 was booked at its ORDERED size (quote / price) while Coinbase took the fee out of the
+    quote, so the ledger overstates each tranche by `fee / price` -- `fee_base`, from
+    `open_tranche_fee_base`. When a product's gap is above the tolerance but no larger than
+    `tolerance + fee_base`, its clause says so and the fix does NOT send the operator to
+    `keel positions close`: that would book a sale nobody made and close a tranche still held.
+    This changes WORDING only. The tolerance is still one increment and the status still WARN --
+    the books still disagree with the account, and widening the tolerance by the fee would hide
+    a real sale of that size. A gap a little past the fees (the fill came in off the expected
+    price) takes the general clause, whose explanation also lists #900 among the causes.
+
+    The COMPARISON (`gap <= tolerance + product_fees`) always uses the raw, unquantized
+    `product_fees`. Only the CLAUSE's rendering of that figure is quantized -- rounded UP
+    (`ROUND_CEILING`, never down: understating what was withheld would make a real sale look
+    smaller than it is) to the product's base increment when `increments` names one, else to
+    `Decimal("0.00000001")`. The raw quotient carries far more digits than any base size can
+    (`fee / fill` is rarely exact), and printing all of them states a precision the figure does
+    not have.
     """
     tolerances = increments or {}
+    fees = fee_base or {}
     drifted: list[tuple[str, str]] = []
+    fee_sized: list[str] = []
     for product in sorted(ledger_by_product):
         ledger = ledger_by_product[product]
         record = venue.get(product)
@@ -1614,12 +1710,21 @@ def venue_drift_findings(
         if total is None:
             drifted.append((product, f"{product}: no venue observation"))
             continue
-        if ledger - total > (tolerances.get(product) or Decimal("0")):
+        tolerance = tolerances.get(product) or Decimal("0")
+        gap = ledger - total
+        if gap > tolerance:
             observed = record.get("observed_at") if isinstance(record, dict) else None
             when = _utc_date(int(observed)) if isinstance(observed, int) else "unknown"
-            drifted.append(
-                (product, f"{product}: ledger {ledger} > venue {total} (observed {when})")
-            )
+            clause = f"{product}: ledger {ledger} > venue {total} (observed {when})"
+            product_fees = fees.get(product) or Decimal("0")
+            if product_fees > 0 and gap <= tolerance + product_fees:
+                fee_sized.append(product)
+                quantum = tolerances.get(product) or Decimal("0.00000001")
+                displayed_fees = product_fees.quantize(quantum, rounding=ROUND_CEILING)
+                clause += (
+                    f", no more than the {displayed_fees} its open tranches paid in fees (#900)"
+                )
+            drifted.append((product, clause))
     if not drifted:
         return [
             Finding(
@@ -1636,14 +1741,33 @@ def venue_drift_findings(
             WARN,
             f"{len(drifted)} product(s) where the ledger holds more than the venue confirms",
             "; ".join(text for _, text in drifted)
-            + " -- an out-of-band sale or transfer (#798), or a venue holding never observed; "
-            "the rails still count what the ledger says",
-            "check the venue's holding; if a tranche was sold on the venue by hand, record it "
-            "with `keel positions close <id> --price P`; if no holding is observed, let a live "
-            "cycle record one",
+            + " -- an out-of-band sale or transfer (#798), a BUY booked at its ordered size "
+            "though the venue took its fee out of the quote (#900), or a venue holding never "
+            "observed; the rails still count what the ledger says",
+            _venue_drift_fix(fee_sized, len(fee_sized) < len(drifted)),
             products=tuple(product for product, _ in drifted),
         )
     ]
+
+
+def _venue_drift_fix(fee_sized: list[str], others: bool) -> str:
+    """`ledger.venue_drift`'s fix line: the #900 advice for the fee-sized products, the #798
+    advice when any other product drifted. The close command is named only in the second --
+    for a fee-sized gap it would declare a sale that never happened."""
+    parts: list[str] = []
+    if fee_sized:
+        parts.append(
+            f"{', '.join(fee_sized)}: a gap no larger than the fees paid is a BUY booked at its "
+            "ordered size (#900), not a sale -- compare the venue's fills with the tranches and "
+            "correct the tranche quantities; do not declare a close for it"
+        )
+    if others:
+        parts.append(
+            "check the venue's holding; if a tranche was sold on the venue by hand, record it "
+            "with `keel positions close <id> --price P`; if no holding is observed, let a live "
+            "cycle record one"
+        )
+    return ". ".join(parts)
 
 
 def position_watch_findings(
@@ -2143,6 +2267,7 @@ def gather_findings(repo: Any, config: Any, log_lines: Iterable[str], now_ts: in
             for key in repo.get_state_keys(reconcile_mod.VENUE_HOLDING_PREFIX)
         },
         increments=increments,
+        fee_base=open_tranche_fee_base(repo.get_open_positions(), repo.get_orders(mode="live")),
     )
 
     from keel.data import freshness as freshness_mod
