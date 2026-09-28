@@ -18,16 +18,20 @@ It writes `candidate` rows through `keel.commands.rules.add_rule_row` and nothin
 
 from __future__ import annotations
 
+import json
 import shlex
-from collections.abc import Mapping
+import sqlite3
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from decimal import ROUND_DOWN, ROUND_UP, Decimal, InvalidOperation
 from typing import Literal
 
 from keel_core.subscription import SubscriptionStatus
 
-from keel.commands._products import _history_product
+from keel import agent
+from keel.commands._products import _history_product, parse_products_option
 from keel.commands.admission import ScreenFn, build_screen_report
+from keel.commands.rules import RulesOutcome, RulesRefused, RulesUsageError, add_rule_row
 from keel.config import Config
 from keel.data.repository import Repository
 
@@ -552,3 +556,78 @@ def _trim_pct(value: Decimal) -> str:
     """`1.200` -> `1.2`; `format(..., "f")` keeps it exponent-free, and `.rstrip` only trims."""
     text = format(value, "f")
     return text.rstrip("0").rstrip(".") if "." in text else text
+
+
+# -- the all-or-nothing `candidate` write ---------------------------------------------------------
+
+
+class DcaPlanRefused(RuntimeError):
+    """Approval refused. Raised before the first insert, so nothing was written -- except the
+    one case R2 names (a row failing AFTER pre-validation), whose message lists what was."""
+
+
+def _noop(message: str) -> None:
+    del message
+
+
+def _rule_params(buy: PlannedBuy) -> dict[str, object]:
+    return {"cadence_days": buy.cadence_days, "budget_usd": format(buy.per_buy_usd, "f")}
+
+
+def apply_dca_plan(
+    repo: Repository,
+    config: Config,
+    plan: DcaPlan,
+    *,
+    now_ts: int,
+    echo: Callable[[str], None] = _noop,
+    echo_err: Callable[[str], None] = _noop,
+) -> tuple[RulesOutcome, ...]:
+    """Write one `candidate` `dca` rule per planned buy, through `keel rules add`'s own service.
+
+    All-or-nothing (R2): refuse a blocked plan; re-read the rules table and refuse if any planned
+    asset gained a non-disabled DCA rule since the preview; construct every rule (rails 18/19 +
+    `build_rule_from_params`) before the FIRST insert. Never promotes; never writes paper/live;
+    never touches an existing row -- `add_rule_row` writes `candidate` and nothing else.
+
+    `add_rule_row` commits per row, so it is not itself transactional across a whole plan: a row
+    that fails AFTER pre-validation has passed (a locked database -- `sqlite3.Error` -- rather
+    than anything `RulesRefused`/`RulesUsageError` names) still leaves the earlier rows written.
+    That refusal names their ids (R2's stated cost if wrong).
+    """
+    if plan.blockers:
+        raise DcaPlanRefused("the plan cannot be approved: " + "; ".join(plan.blockers))
+    fresh = {rule.asset: rule for rule in existing_dca_rules(repo)}
+    stale = [buy.asset for buy in plan.buys if buy.asset in fresh]
+    if stale:
+        raise DcaPlanRefused(
+            f"{', '.join(stale)} gained a DCA rule since this plan was shown "
+            f"({', '.join(f'rule {fresh[a].rule_id}' for a in stale)}); nothing was written -- "
+            "re-run `keel dca plan` to see the current state"
+        )
+    for buy in plan.buys:
+        try:
+            parse_products_option(buy.product_id, config)
+            agent.build_rule_from_params("dca", {**_rule_params(buy), "product_id": buy.product_id})
+        except (ValueError, TypeError, ArithmeticError) as exc:
+            raise DcaPlanRefused(f"{buy.asset}: {exc}; nothing was written") from exc
+
+    outcomes: list[RulesOutcome] = []
+    for buy in plan.buys:
+        try:
+            outcomes.append(
+                add_rule_row(
+                    repo,
+                    config,
+                    kind="dca",
+                    product=buy.product_id,
+                    params_json=json.dumps(_rule_params(buy)),
+                    now_ts=now_ts,
+                    echo=echo,
+                    echo_err=echo_err,
+                )
+            )
+        except (RulesRefused, RulesUsageError, sqlite3.Error) as exc:
+            written = ", ".join(str(o.rule_id) for o in outcomes) or "none"
+            raise DcaPlanRefused(f"{buy.asset}: {exc}; rules already written: {written}") from exc
+    return tuple(outcomes)

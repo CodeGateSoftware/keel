@@ -9,6 +9,7 @@ the all-or-nothing write.
 from __future__ import annotations
 
 import ast
+import sqlite3
 from decimal import Decimal
 from pathlib import Path
 
@@ -20,9 +21,11 @@ from keel.commands import dca_plan as dca_mod
 from keel.commands.dca_plan import (
     RAIL14_NOTE,
     DcaPlanError,
+    DcaPlanRefused,
     ExcludedAsset,
     PlanInputs,
     apply_command,
+    apply_dca_plan,
     build_dca_plan,
     monthly_buy_cap,
     parse_plan_inputs,
@@ -667,3 +670,140 @@ def test_the_rendered_plan_states_rail_14_is_a_buy_cap_and_never_fee_free(
     assert sum(RAIL14_NOTE in line for line in lines) == 1
     assert not any("fee-free" in line.lower() for line in lines)
     assert not any("max_exposure_usd" in line for line in lines)
+
+
+# -- the all-or-nothing `candidate` write (Task 5) ------------------------------------------------
+
+
+def _rows(repo: Repository) -> list[dict]:
+    return [dict(row) for row in repo.get_rules()]
+
+
+def test_approval_writes_one_candidate_dca_rule_per_buy_through_rules_add(
+    valid_config_path: Path,
+) -> None:
+    repo = _repo()
+    plan = _plan(valid_config_path, repo)
+    outcomes = apply_dca_plan(repo, _config(valid_config_path), plan, now_ts=NOW_TS)
+
+    rows = _rows(repo)
+    assert len(outcomes) == len(rows) == plan.buy_count == 3
+    for row, buy, outcome in zip(rows, plan.buys, outcomes, strict=True):
+        assert (row["kind"], row["status"]) == ("dca", "candidate")
+        assert row["params"]["product_id"] == buy.product_id
+        assert row["params"]["cadence_days"] == 7
+        assert Decimal(row["params"]["budget_usd"]) == buy.per_buy_usd
+        assert outcome.rule_id == row["id"] and outcome.new_status == "candidate"
+    # The row round-trips through the agent's own reconstruction (what `rules add` guarantees):
+    from keel.agent import _build_rule
+
+    rebuilt = _build_rule(rows[0])
+    assert rebuilt.params["budget_usd"] == Decimal("41.39")
+
+
+def test_approval_never_touches_an_existing_rule(valid_config_path: Path) -> None:
+    repo = _repo()
+    live_id = _insert_dca(repo, "BTC-USD", "live")
+    other_id = repo.insert_rule(
+        "turtle_breakout", {"product_id": "ETH-USD"}, status="paper", now_ts=NOW_TS
+    )
+    before = {row["id"]: row for row in _rows(repo)}
+
+    apply_dca_plan(repo, _config(valid_config_path), _plan(valid_config_path, repo), now_ts=NOW_TS)
+
+    after = {row["id"]: row for row in _rows(repo)}
+    assert after[live_id] == before[live_id] and after[other_id] == before[other_id]
+    new = [row for rid, row in after.items() if rid not in before]
+    assert {row["params"]["product_id"] for row in new} == {"ETH-USD", "PAXG-USD"}
+    assert {row["status"] for row in new} == {"candidate"}
+
+
+def test_a_blocked_plan_writes_nothing(valid_config_path: Path) -> None:
+    repo = _repo()
+    plan = _plan(valid_config_path, repo, cap="400")
+    with pytest.raises(DcaPlanRefused, match="rail 14"):
+        apply_dca_plan(repo, _config(valid_config_path), plan, now_ts=NOW_TS)
+    assert _rows(repo) == []
+
+
+def test_a_dca_rule_written_after_the_preview_refuses_the_whole_approval(
+    valid_config_path: Path,
+) -> None:
+    """Review Focus 3 / R2: the user's concurrent session adds ETH's DCA rule mid-prompt."""
+    repo = _repo()
+    plan = _plan(valid_config_path, repo)
+    late = _insert_dca(repo, "ETH-USD", "candidate")
+
+    with pytest.raises(DcaPlanRefused, match="ETH"):
+        apply_dca_plan(repo, _config(valid_config_path), plan, now_ts=NOW_TS)
+    assert [row["id"] for row in _rows(repo)] == [late]
+
+
+def test_a_stale_dca_rule_refusal_names_the_late_rules_id(valid_config_path: Path) -> None:
+    """R2: the refusal names the id of the rule that appeared since the preview, not only the
+    asset -- an operator staring at two ETH rows needs to know which one is the intruder."""
+    repo = _repo()
+    plan = _plan(valid_config_path, repo)
+    late = _insert_dca(repo, "ETH-USD", "candidate")
+
+    with pytest.raises(DcaPlanRefused, match=f"rule {late}"):
+        apply_dca_plan(repo, _config(valid_config_path), plan, now_ts=NOW_TS)
+    assert [row["id"] for row in _rows(repo)] == [late]
+
+
+def test_a_buy_the_rule_cannot_construct_is_refused_before_any_write(
+    valid_config_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """R2: pre-validation covers every buy before the first insert."""
+    repo = _repo()
+    plan = _plan(valid_config_path, repo)
+    from keel import agent
+
+    real = agent.build_rule_from_params
+    paxg_calls = {"n": 0}
+
+    def refuse_paxg(kind, params):
+        if params["product_id"] == "PAXG-USD":
+            paxg_calls["n"] += 1
+            raise ValueError("budget_usd must be positive")
+        return real(kind, params)
+
+    monkeypatch.setattr(agent, "build_rule_from_params", refuse_paxg)
+    with pytest.raises(DcaPlanRefused, match="PAXG"):
+        apply_dca_plan(repo, _config(valid_config_path), plan, now_ts=NOW_TS)
+    assert _rows(repo) == []
+    # Non-vacuous: the patched function was actually reached for PAXG's pre-validation call.
+    assert paxg_calls["n"] == 1
+
+
+def test_a_locked_database_mid_write_names_the_rows_already_written(
+    valid_config_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """R2's cost-if-wrong case: `add_rule_row` commits per row, so a row that fails AFTER
+    pre-validation (a locked database, not something pre-validation catches) leaves earlier
+    rows written. The refusal names their ids. The patch targets `dca_mod.add_rule_row` --
+    the NAME bound into this module's namespace by `from keel.commands.rules import
+    add_rule_row` -- not `keel.commands.rules.add_rule_row`, which `apply_dca_plan` never
+    looks up again once that name is bound."""
+    repo = _repo()
+    plan = _plan(valid_config_path, repo)
+    real = dca_mod.add_rule_row
+    calls = {"n": 0}
+
+    def flaky(*args, **kwargs):
+        calls["n"] += 1
+        if calls["n"] == 2:
+            raise sqlite3.OperationalError("database is locked")
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(dca_mod, "add_rule_row", flaky)
+
+    with pytest.raises(DcaPlanRefused) as excinfo:
+        apply_dca_plan(repo, _config(valid_config_path), plan, now_ts=NOW_TS)
+
+    rows = _rows(repo)
+    assert len(rows) == 1
+    assert str(rows[0]["id"]) in str(excinfo.value)
+    # Non-vacuous: the patch reached the two calls `apply_dca_plan`'s write loop made before
+    # the refusal (one delegated to the real writer, one raised).
+    assert calls["n"] == 2
