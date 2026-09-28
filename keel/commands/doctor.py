@@ -1670,12 +1670,14 @@ def position_watch_findings(
       on live cycles) -- every clause here is unconditionally true for every stopped paper
       tranche, so without the skip this finding WARNs on every one of them, always.
 
-    `pending_sells` maps a product to its `pending` SELL order ids that NO open tranche names as
-    its `bracket_order_id`. That is the shape R5 (#799) leaves when `place_bracket`'s
-    `place_order` raised after the row was written: the venue's state is unknown, a bracket may
-    already be resting, and the tranche still reads "no resting bracket". For those products the
-    fix line says to reconcile the pending order first, never "place one at the venue" -- doctor
-    must not invite a second bracket over one that may exist, which would double-commit the base.
+    `pending_sells` maps a product to its RESTING (`executor.RESTING_STATUSES`) SELL order ids
+    that NO open tranche names as its `bracket_order_id`. That is the shape R5 (#799) leaves
+    when `place_bracket`'s `place_order` raised after the row was written: the venue's state is
+    unknown, a bracket may already be resting, and the tranche still reads "no resting bracket".
+    For those products the fix line says to reconcile the pending order first, never "place one
+    at the venue" -- doctor must not invite a second bracket over one that may exist, which would
+    double-commit the base. Products WITHOUT such an order keep the ordinary advice in the same
+    line (`_unprotected_fix`).
 
     WARN, never FAIL: holding spot without a stop can be a human's choice (PAXG since
     2026-09-22). What was wrong is that nobody was told, and FAIL would halt cycles over a state
@@ -1802,20 +1804,31 @@ def position_watch_findings(
 
 def _unprotected_fix(products: tuple[str, ...], pending_sells: dict[str, list[int]]) -> str:
     """The fix line for `position.unprotected` (R5, #799): a pending SELL nothing links to may be
-    a bracket already resting at the venue, so it is reconciled BEFORE anyone places another."""
+    a bracket already resting at the venue, so it is reconciled BEFORE anyone places another.
+
+    PER PRODUCT. The reconcile-first advice covers only the products that HAVE such an order; the
+    others still get "place one at the venue or close the tranche". When both kinds are present
+    the two parts are joined with ` | ` (`data.feed_scope`'s separator), and the plain part names
+    its products, because it no longer applies to every product the finding lists. When only one
+    kind is present the line is that one part, unchanged."""
+    plain_advice = "doctor cannot re-place a bracket; place one at the venue or close the tranche"
     unknown = [
         f"{product} order {order_id}"
         for product in products
         for order_id in pending_sells.get(product, [])
     ]
+    plain = [product for product in products if not pending_sells.get(product)]
     if not unknown:
-        return "doctor cannot re-place a bracket; place one at the venue or close the tranche"
-    return (
+        return plain_advice
+    reconcile_first = (
         "reconcile the pending order first ("
         + ", ".join(unknown)
         + "): its placement state is unknown and it may already be resting at the venue -- "
         "do not place another bracket until it is resolved"
     )
+    if not plain:
+        return reconcile_first
+    return f"{reconcile_first} | {', '.join(plain)}: {plain_advice}"
 
 
 def doctor_exit_code(findings: list[Finding]) -> int:
@@ -1897,15 +1910,25 @@ def _admissibility_rows(
 
 
 def _unlinked_pending_sells(repo: Any) -> dict[str, list[int]]:
-    """`pending` live SELL orders, by product, that no OPEN tranche names as its bracket -- the
-    rows whose venue state R5 (#799) says is unknown. A repo read only."""
+    """RESTING live SELL orders, by product, that no OPEN tranche names as its bracket. A repo
+    read only.
+
+    `executor.RESTING_STATUSES`, not `"pending"` alone -- the tuple the reconcile sweep polls and
+    the cancel-before-place paths clear, aliased rather than restated for the reason
+    `reconcile._POLLED_STATUSES` gives. A `pending` row is R5's (#799) unknown state: the venue
+    may or may not hold it. A `partially_filled` row is known to be working at the venue, which
+    is the same hazard with more certainty: placing another bracket beside it would double-commit
+    the base. Either way the fix line must say "reconcile it first", never "place one"."""
+    from keel.execution.executor import RESTING_STATUSES
+
     linked = repo.open_bracket_order_ids()
     out: dict[str, list[int]] = {}
-    for order in repo.get_orders(mode="live", status="pending"):
-        if order.get("side") != "SELL" or order["id"] in linked:
-            continue
-        out.setdefault(str(order["product_id"]), []).append(int(order["id"]))
-    return out
+    for status in RESTING_STATUSES:
+        for order in repo.get_orders(mode="live", status=status):
+            if order.get("side") != "SELL" or order["id"] in linked:
+                continue
+            out.setdefault(str(order["product_id"]), []).append(int(order["id"]))
+    return {product: sorted(ids) for product, ids in out.items()}
 
 
 def _order_mode(config: Any) -> str:

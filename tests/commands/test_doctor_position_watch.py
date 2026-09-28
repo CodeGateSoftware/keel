@@ -82,8 +82,9 @@ def test_a_resting_bracket_or_a_retry_record_clears_unprotected() -> None:
     assert _by_name(with_retry)["position.unprotected"].status == OK
 
 
-def test_unmanaged_matches_on_product_not_on_rule_id() -> None:
-    """`positions.rule_id` is NULL on everything before #803, so ownership cannot be the key."""
+def test_unmanaged_matches_on_product_and_kind_not_on_rule_id() -> None:
+    """`positions.rule_id` is NULL on everything before #803, so ownership cannot be the key: a
+    live rule of the tranche's own (product, kind) manages it (#897)."""
     live_turtle = {
         "id": 3,
         "kind": "turtle_breakout",
@@ -281,3 +282,45 @@ def test_a_pending_sell_on_another_product_leaves_the_fix_alone() -> None:
     )
     assert "place one at the venue" in found["position.unprotected"].fix
     assert "reconcile the pending order" not in found["position.unprotected"].fix
+
+
+def test_mixed_unprotected_products_each_get_their_own_fix() -> None:
+    """When only SOME unprotected products have an unlinked pending SELL, the reconcile-first
+    advice covers those products and the ordinary advice still reaches the rest. Dropping "place
+    one at the venue or close the tranche" for BTC because PAXG has a pending order would leave
+    BTC's operator with advice about an order that is not theirs."""
+    btc_turtle = {**PAXG_TRANCHE_3, "id": 5, "product_id": "BTC-USD", "qty": Decimal("0.001")}
+    found = _by_name(
+        position_watch_findings(
+            [btc_turtle, PAXG_TRANCHE_3],
+            [],
+            lambda p: False,
+            set(),
+            pending_sells={"PAXG-USD": [41]},
+        )
+    )
+    unprotected = found["position.unprotected"]
+    assert unprotected.products == ("BTC-USD", "PAXG-USD")
+    reconcile_part, plain_part = unprotected.fix.split(" | ")
+    assert reconcile_part.startswith("reconcile the pending order first (PAXG-USD order 41)")
+    assert plain_part == (
+        "BTC-USD: doctor cannot re-place a bracket; place one at the venue or close the tranche"
+    )
+
+
+def test_a_single_kind_of_advice_keeps_its_one_part_fix() -> None:
+    """The split only happens when the products need DIFFERENT advice."""
+    both_pending = _by_name(
+        position_watch_findings(
+            [PAXG_TRANCHE_3],
+            [],
+            lambda p: False,
+            set(),
+            pending_sells={"PAXG-USD": [41]},
+        )
+    )
+    none_pending = _by_name(position_watch_findings([PAXG_TRANCHE_3], [], lambda p: False, set()))
+    assert len(both_pending["position.unprotected"].fix.split(" | ")) == 1
+    assert none_pending["position.unprotected"].fix == (
+        "doctor cannot re-place a bracket; place one at the venue or close the tranche"
+    )

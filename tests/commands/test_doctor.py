@@ -1051,8 +1051,11 @@ def test_gather_findings_reads_the_resting_bracket(tmp_path, valid_config_path) 
 def test_gather_findings_reads_an_unlinked_pending_sell(tmp_path, valid_config_path) -> None:
     """R5 (#799): a pending SELL on the product that no open tranche points at is a bracket whose
     placement state is unknown. The fix line must say to reconcile it before placing another.
-    Controls: a pending SELL an open tranche DOES point at, a pending BUY, a cancelled SELL, and a
-    pending SELL on another product all leave the ordinary fix line."""
+    `partially_filled` counts as well as `pending`: it is one of `executor.RESTING_STATUSES`, the
+    venue has begun executing it, so it is certainly working there -- a second bracket would
+    double-commit the base just the same. Controls: a pending SELL an open tranche DOES point
+    at, a pending BUY, a cancelled SELL, and a pending SELL on another product all leave the
+    ordinary fix line."""
     config = _live(load_config(valid_config_path))
 
     def _order(repo, *, product="PAXG-USD", side="SELL", status="pending") -> int:
@@ -1089,6 +1092,7 @@ def test_gather_findings_reads_an_unlinked_pending_sell(tmp_path, valid_config_p
 
     seeders = {
         "unlinked": lambda repo: _order(repo),
+        "unlinked_partially_filled": lambda repo: _order(repo, status="partially_filled"),
         "linked": _linked,
         "buy": lambda repo: _order(repo, side="BUY"),
         "cancelled": lambda repo: _order(repo, status="cancelled"),
@@ -1107,6 +1111,7 @@ def test_gather_findings_reads_an_unlinked_pending_sell(tmp_path, valid_config_p
         fixes[label] = finding.fix.startswith("reconcile the pending order first")
     assert fixes == {
         "unlinked": True,
+        "unlinked_partially_filled": True,
         "linked": False,
         "buy": False,
         "cancelled": False,
