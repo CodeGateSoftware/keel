@@ -22,6 +22,7 @@ from keel.commands.dca_plan import (
     ExcludedAsset,
     PlanInputs,
     apply_command,
+    build_dca_plan,
     monthly_buy_cap,
     parse_plan_inputs,
     parse_weight,
@@ -384,3 +385,196 @@ def test_selecting_the_universe_writes_nothing(valid_config_path: Path) -> None:
     before = repo._conn.total_changes  # type: ignore[attr-defined]
     select_universe(repo, _config(valid_config_path), screen_fn=_screen())
     assert repo._conn.total_changes == before  # type: ignore[attr-defined]
+
+
+# -- amounts, fees, the cap check, blockers and warnings (`build_dca_plan`) -----------------------
+
+
+def replace_caps(valid_config_path: Path, **caps):
+    from dataclasses import replace
+
+    return replace(load_config(str(valid_config_path)).caps, **caps)
+
+
+def _plan(
+    valid_config_path: Path,
+    repo: Repository | None = None,
+    *,
+    cap: str | None = "500",
+    rejected: tuple[str, ...] = (),
+    budget: str = "500",
+    buffer: str = "0.1",
+    weights_override=None,
+    **config_overrides,
+):
+    repo = repo or _repo()
+    if cap is not None:
+        attest_subscription(repo, now_ts=NOW_TS, free_volume_usd=Decimal(cap))
+    return build_dca_plan(
+        repo,
+        _config(valid_config_path, **config_overrides),
+        parse_plan_inputs(budget, buffer),
+        venue="coinbase",
+        now_ts=NOW_TS,
+        screen_fn=_screen(*rejected),
+        weights_override=weights_override,
+    )
+
+
+def test_the_worked_example(valid_config_path: Path) -> None:
+    plan = _plan(valid_config_path)
+    assert plan.spend_usd == Decimal("450.00")
+    assert plan.buffer_usd == Decimal("50.00")
+    assert [
+        (b.asset, b.cadence_days, b.per_buy_usd, b.monthly_usd, b.est_monthly_fee_usd)
+        for b in plan.buys
+    ] == [
+        ("BTC", 7, Decimal("41.39"), Decimal("179.97"), Decimal("2.16")),
+        ("ETH", 7, Decimal("31.04"), Decimal("134.96"), Decimal("1.62")),
+        ("PAXG", 7, Decimal("31.04"), Decimal("134.96"), Decimal("1.62")),
+    ]
+    assert plan.buy_count == 3
+    assert [b.weight_pct for b in plan.buys] == [Decimal("40.0"), Decimal("30.0"), Decimal("30.0")]
+    assert plan.planned_monthly_usd == Decimal("449.89")
+    assert plan.est_monthly_fees_usd == Decimal("5.40")
+    assert plan.taker_pct == Decimal("0.012")
+    assert plan.taker_pct_display == Decimal("1.200")
+    assert plan.approvable, plan.blockers
+
+
+def test_the_planned_total_never_exceeds_the_spend_that_was_checked(
+    valid_config_path: Path,
+) -> None:
+    """R5: every rounding step errs toward spending less."""
+    for budget in ("37", "101.01", "999.99", "12345"):
+        plan = _plan(valid_config_path, budget=budget, buffer="0.05", cap=None)
+        assert plan.planned_monthly_usd <= plan.spend_usd
+
+
+def test_the_minimum_order_size_is_unknown_and_said_so(valid_config_path: Path) -> None:
+    plan = _plan(valid_config_path)
+    assert all(b.min_order_usd is None for b in plan.buys)
+    assert any("minimum order size" in w for w in plan.warnings)
+
+
+def test_spend_over_the_cap_is_a_blocker_naming_it_a_buy_cap(valid_config_path: Path) -> None:
+    plan = _plan(valid_config_path, cap="400")  # spend 450 > 400
+    assert not plan.approvable
+    (blocker,) = [b for b in plan.blockers if "rail 14" in b]
+    assert "450.00" in blocker and "400" in blocker and "buy cap" in blocker
+
+
+def test_an_unattested_venue_blocks_with_the_attest_command(valid_config_path: Path) -> None:
+    """Review Focus 2: not "450 exceeds 0" -- the reason and the fix."""
+    plan = _plan(valid_config_path, cap=None)
+    (blocker,) = [b for b in plan.blockers if "rail 14" in b]
+    assert "no subscription has been attested" in blocker
+    assert "keel subscription attest --venue coinbase" in blocker
+
+
+def test_an_unlimited_tier_is_never_a_cap_blocker(valid_config_path: Path) -> None:
+    repo = _repo()
+    attest_subscription(repo, now_ts=NOW_TS, free_volume_usd=None)
+    plan = _plan(
+        valid_config_path,
+        repo,
+        cap=None,
+        budget="100000",
+        buffer="0",
+        caps=replace_caps(valid_config_path, max_per_order_usd=Decimal("1000000")),
+    )
+    assert not [b for b in plan.blockers if "rail 14" in b]
+
+
+def test_a_per_buy_that_rounds_to_zero_is_a_named_blocker(valid_config_path: Path) -> None:
+    """Review Focus 1: named, not a traceback from Dca.__init__ and not a dropped asset."""
+    plan = _plan(
+        valid_config_path,
+        budget="1",
+        buffer="0",
+        weights_override={
+            "BTC": Decimal("0.99"),
+            "ETH": Decimal("0.005"),
+            "PAXG": Decimal("0.005"),
+        },
+    )
+    assert [b.asset for b in plan.buys] == ["BTC", "ETH", "PAXG"]  # not dropped
+    assert any("ETH" in b and "$0.00" in b for b in plan.blockers)
+    assert not plan.approvable
+
+
+def test_a_per_buy_over_the_per_order_cap_is_a_blocker(valid_config_path: Path) -> None:
+    """R8: conftest's max_per_order_usd is 100; BTC's per-buy at a 5000 budget is 459.95."""
+    plan = _plan(valid_config_path, budget="5000", buffer="0", cap="100000")
+    assert any("BTC" in b and "max_per_order_usd" in b for b in plan.blockers)
+
+
+def test_an_empty_universe_is_a_blocker(valid_config_path: Path) -> None:
+    plan = _plan(valid_config_path, rejected=("BTC", "ETH", "PAXG"))
+    assert plan.buys == () and plan.buy_count == 0
+    assert any("no asset is eligible" in b for b in plan.blockers)
+
+
+def test_existing_live_dca_spend_is_warned_against_the_cap_at_each_rules_own_amount(
+    valid_config_path: Path,
+) -> None:
+    """R7 amended (#843): a live row's commitment is that rule's OWN `budget_usd` -- what the
+    live executor actually spends per buy since #843 -- not `config.dca.budget_usd`. BTC live
+    weekly 40: 40 x 30.4375/7 = 173.9285... -> 173.92 (down). Planned spend (ETH/PAXG only,
+    since BTC already has a rule) is 450; 450 + 173.92 = 623.92 > the 500 cap: a WARNING, not a
+    blocker (rail 14 only ever blocks the order actually placed, not a forecast)."""
+    repo = _repo()
+    _insert_dca(repo, "BTC-USD", "live", budget="40")
+    _insert_dca(repo, "SOL-USD", "candidate", budget="40")  # not live: no commitment
+    plan = _plan(valid_config_path, repo)
+    assert plan.existing_live_monthly_usd == Decimal("173.92")
+    assert plan.approvable, plan.blockers
+    (warning,) = [w for w in plan.warnings if "173.92" in w]
+    assert "500" in warning
+
+
+def test_two_live_dca_rules_commitments_sum(valid_config_path: Path) -> None:
+    """R7 amended: each live row's commitment is computed from its own budget_usd, and the
+    rows sum. 20 x 30.4375/7 = 86.9642... -> 86.96 (down); 173.92 + 86.96 = 260.88."""
+    repo = _repo()
+    _insert_dca(repo, "BTC-USD", "live", budget="40")
+    _insert_dca(repo, "SOL-USD", "live", budget="20")
+    plan = _plan(valid_config_path, repo)
+    assert plan.existing_live_monthly_usd == Decimal("260.88")
+
+
+def test_no_warning_claims_the_executor_sizes_dca_from_config(valid_config_path: Path) -> None:
+    """R9 withdrawn (#843): the executor sizes each DCA buy from the rule's own size_usd, so a
+    warning saying it uses config dca.budget_usd would be false about the money path."""
+    repo = _repo()
+    _insert_dca(repo, "BTC-USD", "live")
+    plan = _plan(valid_config_path, repo)
+    assert len(plan.warnings) >= 2  # non-vacuous: the min-order note AND the live-commit warning
+    assert not any("dca.budget_usd" in w for w in plan.warnings)
+    assert not hasattr(plan, "executor_budget_usd")
+
+
+def test_a_live_dip_bonus_rule_gets_a_named_warning(valid_config_path: Path) -> None:
+    """R7 amended: a live row's dip bonus is not modelled into the commitment sum (its ceiling
+    is unbounded in principle), so it gets its own warning instead, naming the rule and its
+    product so the operator knows which row can spend more than the figure shown."""
+    repo = _repo()
+    rule_id = _insert_dca(repo, "BTC-USD", "live", dip="2")
+    plan = _plan(valid_config_path, repo)
+    (warning,) = [w for w in plan.warnings if f"rule {rule_id}" in w]
+    assert "dip" in warning
+
+
+def test_a_candidate_dip_bonus_rule_gets_no_such_warning(valid_config_path: Path) -> None:
+    """Only LIVE rows spend real money on a dip bonus -- a candidate row is inert."""
+    repo = _repo()
+    rule_id = _insert_dca(repo, "BTC-USD", "candidate", dip="2")
+    plan = _plan(valid_config_path, repo)
+    assert not [w for w in plan.warnings if f"rule {rule_id}" in w]
+
+
+def test_even_daily_pacing_is_stated(valid_config_path: Path) -> None:
+    repo = _repo()
+    attest_subscription(repo, now_ts=NOW_TS, free_volume_usd=Decimal("500"), pacing="even_daily")
+    plan = _plan(valid_config_path, repo, cap=None)
+    assert any("even_daily" in w for w in plan.warnings)

@@ -21,7 +21,7 @@ from __future__ import annotations
 import shlex
 from collections.abc import Mapping
 from dataclasses import dataclass
-from decimal import Decimal, InvalidOperation
+from decimal import ROUND_DOWN, ROUND_UP, Decimal, InvalidOperation
 from typing import Literal
 
 from keel_core.subscription import SubscriptionStatus
@@ -302,3 +302,188 @@ def apply_command(
     if inputs.cadence_days != DEFAULT_CADENCE_DAYS:
         parts += ["--cadence-days", str(inputs.cadence_days)]
     return " ".join(parts)
+
+
+_CENT = Decimal("0.01")
+_HUNDRED = Decimal("100")
+
+#: keel records no venue minimum order size: `keel_broker_api.results.Instrument` carries none
+#: ("Minimum sizes are still absent for the original reason -- nothing reads them").
+MIN_ORDER_UNKNOWN = (
+    "keel does not record the venue's minimum order size (its instrument record carries none), "
+    "so no per-buy amount was checked against it -- confirm each against the venue's product "
+    "minimum before promoting."
+)
+
+
+@dataclass(frozen=True)
+class PlannedBuy:
+    asset: str
+    product_id: str
+    weight: Decimal
+    #: `weight x 100`, computed here so no front-end multiplies (payload.py Rule 2).
+    weight_pct: Decimal
+    cadence_days: int
+    per_buy_usd: Decimal
+    monthly_usd: Decimal
+    est_monthly_fee_usd: Decimal
+    #: The venue minimum, when keel knows it. It never does today -- see MIN_ORDER_UNKNOWN.
+    min_order_usd: Decimal | None
+
+
+@dataclass(frozen=True)
+class DcaPlan:
+    inputs: PlanInputs
+    spend_usd: Decimal
+    buffer_usd: Decimal
+    buys: tuple[PlannedBuy, ...]
+    buy_count: int
+    excluded: tuple[ExcludedAsset, ...]
+    existing: tuple[ExistingDcaRule, ...]
+    editable: tuple[tuple[str, Decimal], ...]
+    cap: BuyCap
+    planned_monthly_usd: Decimal
+    est_monthly_fees_usd: Decimal
+    taker_pct: Decimal
+    taker_pct_display: Decimal
+    #: Sum, over each non-disabled `live` DCA row, of `_cents_down(rule.budget_usd x MONTH_DAYS /
+    #: rule.cadence_days)` -- that rule's OWN per-buy amount, because since #843 the live executor
+    #: sizes each DCA buy from the rule's own `setup.context["size_usd"]`
+    #: (`keel/execution/executor.py::_dca_budget`), not from `config.dca.budget_usd` (R7,
+    #: amended after #843; R9, which claimed the executor sizes every buy from the config figure,
+    #: is withdrawn -- that statement is no longer true of the money path).
+    existing_live_monthly_usd: Decimal
+    blockers: tuple[str, ...]
+    warnings: tuple[str, ...]
+
+    @property
+    def approvable(self) -> bool:
+        return not self.blockers
+
+
+def _cents_down(value: Decimal) -> Decimal:
+    return value.quantize(_CENT, rounding=ROUND_DOWN)
+
+
+def _usd(value: Decimal) -> str:
+    return f"${format(value.quantize(_CENT), ',f')}"
+
+
+def build_dca_plan(
+    repo: Repository,
+    config: Config,
+    inputs: PlanInputs,
+    *,
+    venue: str,
+    now_ts: int,
+    screen_fn: ScreenFn,
+    weights_override: Mapping[str, Decimal] | None = None,
+) -> DcaPlan:
+    """The whole proposal, every figure computed here and nowhere downstream. READ-ONLY.
+
+    Per buy: `monthly share x cadence_days / (365.25/12)`, rounded DOWN to cents; the monthly
+    total is recomputed from that rounded buy and rounded down again; the fee estimate at the
+    CONFIGURED `fees.taker_pct` is rounded UP (R5). Blockers (R6, R8) make the plan
+    unapprovable; warnings never do:
+
+    - R7 (amended after #843): each existing `live` DCA row's monthly commitment, at that rule's
+      OWN `budget_usd` -- not `config.dca.budget_usd` -- summed against this plan's spend and
+      rail 14's cap.
+    - R7's dip-bonus corollary: a `live` row with `dip_bonus_pct > 0` can spend more than the
+      commitment above on any given buy, so it gets its own warning naming the rule.
+    - The minimum-order gap: keel does not know the venue's minimum order size
+      (`MIN_ORDER_UNKNOWN`).
+    - Rail 14's `even_daily` pacing, when the attested record uses it.
+    """
+    universe = select_universe(repo, config, screen_fn=screen_fn, weights_override=weights_override)
+    cap = monthly_buy_cap(repo, config, venue=venue, now_ts=now_ts)
+    cadence = inputs.cadence_days
+    spend = _cents_down(inputs.budget_usd * (Decimal("1") - inputs.buffer_pct))
+    taker = config.fees.taker_pct
+
+    buys: list[PlannedBuy] = []
+    blockers: list[str] = []
+    for allocation in universe.allocations:
+        per_buy = _cents_down(spend * allocation.weight * cadence / MONTH_DAYS)
+        monthly = _cents_down(per_buy * MONTH_DAYS / cadence)
+        buys.append(
+            PlannedBuy(
+                asset=allocation.asset,
+                product_id=allocation.product_id,
+                weight=allocation.weight,
+                weight_pct=(allocation.weight * _HUNDRED).quantize(Decimal("0.1")),
+                cadence_days=cadence,
+                per_buy_usd=per_buy,
+                monthly_usd=monthly,
+                est_monthly_fee_usd=(monthly * taker).quantize(_CENT, rounding=ROUND_UP),
+                min_order_usd=None,
+            )
+        )
+        if per_buy <= 0:
+            blockers.append(
+                f"{allocation.asset}'s per-buy rounds to $0.00 -- raise the budget or its weight"
+            )
+        elif per_buy > config.caps.max_per_order_usd:
+            blockers.append(
+                f"{allocation.asset}'s per-buy {_usd(per_buy)} exceeds caps.max_per_order_usd "
+                f"{_usd(config.caps.max_per_order_usd)}; that rail would veto every buy"
+            )
+    if not buys:
+        blockers.append("no asset is eligible -- see the excluded list for each reason")
+    if cap.allowance_usd is not None and spend > cap.allowance_usd:
+        if cap.in_force:
+            blockers.append(
+                f"planned spend {_usd(spend)} exceeds rail 14's monthly buy cap "
+                f"{_usd(cap.allowance_usd)} on {cap.venue}"
+            )
+        else:
+            blockers.append(
+                f"rail 14's monthly buy cap on {cap.venue} is {_usd(cap.allowance_usd)} because "
+                f"{cap.degraded_reason}; planned spend is {_usd(spend)}. Run `keel subscription "
+                f"attest --venue {cap.venue} --tier <tier>` to restore it."
+            )
+
+    live_rules = [rule for rule in universe.existing if rule.status == "live"]
+    live_monthly = sum(
+        (_cents_down(rule.budget_usd * MONTH_DAYS / rule.cadence_days) for rule in live_rules),
+        Decimal("0"),
+    )
+    warnings: list[str] = [MIN_ORDER_UNKNOWN]
+    allowance = cap.allowance_usd
+    if allowance is not None and live_monthly > 0 and spend + live_monthly > allowance:
+        warnings.append(
+            f"existing live DCA rules commit about {_usd(live_monthly)}/month, at each rule's "
+            f"own amount; with this plan's {_usd(spend)} that exceeds rail 14's monthly buy cap "
+            f"{_usd(allowance)}, which will veto buys once the month's total reaches it"
+        )
+    for rule in live_rules:
+        if rule.dip_bonus_pct > 0:
+            warnings.append(
+                f"rule {rule.rule_id} ({rule.product_id}) has a dip bonus of "
+                f"{rule.dip_bonus_pct}%: its buys scale up on dips, so they can exceed both its "
+                "listed per-buy amount and the commitment shown above"
+            )
+    if cap.pacing == "even_daily":
+        warnings.append(
+            "rail 14 pacing is even_daily: the cap is also paced per business day, so an early-"
+            "month buy can be vetoed below the full-month figure shown"
+        )
+
+    return DcaPlan(
+        inputs=inputs,
+        spend_usd=spend,
+        buffer_usd=_cents_down(inputs.budget_usd) - spend,
+        buys=tuple(buys),
+        buy_count=len(buys),
+        excluded=universe.excluded,
+        existing=universe.existing,
+        editable=universe.editable,
+        cap=cap,
+        planned_monthly_usd=sum((b.monthly_usd for b in buys), Decimal("0")),
+        est_monthly_fees_usd=sum((b.est_monthly_fee_usd for b in buys), Decimal("0")),
+        taker_pct=taker,
+        taker_pct_display=taker * _HUNDRED,
+        existing_live_monthly_usd=live_monthly,
+        blockers=tuple(blockers),
+        warnings=tuple(warnings),
+    )
