@@ -6,15 +6,12 @@ the rule set -- but a FRESH deployment gets `keel init`, which seeds every rule 
 using each rule kind's CONSTRUCTOR DEFAULTS. Any parameter an operator tuned by hand is silently
 replaced by the default: a DCA rule deliberately set to `budget_usd: 25` comes back as the
 built-in `50`, at `candidate`, on a box that otherwise looks correctly provisioned. Nothing
-errors. (That is a worked example rather than a description of today's deployment -- the live DCA
-rule is now `50` on purpose, matching the constructor default. Since #840 the live executor spends
-the RULE's own `budget_usd` (the `size_usd` its setup carries), not `config.dca.budget_usd` --
-that config value is only the FALLBACK for a setup whose `size_usd` is absent -- so the manifest
-and the config are free to diverge by design and this module does not require them to agree.
-Because the rule's value now matches the default, the VALUE alone can no longer prove the rule
-wasn't reseeded; `tests/test_rule_manifest.py`'s
-`test_committed_manifest_is_valid` also asserts every committed rule's `status` is `live`, since a
-`keel init` reseed always lands at `candidate` no matter what the params say.) This module makes
+errors. (That is a worked example: since #840 the live executor spends the RULE's own
+`budget_usd` (the `size_usd` its setup carries) -- `config.dca.budget_usd` is only the FALLBACK
+for a setup whose `size_usd` is absent -- so the manifest and the config are free to diverge by
+design and this module does not require them to agree. The live DCA rules are tuned off the
+constructor defaults, so a reseed shows up as a VALUE change as well as a `candidate` status;
+`tests/test_rule_manifest.py`'s `test_committed_manifest_is_valid` asserts both.) This module makes
 that state an artifact you can diff in a PR instead of a fact that lives only on one laptop.
 
 **`export`** writes the manifest. It is the source of truth's snapshot, not the source of truth:

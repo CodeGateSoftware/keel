@@ -3,7 +3,7 @@
   "rules": [
     {
       "kind": "turtle_breakout",
-      "status": "live",
+      "status": "paper",
       "params": {
         "entry_lookback": 40,
         "exit_lookback": 20,
@@ -22,7 +22,7 @@
     },
     {
       "kind": "turtle_breakout",
-      "status": "live",
+      "status": "paper",
       "params": {
         "entry_lookback": 40,
         "exit_lookback": 20,
@@ -41,7 +41,7 @@
     },
     {
       "kind": "turtle_breakout",
-      "status": "live",
+      "status": "paper",
       "params": {
         "entry_lookback": 40,
         "exit_lookback": 20,
@@ -60,7 +60,7 @@
     },
     {
       "kind": "turtle_breakout",
-      "status": "live",
+      "status": "paper",
       "params": {
         "entry_lookback": 40,
         "exit_lookback": 20,
@@ -79,7 +79,7 @@
     },
     {
       "kind": "turtle_breakout",
-      "status": "live",
+      "status": "paper",
       "params": {
         "entry_lookback": 40,
         "exit_lookback": 20,
@@ -100,9 +100,94 @@
       "kind": "dca",
       "status": "live",
       "params": {
-        "product_id": "BTC-USD",
+        "budget_usd": "40",
         "cadence_days": 7,
-        "budget_usd": "50",
+        "dip_bonus_pct": "0",
+        "lookback_days": 90,
+        "product_id": "BTC-USD"
+      }
+    },
+    {
+      "kind": "turtle_breakout",
+      "status": "paper",
+      "params": {
+        "entry_lookback": 40,
+        "exit_lookback": 20,
+        "adx_period": 14,
+        "adx_threshold": 25.0,
+        "atr_period": 20,
+        "atr_stop_mult": "2",
+        "use_macd_confirm": false,
+        "s1_filter": false,
+        "min_volume_filter": false,
+        "volume_ma_period": 20,
+        "volume_mult": 1.2,
+        "target_rr": "6",
+        "product_id": "DOGE-USD"
+      }
+    },
+    {
+      "kind": "dca",
+      "status": "live",
+      "params": {
+        "product_id": "ETH-USD",
+        "cadence_days": 7,
+        "budget_usd": "25",
+        "dip_bonus_pct": "0",
+        "lookback_days": 90
+      }
+    },
+    {
+      "kind": "dca",
+      "status": "live",
+      "params": {
+        "product_id": "PAXG-USD",
+        "cadence_days": 14,
+        "budget_usd": "25",
+        "dip_bonus_pct": "0",
+        "lookback_days": 90
+      }
+    },
+    {
+      "kind": "dca",
+      "status": "live",
+      "params": {
+        "product_id": "ADA-USD",
+        "cadence_days": 14,
+        "budget_usd": "15",
+        "dip_bonus_pct": "0",
+        "lookback_days": 90
+      }
+    },
+    {
+      "kind": "dca",
+      "status": "live",
+      "params": {
+        "product_id": "XLM-USD",
+        "cadence_days": 14,
+        "budget_usd": "15",
+        "dip_bonus_pct": "0",
+        "lookback_days": 90
+      }
+    },
+    {
+      "kind": "dca",
+      "status": "live",
+      "params": {
+        "product_id": "DOGE-USD",
+        "cadence_days": 14,
+        "budget_usd": "15",
+        "dip_bonus_pct": "0",
+        "lookback_days": 90
+      }
+    },
+    {
+      "kind": "dca",
+      "status": "live",
+      "params": {
+        "product_id": "FET-USD",
+        "cadence_days": 14,
+        "budget_usd": "15",
         "dip_bonus_pct": "0",
         "lookback_days": 90
       }
