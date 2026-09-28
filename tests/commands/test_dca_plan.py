@@ -1030,7 +1030,10 @@ def test_a_busy_day_over_the_per_day_cap_is_a_named_blocker(valid_config_path: P
             existing_live_daily_usd=Decimal("0"),
             live_rule_count=0,
             max_per_day_usd=Decimal("100"),
-        ),
+        )
+        # #874: rail 3 is budget-driven, so it carries the passing-value clause too.
+        + "; "
+        + _suggestion(plan),
     )
     # One sentence, shown by the CLI exactly as the plan carries it.
     lines = dca_mod.render_dca_plan(plan)
@@ -1060,7 +1063,9 @@ def test_a_busy_day_one_cent_over_the_per_day_cap_blocks(valid_config_path: Path
             existing_live_daily_usd=Decimal("0"),
             live_rule_count=0,
             max_per_day_usd=Decimal("103.46"),
-        ),
+        )
+        + "; "
+        + _suggestion(plan),
     )
 
 
@@ -1073,6 +1078,10 @@ def test_existing_live_dca_rules_push_the_busy_day_over_the_cap(valid_config_pat
     plan = _plan(valid_config_path, repo, caps=caps)
     assert plan.existing_live_daily_usd == Decimal("200")
     assert plan.worst_day_spend_usd == Decimal("303.47")
+    # #874: the passing-value search reserves the live rule's own worst month ($200 x 5 =
+    # $1,000) out of the $600 cap first (R20), which leaves nothing -- so no value is named.
+    assert plan.max_passing_budget_usd is None
+    assert plan.min_passing_buffer_pct is None
     assert plan.blockers == (
         dca_mod.per_day_cap_text(
             worst_day_spend_usd=Decimal("303.47"),
@@ -1080,7 +1089,9 @@ def test_existing_live_dca_rules_push_the_busy_day_over_the_cap(valid_config_pat
             existing_live_daily_usd=Decimal("200"),
             live_rule_count=1,
             max_per_day_usd=Decimal("300"),
-        ),
+        )
+        + "; "
+        + _suggestion(plan, live_worst_month_usd=Decimal("1000")),
     )
 
 
@@ -1105,6 +1116,166 @@ def test_rail3_blocker_does_not_claim_dca_is_the_whole_days_spend(valid_config_p
     )
     (blocker,) = [b for b in plan.blockers if "rail 3" in b]
     assert "DCA" in blocker and "not just DCA" in blocker
+
+
+# -- #874: the suggestion names a value EVERY budget-driven rail passes (14, 3 and 2) ------------
+
+
+def _suggestion(plan, live_worst_month_usd: Decimal = Decimal("0")) -> str:
+    """The clause `build_dca_plan` appends to a budget-driven blocker, rebuilt from the plan's own
+    fields by the one service function that words it."""
+    return dca_mod._passing_suggestion_text(
+        plan.max_passing_budget_usd,
+        plan.min_passing_buffer_pct,
+        buffer_pct=plan.inputs.buffer_pct,
+        budget_usd=plan.inputs.budget_usd,
+        live_worst_month_usd=live_worst_month_usd,
+    )
+
+
+def _rail3_blocker(plan, max_per_day_usd: Decimal, live_rule_count: int = 0) -> str:
+    return (
+        dca_mod.per_day_cap_text(
+            worst_day_spend_usd=plan.worst_day_spend_usd,
+            worst_day_cycle_usd=plan.worst_day_cycle_usd,
+            existing_live_daily_usd=plan.existing_live_daily_usd,
+            live_rule_count=live_rule_count,
+            max_per_day_usd=max_per_day_usd,
+        )
+        + "; "
+        + _suggestion(plan)
+    )
+
+
+def _rail2_blocker(plan, asset: str, max_per_order_usd: Decimal) -> str:
+    (buy,) = [b for b in plan.buys if b.asset == asset]
+    return (
+        f"{asset}'s per-buy {dca_mod._usd(buy.per_buy_usd)} exceeds caps.max_per_order_usd "
+        f"{dca_mod._usd(max_per_order_usd)}; that rail would veto every buy; " + _suggestion(plan)
+    )
+
+
+def _rail14_blocker(plan) -> str:
+    return (
+        f"planned spend {dca_mod._usd(plan.spend_usd)}/month; the worst calendar month for a "
+        f"7-day cadence holds 5 buy day(s), which at {dca_mod._usd(plan.worst_month_cycle_usd)} "
+        f"per cycle is {dca_mod._usd(plan.worst_month_spend_usd)} -- that exceeds rail 14's "
+        f"monthly buy cap {dca_mod._usd(plan.cap.allowance_usd)} on coinbase; " + _suggestion(plan)
+    )
+
+
+def test_the_issue_874_suggestion_clears_rail_3_as_well_as_rail_14(valid_config_path: Path) -> None:
+    """#874's reproduction: cap $500, budget 500, buffer 0.1, max_per_day_usd 60. Before the fix
+    the search looked only at rail 14 and named `--budget 483.26` / `--buffer-pct 0.1302`, both
+    still blocked by rail 3 ($100+ > $60). The suggestion must pass EVERY budget-driven rail:
+    re-running at it is approvable outright, and one step past it is blocked by rail 3 alone."""
+    caps = replace_caps(valid_config_path, max_per_day_usd=Decimal("60"))
+    plan = _plan(valid_config_path, cap="500", caps=caps)
+    assert plan.max_passing_budget_usd is not None
+    assert plan.min_passing_buffer_pct is not None
+    assert plan.blockers == (_rail3_blocker(plan, Decimal("60")), _rail14_blocker(plan))
+
+    budget = plan.max_passing_budget_usd
+    at_budget = _plan(valid_config_path, cap="500", caps=caps, budget=format(budget, "f"))
+    assert at_budget.blockers == ()
+    over = _plan(
+        valid_config_path, cap="500", caps=caps, budget=format(budget + Decimal("0.01"), "f")
+    )
+    assert over.max_passing_budget_usd == budget
+    assert over.blockers == (_rail3_blocker(over, Decimal("60")),)
+
+    buffer = plan.min_passing_buffer_pct
+    at_buffer = _plan(valid_config_path, cap="500", caps=caps, buffer=format(buffer, "f"))
+    assert at_buffer.blockers == ()
+    under = _plan(
+        valid_config_path, cap="500", caps=caps, buffer=format(buffer - Decimal("0.0001"), "f")
+    )
+    assert under.min_passing_buffer_pct == buffer
+    assert under.blockers == (_rail3_blocker(under, Decimal("60")),)
+
+
+def test_the_suggestion_clears_rail_2_as_well_as_rail_14(valid_config_path: Path) -> None:
+    """#874's second reproduction: max_per_order_usd 30. At budget 500 all three per-buys
+    ($41.39/$31.04/$31.04) exceed it; the rail-14-only suggestion left BTC over it. The
+    suggestion must bring every per-buy to $30.00 or under, and one step past it must be blocked
+    by rail 2 on BTC (the heaviest weight) alone."""
+    caps = replace_caps(valid_config_path, max_per_order_usd=Decimal("30"))
+    plan = _plan(valid_config_path, cap="500", caps=caps)
+    assert plan.max_passing_budget_usd is not None
+    assert plan.min_passing_buffer_pct is not None
+    assert plan.blockers == (
+        _rail2_blocker(plan, "BTC", Decimal("30")),
+        _rail2_blocker(plan, "ETH", Decimal("30")),
+        _rail2_blocker(plan, "PAXG", Decimal("30")),
+        _rail14_blocker(plan),
+    )
+
+    budget = plan.max_passing_budget_usd
+    at_budget = _plan(valid_config_path, cap="500", caps=caps, budget=format(budget, "f"))
+    assert at_budget.blockers == ()
+    over = _plan(
+        valid_config_path, cap="500", caps=caps, budget=format(budget + Decimal("0.01"), "f")
+    )
+    assert over.max_passing_budget_usd == budget
+    assert over.blockers == (_rail2_blocker(over, "BTC", Decimal("30")),)
+
+    buffer = plan.min_passing_buffer_pct
+    at_buffer = _plan(valid_config_path, cap="500", caps=caps, buffer=format(buffer, "f"))
+    assert at_buffer.blockers == ()
+    under = _plan(
+        valid_config_path, cap="500", caps=caps, buffer=format(buffer - Decimal("0.0001"), "f")
+    )
+    assert under.min_passing_buffer_pct == buffer
+    assert under.blockers == (_rail2_blocker(under, "BTC", Decimal("30")),)
+
+
+def test_a_rail_3_blocker_on_its_own_now_names_a_passing_value(valid_config_path: Path) -> None:
+    """#874: with rail 14 clear ($600 cap), rail 3 alone used to name no passing value at all."""
+    caps = replace_caps(valid_config_path, max_per_day_usd=Decimal("100"))
+    plan = _plan(valid_config_path, caps=caps)
+    assert plan.max_passing_budget_usd is not None
+    assert plan.min_passing_buffer_pct is not None
+    assert plan.blockers == (_rail3_blocker(plan, Decimal("100")),)
+
+    at_budget = _plan(valid_config_path, caps=caps, budget=format(plan.max_passing_budget_usd, "f"))
+    assert at_budget.blockers == ()
+    at_buffer = _plan(valid_config_path, caps=caps, buffer=format(plan.min_passing_buffer_pct, "f"))
+    assert at_buffer.blockers == ()
+
+
+def test_a_rail_2_blocker_on_its_own_now_names_a_passing_value(valid_config_path: Path) -> None:
+    """#874: rail 2 alone ($600 cap, max_per_order_usd 40: only BTC's $41.39 is over) names a
+    value, and it is approvable when re-run."""
+    caps = replace_caps(valid_config_path, max_per_order_usd=Decimal("40"))
+    plan = _plan(valid_config_path, caps=caps)
+    assert plan.max_passing_budget_usd is not None
+    assert plan.min_passing_buffer_pct is not None
+    assert plan.blockers == (_rail2_blocker(plan, "BTC", Decimal("40")),)
+
+    at_budget = _plan(valid_config_path, caps=caps, budget=format(plan.max_passing_budget_usd, "f"))
+    assert at_budget.blockers == ()
+    at_buffer = _plan(valid_config_path, caps=caps, buffer=format(plan.min_passing_buffer_pct, "f"))
+    assert at_buffer.blockers == ()
+
+
+def test_rail_3_says_no_value_passes_when_live_rules_alone_fill_the_day(
+    valid_config_path: Path,
+) -> None:
+    """#874: an existing live rule's own per-buy ($200) already exceeds max_per_day_usd ($150),
+    so no budget or buffer for THIS plan clears rail 3. Unlimited tier, so rail 14 plays no part:
+    the blocker says so in words and names no number."""
+    repo = _repo()
+    attest_subscription(repo, now_ts=NOW_TS, free_volume_usd=None)
+    _insert_dca(repo, "SOL-USD", "live", budget="200")
+    caps = replace_caps(valid_config_path, max_per_day_usd=Decimal("150"))
+    plan = _plan(valid_config_path, repo, cap=None, caps=caps)
+    assert plan.max_passing_budget_usd is None
+    assert plan.min_passing_buffer_pct is None
+    assert plan.blockers == (_rail3_blocker(plan, Decimal("150"), live_rule_count=1),)
+    assert plan.blockers[0].endswith(
+        "no positive --budget would pass at --buffer-pct 0.1; "
+        "no --buffer-pct below 1 would pass at --budget 500"
+    )
 
 
 # -- rail 5 (#853): a per-buy above the correlated-size cap is a WARNING, naming the asset -------

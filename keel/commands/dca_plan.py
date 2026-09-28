@@ -490,8 +490,11 @@ class DcaPlan:
     #: `live` DCA rules' own worst-case commitment too (R7), computed by
     #: `_max_passing_budget_usd`'s binary search over `_worst_month_spend_for`, the SAME rounding
     #: `build_dca_plan` uses, and never at a value that rounds any per-buy to $0.00 (#872).
-    #: `None` when the blocker did not fire, or when no such budget clears it (the headroom left
-    #: after the reservation cannot fund a cent per asset per buy).
+    #: #874: set whenever ANY budget-driven blocker fires -- rail 14, rail 3 (per-day) or rail 2
+    #: (per-order) -- and the budget it names clears all three at once (`_within_budget_rails`).
+    #: `None` when none of them fired, or when no such budget clears them (the headroom left
+    #: after the reservation cannot fund a cent per asset per buy, or live rules alone fill the
+    #: day).
     max_passing_budget_usd: Decimal | None
     #: #854's other half: the smallest `--buffer-pct` (to 0.0001, at this plan's OWN `--budget`)
     #: that would clear the same blocker, by the same search and the same reservation. `None`
@@ -618,6 +621,51 @@ def _every_per_buy_nonzero(
     return all(_per_buy_usd(spend, w, cadence_days) > 0 for w in weights)
 
 
+@dataclass(frozen=True)
+class _BudgetRails:
+    """#874: every budget-driven upper limit a suggested `--budget`/`--buffer-pct` must clear, so
+    the value named in a blocker is approvable when pasted back in -- not merely clear of the rail
+    that happened to fire. Each is the same comparison `build_dca_plan`'s own blocker makes:
+
+    - rail 14 (R6/R20): the plan's worst calendar month against `month_headroom_usd` -- the cap
+      with R7's existing `live` DCA commitment reserved out of it (#854), or `None` for an
+      unlimited tier, which has no monthly cap to clear;
+    - rail 3 (R21): the busiest day, this plan's per-cycle total plus `existing_live_daily_usd`,
+      against `max_per_day_usd`;
+    - rail 2 (R8): each per-buy against `max_per_order_usd`.
+    """
+
+    month_headroom_usd: Decimal | None
+    max_per_day_usd: Decimal
+    existing_live_daily_usd: Decimal
+    max_per_order_usd: Decimal
+
+
+def _within_budget_rails(
+    budget_usd: Decimal,
+    buffer_pct: Decimal,
+    weights: tuple[Decimal, ...],
+    cadence_days: int,
+    worst_days: int,
+    rails: _BudgetRails,
+) -> bool:
+    """#874: whether re-running `build_dca_plan` at `budget_usd` / `buffer_pct` would clear every
+    rail in `rails`. The same R5 pipeline as `_worst_month_spend_for` (spend rounded down, each
+    per-buy rounded down through `_per_buy_usd`), so it cannot disagree with the plan's own
+    figures. Every term is an upper limit on a quantity that is non-decreasing in the budget and
+    non-increasing in the buffer, so the conjunction is too: true below some largest budget
+    (above some smallest buffer) and false past it -- which keeps both binary searches exact."""
+    worst_month = _worst_month_spend_for(budget_usd, buffer_pct, weights, cadence_days, worst_days)
+    if rails.month_headroom_usd is not None and worst_month > rails.month_headroom_usd:
+        return False
+    spend = _cents_down(budget_usd * (Decimal("1") - buffer_pct))
+    per_buys = [_per_buy_usd(spend, w, cadence_days) for w in weights]
+    worst_day_cycle = sum(per_buys, Decimal("0"))
+    if worst_day_cycle + rails.existing_live_daily_usd > rails.max_per_day_usd:
+        return False
+    return all(per_buy <= rails.max_per_order_usd for per_buy in per_buys)
+
+
 #: `--buffer-pct` is a fraction in [0, 1) (R11). #854 searches it at 0.0001 resolution: steps
 #: 0..9999 cover [0, 0.9999], the highest buffer strictly below 1.
 _BUFFER_STEP = Decimal("0.0001")
@@ -631,15 +679,17 @@ def _max_passing_budget_usd(
     weights: tuple[Decimal, ...],
     cadence_days: int,
     worst_days: int,
-    headroom_usd: Decimal,
+    rails: _BudgetRails,
 ) -> Decimal | None:
     """#854: the largest `--budget` (to the cent) that keeps this plan's own worst calendar month
-    at or under `headroom_usd` -- the cap with the existing `live` DCA rules' own worst-case
-    commitment (R7) already reserved out of it. Binary search over cents, each candidate checked
-    by calling `_worst_month_spend_for` (never a closed-form inverse); `_worst_month_spend_for` is
-    monotone non-decreasing in the budget (see its own docstring), so the search is exact. The
-    boundary is verified by a direct check on both sides of it rather than merely assumed (a
-    defence against a rounding surprise the monotonicity argument missed).
+    at or under `rails.month_headroom_usd` -- the cap with the existing `live` DCA rules' own
+    worst-case commitment (R7) already reserved out of it -- and, since #874, its busiest day
+    under rail 3 and every per-buy under rail 2 (`_within_budget_rails`). Binary search over
+    cents, each candidate checked by calling the plan's own rounding (never a closed-form
+    inverse); every term is monotone non-decreasing in the budget (see
+    `_within_budget_rails`), so the search is exact. The boundary is verified by a direct check on
+    both sides of it rather than merely assumed (a defence against a rounding surprise the
+    monotonicity argument missed).
 
     A passing budget must ALSO leave every per-buy at $0.01 or more (#872,
     `_every_per_buy_nonzero`): that condition holds from some smallest budget upward, the headroom
@@ -652,8 +702,7 @@ def _max_passing_budget_usd(
 
     def fits(cents: int) -> bool:
         budget = Decimal(cents) / _HUNDRED
-        spend_value = _worst_month_spend_for(budget, buffer_pct, weights, cadence_days, worst_days)
-        return spend_value <= headroom_usd
+        return _within_budget_rails(budget, buffer_pct, weights, cadence_days, worst_days, rails)
 
     def nonzero(cents: int) -> bool:
         return _every_per_buy_nonzero(Decimal(cents) / _HUNDRED, buffer_pct, weights, cadence_days)
@@ -684,7 +733,7 @@ def _max_passing_budget_usd(
         int((current_budget_usd * _HUNDRED).to_integral_value(rounding=ROUND_UP)), lo_cents + 1
     )
     # `current_budget_usd` is the input that triggered the blocker this is computed for, so it
-    # must already fail (its worst month exceeds the cap outright, and `headroom_usd` only
+    # must already fail (it breaches rail 14, 3 or 2 outright, and `month_headroom_usd` only
     # subtracts more from the cap) -- widened defensively rather than trusted blindly.
     while passes(hi_cents):
         hi_cents *= 2
@@ -706,12 +755,13 @@ def _min_passing_buffer_pct(
     weights: tuple[Decimal, ...],
     cadence_days: int,
     worst_days: int,
-    headroom_usd: Decimal,
+    rails: _BudgetRails,
 ) -> Decimal | None:
     """#854's other half: the smallest `--buffer-pct`, to 0.0001, that keeps this plan's own
-    worst calendar month at or under `headroom_usd` at `budget_usd`. Binary search over 0.0001
-    steps in [0, 1), the same `_worst_month_spend_for` call, which is monotone non-increasing in
-    the buffer (more held back can only shrink spend). A passing buffer must ALSO leave every
+    worst calendar month at or under `rails.month_headroom_usd` at `budget_usd` -- and, since
+    #874, its busiest day and every per-buy under rails 3 and 2. Binary search over 0.0001 steps
+    in [0, 1), the same `_within_budget_rails` call, which is monotone in the buffer (more held
+    back can only shrink spend). A passing buffer must ALSO leave every
     per-buy at $0.01 or more (#872, `_every_per_buy_nonzero`), which holds from buffer 0 up to
     some largest step; the search runs below that step only. `None` when no buffer below 1
     satisfies both.
@@ -719,12 +769,9 @@ def _min_passing_buffer_pct(
 
     def passes(step: int) -> bool:
         buffer_pct = Decimal(step) * _BUFFER_STEP
-        spend_value = _worst_month_spend_for(
-            budget_usd, buffer_pct, weights, cadence_days, worst_days
-        )
-        return spend_value <= headroom_usd and _every_per_buy_nonzero(
-            budget_usd, buffer_pct, weights, cadence_days
-        )
+        return _within_budget_rails(
+            budget_usd, buffer_pct, weights, cadence_days, worst_days, rails
+        ) and _every_per_buy_nonzero(budget_usd, buffer_pct, weights, cadence_days)
 
     def nonzero(step: int) -> bool:
         return _every_per_buy_nonzero(
@@ -767,7 +814,8 @@ def _passing_suggestion_text(
     budget_usd: Decimal,
     live_worst_month_usd: Decimal,
 ) -> str:
-    """#854: one clause, appended to the rail-14 blocker, naming what WOULD pass. Both figures are
+    """#854: one clause, appended to every budget-driven blocker -- rail 14's, and since #874 rail
+    3's and each rail-2 one -- naming what WOULD pass all three. Both figures are
     read verbatim off `DcaPlan.max_passing_budget_usd` / `.min_passing_buffer_pct` -- this is the
     only function that turns them into words, and both front-ends show `plan.blockers` verbatim
     (never a value recomputed downstream), so the CLI and the card can never disagree.
@@ -849,6 +897,12 @@ def build_dca_plan(
     reason. `DcaPlan.max_passing_budget_usd` / `.min_passing_buffer_pct` carry the two values (or
     `None`) for a test to check directly, and `/api/dca-plan`'s card shows the identical sentence
     because it reads `plan.blockers` verbatim, as it always has.
+
+    Ruling R23 (2026-09-28, #874): the search clears EVERY budget-driven rail, not just the one
+    that fired -- rail 14 (with R20's reservation), rail 3's busiest day (R21's own sum) and rail
+    2's per-order cap on each per-buy (R8) -- and the clause is appended to each of those
+    blockers, so a rail-3- or rail-2-only plan names a value too. Every term is monotone in the
+    budget and buffer, so the searches stay exact (`_within_budget_rails`).
     """
     universe = select_universe(
         repo,
@@ -863,7 +917,9 @@ def build_dca_plan(
     taker = config.fees.taker_pct
 
     buys: list[PlannedBuy] = []
-    blockers: list[str] = []
+    # #874: each blocker paired with whether it is budget-driven (rails 14, 3 and 2) -- those get
+    # the passing-value clause appended once it is computed below, after every rail is known.
+    blockers: list[tuple[str, bool]] = []
     for allocation in universe.allocations:
         per_buy = _per_buy_usd(spend, allocation.weight, cadence)
         monthly = _cents_down(per_buy * MONTH_DAYS / cadence)
@@ -882,15 +938,22 @@ def build_dca_plan(
         )
         if per_buy <= 0:
             blockers.append(
-                f"{allocation.asset}'s per-buy rounds to $0.00 -- raise the budget or its weight"
+                (
+                    f"{allocation.asset}'s per-buy rounds to $0.00 -- raise the budget or its "
+                    "weight",
+                    False,
+                )
             )
         elif per_buy > config.caps.max_per_order_usd:
             blockers.append(
-                f"{allocation.asset}'s per-buy {_usd(per_buy)} exceeds caps.max_per_order_usd "
-                f"{_usd(config.caps.max_per_order_usd)}; that rail would veto every buy"
+                (
+                    f"{allocation.asset}'s per-buy {_usd(per_buy)} exceeds caps.max_per_order_usd "
+                    f"{_usd(config.caps.max_per_order_usd)}; that rail would veto every buy",
+                    True,
+                )
             )
     if not buys:
-        blockers.append("no asset is eligible -- see the excluded list for each reason")
+        blockers.append(("no asset is eligible -- see the excluded list for each reason", False))
 
     # R6, amended #847: the worst UTC CALENDAR month this cadence can land in, not the
     # 30.4375-day average `spend` alone -- rail 14 caps the calendar month
@@ -920,12 +983,15 @@ def build_dca_plan(
     worst_day_spend = worst_day_cycle + existing_live_daily
     if worst_day_spend > config.caps.max_per_day_usd:
         blockers.append(
-            per_day_cap_text(
-                worst_day_spend_usd=worst_day_spend,
-                worst_day_cycle_usd=worst_day_cycle,
-                existing_live_daily_usd=existing_live_daily,
-                live_rule_count=len(live_rules),
-                max_per_day_usd=config.caps.max_per_day_usd,
+            (
+                per_day_cap_text(
+                    worst_day_spend_usd=worst_day_spend,
+                    worst_day_cycle_usd=worst_day_cycle,
+                    existing_live_daily_usd=existing_live_daily,
+                    live_rule_count=len(live_rules),
+                    max_per_day_usd=config.caps.max_per_day_usd,
+                ),
+                True,
             )
         )
 
@@ -945,11 +1011,24 @@ def build_dca_plan(
 
     max_passing_budget: Decimal | None = None
     min_passing_buffer: Decimal | None = None
-    if cap.allowance_usd is not None and worst_month_spend > cap.allowance_usd:
+    rail14_fires = cap.allowance_usd is not None and worst_month_spend > cap.allowance_usd
+    suggestion = ""
+    if rail14_fires or any(budget_driven for _, budget_driven in blockers):
         # #854: the reservation includes R7's existing live commitments at THEIR OWN worst
-        # calendar month -- stricter than the plain cap this blocker itself compares against, so
-        # a suggested value does not merely clear the cap, it leaves room for those rules too.
-        headroom = cap.allowance_usd - live_worst_monthly
+        # calendar month -- stricter than the plain cap the rail-14 blocker itself compares
+        # against, so a suggested value does not merely clear the cap, it leaves room for those
+        # rules too. #874: and it clears rails 3 and 2 as well, whichever of the three fired, so
+        # the value named is one re-running this function at would approve. An unlimited tier
+        # has no monthly cap, so nothing is reserved against one.
+        reserved = live_worst_monthly if cap.allowance_usd is not None else Decimal("0")
+        rails = _BudgetRails(
+            month_headroom_usd=(
+                None if cap.allowance_usd is None else cap.allowance_usd - live_worst_monthly
+            ),
+            max_per_day_usd=config.caps.max_per_day_usd,
+            existing_live_daily_usd=existing_live_daily,
+            max_per_order_usd=config.caps.max_per_order_usd,
+        )
         weights = tuple(b.weight for b in buys)
         max_passing_budget = _max_passing_budget_usd(
             current_budget_usd=inputs.budget_usd,
@@ -957,37 +1036,44 @@ def build_dca_plan(
             weights=weights,
             cadence_days=cadence,
             worst_days=worst_days,
-            headroom_usd=headroom,
+            rails=rails,
         )
         min_passing_buffer = _min_passing_buffer_pct(
             budget_usd=inputs.budget_usd,
             weights=weights,
             cadence_days=cadence,
             worst_days=worst_days,
-            headroom_usd=headroom,
+            rails=rails,
         )
         suggestion = _passing_suggestion_text(
             max_passing_budget,
             min_passing_buffer,
             buffer_pct=inputs.buffer_pct,
             budget_usd=inputs.budget_usd,
-            live_worst_month_usd=live_worst_monthly,
+            live_worst_month_usd=reserved,
         )
+    if rail14_fires and cap.allowance_usd is not None:
         if cap.in_force:
             blockers.append(
-                f"planned spend {_usd(spend)}/month; the worst calendar month for a "
-                f"{cadence}-day cadence holds {worst_days} buy day(s), which at "
-                f"{_usd(worst_month_cycle)} per cycle is {_usd(worst_month_spend)} -- that "
-                f"exceeds rail 14's monthly buy cap {_usd(cap.allowance_usd)} on {cap.venue}; "
-                f"{suggestion}"
+                (
+                    f"planned spend {_usd(spend)}/month; the worst calendar month for a "
+                    f"{cadence}-day cadence holds {worst_days} buy day(s), which at "
+                    f"{_usd(worst_month_cycle)} per cycle is {_usd(worst_month_spend)} -- that "
+                    f"exceeds rail 14's monthly buy cap {_usd(cap.allowance_usd)} on "
+                    f"{cap.venue}; {suggestion}",
+                    False,
+                )
             )
         else:
             blockers.append(
-                f"rail 14's monthly buy cap on {cap.venue} is {_usd(cap.allowance_usd)} because "
-                f"{cap.degraded_reason}; the worst calendar month for a {cadence}-day cadence "
-                f"would spend {_usd(worst_month_spend)} ({worst_days} buy day(s) x "
-                f"{_usd(worst_month_cycle)} per cycle). Run `keel subscription attest --venue "
-                f"{cap.venue} --tier <tier>` to restore it. {suggestion}"
+                (
+                    f"rail 14's monthly buy cap on {cap.venue} is {_usd(cap.allowance_usd)} "
+                    f"because {cap.degraded_reason}; the worst calendar month for a "
+                    f"{cadence}-day cadence would spend {_usd(worst_month_spend)} ({worst_days} "
+                    f"buy day(s) x {_usd(worst_month_cycle)} per cycle). Run `keel subscription "
+                    f"attest --venue {cap.venue} --tier <tier>` to restore it. {suggestion}",
+                    False,
+                )
             )
 
     warnings: list[str] = [MIN_ORDER_UNKNOWN]
@@ -1055,7 +1141,10 @@ def build_dca_plan(
         worst_day_spend_usd=worst_day_spend,
         max_passing_budget_usd=max_passing_budget,
         min_passing_buffer_pct=min_passing_buffer,
-        blockers=tuple(blockers),
+        # #874: rails 3 and 2 carry the same clause rail 14 embeds in its own sentence above.
+        blockers=tuple(
+            f"{text}; {suggestion}" if budget_driven else text for text, budget_driven in blockers
+        ),
         warnings=tuple(warnings),
     )
 
