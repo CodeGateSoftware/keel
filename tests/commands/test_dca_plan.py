@@ -13,17 +13,24 @@ from decimal import Decimal
 from pathlib import Path
 
 import pytest
+from keel_core.config import load_config
 from keel_core.subscription import SubscriptionStatus
 
 from keel.commands import dca_plan as dca_mod
 from keel.commands.dca_plan import (
     DcaPlanError,
+    ExcludedAsset,
     PlanInputs,
     apply_command,
     monthly_buy_cap,
     parse_plan_inputs,
     parse_weight,
+    select_universe,
 )
+from keel.compliance.screen import MarketFacts, ScreenResult
+from keel.config import Config
+from keel.data.db import connect, migrate
+from keel.data.repository import Repository
 from keel.execution import guards
 from tests.conftest import attest_subscription
 from tests.execution.test_guards import NOW_TS, _intent, _keys, _roomy_config, _unattested_repo
@@ -182,3 +189,198 @@ def test_apply_command_names_the_deployment_before_the_subcommand() -> None:
 
 def test_apply_command_without_inputs_is_the_template() -> None:
     assert apply_command(None) == "keel dca plan --budget <monthly USD> --buffer-pct <fraction>"
+
+
+# -- the universe: admitted, weighted, allowlisted, no existing DCA rule -------------------------
+
+
+def _repo() -> Repository:
+    conn = connect(":memory:")
+    migrate(conn)
+    return Repository(conn)
+
+
+def _screen(*rejected: str):
+    """A fake `screen_fn` admitting every product except the named ASSETS. Injected exactly as
+    `build_screen_report` takes it -- no candles or attestations needed to reach the plan."""
+
+    def screen_fn(repo: Repository, product: str, quote: str) -> tuple[MarketFacts, ScreenResult]:
+        asset = product.split("-")[0]
+        facts = MarketFacts(
+            asset=asset,
+            daily_bars=2000,
+            median_daily_volume=Decimal("5000000"),
+            quotable_in_settlement_currency=True,
+            product_id=product,
+            venue="coinbase",
+        )
+        admitted = asset not in rejected
+        failures = [] if admitted else ["history: 12 bars < 1460"]
+        return facts, ScreenResult(asset=asset, admitted=admitted, failures=failures)
+
+    return screen_fn
+
+
+def _config(valid_config_path: Path, **overrides) -> Config:
+    """conftest's VALID_CONFIG_YAML: allowlist BTC/ETH/PAXG, weights .40/.30/.30, taker 0.012 by
+    default, max_per_order_usd 100, dca.budget_usd 50."""
+    from dataclasses import replace
+
+    return replace(load_config(str(valid_config_path)), **overrides)
+
+
+def _insert_dca(
+    repo: Repository, product: str, status: str, budget: str = "40", dip: str = "0"
+) -> int:
+    return repo.insert_rule(
+        "dca",
+        {
+            "product_id": product,
+            "cadence_days": 7,
+            "budget_usd": budget,
+            "dip_bonus_pct": dip,
+            "lookback_days": 90,
+        },
+        status=status,
+        now_ts=NOW_TS,
+    )
+
+
+def test_every_admitted_weighted_allowlisted_asset_is_allocated(valid_config_path: Path) -> None:
+    universe = select_universe(_repo(), _config(valid_config_path), screen_fn=_screen())
+    assert [(a.asset, a.product_id, a.weight) for a in universe.allocations] == [
+        ("BTC", "BTC-USD", Decimal("0.4")),
+        ("ETH", "ETH-USD", Decimal("0.3")),
+        ("PAXG", "PAXG-USD", Decimal("0.3")),
+    ]
+    assert universe.excluded == ()
+    assert sum(a.weight for a in universe.allocations) == Decimal("1")
+
+
+def test_a_rejected_asset_is_excluded_with_the_screens_reason_and_weights_renormalise(
+    valid_config_path: Path,
+) -> None:
+    universe = select_universe(_repo(), _config(valid_config_path), screen_fn=_screen("BTC"))
+    assert [a.asset for a in universe.allocations] == ["ETH", "PAXG"]
+    assert [a.weight for a in universe.allocations] == [Decimal("0.5"), Decimal("0.5")]
+    assert universe.excluded == (
+        ExcludedAsset("BTC", ("not_admitted",), "history: 12 bars < 1460"),
+    )
+
+
+def test_an_asset_with_no_weight_is_excluded_as_such(valid_config_path: Path) -> None:
+    config = _config(
+        valid_config_path, target_weights={"BTC": Decimal("0.5"), "ETH": Decimal("0.5")}
+    )
+    universe = select_universe(_repo(), config, screen_fn=_screen())
+    assert [a.asset for a in universe.allocations] == ["BTC", "ETH"]
+    assert universe.excluded == (ExcludedAsset("PAXG", ("no_weight",), ""),)
+
+
+def test_an_existing_non_disabled_dca_rule_leaves_its_asset_untouched(
+    valid_config_path: Path,
+) -> None:
+    """Rule 6 on the live account ($/week BTC) is the prime case: listed, unchanged, no new rule."""
+    repo = _repo()
+    rule_id = _insert_dca(repo, "BTC-USD", "live")
+    _insert_dca(repo, "ETH-USD", "disabled")  # disabled does NOT count as existing
+
+    universe = select_universe(repo, _config(valid_config_path), screen_fn=_screen())
+
+    assert [a.asset for a in universe.allocations] == ["ETH", "PAXG"]
+    assert universe.excluded == (ExcludedAsset("BTC", ("has_dca_rule",), f"rule {rule_id} (live)"),)
+    assert [(e.rule_id, e.asset, e.status, e.budget_usd) for e in universe.existing] == [
+        (rule_id, "BTC", "live", Decimal("40"))
+    ]
+
+
+def test_an_existing_rules_dip_bonus_pct_is_carried(valid_config_path: Path) -> None:
+    """Coordinator amendment: R7 (Task 3) needs each existing row's own `dip_bonus_pct`."""
+    repo = _repo()
+    _insert_dca(repo, "BTC-USD", "live", dip="2")
+
+    universe = select_universe(repo, _config(valid_config_path), screen_fn=_screen())
+
+    assert universe.existing[0].dip_bonus_pct == Decimal("2")
+
+
+def test_every_reason_that_applies_is_named(valid_config_path: Path) -> None:
+    repo = _repo()
+    _insert_dca(repo, "BTC-USD", "candidate")
+    config = _config(valid_config_path, target_weights={"ETH": Decimal("1")})
+    universe = select_universe(repo, config, screen_fn=_screen("BTC"))
+    btc = next(e for e in universe.excluded if e.asset == "BTC")
+    assert btc.reasons == ("not_admitted", "no_weight", "has_dca_rule")
+
+
+def test_a_weight_for_an_asset_off_the_allowlist_is_reported_not_dropped(
+    valid_config_path: Path,
+) -> None:
+    """R4 / Review Focus 5: a weight never vanishes without a line saying why."""
+    config = _config(
+        valid_config_path,
+        target_weights={
+            "BTC": Decimal("0.5"),
+            "ETH": Decimal("0.3"),
+            "PAXG": Decimal("0.1"),
+            "FET": Decimal("0.1"),
+        },
+    )
+    universe = select_universe(_repo(), config, screen_fn=_screen())
+    assert ExcludedAsset("FET", ("not_on_allowlist",), "") in universe.excluded
+
+
+def test_weight_keys_are_matched_case_insensitively(valid_config_path: Path) -> None:
+    """Review Focus 5: `btc: 0.4` in YAML is BTC's weight, not an off-allowlist asset."""
+    config = _config(
+        valid_config_path,
+        target_weights={"btc": Decimal("0.4"), "Eth": Decimal("0.3"), "PAXG": Decimal("0.3")},
+    )
+    universe = select_universe(_repo(), config, screen_fn=_screen())
+    assert [a.asset for a in universe.allocations] == ["BTC", "ETH", "PAXG"]
+    assert universe.excluded == ()
+
+
+def test_editable_assets_are_admitted_allowlisted_and_without_a_dca_rule(
+    valid_config_path: Path,
+) -> None:
+    """R14: `[E]` cannot re-admit a rejected asset or stack a rule on an existing one."""
+    repo = _repo()
+    _insert_dca(repo, "BTC-USD", "paper")
+    universe = select_universe(repo, _config(valid_config_path), screen_fn=_screen("PAXG"))
+    assert universe.editable == (("ETH", Decimal("0.3")),)
+
+
+def test_a_weights_override_replaces_config_weights_and_zero_excludes(
+    valid_config_path: Path,
+) -> None:
+    universe = select_universe(
+        _repo(),
+        _config(valid_config_path),
+        screen_fn=_screen(),
+        weights_override={"BTC": Decimal("1"), "ETH": Decimal("1"), "PAXG": Decimal("0")},
+    )
+    assert [(a.asset, a.weight) for a in universe.allocations] == [
+        ("BTC", Decimal("0.5")),
+        ("ETH", Decimal("0.5")),
+    ]
+    assert ExcludedAsset("PAXG", ("no_weight",), "set to 0 in this session") in universe.excluded
+    # Edits persist into the next edit's defaults:
+    assert dict(universe.editable)["PAXG"] == Decimal("0")
+
+
+def test_a_weights_override_for_a_non_editable_asset_is_refused(valid_config_path: Path) -> None:
+    with pytest.raises(DcaPlanError, match="BTC"):
+        select_universe(
+            _repo(),
+            _config(valid_config_path),
+            screen_fn=_screen("BTC"),
+            weights_override={"BTC": Decimal("1")},
+        )
+
+
+def test_selecting_the_universe_writes_nothing(valid_config_path: Path) -> None:
+    repo = _repo()
+    before = repo._conn.total_changes  # type: ignore[attr-defined]
+    select_universe(repo, _config(valid_config_path), screen_fn=_screen())
+    assert repo._conn.total_changes == before  # type: ignore[attr-defined]

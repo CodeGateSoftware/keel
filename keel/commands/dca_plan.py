@@ -19,13 +19,21 @@ It writes `candidate` rows through `keel.commands.rules.add_rule_row` and nothin
 from __future__ import annotations
 
 import shlex
+from collections.abc import Mapping
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
+from typing import Literal
 
 from keel_core.subscription import SubscriptionStatus
 
+from keel.commands._products import _history_product
+from keel.commands.admission import ScreenFn, build_screen_report
 from keel.config import Config
 from keel.data.repository import Repository
+
+# Rail 1's own key function, as `keel/commands/rules.py` imports it: an existing rule's asset is
+# read the way the rails read it, so "already has a DCA rule" cannot disagree with them.
+from keel.execution.guards import _asset as _asset_of
 
 #: Average days per month (365.25 / 12 = 30.4375): the per-buy formula's month.
 MONTH_DAYS = Decimal("365.25") / Decimal("12")
@@ -116,6 +124,157 @@ def monthly_buy_cap(repo: Repository, config: Config, *, venue: str, now_ts: int
     else:
         reason = f"its subscription is {effective.value}"
     return BuyCap(venue, record.allowance_usd(now_ts, unsubscribed), reason, record.pacing)
+
+
+ExclusionReason = Literal["not_on_allowlist", "not_admitted", "no_weight", "has_dca_rule"]
+
+#: The operator-facing words for each reason. One table, read by the terminal renderer and the
+#: web payload alike.
+REASON_TEXT: dict[str, str] = {
+    "not_on_allowlist": "not on the allowlist",
+    "not_admitted": "not admitted by the screen",
+    "no_weight": "no positive target weight",
+    "has_dca_rule": "already has a DCA rule -- existing, unchanged",
+}
+
+_NON_EXISTING = frozenset({"disabled"})
+
+
+@dataclass(frozen=True)
+class ExcludedAsset:
+    asset: str
+    reasons: tuple[ExclusionReason, ...]
+    detail: str
+
+
+@dataclass(frozen=True)
+class ExistingDcaRule:
+    rule_id: int
+    asset: str
+    product_id: str
+    status: str
+    budget_usd: Decimal
+    cadence_days: int
+    #: Coordinator amendment (2026-09-27), for Task 3's amended R7: the ceiling `dip_bonus_pct`
+    #: rule params carry. Not itself modelled into the live commitment sum -- a row with
+    #: `dip_bonus_pct > 0` gets a warning instead, since #843 sizes a live DCA buy from the rule's
+    #: own `budget_usd` context and the dip bonus can push a single buy above that figure.
+    dip_bonus_pct: Decimal
+
+
+@dataclass(frozen=True)
+class Allocation:
+    asset: str
+    product_id: str
+    raw_weight: Decimal
+    #: `raw_weight` renormalised over the allocated set; the allocations' weights sum to 1.
+    weight: Decimal
+
+
+@dataclass(frozen=True)
+class Universe:
+    allocations: tuple[Allocation, ...]
+    excluded: tuple[ExcludedAsset, ...]
+    existing: tuple[ExistingDcaRule, ...]
+    #: `(asset, current raw weight)` for every asset `[E]` may edit (R14), allowlist order.
+    editable: tuple[tuple[str, Decimal], ...]
+
+
+def existing_dca_rules(repo: Repository) -> tuple[ExistingDcaRule, ...]:
+    """Every non-disabled `dca` row, in id order. Read fresh by `apply_dca_plan` too."""
+    found: list[ExistingDcaRule] = []
+    for row in repo.get_rules():
+        if row["kind"] != "dca" or row["status"] in _NON_EXISTING:
+            continue
+        params = row["params"] or {}
+        product = str(params.get("product_id", ""))
+        found.append(
+            ExistingDcaRule(
+                rule_id=int(row["id"]),
+                # `_asset_of` (rail 1's key function) does NOT uppercase its result -- confirmed
+                # by reading `guards._asset` -- so the `.upper()` here is this module's own,
+                # deliberate on top of it.
+                asset=_asset_of(product).upper(),
+                product_id=product,
+                status=str(row["status"]),
+                budget_usd=Decimal(str(params.get("budget_usd", "0"))),
+                cadence_days=int(params.get("cadence_days", DEFAULT_CADENCE_DAYS)),
+                dip_bonus_pct=Decimal(str(params.get("dip_bonus_pct", "0"))),
+            )
+        )
+    return tuple(found)
+
+
+def select_universe(
+    repo: Repository,
+    config: Config,
+    *,
+    screen_fn: ScreenFn,
+    weights_override: Mapping[str, Decimal] | None = None,
+) -> Universe:
+    """allowlist ∩ admitted ∩ positive weight, minus assets with a non-disabled DCA rule.
+
+    Admission comes from `build_screen_report` with the injected `screen_fn`
+    (`keel.commands.assets.screen_product` in production) -- the one gate every candidate source
+    routes through, never a laxer copy. READ-ONLY: this writes nothing.
+    """
+    quote = config.quote_currency
+    allowlist = [asset.upper() for asset in config.allowlist]
+    weights = {asset.upper(): Decimal(str(w)) for asset, w in config.target_weights.items()}
+    admitted = {
+        sp.asset.upper(): sp for sp in build_screen_report(repo, config, screen_fn).screened
+    }
+    existing = existing_dca_rules(repo)
+    existing_by_asset = {rule.asset: rule for rule in existing}
+
+    editable_assets = [
+        asset
+        for asset in allowlist
+        if asset in admitted and admitted[asset].result.admitted and asset not in existing_by_asset
+    ]
+    override = {asset.upper(): w for asset, w in (weights_override or {}).items()}
+    stray = sorted(set(override) - set(editable_assets))
+    if stray:
+        raise DcaPlanError(
+            f"cannot edit the weight of {', '.join(stray)}: only admitted, allowlisted assets "
+            "with no DCA rule are in this plan"
+        )
+    effective = {**weights, **override}
+
+    excluded: list[ExcludedAsset] = []
+    chosen: list[tuple[str, Decimal]] = []
+    for asset in allowlist:
+        reasons: list[ExclusionReason] = []
+        details: list[str] = []
+        screened = admitted.get(asset)
+        if screened is None or not screened.result.admitted:
+            reasons.append("not_admitted")
+            details.append("; ".join(screened.result.failures) if screened else "not screened")
+        weight = effective.get(asset, Decimal("0"))
+        if weight <= 0:
+            reasons.append("no_weight")
+            if asset in override:
+                details.append("set to 0 in this session")
+        rule = existing_by_asset.get(asset)
+        if rule is not None:
+            reasons.append("has_dca_rule")
+            details.append(f"rule {rule.rule_id} ({rule.status})")
+        if reasons:
+            excluded.append(
+                ExcludedAsset(asset, tuple(reasons), "; ".join(d for d in details if d))
+            )
+        else:
+            chosen.append((asset, weight))
+    for asset in sorted(set(weights) - set(allowlist)):
+        if weights[asset] > 0:
+            excluded.append(ExcludedAsset(asset, ("not_on_allowlist",), ""))
+
+    total = sum((w for _, w in chosen), Decimal("0"))
+    allocations = tuple(
+        Allocation(asset, _history_product(asset, quote), w, w / total) for asset, w in chosen
+    )
+    editable = tuple((asset, effective.get(asset, Decimal("0"))) for asset in editable_assets)
+    return Universe(allocations, tuple(excluded), existing, editable)
 
 
 def apply_command(
