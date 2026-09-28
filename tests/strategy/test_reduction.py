@@ -102,7 +102,9 @@ def test_a_reduction_must_name_its_rule_kind() -> None:
 
 
 @pytest.mark.parametrize(
-    "fee,slip", [(D("-0.01"), D("0")), (D("0"), D("-0.01")), (D("0.6"), D("0.5"))]
+    "fee,slip",
+    [(D("-0.01"), D("0")), (D("0"), D("-0.01")), (D("0.6"), D("0.5")), (D("0.5"), D("0.5"))],
+    ids=["negative-fee", "negative-slippage", "over-one", "exactly-one"],
 )
 def test_sell_costs_refuse_rates_that_make_net_from_gross_undefined(fee, slip) -> None:
     with pytest.raises(ValueError):
