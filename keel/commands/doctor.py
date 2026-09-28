@@ -47,6 +47,7 @@ from keel_core.telemetry import current_venue
 from keel_core.trade_scope import READ_ONLY, TRADING, TradeScopeState, VenueTradeScope
 
 from keel import attestations
+from keel.commands.positions_close import DECLARED_ORDER_TYPE
 from keel.data.feed_scope import reports_consolidated_volume
 from keel.data.freshness import Freshness
 from keel.execution import guards, sizing
@@ -1449,6 +1450,11 @@ def unbooked_exit_findings(
       every time a position was de-risked, which is how a check gets ignored.
     * The SELL must be at or after `opened_at`. A sale that closed an EARLIER tranche says
       nothing about one opened after it, and the ledger is FIFO so the ordering is meaningful.
+    * A DECLARED close (`order_type = 'out_of_band'`, `keel positions close <id>`, #798) is
+      EXCLUDED. It books the tranche the operator NAMED, in the same call that writes the row,
+      so it is booked by construction -- and it need not be the oldest: closing a newer lot by
+      hand leaves an older tranche open behind a later filled SELL, which is correct, and this
+      finding would otherwise WARN on it for as long as that tranche is held.
 
     Modes are pooled on purpose: paper is where this was found, but the invariant is not
     paper's -- `agent._open_tranche` writes the ledger for both, and an unbooked LIVE exit is
@@ -1461,6 +1467,8 @@ def unbooked_exit_findings(
     sold_at_by_product: dict[str, list[int]] = {}
     for order in orders:
         if order.get("side") != "SELL" or order.get("status") != "filled":
+            continue
+        if order.get("order_type") == DECLARED_ORDER_TYPE:
             continue
         ts = order.get("created_at")
         if ts is None:
