@@ -479,6 +479,17 @@ class DcaPlan:
     #: that day, not just DCA, but this plan only knows about DCA rules -- so this is a DCA-only
     #: FLOOR on that day's total, and the blocker text says so rather than overclaiming.
     worst_day_spend_usd: Decimal
+    #: #854: when the rail-14 blocker below fires, the largest `--budget` (to the cent, at this
+    #: plan's OWN `--buffer-pct`) that would clear it -- reserving headroom for the existing
+    #: `live` DCA rules' own worst-case commitment too (R7), computed by
+    #: `_max_passing_budget_usd`'s binary search over `_worst_month_spend_for`, the SAME rounding
+    #: `build_dca_plan` uses. `None` when the blocker did not fire, or when no positive budget
+    #: clears it (the reservation alone already meets or exceeds the cap).
+    max_passing_budget_usd: Decimal | None
+    #: #854's other half: the smallest `--buffer-pct` (to 0.0001, at this plan's OWN `--budget`)
+    #: that would clear the same blocker, by the same search and the same reservation. `None`
+    #: under the same two conditions as `max_passing_budget_usd` above.
+    min_passing_buffer_pct: Decimal | None
     blockers: tuple[str, ...]
     warnings: tuple[str, ...]
 
@@ -551,6 +562,167 @@ def correlated_size_text(buy: PlannedBuy, correlated_cap: Decimal) -> str:
     )
 
 
+def _per_buy_usd(spend: Decimal, weight: Decimal, cadence_days: int) -> Decimal:
+    """One asset's per-buy amount (R5): `spend x weight x cadence_days / MONTH_DAYS`, rounded
+    DOWN to cents. `build_dca_plan`'s own loop and `_worst_month_spend_for` (#854, below) both
+    call this -- one function, so a suggested `--budget`/`--buffer-pct` can never be computed by
+    arithmetic that disagrees with what re-running `build_dca_plan` at that value would actually
+    produce."""
+    return _cents_down(spend * weight * cadence_days / MONTH_DAYS)
+
+
+def _worst_month_spend_for(
+    budget_usd: Decimal,
+    buffer_pct: Decimal,
+    weights: tuple[Decimal, ...],
+    cadence_days: int,
+    worst_days: int,
+) -> Decimal:
+    """#854: the worst-calendar-month figure `build_dca_plan` would compute for `budget_usd` /
+    `buffer_pct` at these allocation weights and cadence -- the exact R5 pipeline (spend rounded
+    down, each per-buy rounded down, summed, times the worst month's buy-day count). The two
+    binary searches below call this instead of a closed-form inverse, so a suggested value cannot
+    disagree with what `build_dca_plan` itself would compute if re-run with it.
+
+    Monotone by construction: `spend` is `ROUND_DOWN` of a linear function that is non-decreasing
+    in `budget_usd` and non-increasing in `buffer_pct`; each per-buy is `ROUND_DOWN` of a linear,
+    non-decreasing function of `spend`; `ROUND_DOWN` (floor, for a non-negative argument)
+    preserves order. So the return value is non-decreasing in `budget_usd` and non-increasing in
+    `buffer_pct`, which is what makes binary search over either one exact rather than a heuristic.
+    """
+    spend = _cents_down(budget_usd * (Decimal("1") - buffer_pct))
+    cycle = sum((_per_buy_usd(spend, w, cadence_days) for w in weights), Decimal("0"))
+    return cycle * worst_days
+
+
+#: `--buffer-pct` is a fraction in [0, 1) (R11). #854 searches it at 0.0001 resolution: steps
+#: 0..9999 cover [0, 0.9999], the highest buffer strictly below 1.
+_BUFFER_STEP = Decimal("0.0001")
+_BUFFER_STEPS = 10_000
+
+
+def _max_passing_budget_usd(
+    *,
+    current_budget_usd: Decimal,
+    buffer_pct: Decimal,
+    weights: tuple[Decimal, ...],
+    cadence_days: int,
+    worst_days: int,
+    headroom_usd: Decimal,
+) -> Decimal | None:
+    """#854: the largest `--budget` (to the cent) that keeps this plan's own worst calendar month
+    at or under `headroom_usd` -- the cap with the existing `live` DCA rules' own worst-case
+    commitment (R7) already reserved out of it. Binary search over cents, each candidate checked
+    by calling `_worst_month_spend_for` (never a closed-form inverse); `_worst_month_spend_for` is
+    monotone non-decreasing in the budget (see its own docstring), so the search is exact. The
+    boundary is verified by a direct check on both sides of it rather than merely assumed (a
+    defence against a rounding surprise the monotonicity argument missed).
+
+    `None` when no positive budget clears `headroom_usd` -- it is already at or below zero.
+    """
+
+    def passes(cents: int) -> bool:
+        budget = Decimal(cents) / _HUNDRED
+        spend_value = _worst_month_spend_for(budget, buffer_pct, weights, cadence_days, worst_days)
+        return spend_value <= headroom_usd
+
+    if not passes(1):
+        return None
+    hi_cents = max(int((current_budget_usd * _HUNDRED).to_integral_value(rounding=ROUND_UP)), 1)
+    # `current_budget_usd` is the input that triggered the blocker this is computed for, so it
+    # must already fail (its worst month exceeds the cap outright, and `headroom_usd` only
+    # subtracts more from the cap) -- widened defensively rather than trusted blindly.
+    while passes(hi_cents):
+        hi_cents *= 2
+    lo_cents, hi_cents = 1, hi_cents  # invariant: passes(lo_cents) and not passes(hi_cents)
+    while hi_cents - lo_cents > 1:
+        mid = (lo_cents + hi_cents) // 2
+        if passes(mid):
+            lo_cents = mid
+        else:
+            hi_cents = mid
+    assert passes(lo_cents) and not passes(lo_cents + 1)  # boundary verified, not assumed
+    return Decimal(lo_cents) / _HUNDRED
+
+
+def _min_passing_buffer_pct(
+    *,
+    budget_usd: Decimal,
+    weights: tuple[Decimal, ...],
+    cadence_days: int,
+    worst_days: int,
+    headroom_usd: Decimal,
+) -> Decimal | None:
+    """#854's other half: the smallest `--buffer-pct`, to 0.0001, that keeps this plan's own
+    worst calendar month at or under `headroom_usd` at `budget_usd`. Binary search over 0.0001
+    steps in [0, 1), the same `_worst_month_spend_for` call, which is monotone non-increasing in
+    the buffer (more held back can only shrink spend). `None` when no buffer below 1 clears it.
+    """
+
+    def passes(step: int) -> bool:
+        buffer_pct = Decimal(step) * _BUFFER_STEP
+        spend_value = _worst_month_spend_for(
+            budget_usd, buffer_pct, weights, cadence_days, worst_days
+        )
+        return spend_value <= headroom_usd
+
+    hi = _BUFFER_STEPS - 1
+    if not passes(hi):
+        return None
+    lo = 0
+    # buffer-pct 0 is the smallest legal value, and this is only reached from a plan that already
+    # failed at its OWN buffer-pct (>= 0); `passes` is monotone non-decreasing in the buffer, so
+    # buffer-pct 0 must fail too -- verified, not merely assumed.
+    assert not passes(lo)
+    while hi - lo > 1:
+        mid = (lo + hi) // 2
+        if passes(mid):
+            hi = mid
+        else:
+            lo = mid
+    assert passes(hi) and not passes(hi - 1)  # boundary verified, not assumed
+    return (Decimal(hi) * _BUFFER_STEP).quantize(_BUFFER_STEP)
+
+
+def _passing_suggestion_text(
+    max_budget: Decimal | None,
+    min_buffer: Decimal | None,
+    *,
+    buffer_pct: Decimal,
+    budget_usd: Decimal,
+    live_worst_month_usd: Decimal,
+) -> str:
+    """#854: one clause, appended to the rail-14 blocker, naming what WOULD pass. Both figures are
+    read verbatim off `DcaPlan.max_passing_budget_usd` / `.min_passing_buffer_pct` -- this is the
+    only function that turns them into words, and both front-ends show `plan.blockers` verbatim
+    (never a value recomputed downstream), so the CLI and the card can never disagree.
+
+    Ruling (#854): the search that produced `max_budget`/`min_buffer` reserves
+    `live_worst_month_usd` (R7's existing `live` DCA rules, at THEIR OWN worst calendar month) out
+    of the cap -- stricter than what the rail-14 blocker itself compares against, which looks only
+    at this plan. The clause says so whenever that reservation is nonzero, since otherwise a
+    suggested value that still collides with a live rule's own worst month would read as a clean
+    number. `None` is spelled out in words rather than a number that does not exist.
+    """
+    budget_clause = (
+        f"no positive --budget would pass at --buffer-pct {format(buffer_pct, 'f')}"
+        if max_budget is None
+        else f"the largest --budget that would pass is {format(max_budget, 'f')}"
+    )
+    buffer_clause = (
+        f"no --buffer-pct below 1 would pass at --budget {format(budget_usd, 'f')}"
+        if min_buffer is None
+        else f"the smallest --buffer-pct that would pass is {format(min_buffer, 'f')}"
+    )
+    reservation = (
+        f" (both leave room for the existing live DCA rules' own worst-case commitment "
+        f"{_usd(live_worst_month_usd)}/month)"
+        if live_worst_month_usd > 0
+        else ""
+    )
+    return f"{budget_clause}; {buffer_clause}{reservation}"
+
+
 def build_dca_plan(
     repo: Repository,
     config: Config,
@@ -583,6 +755,21 @@ def build_dca_plan(
     - The minimum-order gap: keel does not know the venue's minimum order size
       (`MIN_ORDER_UNKNOWN`).
     - Rail 14's `even_daily` pacing, when the attested record uses it.
+
+    Ruling R20 (2026-09-28, #854): when the rail-14 blocker fires, it names the largest
+    `--budget` (at this plan's own `--buffer-pct`) and the smallest `--buffer-pct` (at this
+    plan's own `--budget`) that would clear it -- each found by binary search
+    (`_max_passing_budget_usd`/`_min_passing_buffer_pct`) over `_worst_month_spend_for`, which
+    calls the SAME per-buy rounding (`_per_buy_usd`) this function's own loop uses, so a
+    suggested value can never disagree with what re-running this function at that value would
+    produce. Both searches reserve R7's existing `live` DCA rules' own worst-case commitment out
+    of the cap first -- stricter than the blocker's own comparison, which looks only at this
+    plan -- and the appended clause says so whenever that reservation is nonzero. `None` (spelled
+    out in words, never a number) when no value in the legal range clears it: a positive budget
+    when the reservation alone already meets or exceeds the cap, or a buffer below 1 for the same
+    reason. `DcaPlan.max_passing_budget_usd` / `.min_passing_buffer_pct` carry the two values (or
+    `None`) for a test to check directly, and `/api/dca-plan`'s card shows the identical sentence
+    because it reads `plan.blockers` verbatim, as it always has.
     """
     universe = select_universe(repo, config, screen_fn=screen_fn, weights_override=weights_override)
     cap = monthly_buy_cap(repo, config, venue=venue, now_ts=now_ts)
@@ -593,7 +780,7 @@ def build_dca_plan(
     buys: list[PlannedBuy] = []
     blockers: list[str] = []
     for allocation in universe.allocations:
-        per_buy = _cents_down(spend * allocation.weight * cadence / MONTH_DAYS)
+        per_buy = _per_buy_usd(spend, allocation.weight, cadence)
         monthly = _cents_down(per_buy * MONTH_DAYS / cadence)
         buys.append(
             PlannedBuy(
@@ -629,23 +816,9 @@ def build_dca_plan(
     worst_days = _worst_month_buy_days(cadence)
     worst_month_cycle = sum((b.per_buy_usd for b in buys), Decimal("0"))
     worst_month_spend = worst_month_cycle * worst_days
-    if cap.allowance_usd is not None and worst_month_spend > cap.allowance_usd:
-        if cap.in_force:
-            blockers.append(
-                f"planned spend {_usd(spend)}/month; the worst calendar month for a "
-                f"{cadence}-day cadence holds {worst_days} buy day(s), which at "
-                f"{_usd(worst_month_cycle)} per cycle is {_usd(worst_month_spend)} -- that "
-                f"exceeds rail 14's monthly buy cap {_usd(cap.allowance_usd)} on {cap.venue}"
-            )
-        else:
-            blockers.append(
-                f"rail 14's monthly buy cap on {cap.venue} is {_usd(cap.allowance_usd)} because "
-                f"{cap.degraded_reason}; the worst calendar month for a {cadence}-day cadence "
-                f"would spend {_usd(worst_month_spend)} ({worst_days} buy day(s) x "
-                f"{_usd(worst_month_cycle)} per cycle). Run `keel subscription attest --venue "
-                f"{cap.venue} --tier <tier>` to restore it."
-            )
 
+    # Moved up (#854, from just below the blocker check that follows): the blocker's suggested
+    # passing values reserve headroom for these, so they must exist BEFORE that text is built.
     live_rules = [rule for rule in universe.existing if rule.status == "live"]
 
     # R21 (#853): rail 3 (`guards.py`'s per-day cap) counts EVERY BUY placed that day, and
@@ -684,6 +857,54 @@ def build_dca_plan(
         (rule.budget_usd * _worst_month_buy_days(rule.cadence_days) for rule in live_rules),
         Decimal("0"),
     )
+
+    max_passing_budget: Decimal | None = None
+    min_passing_buffer: Decimal | None = None
+    if cap.allowance_usd is not None and worst_month_spend > cap.allowance_usd:
+        # #854: the reservation includes R7's existing live commitments at THEIR OWN worst
+        # calendar month -- stricter than the plain cap this blocker itself compares against, so
+        # a suggested value does not merely clear the cap, it leaves room for those rules too.
+        headroom = cap.allowance_usd - live_worst_monthly
+        weights = tuple(b.weight for b in buys)
+        max_passing_budget = _max_passing_budget_usd(
+            current_budget_usd=inputs.budget_usd,
+            buffer_pct=inputs.buffer_pct,
+            weights=weights,
+            cadence_days=cadence,
+            worst_days=worst_days,
+            headroom_usd=headroom,
+        )
+        min_passing_buffer = _min_passing_buffer_pct(
+            budget_usd=inputs.budget_usd,
+            weights=weights,
+            cadence_days=cadence,
+            worst_days=worst_days,
+            headroom_usd=headroom,
+        )
+        suggestion = _passing_suggestion_text(
+            max_passing_budget,
+            min_passing_buffer,
+            buffer_pct=inputs.buffer_pct,
+            budget_usd=inputs.budget_usd,
+            live_worst_month_usd=live_worst_monthly,
+        )
+        if cap.in_force:
+            blockers.append(
+                f"planned spend {_usd(spend)}/month; the worst calendar month for a "
+                f"{cadence}-day cadence holds {worst_days} buy day(s), which at "
+                f"{_usd(worst_month_cycle)} per cycle is {_usd(worst_month_spend)} -- that "
+                f"exceeds rail 14's monthly buy cap {_usd(cap.allowance_usd)} on {cap.venue}; "
+                f"{suggestion}"
+            )
+        else:
+            blockers.append(
+                f"rail 14's monthly buy cap on {cap.venue} is {_usd(cap.allowance_usd)} because "
+                f"{cap.degraded_reason}; the worst calendar month for a {cadence}-day cadence "
+                f"would spend {_usd(worst_month_spend)} ({worst_days} buy day(s) x "
+                f"{_usd(worst_month_cycle)} per cycle). Run `keel subscription attest --venue "
+                f"{cap.venue} --tier <tier>` to restore it. {suggestion}"
+            )
+
     warnings: list[str] = [MIN_ORDER_UNKNOWN]
     allowance = cap.allowance_usd
     combined_worst = worst_month_spend + live_worst_monthly
@@ -747,6 +968,8 @@ def build_dca_plan(
         worst_day_cycle_usd=worst_day_cycle,
         existing_live_daily_usd=existing_live_daily,
         worst_day_spend_usd=worst_day_spend,
+        max_passing_budget_usd=max_passing_budget,
+        min_passing_buffer_pct=min_passing_buffer,
         blockers=tuple(blockers),
         warnings=tuple(warnings),
     )

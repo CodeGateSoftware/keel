@@ -604,10 +604,20 @@ def test_the_worked_examples_worst_month_blocks_the_500_cap(valid_config_path: P
     assert plan.worst_month_spend_usd == Decimal("517.35")
     assert not plan.approvable
     (blocker,) = [b for b in plan.blockers if "rail 14" in b]
+    # #854: the blocker now also names the largest passing budget and smallest passing
+    # buffer-pct, built by the one service function `_passing_suggestion_text` -- see the
+    # dedicated section below for the values themselves and the proof that they pass.
     assert blocker == (
         "planned spend $450.00/month; the worst calendar month for a 7-day cadence holds 5 buy "
         "day(s), which at $103.47 per cycle is $517.35 -- that exceeds rail 14's monthly buy cap "
-        "$500.00 on coinbase"
+        "$500.00 on coinbase; "
+        + dca_mod._passing_suggestion_text(
+            plan.max_passing_budget_usd,
+            plan.min_passing_buffer_pct,
+            buffer_pct=plan.inputs.buffer_pct,
+            budget_usd=plan.inputs.budget_usd,
+            live_worst_month_usd=Decimal("0"),
+        )
     )
 
 
@@ -620,6 +630,176 @@ def test_a_worst_month_that_fits_the_cap_is_still_approvable(valid_config_path: 
     assert plan.worst_month_cycle_usd == Decimal("103.47")
     assert plan.worst_month_spend_usd == Decimal("517.35")
     assert plan.approvable, plan.blockers
+    # #854: an approvable plan has nothing to suggest.
+    assert plan.max_passing_budget_usd is None
+    assert plan.min_passing_buffer_pct is None
+
+
+# -- #854: the rail-14 blocker names the largest passing budget and smallest passing buffer -----
+
+
+def test_the_blocker_names_the_exact_largest_passing_budget(valid_config_path: Path) -> None:
+    """The issue's own worked example: $500/0.10 against a $500 cap blocks at $517.35. Pinned
+    (not merely re-derived) so a regression in the search shows up as a diff, not a silent pass;
+    `test_the_suggested_budget_and_buffer_actually_pass_when_rerun` below is the proof that this
+    number is not just plausible but correct -- re-running `build_dca_plan` at it and one cent
+    over it."""
+    plan = _plan(valid_config_path, cap="500")
+    assert plan.max_passing_budget_usd == Decimal("483.26")
+    assert plan.min_passing_buffer_pct == Decimal("0.1302")
+
+
+def test_the_suggested_budget_and_buffer_actually_pass_when_rerun(valid_config_path: Path) -> None:
+    """Proof, not assertion: re-run `build_dca_plan` with the suggested budget (same buffer) and
+    the suggested buffer (same budget), and confirm rail 14 no longer blocks -- then confirm one
+    cent more / 0.0001 less DOES block, pinning the boundary from both sides."""
+    plan = _plan(valid_config_path, cap="500")
+    assert plan.max_passing_budget_usd is not None
+    assert plan.min_passing_buffer_pct is not None
+
+    at_budget = _plan(valid_config_path, cap="500", budget=format(plan.max_passing_budget_usd, "f"))
+    assert not [b for b in at_budget.blockers if "rail 14" in b], at_budget.blockers
+    over_budget = _plan(
+        valid_config_path,
+        cap="500",
+        budget=format(plan.max_passing_budget_usd + Decimal("0.01"), "f"),
+    )
+    assert any("rail 14" in b for b in over_budget.blockers)
+
+    at_buffer = _plan(valid_config_path, cap="500", buffer=format(plan.min_passing_buffer_pct, "f"))
+    assert not [b for b in at_buffer.blockers if "rail 14" in b], at_buffer.blockers
+    under_buffer = _plan(
+        valid_config_path,
+        cap="500",
+        buffer=format(plan.min_passing_buffer_pct - Decimal("0.0001"), "f"),
+    )
+    assert any("rail 14" in b for b in under_buffer.blockers)
+
+
+def test_the_suggestion_reserves_headroom_for_existing_live_commitments(
+    valid_config_path: Path,
+) -> None:
+    """R7, folded into #854: the search reserves the existing `live` DCA rules' own worst-case
+    commitment out of the cap, so the suggested budget/buffer for an otherwise-identical plan
+    are STRICTER (smaller budget, larger buffer) once a live rule exists. SOL is off the
+    BTC/ETH/PAXG allowlist, so it does not change this plan's own weights or figures -- only the
+    headroom reserved against the cap. SOL's own worst month: $10 x 5 buy days = $50."""
+    plan_no_live = _plan(valid_config_path, cap="500")
+    assert plan_no_live.max_passing_budget_usd == Decimal("483.26")
+    assert plan_no_live.min_passing_buffer_pct == Decimal("0.1302")
+
+    repo = _repo()
+    _insert_dca(repo, "SOL-USD", "live", budget="10")
+    plan_with_live = _plan(valid_config_path, repo, cap="500")
+    assert not plan_with_live.approvable
+    assert plan_with_live.max_passing_budget_usd == Decimal("434.94")
+    assert plan_with_live.min_passing_buffer_pct == Decimal("0.2172")
+    assert plan_with_live.max_passing_budget_usd < plan_no_live.max_passing_budget_usd
+    assert plan_with_live.min_passing_buffer_pct > plan_no_live.min_passing_buffer_pct
+
+    (blocker,) = [b for b in plan_with_live.blockers if "rail 14" in b]
+    assert "existing live DCA rules' own worst-case commitment $50.00/month" in blocker
+
+    # Proof: at the suggested budget, the plan collides with neither the rail-14 blocker (R6,
+    # which only ever compares THIS plan's own worst month against the raw cap -- it does not
+    # know about other rules) NOR the R7 warning that DOES watch the combined worst-case total
+    # against the live rule. One cent more clears R6 too (R6 is looser than our reservation) but
+    # now trips the R7 warning -- proving the reservation actually did something, since R6 alone
+    # would have kept waving this budget through.
+    at_budget = _plan(
+        valid_config_path,
+        repo,
+        cap="500",
+        budget=format(plan_with_live.max_passing_budget_usd, "f"),
+    )
+    assert not [b for b in at_budget.blockers if "rail 14" in b], at_budget.blockers
+    combined_warnings = [w for w in at_budget.warnings if "worst-case combined total" in w]
+    assert not combined_warnings, combined_warnings
+
+    over_budget = _plan(
+        valid_config_path,
+        repo,
+        cap="500",
+        budget=format(plan_with_live.max_passing_budget_usd + Decimal("0.01"), "f"),
+    )
+    assert not [b for b in over_budget.blockers if "rail 14" in b], over_budget.blockers
+    assert any("worst-case combined total" in w for w in over_budget.warnings)
+
+    # -- and the NAIVE (no-live) suggestion, replayed against the SAME repo, still collides with
+    # the live rule (the R7 warning fires) -- proving the reservation is not a no-op: ignoring
+    # existing commitments would have suggested a budget that still spends into the live rule's
+    # own worst month, R6's blindness to other rules notwithstanding.
+    naive_replay = _plan(
+        valid_config_path, repo, cap="500", budget=format(plan_no_live.max_passing_budget_usd, "f")
+    )
+    assert not [b for b in naive_replay.blockers if "rail 14" in b], naive_replay.blockers
+    assert any("worst-case combined total" in w for w in naive_replay.warnings)
+
+
+def test_no_positive_value_passes_when_existing_commitments_alone_exceed_the_cap(
+    valid_config_path: Path,
+) -> None:
+    """Requirement 3's other named case: existing live commitments alone already exceed the cap
+    (SOL's own worst month is $100 x 5 = $500, over the $400 cap used here), so no budget or
+    buffer-pct for THIS plan could ever leave room for them. Both fields are `None`, and the
+    blocker says so in words rather than a number."""
+    repo = _repo()
+    _insert_dca(repo, "SOL-USD", "live", budget="100")
+    plan = _plan(valid_config_path, repo, cap="400")
+    assert not plan.approvable
+    assert plan.max_passing_budget_usd is None
+    assert plan.min_passing_buffer_pct is None
+    (blocker,) = [b for b in plan.blockers if "rail 14" in b]
+    assert "no positive --budget would pass" in blocker
+    assert "no --buffer-pct below 1 would pass" in blocker
+
+
+def test_no_buffer_below_one_passes_at_a_zero_cap_for_a_large_enough_budget(
+    valid_config_path: Path,
+) -> None:
+    """Requirement 3's first named case: cap $0 (no subscription attested). At a large enough
+    budget, even the largest legal buffer-pct (0.9999) leaves more than $0.00 spend, so no
+    buffer-pct below 1 passes -- while a much smaller budget still could (the budget side is not
+    vacuously `None` here, proving the two searches fail independently)."""
+    plan = _plan(valid_config_path, budget="5000", buffer="0.1", cap=None)
+    assert not plan.approvable
+    assert plan.min_passing_buffer_pct is None
+    assert plan.max_passing_budget_usd is not None
+    (blocker,) = [b for b in plan.blockers if "rail 14" in b]
+    assert "no --buffer-pct below 1 would pass" in blocker
+    assert "the largest --budget that would pass is" in blocker
+
+
+def test_suggested_values_never_use_exponent_notation() -> None:
+    """#854: `format(value, "f")` is the only formatting path used for the suggested values --
+    the same guard `parse_plan_inputs` already relies on
+    (`test_an_input_with_an_absurd_exponent_is_refused_before_it_is_spelled_out`).
+    `Decimal("4E+2")` / `Decimal("1E-4")` are exactly the shapes `str()`/`repr()` would spell as
+    `4E+2` / `1E-4`; `format(x, "f")` must render them as plain decimals instead."""
+    text = dca_mod._passing_suggestion_text(
+        Decimal("4E+2"),
+        Decimal("1E-4"),
+        buffer_pct=Decimal("1E-1"),
+        budget_usd=Decimal("5E+2"),
+        live_worst_month_usd=Decimal("0"),
+    )
+    assert "E+" not in text
+    assert "E-" not in text
+    assert "400" in text
+    assert "0.0001" in text
+
+    # And directly on a value carrying a live-commitment reservation (`_usd`, not `format(...,
+    # 'f')`, but the same hazard: `_usd` quantizes to cents first, which never emits an exponent
+    # either).
+    text_with_reservation = dca_mod._passing_suggestion_text(
+        Decimal("4E+2"),
+        Decimal("1E-4"),
+        buffer_pct=Decimal("1E-1"),
+        budget_usd=Decimal("5E+2"),
+        live_worst_month_usd=Decimal("5E-5"),
+    )
+    assert "E+" not in text_with_reservation
+    assert "E-" not in text_with_reservation
 
 
 def test_the_planned_total_never_exceeds_the_spend_that_was_checked(
