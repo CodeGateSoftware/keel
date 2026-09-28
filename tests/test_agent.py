@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import replace
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from types import SimpleNamespace
 from typing import Any
 
@@ -2662,6 +2662,45 @@ class _AlwaysEnterRule(Rule):
 
     def describe(self) -> dict:
         return {"name": self.name, "params": self.params}
+
+
+class _SellPreviewRaisesAgentBroker(FakeBroker):
+    """#799's venue: the ENTRY previews and fills, the protective SELL's preview throws."""
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self.sell_previews = 0
+
+    def preview_order(self, spec: OrderSpec) -> Preview:
+        if spec.side is Side.SELL:
+            self.sell_previews += 1
+            raise InvalidOperation("[<class 'decimal.ConversionSyntax'>]")
+        return super().preview_order(spec)
+
+
+def test_799_a_throwing_bracket_preview_still_records_the_tranche(repo, monkeypatch):
+    """#799's acceptance: the entry filled, the bracket's preview threw, and the tranche is
+    still in the ledger with the stop the rule computed -- not stranded as unmanaged spot."""
+    rule = _AlwaysEnterRule(PRODUCT)
+    _seed_rule(repo, monkeypatch, rule, status="live")
+    broker = _SellPreviewRaisesAgentBroker(
+        series={(PRODUCT, Granularity.ONE_DAY): [_candle(0, "100")]}
+    )
+
+    # A small risk budget: at the default 1% of this fake's $1M balance the entry sizes past rail
+    # 2 and is vetoed, and a vetoed ENTRY never reaches the bracket leg this test is about (the
+    # `sell_previews` count below proves it did).
+    run_once(broker, repo, _config(risk_pct=Decimal("0.0001")), now_ts=90_000)
+
+    assert broker.sell_previews == 1, "the bracket leg must actually have reached the preview"
+    [entry] = [o for o in repo.get_orders(mode="live") if o["side"] == Side.BUY.value]
+    assert entry["status"] == "filled"
+    [tranche] = repo.get_open_positions(PRODUCT)
+    assert tranche["initial_stop"] == Decimal("95.00"), "#799: the stop was computed and discarded"
+    assert tranche["bracket_order_id"] is None
+    assert repo.get_state(f"{executor.UNBRACKETED_PREFIX}{PRODUCT}") is not None, (
+        "the next cycle's sweep re-places the bracket from this record"
+    )
 
 
 def _paper_config(**over):

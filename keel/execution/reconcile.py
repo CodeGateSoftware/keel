@@ -303,7 +303,9 @@ def reconcile_unbracketed_positions(
 
         if new_id is None:
             # `place_bracket` has re-written the `unbracketed:` record on its way out, so the
-            # retry survives to the next cycle rather than being stranded here.
+            # retry survives to the next cycle rather than being stranded here -- except when
+            # `place_order` itself raised (#799, plan R5): the venue may hold that bracket, so
+            # `place_bracket` CLEARED the record and a human reconciles the `pending` row.
             _escalate_unprotected_position(
                 position, qty, "bracket placement was vetoed or rejected again"
             )

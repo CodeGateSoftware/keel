@@ -1272,6 +1272,37 @@ def test_a_tranche_that_could_not_be_bracketed_keeps_its_record_for_the_next_cyc
     assert repo.get_state(f"unbracketed:{PRODUCT}") is not None
 
 
+class _TimingOutRebracketBroker(_RebracketingBroker):
+    """The bracket previews, then `place_order` raises: the venue may or may not hold it."""
+
+    def place_order(self, spec: OrderSpec, *, idempotency_key: str | None = None) -> PlaceResult:
+        self.placed.append({"spec": spec})
+        raise TimeoutError("read timed out")
+
+
+def test_a_retry_whose_placement_state_is_unknown_is_not_retried_again(repo, caplog):
+    """#799, plan R5. The one exception to "a failed retry stays retryable" above: when
+    `place_order` itself raised, the `orders` row is written and the venue may be holding the
+    bracket. The tranche still names no bracket, so a surviving `unbracketed:` record would make
+    the NEXT sweep place a second one against inventory the first may already commit. The
+    record goes, the `pending` row stays for a human, and the position is escalated."""
+    _seed_unbracketed_tranche(repo)
+    _allow_orders(repo)
+    broker = _TimingOutRebracketBroker()
+
+    with caplog.at_level(logging.CRITICAL):
+        reconcile.reconcile_unbracketed_positions(broker, repo, _config(), now_ts=NOW)
+        assert repo.get_state(f"unbracketed:{PRODUCT}") is None
+        reconcile.reconcile_unbracketed_positions(broker, repo, _config(), now_ts=NOW)
+
+    assert len(broker.placed) == 1, "the second sweep re-placed a bracket the venue may hold"
+    [pending] = repo.get_orders(mode="live", product_id=PRODUCT, status="pending")
+    assert pending["side"] == Side.SELL.value
+    events = [r.getMessage() for r in caplog.records if r.levelno == logging.CRITICAL]
+    assert events.count("executor.bracket_state_unknown") == 1
+    assert events.count("reconcile.position_unprotected") == 1
+
+
 def test_a_tranche_with_a_resting_bracket_is_left_alone(repo):
     """Already protected. Re-placing would commit inventory the resting bracket already holds
     and be refused for insufficient funds -- turning a healthy position into a naked one."""

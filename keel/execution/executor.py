@@ -2264,6 +2264,10 @@ def _floor_or_original(qty: Decimal, increment: Decimal) -> Decimal:
 #: ("silently re-risk the position on a level no rule produced"), so they get a key of their own.
 UNBRACKETED_PREFIX = "unbracketed:"
 
+#: Logged when a bracket leg failed AFTER its `orders` row was written (plan R5, #799): the venue
+#: may or may not be holding it, so nothing re-places it and the row stays `pending` for a human.
+BRACKET_STATE_UNKNOWN_EVENT = "executor.bracket_state_unknown"
+
 
 def place_bracket(
     broker: Any,
@@ -2287,6 +2291,18 @@ def place_bracket(
     for future entries and rolls, and `open_target:<product_id>` is needed because a single order
     now carries both prices -- rolling the stop means re-placing the bracket, and the target is
     no longer recoverable from a separate leg.
+
+    **It never raises for a bracket-leg failure (#799, plan R5).** Its callers run it after an
+    entry has already FILLED, so an exception here costs a real position its ledger row. Every
+    failure returns `None`, and the stage decides what is left behind:
+
+    - before the bracket's `orders` row exists (the spec cannot be built, or the preview
+      raised): the `unbracketed:` retry record, exactly as for a veto or a venue refusal;
+    - after it exists (`place_order` raised, `TradeScopeDenied` included): NO retry record --
+      one already standing from an earlier attempt is CLEARED -- the `pending` row stays, and a
+      CRITICAL `executor.bracket_state_unknown` names it. The venue may be holding that bracket,
+      so a retry could double-commit the base; exits on the product fail closed on the row until
+      a human reconciles it.
     """
     # #667, and this is the site the fee-dust case actually bites: `qty` here is the size the
     # ENTRY was placed for, and a venue that takes its taker fee out of the received base leaves
@@ -2343,16 +2359,66 @@ def place_bracket(
         )
         return None
 
-    result = _run_order(
-        intent,
-        broker,
-        repo,
-        config,
-        "autonomous",
-        None,
-        now_ts,
-        spec=spec,
-    )
+    # #799 proposal 2 (plan R5). The ENTRY has already filled when this runs, so NOTHING raised
+    # by the bracket leg may escape: an exception here used to unwind through `execute` and
+    # `run_once` past `_open_tranche`, and a funded position was left with no ledger row, no exit
+    # and no stop for three weeks. The stage decides the recovery. Before the row exists (the
+    # preview threw) nothing reached the venue: record the retry exactly like a refusal. After it
+    # exists (`place_order` threw) the venue's state is unknown: a retry could double-commit the
+    # base, so leave the `pending` row -- `_clear_resting_bracket` fails closed on it -- and say
+    # so. `TradeScopeDenied` is included on purpose: `_run_order` has already written the
+    # refutation before re-raising, so swallowing it here loses nothing.
+    before = {o["id"] for o in repo.get_orders(mode="live", product_id=product_id)}
+    try:
+        result = _run_order(
+            intent,
+            broker,
+            repo,
+            config,
+            "autonomous",
+            None,
+            now_ts,
+            spec=spec,
+        )
+    except Exception as exc:  # noqa: BLE001 -- see the comment above
+        written = [
+            o
+            for o in repo.get_orders(mode="live", product_id=product_id)
+            if o["id"] not in before and o["side"] == Side.SELL.value
+        ]
+        if not written:
+            repo.set_state(
+                f"{UNBRACKETED_PREFIX}{product_id}",
+                {"stop": stop, "target": target, "qty": qty},
+            )
+            log_event(
+                logger,
+                logging.WARNING,
+                "executor.bracket_not_placed",
+                product=product_id,
+                reason=f"the bracket leg raised before reaching the venue: {exc!r}",
+                vetoed_by=[],
+            )
+        else:
+            # CLEARED, not merely left unwritten. When this call IS the sweep's retry
+            # (`reconcile.reconcile_unbracketed_positions`), the record from the first attempt is
+            # still standing, and the tranche still names no bracket -- so the next sweep would
+            # place a second bracket against base the first may already commit.
+            repo.set_state(f"{UNBRACKETED_PREFIX}{product_id}", None)
+            log_event(
+                logger,
+                logging.CRITICAL,
+                BRACKET_STATE_UNKNOWN_EVENT,
+                product=product_id,
+                order_id=written[-1]["id"],
+                reason=repr(exc),
+                detail=(
+                    "the entry filled and its bracket's placement raised after the order row "
+                    "was written: the venue may be holding it. Nothing will re-place it; "
+                    "exits on this product wait until a human reconciles the row"
+                ),
+            )
+        return None
     if not result.placed:
         # The entry has ALREADY filled by the time we get here, so this is a real position with
         # no stop at the exchange -- not a trade that simply did not happen. Record the levels so
