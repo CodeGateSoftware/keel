@@ -1957,6 +1957,7 @@ _DCA_KEYS = {
     "existing",
     "blockers",
     "warnings",
+    "screen_age",
 }
 
 
@@ -1998,6 +1999,63 @@ def test_the_dca_payload_has_one_shape_in_both_states(valid_config_path: Path) -
     assert awaiting["state"]["state"] == "unknown"
     assert awaiting["buys"] == [] and awaiting["summary"]["spend"]["state"] == "unknown"
     assert awaiting["cap_check"]["state"] == "unknown"
+
+
+#: #856 review: what `screen_age` carries when no screen was run for the response -- a judged
+#: field with its own words, so the card's note line never shows a lone, unlabeled "—".
+_NOT_SCREENED = {
+    "value": "not_screened",
+    "display": "Asset screen: not run yet -- it runs once a budget is entered.",
+    "state": "unknown",
+}
+
+
+def test_the_dca_payload_awaiting_state_says_no_screen_ran(valid_config_path: Path) -> None:
+    """#856: no budget means `read_dca_plan` never reaches the screen cache, so `screen_age` names
+    that in words -- never a manufactured age for a screen that was not built, and never a bare
+    "—" the card would place as an unlabeled line."""
+    from keel.commands.dca_plan import apply_command
+
+    awaiting = payload.dca_plan_awaiting_payload(command=apply_command(None))
+    assert awaiting["screen_age"] == _NOT_SCREENED
+
+
+def test_the_dca_payload_without_a_screen_age_never_claims_a_fresh_screen(
+    valid_config_path: Path,
+) -> None:
+    """#856 review: a caller that passes no screen age gets the not-screened field, not a silent
+    default of "0s ago" claiming a screen nobody measured."""
+    body = payload.dca_plan_payload(_dca_plan(valid_config_path), command="x")
+    assert body["screen_age"] == _NOT_SCREENED
+
+
+def test_the_dca_payload_carries_the_screen_age_as_structure(valid_config_path: Path) -> None:
+    """#856: the exact field shape a stale-but-cached screen sends -- checked field by field, not
+    by scanning the rendered sentence for a substring. The refresh interval is the caller's TTL,
+    written by the same `_human_remaining` ladder, never a second copy of the constant."""
+    plan = _dca_plan(valid_config_path)
+    body = payload.dca_plan_payload(
+        plan, command="x", screen_age_seconds=125, screen_ttl_seconds=300
+    )
+    assert body["screen_age"] == {
+        "value": "125",
+        "display": "Asset screen from 2m ago; refreshes every 5m.",
+        "state": "neutral",
+    }
+    # A freshly-built screen (age 0) is phrased the same way `_human_age(0)` phrases any instant.
+    fresh = payload.dca_plan_payload(
+        plan, command="x", screen_age_seconds=0, screen_ttl_seconds=300
+    )
+    assert fresh["screen_age"] == {
+        "value": "0",
+        "display": "Asset screen from 0s ago; refreshes every 5m.",
+        "state": "neutral",
+    }
+    # The interval follows the TTL it is handed.
+    longer = payload.dca_plan_payload(
+        plan, command="x", screen_age_seconds=0, screen_ttl_seconds=600
+    )
+    assert longer["screen_age"]["display"] == "Asset screen from 0s ago; refreshes every 10m."
 
 
 def test_the_dca_payload_places_every_figure_the_plan_computed(valid_config_path: Path) -> None:

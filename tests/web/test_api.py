@@ -1686,3 +1686,336 @@ def test_dca_plan_answers_no_post(running: web_server.ServeConfig) -> None:
         headers={"X-Keel-Client": "1"},
     )
     assert status == 404
+
+
+# -- #856: the admission screen behind /api/dca-plan is cached ------------------------------------
+
+
+def _counting_build_screen_report(monkeypatch: pytest.MonkeyPatch) -> dict[str, int]:
+    """Wraps `keel.commands.admission.build_screen_report` with a call counter, patched at ITS OWN
+    module so `read_dca_plan`'s per-call `from keel.commands.admission import build_screen_report`
+    (resolved fresh on every call, the same reason `screen_product` is) picks up the wrapper."""
+    from keel.commands import admission
+
+    calls = {"n": 0}
+    original = admission.build_screen_report
+
+    def counting(repo: Any, config: Any, screen_fn: Any) -> Any:
+        calls["n"] += 1
+        return original(repo, config, screen_fn)
+
+    monkeypatch.setattr(admission, "build_screen_report", counting)
+    return calls
+
+
+def _screen_cache_cfg(db_path: str, config_path: str) -> web_server.ServeConfig:
+    """A `ServeConfig` built but never bound to a socket -- `read_dca_plan` needs only its paths
+    and its `screen_cache`, so a real `keel serve` process is not needed to exercise it."""
+    return web_server.ServeConfig(
+        host="127.0.0.1",
+        port=0,
+        token=new_session_token(),
+        db_path=db_path,
+        config_path=config_path,
+    )
+
+
+def test_dca_plan_screen_cache_is_a_hit_on_a_second_read_within_the_ttl(
+    deployment: tuple[str, str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#856: two reads of the same deployment, close together, re-screen the allowlist only once.
+
+    Driven directly against `read_dca_plan` (not over HTTP) so `now_ts` -- the reader's own
+    injected clock, already threaded through every reader in this file -- can be moved without a
+    real `time.sleep`."""
+    db_path, config_path = deployment
+    cfg = _screen_cache_cfg(db_path, config_path)
+    asked = _admit_everything(monkeypatch)
+    builds = _counting_build_screen_report(monkeypatch)
+    query: web_api.Query = {"budget": ["1e3"], "buffer": ["0.1"]}
+
+    first = web_api.read_dca_plan(cfg, query, None, 1_700_000_000)
+    assert builds["n"] == 1
+    assert asked, "the first read never reached the per-product screen at all"
+    assert first["screen_age"]["value"] == "0"
+
+    asked.clear()
+    second = web_api.read_dca_plan(cfg, query, None, 1_700_000_000 + 299)
+    assert builds["n"] == 1, "a read inside the 5-minute TTL re-screened the allowlist"
+    assert asked == [], "a cache HIT must not call the per-product screen at all"
+    assert second["screen_age"]["value"] == "299"
+
+
+def test_dca_plan_screen_cache_expires_exactly_at_the_ttl_boundary(
+    deployment: tuple[str, str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The boundary ruling: an entry exactly 300s old is STALE (`<`, not `<=`, is freshness),
+    matching `keel/execution/guards.py`'s own `attest_due_ts <= now_ts` (equality means due)."""
+    db_path, config_path = deployment
+    cfg = _screen_cache_cfg(db_path, config_path)
+    _admit_everything(monkeypatch)
+    builds = _counting_build_screen_report(monkeypatch)
+    query: web_api.Query = {"budget": ["1e3"], "buffer": ["0.1"]}
+
+    web_api.read_dca_plan(cfg, query, None, 1_700_000_000)
+    web_api.read_dca_plan(cfg, query, None, 1_700_000_000 + 300)
+    assert builds["n"] == 2, "an entry exactly 300s old must be treated as stale, not fresh"
+
+
+def test_dca_plan_screen_cache_rebuilds_well_past_the_ttl(
+    deployment: tuple[str, str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    db_path, config_path = deployment
+    cfg = _screen_cache_cfg(db_path, config_path)
+    _admit_everything(monkeypatch)
+    builds = _counting_build_screen_report(monkeypatch)
+    query: web_api.Query = {"budget": ["1e3"], "buffer": ["0.1"]}
+
+    web_api.read_dca_plan(cfg, query, None, 1_700_000_000)
+    web_api.read_dca_plan(cfg, query, None, 1_700_000_600)
+    assert builds["n"] == 2
+
+
+def test_dca_plan_screen_cache_keys_on_both_config_and_db_path(
+    deployment: tuple[str, str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A different config path (a second deployment on the same machine) must not read the first
+    deployment's cached screen, even if both are asked about at the same instant."""
+    db_path, config_path = deployment
+    other_config_path = str(Path(config_path).with_name("other-config.yaml"))
+    Path(other_config_path).write_text(Path(config_path).read_text())
+    cfg = _screen_cache_cfg(db_path, config_path)
+    other_cfg = web_server.ServeConfig(
+        host=cfg.host,
+        port=cfg.port,
+        token=cfg.token,
+        db_path=cfg.db_path,
+        config_path=other_config_path,
+        screen_cache=cfg.screen_cache,
+    )
+    _admit_everything(monkeypatch)
+    builds = _counting_build_screen_report(monkeypatch)
+    query: web_api.Query = {"budget": ["1e3"], "buffer": ["0.1"]}
+
+    web_api.read_dca_plan(cfg, query, None, 1_700_000_000)
+    web_api.read_dca_plan(other_cfg, query, None, 1_700_000_000)
+    assert builds["n"] == 2, "a different config_path sharing a cache must still be a MISS"
+
+
+def test_dca_plan_screen_cache_misses_when_the_allowlist_changes_within_the_ttl(
+    deployment: tuple[str, str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#873: `load_config` re-reads config.yaml on every request, so an operator who adds an
+    asset to the allowlist at the SAME path must not be told, for up to 5 minutes, that it was
+    "not screened". The screen depends on the allowlist and the quote currency, so the key
+    carries both: the second read below is a MISS and admits PAXG."""
+    db_path, config_path = deployment
+    full = Path(config_path).read_text()
+    without_paxg = full.replace("  - PAXG\n", "", 1).replace("  PAXG: 0.30\n", "", 1)
+    assert without_paxg.count("PAXG") == full.count("PAXG") - 2, "the fixture edit did not apply"
+    without_paxg = without_paxg.replace("  BTC: 0.40\n", "  BTC: 0.70\n", 1)
+    Path(config_path).write_text(without_paxg)
+    cfg = _screen_cache_cfg(db_path, config_path)
+    asked = _admit_everything(monkeypatch)
+    builds = _counting_build_screen_report(monkeypatch)
+    query: web_api.Query = {"budget": ["1e3"], "buffer": ["0.1"]}
+
+    first = web_api.read_dca_plan(cfg, query, None, 1_700_000_000)
+    assert [row["asset"] for row in first["buys"]] == ["BTC", "ETH"]
+    assert builds["n"] == 1
+
+    Path(config_path).write_text(full)
+    asked.clear()
+    second = web_api.read_dca_plan(cfg, query, None, 1_700_000_000 + 60)
+    assert builds["n"] == 2, "an allowlist change at the same config path must be a MISS"
+    assert "PAXG-USD" in asked, "the rebuilt screen never asked about the new asset"
+    assert [row["asset"] for row in second["buys"]] == ["BTC", "ETH", "PAXG"]
+
+
+def test_dca_plan_cache_hit_still_reads_the_budget_and_the_rules_fresh(
+    deployment: tuple[str, str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#856 review: ONLY the screen is cached. Within the TTL, a changed budget and a DCA rule
+    added to the database both reach the plan, while the screen is still a HIT -- a regression
+    that cached the built plan (or the rule list) with the screen fails here."""
+    from keel.data.repository import Repository
+    from tests.commands.test_dca_plan import _insert_dca
+
+    db_path, config_path = deployment
+    cfg = _screen_cache_cfg(db_path, config_path)
+    _admit_everything(monkeypatch)
+    builds = _counting_build_screen_report(monkeypatch)
+
+    first = web_api.read_dca_plan(cfg, {"budget": ["1e3"], "buffer": ["0.1"]}, None, 1_700_000_000)
+    assert first["existing"] == []
+    assert first["summary"]["budget"]["value"] == "1000"
+
+    conn = connect(db_path)
+    rule_id = _insert_dca(Repository(conn), "SOL-USD", "live", budget="10")
+    conn.commit()
+    conn.close()
+
+    # The SAME query the page's poll repeats: a plan cached per query string would still answer
+    # with the stale, rule-less plan here.
+    same_query = web_api.read_dca_plan(
+        cfg, {"budget": ["1e3"], "buffer": ["0.1"]}, None, 1_700_000_000 + 30
+    )
+    assert builds["n"] == 1
+    assert [
+        (row["rule_id"], row["product_id"], row["status"]) for row in same_query["existing"]
+    ] == [(str(rule_id), "SOL-USD", "live")]
+
+    second = web_api.read_dca_plan(
+        cfg, {"budget": ["600"], "buffer": ["0.1"]}, None, 1_700_000_000 + 60
+    )
+    assert builds["n"] == 1, "the screen must still be a HIT for this test to mean anything"
+    assert second["summary"]["budget"]["value"] == "600"
+    assert [(row["rule_id"], row["product_id"], row["status"]) for row in second["existing"]] == [
+        (str(rule_id), "SOL-USD", "live")
+    ]
+
+
+def test_screen_cache_key_isolation() -> None:
+    """`ScreenCache` itself, isolated from the DCA plan entirely: a different key -- either half
+    of it -- is a separate entry, and the SAME key at the SAME instant never rebuilds."""
+    cache = web_api.ScreenCache()
+    calls = {"a": 0, "b": 0}
+
+    def build_a() -> str:
+        calls["a"] += 1
+        return "report-a"
+
+    def build_b() -> str:
+        calls["b"] += 1
+        return "report-b"
+
+    report_a1, age_a1 = cache.get_or_build(("config-a", "db-x"), 1000, build_a)
+    report_b1, _age_b1 = cache.get_or_build(("config-b", "db-x"), 1000, build_b)
+    report_a2, age_a2 = cache.get_or_build(("config-a", "db-x"), 1000, build_a)
+    report_c1, _age_c1 = cache.get_or_build(("config-a", "db-y"), 1000, build_b)
+
+    assert calls == {"a": 1, "b": 2}, "a different config path OR db path is a separate entry"
+    assert (report_a1, age_a1) == ("report-a", 0)
+    assert (report_a2, age_a2) == ("report-a", 0), "the same key at the same instant is a HIT"
+    assert report_b1 == "report-b" and report_c1 == "report-b"
+
+
+def test_screen_cache_hit_and_miss_boundary() -> None:
+    """The TTL arithmetic on its own, with no DCA plan involved at all."""
+    cache = web_api.ScreenCache()
+    calls = {"n": 0}
+
+    def build() -> object:
+        calls["n"] += 1
+        return object()
+
+    first, first_age = cache.get_or_build(("c", "d"), 1_000, build)
+    assert calls["n"] == 1 and first_age == 0
+
+    hit, hit_age = cache.get_or_build(("c", "d"), 1_000 + 299, build)
+    assert calls["n"] == 1, "an entry 299s old is still a HIT"
+    assert hit is first and hit_age == 299
+
+    miss, miss_age = cache.get_or_build(("c", "d"), 1_000 + 300, build)
+    assert calls["n"] == 2, "an entry exactly TTL_SECONDS old is a MISS"
+    assert miss is not first and miss_age == 0
+
+
+def test_screen_cache_age_is_never_negative_for_a_request_stamped_before_the_build() -> None:
+    """`ThreadingHTTPServer` stamps `now_ts` when a request arrives, and a request can wait on the
+    lock while a LATER-stamped one builds the entry. Its age must read 0, never "-1s ago"."""
+    cache = web_api.ScreenCache()
+    calls = {"n": 0}
+
+    def build() -> object:
+        calls["n"] += 1
+        return object()
+
+    built, _ = cache.get_or_build(("c", "d"), 1_001, build)
+    earlier, earlier_age = cache.get_or_build(("c", "d"), 1_000, build)
+    assert calls["n"] == 1
+    assert earlier is built and earlier_age == 0
+
+
+def test_screen_cache_treats_a_clock_stepped_back_past_the_ttl_as_a_miss() -> None:
+    """#856 review: the wall clock can step BACKWARDS (an NTP correction). A lock-wait makes an
+    age of a second or two negative legitimately (the test above), but an entry "built" a full
+    TTL or more in this request's future is a clock that moved, and serving it would keep a stale
+    screen up for the step plus the TTL while the card read "0s ago". It is a MISS."""
+    cache = web_api.ScreenCache()
+    calls = {"n": 0}
+
+    def build() -> object:
+        calls["n"] += 1
+        return object()
+
+    built, _ = cache.get_or_build(("c", "d"), 10_000, build)
+    within, within_age = cache.get_or_build(("c", "d"), 10_000 - 299, build)
+    assert calls["n"] == 1, "a step back of less than the TTL is still a HIT"
+    assert within is built and within_age == 0
+
+    rebuilt, rebuilt_age = cache.get_or_build(("c", "d"), 10_000 - 300, build)
+    assert calls["n"] == 2, "a step back of the whole TTL or more must rebuild"
+    assert rebuilt is not built and rebuilt_age == 0
+
+
+def test_dca_plan_screen_age_states_the_caches_own_ttl(
+    deployment: tuple[str, str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#856 review: the card's "refreshes every ..." is the TTL the cache actually applies, handed
+    through by `read_dca_plan` -- change the TTL and both the expiry and the sentence move."""
+    db_path, config_path = deployment
+    cfg = _screen_cache_cfg(db_path, config_path)
+    monkeypatch.setattr(cfg.screen_cache, "TTL_SECONDS", 600)
+    _admit_everything(monkeypatch)
+    builds = _counting_build_screen_report(monkeypatch)
+    query: web_api.Query = {"budget": ["1e3"], "buffer": ["0.1"]}
+
+    first = web_api.read_dca_plan(cfg, query, None, 1_700_000_000)
+    later = web_api.read_dca_plan(cfg, query, None, 1_700_000_000 + 599)
+    assert builds["n"] == 1, "the 600s TTL set on the cache is the one that governs expiry"
+    assert first["screen_age"] == {
+        "value": "0",
+        "display": "Asset screen from 0s ago; refreshes every 10m.",
+        "state": "neutral",
+    }
+    assert later["screen_age"] == {
+        "value": "599",
+        "display": "Asset screen from 9m ago; refreshes every 10m.",
+        "state": "neutral",
+    }
+
+
+def test_screen_cache_is_thread_safe_under_concurrent_misses(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Two threads racing a cold cache must not corrupt `_entries`, and the lock held across a
+    MISS's rebuild (a deliberate choice -- see `ScreenCache`'s docstring) means exactly one of
+    them actually builds while the other waits for and then reads that same result."""
+    import threading
+    import time as time_mod
+
+    cache = web_api.ScreenCache()
+    calls = {"n": 0}
+    calls_lock = threading.Lock()
+
+    def build() -> str:
+        with calls_lock:
+            calls["n"] += 1
+        time_mod.sleep(0.05)
+        return "report"
+
+    results: list[str] = []
+
+    def worker() -> None:
+        report, _age = cache.get_or_build(("c", "d"), 1_000, build)
+        results.append(report)
+
+    threads = [threading.Thread(target=worker) for _ in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=5)
+
+    assert calls["n"] == 1, "concurrent misses on the same key must build exactly once"
+    assert results == ["report"] * 8

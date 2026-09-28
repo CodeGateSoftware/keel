@@ -34,8 +34,9 @@ AST scan over this file for exactly that reason.
 
 from __future__ import annotations
 
+import threading
 import time
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Hashable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -783,6 +784,97 @@ def read_rules(cfg: ServeConfig, _query: Query, _state: Any, _now_ts: int) -> di
     return payload.rules_payload(rows)
 
 
+#: How long one deployment's admission screen stays cached (#856). 5 minutes: short enough that
+#: an operator who just fixed a candle gap or attested an asset sees it admitted within one
+#: coffee, long enough that `/rules?budget=`'s 15s poll (`server._REFRESH_SEC`) stops re-running
+#: the whole allowlist's `screen_product` against the database twenty times for every time an
+#: operator actually changes the budget or buffer in the address bar.
+_SCREEN_CACHE_TTL_SECONDS = 300
+
+
+@dataclass(frozen=True)
+class _ScreenCacheEntry:
+    report: Any
+    built_at_ts: int
+
+
+class ScreenCache:
+    """Caches one deployment's admission screen -- `build_screen_report`'s result -- across the
+    repeated `/api/dca-plan` reads `/rules?budget=`'s 15s poll makes (#856).
+
+    **What is cached, and why not the whole plan.** `/api/dca-plan`'s budget and buffer are query
+    parameters an operator can retype at will, and `build_dca_plan` recomputes every buy from
+    them; caching the PLAN would serve one operator's first-typed budget back on their fifth
+    request. The screen (`select_universe`'s admission gate) reads only the allowlist and the
+    database, which the config and the database on disk govern -- not the query string -- so it
+    is the one part of this read that is genuinely the same answer for `TTL_SECONDS`.
+
+    **Keyed on `(config_path, db_path)`, not relied on being one-per-`ServeConfig`.** In
+    production a `ServeConfig` is frozen and built once per `keel serve` process (`server.py`), so
+    a cache living on it is already scoped to one deployment by construction. Keying on the paths
+    anyway is what keeps a `ScreenCache` correct on its own terms -- a test harness, or a future
+    hot-reloaded `ServeConfig`, sharing one `ScreenCache` across two deployments still gets two
+    entries rather than one deployment's screen answering for another's.
+
+    **And on what the screen reads from the config (#873).** `read_dca_plan` re-reads
+    config.yaml on every request, so the same path can name a new allowlist a minute later. The
+    caller's key therefore also carries the screened product ids and the quote currency --
+    exactly the inputs `build_screen_report` takes from the config -- so an asset added at the
+    same path is screened on the next read, never reported "not screened" for a whole TTL.
+
+    **Holds no connection and no repository.** A `ScreenReport` is a frozen dataclass of
+    `MarketFacts`/`ScreenResult` rows -- plain data, read once and never re-touched by this cache.
+    `build()` is a closure the CALLER makes from its OWN per-request repo and connection
+    (`server.py`'s module docstring: each request opens its own SQLite connection); the entry
+    stored here outlives that connection by design and never needs it again.
+
+    **Reads no clock of its own.** `now_ts` is the caller's -- `respond`'s one `time.time()`,
+    already threaded down to every reader (`test_no_reader_reads_the_clock_a_second_time`'s AST
+    scan is the rule this keeps: a second clock read here would let the entry's age and the
+    envelope's `generated_at` describe two different instants).
+
+    **Thread-safe, and the lock is held across a MISS's rebuild -- deliberately.** `KeelServer` is
+    a `ThreadingHTTPServer`: two polls of `/rules` landing at once, both past a stale entry, would
+    otherwise both re-screen the whole allowlist concurrently (a thundering herd) for a page one
+    operator reads alone on a loopback socket. Serialising the rebuild means the second thread's
+    poll waits for the first's screen (a handful of indexed local DB reads, not a network call)
+    and then reads the SAME answer, rather than building a redundant copy of its own. One thread
+    blocked instead of two racing is the right trade for a single-operator dashboard.
+    """
+
+    TTL_SECONDS = _SCREEN_CACHE_TTL_SECONDS
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._entries: dict[tuple[Hashable, ...], _ScreenCacheEntry] = {}
+
+    def get_or_build(
+        self, key: tuple[Hashable, ...], now_ts: int, build: Callable[[], Any]
+    ) -> tuple[Any, int]:
+        """`(report, age_seconds)` for `key` as of `now_ts`.
+
+        A HIT is an entry younger than `TTL_SECONDS`; the boundary is EXCLUSIVE of freshness -- an
+        entry exactly `TTL_SECONDS` old is a MISS, matching `keel/execution/guards.py`'s own
+        `attest_due_ts <= now_ts` (equality already means due, not "an instant of grace left").
+        A MISS calls `build()` while the lock is held (see the class docstring), so `build` must
+        stay a plain, synchronous read -- exactly what `build_screen_report` is.
+
+        The window is symmetric: an entry built `TTL_SECONDS` or more AFTER `now_ts` is a MISS
+        too. A lock-wait legitimately makes the age a second or two negative (read as 0 below),
+        but an entry a whole TTL in this request's future means the wall clock stepped back, and
+        serving it would keep a stale screen up for the step plus the TTL under "0s ago".
+        """
+        with self._lock:
+            entry = self._entries.get(key)
+            if entry is not None and abs(now_ts - entry.built_at_ts) < self.TTL_SECONDS:
+                # A request stamped before a later-stamped one built this entry (it waited on the
+                # lock) reads age 0, never a negative age.
+                return entry.report, max(0, now_ts - entry.built_at_ts)
+            report = build()
+            self._entries[key] = _ScreenCacheEntry(report, now_ts)
+            return report, 0
+
+
 def read_dca_plan(cfg: ServeConfig, query: Query, _state: Any, now_ts: int) -> dict[str, Any]:
     """The DCA proposal card on `/rules`, from THE service the CLI calls
     (`keel.commands.dca_plan.build_dca_plan`). READ-ONLY: it builds a plan and writes nothing;
@@ -797,7 +889,18 @@ def read_dca_plan(cfg: ServeConfig, query: Query, _state: Any, now_ts: int) -> d
     module's one way of saying "declined, and here is why" -- the CLI refuses the same error as a
     clean message rather than a traceback, and a 500 here would read "That report could not be
     built" over a message that already names the fix. The card shows the refusal's detail.
+
+    **#856: the admission screen is cached, nothing else is.** `cfg.screen_cache` (a `ScreenCache`
+    scoped to this `ServeConfig`, i.e. this served deployment) answers `build_screen_report` for
+    up to 5 minutes; on a HIT, `screen_fn` (`screen_product`) is never even called. The cached
+    `ScreenReport` is handed to `build_dca_plan` through its `screen_report_fn` injection point --
+    a fixed callable that ignores the arguments `select_universe` would otherwise pass
+    `build_screen_report` and returns the cached report -- so budget/buffer keep varying per
+    request exactly as before; only the screen itself is stale for up to 5 minutes, and the
+    payload's `screen_age` says so.
     """
+    from keel.commands._products import _default_sim_products
+    from keel.commands.admission import build_screen_report
     from keel.commands.assets import screen_product  # resolved per call: one patch point
     from keel.commands.dca_plan import (
         DcaPlanError,
@@ -821,15 +924,34 @@ def read_dca_plan(cfg: ServeConfig, query: Query, _state: Any, now_ts: int) -> d
     config = load_config(cfg.config_path)
     repo = open_repo(cfg.db_path)
     try:
+        screen_report, screen_age_seconds = cfg.screen_cache.get_or_build(
+            (
+                cfg.config_path,
+                cfg.db_path,
+                config.quote_currency,
+                tuple(_default_sim_products(config)),
+            ),
+            now_ts,
+            lambda: build_screen_report(repo, config, screen_product),
+        )
         plan = build_dca_plan(
-            repo, config, inputs, venue=_bound_venue(cfg), now_ts=now_ts, screen_fn=screen_product
+            repo,
+            config,
+            inputs,
+            venue=_bound_venue(cfg),
+            now_ts=now_ts,
+            screen_fn=screen_product,
+            screen_report_fn=lambda *_a, **_kw: screen_report,
         )
     except DcaPlanError as exc:
         raise ApiRefusal(400, "DCA plan refused", str(exc)) from exc
     finally:
         close_repo(repo)
     return payload.dca_plan_payload(
-        plan, command=apply_command(inputs, config_path=cfg.config_path, db_path=cfg.db_path)
+        plan,
+        command=apply_command(inputs, config_path=cfg.config_path, db_path=cfg.db_path),
+        screen_age_seconds=screen_age_seconds,
+        screen_ttl_seconds=cfg.screen_cache.TTL_SECONDS,
     )
 
 

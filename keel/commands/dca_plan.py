@@ -39,7 +39,7 @@ from keel_core.subscription import SubscriptionStatus
 
 from keel import agent
 from keel.commands._products import _history_product, parse_products_option
-from keel.commands.admission import ScreenFn, build_screen_report
+from keel.commands.admission import ScreenFn, ScreenReport, build_screen_report
 from keel.commands.rules import RulesOutcome, RulesRefused, RulesUsageError, add_rule_row
 from keel.config import Config
 from keel.data.repository import Repository
@@ -300,12 +300,20 @@ def select_universe(
     *,
     screen_fn: ScreenFn,
     weights_override: Mapping[str, Decimal] | None = None,
+    screen_report_fn: Callable[[Repository, Config, ScreenFn], ScreenReport] = build_screen_report,
 ) -> Universe:
     """allowlist ∩ admitted ∩ positive weight, minus assets with a non-disabled DCA rule.
 
     Admission comes from `build_screen_report` with the injected `screen_fn`
     (`keel.commands.assets.screen_product` in production) -- the one gate every candidate source
     routes through, never a laxer copy. READ-ONLY: this writes nothing.
+
+    `screen_report_fn` defaults to `build_screen_report` itself, so every caller before #856 is
+    unaffected. `keel/web/api.py`'s `read_dca_plan` is the one caller that passes something else --
+    a lookup into its `ServeConfig`'s `ScreenCache` -- so `/rules?budget=`'s 15s poll does not
+    re-screen the whole allowlist against the database on every reload. `screen_fn` itself is left
+    untouched by that: a cache HIT never even reaches `screen_fn`, and a MISS calls it exactly the
+    way `build_screen_report` always has.
     """
     quote = config.quote_currency
     # #849: the allowlist names assets, so a repeat (`[BTC, ETH, btc]` passes `load_config`) is
@@ -313,9 +321,7 @@ def select_universe(
     # nothing is dropped, because a repeat carries no weight of its own.
     allowlist = list(dict.fromkeys(asset.upper() for asset in config.allowlist))
     weights = _weights_by_asset(config.target_weights, "target_weights")
-    admitted = {
-        sp.asset.upper(): sp for sp in build_screen_report(repo, config, screen_fn).screened
-    }
+    admitted = {sp.asset.upper(): sp for sp in screen_report_fn(repo, config, screen_fn).screened}
     existing = existing_dca_rules(repo)
     existing_by_asset = {rule.asset: rule for rule in existing}
 
@@ -801,8 +807,12 @@ def build_dca_plan(
     now_ts: int,
     screen_fn: ScreenFn,
     weights_override: Mapping[str, Decimal] | None = None,
+    screen_report_fn: Callable[[Repository, Config, ScreenFn], ScreenReport] = build_screen_report,
 ) -> DcaPlan:
     """The whole proposal, every figure computed here and nowhere downstream. READ-ONLY.
+
+    `screen_report_fn` is threaded straight through to `select_universe`, unchanged -- see that
+    function's docstring for why it exists (#856's screen cache).
 
     Per buy: `monthly share x cadence_days / (365.25/12)`, rounded DOWN to cents; the monthly
     total is recomputed from that rounded buy and rounded down again; the fee estimate at the
@@ -840,7 +850,13 @@ def build_dca_plan(
     `None`) for a test to check directly, and `/api/dca-plan`'s card shows the identical sentence
     because it reads `plan.blockers` verbatim, as it always has.
     """
-    universe = select_universe(repo, config, screen_fn=screen_fn, weights_override=weights_override)
+    universe = select_universe(
+        repo,
+        config,
+        screen_fn=screen_fn,
+        weights_override=weights_override,
+        screen_report_fn=screen_report_fn,
+    )
     cap = monthly_buy_cap(repo, config, venue=venue, now_ts=now_ts)
     cadence = inputs.cadence_days
     spend = _cents_down(inputs.budget_usd * (Decimal("1") - inputs.buffer_pct))

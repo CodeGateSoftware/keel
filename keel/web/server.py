@@ -114,6 +114,16 @@ class ServeConfig:
     #: When this run began, for the remote session lifetime (#648). Defaults to the moment the
     #: config is built, which is the moment `keel serve` mints the token it bounds.
     started_at: float = field(default_factory=time.time)
+    #: #856: `/api/dca-plan`'s cached admission screen, scoped to THIS deployment. `ServeConfig`
+    #: is frozen and built once per `keel serve` process (`build_server`), then shared by every
+    #: thread `ThreadingHTTPServer` hands a request to via `BoundKeelHandler.cfg` -- exactly the
+    #: lifetime a 5-minute cache needs, and `default_factory` gives a fresh, empty `ScreenCache`
+    #: to every `ServeConfig` built (so two servers, or two deployments in one test session,
+    #: never share one). `ScreenCache` itself is a plain class in `keel/web/api.py`, not a
+    #: dataclass field with a mutable default -- `field(default_factory=api.ScreenCache)` is what
+    #: keeps a frozen `ServeConfig` correct here: the FIELD is never reassigned, only the cache
+    #: object it names is ever mutated internally, through its own lock.
+    screen_cache: api.ScreenCache = field(default_factory=api.ScreenCache)
 
     @property
     def session_expired_at(self) -> float | None:
