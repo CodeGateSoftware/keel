@@ -1046,6 +1046,72 @@ def test_gather_findings_reads_the_resting_bracket(tmp_path, valid_config_path) 
     assert statuses == {"pending": "ok", "cancelled": "warn"}
 
 
+def test_gather_findings_reads_an_unlinked_pending_sell(tmp_path, valid_config_path) -> None:
+    """R5 (#799): a pending SELL on the product that no open tranche points at is a bracket whose
+    placement state is unknown. The fix line must say to reconcile it before placing another.
+    Controls: a pending SELL an open tranche DOES point at, a pending BUY, a cancelled SELL, and a
+    pending SELL on another product all leave the ordinary fix line."""
+    config = _live(load_config(valid_config_path))
+
+    def _order(repo, *, product="PAXG-USD", side="SELL", status="pending") -> int:
+        return repo.insert_order(
+            dict(
+                mode="live",
+                product_id=product,
+                side=side,
+                order_type="market",
+                qty=Decimal("0.0132"),
+                limit_price=None,
+                status=status,
+                fee=None,
+                expected_fill=Decimal("4521.76"),
+                actual_fill=None,
+                raw_response=None,
+                created_at=NOW - 29 * DAY,
+                updated_at=NOW - 29 * DAY,
+            )
+        )
+
+    def _linked(repo) -> None:
+        order_id = _order(repo)
+        repo.open_position(
+            product_id="PAXG-USD",
+            rule_name="turtle_breakout",
+            opened_at=NOW - 20 * DAY,
+            qty=Decimal("0.01"),
+            entry_fill=Decimal("4600"),
+            entry_fee=Decimal("0"),
+            initial_stop=Decimal("4400"),
+            bracket_order_id=order_id,
+        )
+
+    seeders = {
+        "unlinked": lambda repo: _order(repo),
+        "linked": _linked,
+        "buy": lambda repo: _order(repo, side="BUY"),
+        "cancelled": lambda repo: _order(repo, status="cancelled"),
+        "other_product": lambda repo: _order(repo, product="BTC-USD"),
+    }
+    fixes = {}
+    for label, seed in seeders.items():
+        repo = _seeded_repo(tmp_path / f"{label}.db")
+        seed(repo)
+        _paxg_tranche_3(repo)
+        (finding,) = [
+            f for f in gather_findings(repo, config, [], NOW) if f.name == "position.unprotected"
+        ]
+        assert finding.status == "warn", label
+        assert finding.products == ("PAXG-USD",), label
+        fixes[label] = finding.fix.startswith("reconcile the pending order first")
+    assert fixes == {
+        "unlinked": True,
+        "linked": False,
+        "buy": False,
+        "cancelled": False,
+        "other_product": False,
+    }
+
+
 def test_gather_findings_on_a_paper_profile_reports_neither(tmp_path, valid_config_path) -> None:
     """#881: a paper engine promotes to `status="paper"` and never places a bracket. The same
     tranche that warns twice on a live profile is ordinary on a paper one."""

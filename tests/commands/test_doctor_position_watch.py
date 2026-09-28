@@ -252,3 +252,32 @@ def test_the_resting_predicate_is_asked_about_each_stopped_tranche() -> None:
 
     position_watch_findings([BTC_DCA, PAXG_TRANCHE_3], [], resting, set())
     assert asked == [3]
+
+
+def test_an_unlinked_pending_sell_turns_the_fix_into_reconcile_first() -> None:
+    """R5 (#799): when `place_bracket`'s `place_order` raised AFTER the SELL row was written, the
+    venue may already hold that bracket while the tranche's `bracket_order_id` stays NULL. Telling
+    the operator to "place one at the venue" then invites a second bracket over the first, which
+    double-commits the base. The fix line must send them to the pending order first."""
+    plain = _by_name(position_watch_findings([PAXG_TRANCHE_3], [], lambda p: False, set()))
+    unknown = _by_name(
+        position_watch_findings(
+            [PAXG_TRANCHE_3], [], lambda p: False, set(), pending_sells={"PAXG-USD": [41]}
+        )
+    )
+    assert "place one at the venue" in plain["position.unprotected"].fix
+    fix = unknown["position.unprotected"].fix
+    assert unknown["position.unprotected"].status == WARN
+    assert fix.startswith("reconcile the pending order first")
+    assert "PAXG-USD order 41" in fix
+    assert "place one at the venue" not in fix
+
+
+def test_a_pending_sell_on_another_product_leaves_the_fix_alone() -> None:
+    found = _by_name(
+        position_watch_findings(
+            [PAXG_TRANCHE_3], [], lambda p: False, set(), pending_sells={"BTC-USD": [7]}
+        )
+    )
+    assert "place one at the venue" in found["position.unprotected"].fix
+    assert "reconcile the pending order" not in found["position.unprotected"].fix

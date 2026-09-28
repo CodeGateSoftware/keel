@@ -1507,6 +1507,7 @@ def position_watch_findings(
     retry_products: set[str],
     *,
     managed_status: str = "live",
+    pending_sells: dict[str, list[int]] | None = None,
 ) -> list[Finding]:
     """Is anything still WATCHING each held tranche (#811)?
 
@@ -1535,6 +1536,13 @@ def position_watch_findings(
       writes an `unbracketed:` retry record either (`reconcile_unbracketed_positions` only runs
       on live cycles) -- every clause here is unconditionally true for every stopped paper
       tranche, so without the skip this finding WARNs on every one of them, always.
+
+    `pending_sells` maps a product to its `pending` SELL order ids that NO open tranche names as
+    its `bracket_order_id`. That is the shape R5 (#799) leaves when `place_bracket`'s
+    `place_order` raised after the row was written: the venue's state is unknown, a bracket may
+    already be resting, and the tranche still reads "no resting bracket". For those products the
+    fix line says to reconcile the pending order first, never "place one at the venue" -- doctor
+    must not invite a second bracket over one that may exist, which would double-commit the base.
 
     WARN, never FAIL: holding spot without a stop can be a human's choice (PAXG since
     2026-09-22). What was wrong is that nobody was told, and FAIL would halt cycles over a state
@@ -1632,7 +1640,7 @@ def position_watch_findings(
                 f"{len(unprotected)} tranche(s) hold a stop level and nothing resting",
                 _describe(unprotected, levels=True)
                 + " -- the next cycle will NOT retry: the retry record is gone",
-                "doctor cannot re-place a bracket; place one at the venue or close the tranche",
+                _unprotected_fix(_products(unprotected), pending_sells or {}),
                 products=_products(unprotected),
             )
         )
@@ -1657,6 +1665,24 @@ def position_watch_findings(
             )
         )
     return out
+
+
+def _unprotected_fix(products: tuple[str, ...], pending_sells: dict[str, list[int]]) -> str:
+    """The fix line for `position.unprotected` (R5, #799): a pending SELL nothing links to may be
+    a bracket already resting at the venue, so it is reconciled BEFORE anyone places another."""
+    unknown = [
+        f"{product} order {order_id}"
+        for product in products
+        for order_id in pending_sells.get(product, [])
+    ]
+    if not unknown:
+        return "doctor cannot re-place a bracket; place one at the venue or close the tranche"
+    return (
+        "reconcile the pending order first ("
+        + ", ".join(unknown)
+        + "): its placement state is unknown and it may already be resting at the venue -- "
+        "do not place another bracket until it is resolved"
+    )
 
 
 def doctor_exit_code(findings: list[Finding]) -> int:
@@ -1735,6 +1761,18 @@ def _admissibility_rows(
             AdmissibilityRow(product_id=product, price=candles[-1].close, atr=Decimal(str(atr_val)))
         )
     return rows
+
+
+def _unlinked_pending_sells(repo: Any) -> dict[str, list[int]]:
+    """`pending` live SELL orders, by product, that no OPEN tranche names as its bracket -- the
+    rows whose venue state R5 (#799) says is unknown. A repo read only."""
+    linked = repo.open_bracket_order_ids()
+    out: dict[str, list[int]] = {}
+    for order in repo.get_orders(mode="live", status="pending"):
+        if order.get("side") != "SELL" or order["id"] in linked:
+            continue
+        out.setdefault(str(order["product_id"]), []).append(int(order["id"]))
+    return out
 
 
 def gather_findings(repo: Any, config: Any, log_lines: Iterable[str], now_ts: int) -> list[Finding]:
@@ -1866,6 +1904,7 @@ def gather_findings(repo: Any, config: Any, log_lines: Iterable[str], now_ts: in
             if repo.get_state(key)
         },
         managed_status="paper" if config.auto_trade.mode == "paper" else "live",
+        pending_sells=_unlinked_pending_sells(repo),
     )
 
     from keel.data import freshness as freshness_mod
