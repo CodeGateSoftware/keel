@@ -148,13 +148,29 @@ def _call_target(node: ast.AST) -> str | None:
     )
 
 
+def _reaches_name(node: ast.AST, names: set[str]) -> str | None:
+    """Whether `node` reaches one of `names` -- as a `_call_target` (a `Call`, which already
+    covers `getattr`), or as a bare LOAD with no call at all. Bypass, issue #895:
+    `f = executor._run_order; f()` and `f = broker.place_order; f(spec)` never spell the reach as
+    a single `Call` node -- the assignment's right-hand side is a LOAD of the target (an
+    `Attribute` or a bare `Name`), which is what this checks in addition to `_call_target`."""
+    target = _call_target(node)
+    if target is not None and target in names:
+        return target
+    if isinstance(node, ast.Attribute) and isinstance(node.ctx, ast.Load) and node.attr in names:
+        return node.attr
+    if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load) and node.id in names:
+        return node.id
+    return None
+
+
 def _calls_in(tree: ast.AST, module: str, names: set[str]) -> set[tuple[str, str]]:
     found: set[tuple[str, str]] = set()
     for func in ast.walk(tree):
         if not isinstance(func, ast.FunctionDef | ast.AsyncFunctionDef):
             continue
         for node in ast.walk(func):
-            if _call_target(node) in names:
+            if _reaches_name(node, names) is not None:
                 found.add((module, func.name))
     return found
 
@@ -164,7 +180,7 @@ def _calls_outside_functions(tree: ast.AST, module: str, names: set[str]) -> set
     ever entering a `def`/`async def`. Returns a single `<module>` entry the same way `_calls_in`
     returns one entry per offending function -- there is exactly one pseudo-function to name."""
     for node in _iter_outside_functions(tree):
-        if _call_target(node) in names:
+        if _reaches_name(node, names) is not None:
             return {(module, "<module>")}
     return set()
 
@@ -185,6 +201,11 @@ _EXECUTOR_MODULE = "keel.execution.executor"
 
 #: Every executor function that reaches `_run_order`, by any name a caller could import.
 _ORDER_REACHING_NAMES = SECOND_LEVEL_NAMES | {"_run_order", "_roll_stop"}
+
+#: The two names with NO legitimate external caller at all -- not even through the pinned
+#: `SECOND_LEVEL_CALLERS` set, which governs only the PUBLIC `SECOND_LEVEL_NAMES`. Reaching
+#: either of these from outside `executor.py`, under any spelling, is always a bypass (#895).
+_PRIVATE_ORDER_REACHING_NAMES = {"_run_order", "_roll_stop"}
 
 
 def _attr_reach(node: ast.AST, base: str, names: set[str]) -> str | None:
@@ -275,7 +296,12 @@ def _executor_bypasses(tree: ast.AST, module: str) -> list[str]:
     import, `from keel.execution.executor import <order-reaching name>`, and a reach through any
     OTHER name the module binds to the executor module -- as a call, a bare reference, or at
     module scope, outside every function. An alias used only for constants (`doctor.py`'s
-    `executor_mod`) is not an offender."""
+    `executor_mod`) is not an offender.
+
+    `executor`/the dotted `keel.execution.executor` path itself are scanned too, but only for
+    `_PRIVATE_ORDER_REACHING_NAMES` (issue #895): those two names have no legitimate external
+    caller under any spelling, unlike the public `SECOND_LEVEL_NAMES`, which the pinned
+    `SECOND_LEVEL_CALLERS` set already governs when reached as plain `executor.<name>`."""
     offenders: list[str] = []
     aliases: set[str] = set()
     for node in ast.walk(tree):
@@ -296,6 +322,17 @@ def _executor_bypasses(tree: ast.AST, module: str) -> list[str]:
             hit = _attr_reach(node, alias, _ORDER_REACHING_NAMES)
             if hit is not None:
                 offenders.append(f"{module}: {func_name} reaches {alias}.{hit}")
+        # `executor` itself is deliberately NOT in `aliases` above: scanning it for the FULL
+        # `_ORDER_REACHING_NAMES` would flag every already-legitimate `SECOND_LEVEL_CALLERS` site
+        # (`agent.py`'s `executor.execute`, `reconcile.py`'s `executor.place_bracket`, ...) as a
+        # bypass. But `_run_order`/`_roll_stop` have no legitimate caller under ANY name -- not
+        # even a pinned second-level one -- so they ARE scanned here, through "executor" itself
+        # and the fully dotted module path `_reaches_via_attr` already knows how to match
+        # (issue #895): a plain `executor._roll_stop(...)`, `keel.execution.executor._run_order
+        # (...)`, and a non-call load of either (`f = executor._run_order; f()`) all reach here.
+        hit = _reaches_via_attr(node, "executor", _PRIVATE_ORDER_REACHING_NAMES)
+        if hit is not None:
+            offenders.append(f"{module}: {func_name} reaches executor.{hit}")
 
     for func in ast.walk(tree):
         if not isinstance(func, ast.FunctionDef | ast.AsyncFunctionDef):
@@ -438,6 +475,50 @@ def test_the_attr_scan_also_covers_the_module_level_shape() -> None:
     tree = ast.parse("import keel.execution.executor as executor\nexecutor.scale_out(1)\n")
     assert _calls_via_attr(tree, "m", "executor", {"scale_out"}) == set()
     assert _attr_outside_functions(tree, "m", "executor", {"scale_out"}) == {("m", "<module>")}
+
+
+def test_the_bypass_scan_catches_a_private_name_call_via_the_bare_executor_name() -> None:
+    """Issue #895: `from keel.execution import executor` binds the module under its own name,
+    which `_executor_bypasses` discards from `aliases` -- scanning it for the full
+    `_ORDER_REACHING_NAMES` would flag every already-legitimate `SECOND_LEVEL_CALLERS` site
+    (`agent.py`'s `executor.execute`, and so on) as a bypass. But `_roll_stop` has no legitimate
+    external caller under ANY name -- not even a pinned second-level one -- so a direct
+    `executor._roll_stop(...)` must still be caught."""
+    tree = ast.parse(
+        "from keel.execution import executor\ndef sneaky():\n    executor._roll_stop(1)\n"
+    )
+    assert _executor_bypasses(tree, "m") == ["m: sneaky reaches executor._roll_stop"]
+
+
+def test_the_bypass_scan_catches_a_private_name_call_via_the_dotted_module_path() -> None:
+    """The same gap (issue #895), spelled as the fully dotted `keel.execution.executor.<name>`
+    path after a plain `import keel.execution.executor` -- no `as`, so `executor` itself is never
+    bound as a name."""
+    tree = ast.parse(
+        "import keel.execution.executor\ndef sneaky():\n    keel.execution.executor._run_order(1)\n"
+    )
+    assert _executor_bypasses(tree, "m") == ["m: sneaky reaches executor._run_order"]
+
+
+def test_the_bypass_scan_catches_a_non_call_reference_to_a_private_name() -> None:
+    """Issue #895: `f = executor._run_order; f()` never spells the reach as a single `Call`
+    node -- the assignment itself is a LOAD of the attribute, which `_reaches_via_attr` catches
+    regardless of whether a `Call` ever wraps it."""
+    tree = ast.parse(
+        "from keel.execution import executor\n"
+        "def sneaky():\n"
+        "    f = executor._run_order\n"
+        "    f(1)\n"
+    )
+    assert _executor_bypasses(tree, "m") == ["m: sneaky reaches executor._run_order"]
+
+
+def test_the_call_scan_catches_a_non_call_reference() -> None:
+    """Issue #895: `f = broker.place_order; f(spec)` never spells `broker.place_order(...)` as a
+    single `Call` node either -- the assignment's right-hand side is a bare LOAD of the
+    attribute, which `_calls_in` must match without requiring a `Call` around it."""
+    tree = ast.parse("def sneaky():\n    f = broker.place_order\n    f(1)\n")
+    assert _calls_in(tree, "m", {"place_order"}) == {("m", "sneaky")}
 
 
 def test_no_module_reaches_the_executor_order_paths_under_another_name() -> None:

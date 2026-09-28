@@ -22,7 +22,7 @@ from keel_core.telemetry import _FIELDS_ATTR
 from keel.config import Caps, Config, MarketDataConfig, MoneyMgmtConfig
 from keel.data.db import connect, migrate
 from keel.data.repository import Repository
-from keel.execution import reconcile
+from keel.execution import executor, reconcile
 from keel.types import Side
 
 NOW = 1_800_000_000
@@ -957,6 +957,62 @@ def test_a_broker_error_while_re_bracketing_does_not_abandon_the_rest_of_the_pas
 
     assert changed, "the dead order was still reconciled"
     assert "reconcile.position_unprotected" in caplog.text
+
+
+class _RebracketPlaceRaises(_RebracketingBroker):
+    """The replacement bracket previews, then `place_order` RAISES: the venue may or may not
+    have accepted it (#799, plan R5). Reached here through `_rebracket_or_escalate` (a bracket
+    that WAS accepted and later died), not through `reconcile_unbracketed_positions`'s own route
+    (`_TimingOutRebracketBroker` below, for a bracket that was never placed at all)."""
+
+    def place_order(self, spec: OrderSpec, *, idempotency_key: str | None = None) -> PlaceResult:
+        self.placed.append({"spec": spec})
+        raise TimeoutError("read timed out")
+
+
+def test_a_replacement_bracket_that_raises_leaves_no_retry_record(repo, caplog):
+    """`_rebracket_or_escalate`'s `retry_scheduled=False` branch, uncovered until now: mutating
+    that line to `retry_scheduled = True` left the whole suite green. Here the replacement
+    bracket's `place_order` RAISES after its order row was written, rather than being vetoed or
+    rejected as in `test_a_vetoed_replacement_bracket_escalates_instead_of_going_quiet` above.
+    `place_bracket` (#892) then CLEARS the `unbracketed:` record instead of re-writing it -- the
+    venue may be holding that bracket, and a surviving record would let the next sweep place a
+    second one against inventory the first may already commit.
+    """
+    _seed_bracket(repo)
+    repo.set_state("open_target:BTC-USD", Decimal("53000"))
+    _allow_orders(repo)
+    broker = _RebracketPlaceRaises(
+        {
+            "cb-1": {
+                "order_id": "cb-1",
+                "status": "CANCELLED",
+                "filled_size": Decimal("0"),
+                "average_filled_price": Decimal("0"),
+                "total_fees": Decimal("0"),
+            }
+        }
+    )
+
+    with caplog.at_level(logging.CRITICAL):
+        reconcile.reconcile_open_orders(broker, repo, _config(), now_ts=NOW)
+
+    assert len(broker.placed) == 1, (
+        "the replacement bracket's place_order must have been reached exactly once"
+    )
+    assert repo.get_state(f"{executor.UNBRACKETED_PREFIX}{PRODUCT}") is None, (
+        "the venue may hold the replacement bracket -- a surviving record would let the next "
+        "sweep place a second one against inventory the first may already commit"
+    )
+    pending_sells = [
+        o
+        for o in repo.get_orders(mode="live", product_id=PRODUCT, status="pending")
+        if o["side"] == Side.SELL.value
+    ]
+    assert len(pending_sells) == 1, "the replacement's own order row must survive for a human"
+    assert "reconcile.position_unprotected" in caplog.text
+    [critical] = [r for r in caplog.records if r.getMessage() == "reconcile.position_unprotected"]
+    assert getattr(critical, _FIELDS_ATTR)["retry_scheduled"] is False
 
 
 def test_a_dead_bracket_on_a_position_already_gone_does_not_escalate(repo, caplog):
