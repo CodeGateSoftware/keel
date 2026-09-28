@@ -27,6 +27,21 @@ _DOCTOR = _ROOT / "keel/commands/doctor.py"
 #: yields `scope attest`.
 _INVOCATION = re.compile(r'"keel ((?:[a-z][a-z-]*)(?: [a-z][a-z-]*)?)')
 
+#: The same shape, but for a `keel ...` invocation quoted with BACKTICKS inside a longer fix
+#: string rather than one that IS the whole quoted literal (`_INVOCATION` above only ever matches
+#: a string that opens with `"keel `). Most fix lines name their command this way, e.g. "...
+#: record a missing tranche, or declare an out-of-band close (`keel positions close <id>` once
+#: #798 ships)".
+_BACKTICK_INVOCATION = re.compile(r"`keel ((?:[a-z][a-z-]*)(?: [a-z][a-z-]*)?)")
+
+#: `position.unmanaged`'s fix line names `keel positions close <id>` explicitly "once #798
+#: ships" -- the command does not exist yet, #798 tracks it, and this one line is allowed to
+#: name it anyway (#899 review: a forward reference is a suggestion for a WARN whose command
+#: really is coming, not a defect to fix here). Spelled as the exact text of that one line, not
+#: as the bare string "positions close": matching the substring would also allow any OTHER
+#: `positions close` reference elsewhere in the file, including a new one nobody meant to permit.
+_ALLOWED_UNSHIPPED_LINE = '"(`keel positions close <id>` once #798 ships)",'
+
 
 def _resolves(path: str) -> bool:
     """Whether `path` (e.g. `"scope attest"`) is a real command in the CLI tree."""
@@ -53,6 +68,47 @@ def test_every_command_named_in_a_fix_line_exists() -> None:
     assert not missing, (
         f"doctor names {len(missing)} command(s) that do not exist: {missing}. An operator "
         "following that advice gets `No such command`."
+    )
+
+
+def test_every_backtick_invocation_in_a_fix_line_exists() -> None:
+    """The same check as above, but for the backtick-quoted form most fix lines actually use.
+
+    `_INVOCATION` only matches a string that OPENS with `"keel `, which is `rail.kill_switch`'s
+    shape but not most others' -- a fix line typically embeds `` `keel ...` `` inside a longer
+    sentence. #899's review found two such references (`ledger.drift`, `ledger.venue_drift`)
+    naming `keel positions close <id>` before that command exists, which `_INVOCATION` never saw.
+
+    One reference is allowed to name it anyway: `position.unmanaged`'s, which says so explicitly
+    ("once #798 ships"). It is allowlisted by that ONE LINE'S exact text, not by the substring
+    "positions close" -- so a *different* new unresolvable reference, even one about the same
+    command, still fails this test.
+    """
+    text = _DOCTOR.read_text(encoding="utf-8")
+    lines = text.splitlines()
+
+    allowed_line_numbers = {i for i, line in enumerate(lines) if _ALLOWED_UNSHIPPED_LINE in line}
+    assert len(allowed_line_numbers) == 1, (
+        f"expected exactly one #798-pending line to allowlist, found {len(allowed_line_numbers)}: "
+        "has `position.unmanaged`'s fix line changed, or did the source pick up another copy of "
+        "it?"
+    )
+
+    found = [
+        match.group(1)
+        for lineno, line in enumerate(lines)
+        if lineno not in allowed_line_numbers
+        for match in _BACKTICK_INVOCATION.finditer(line)
+    ]
+    assert found, "no backtick `keel ...` invocations found -- has the fix format changed?"
+    assert "orders list" in found, (
+        f"sanity check failed: a known invocation is missing from the scan: {found}"
+    )
+
+    missing = [path for path in found if not _resolves(path)]
+    assert not missing, (
+        f"doctor names {len(missing)} command(s) in backtick-quoted fix text that do not exist: "
+        f"{missing}. An operator following that advice gets `No such command`."
     )
 
 

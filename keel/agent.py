@@ -2134,6 +2134,25 @@ def run_once(
         if paper_trader is None:
             _manage_stops(broker, repo, config, rules, candles_by_tf_by_product, now_ts)
 
+        # Then record what the venue holds of each product keel has a tranche in, for doctor's
+        # `ledger.venue_drift` (#798, plan R3; moved after this cycle's own trading by #899):
+        # doctor holds no broker, so the cycle observes and doctor compares. One balance READ;
+        # nothing placed or cancelled. LAST of everything the cycle does to the account -- AFTER
+        # exits, entries, AND stop management above -- so it records the account as THIS CYCLE
+        # LEAVES it. It has to run here, not earlier: an entry above just wrote a fresh tranche,
+        # and a record taken before that write named the venue's holding for every product
+        # `ledger.venue_drift` will now compare it against except the one that just changed --
+        # reading as an unobserved (or stale) holding until the NEXT live cycle, a day on this
+        # deployment. LIVE cycles only -- paper has no venue account, and a paper cycle must not
+        # read the real one on its own behalf. And wrapped: `record_venue_holdings` already
+        # swallows a venue failure, but a diagnostic WRITE (a locked database) must not cost the
+        # cycle either -- `notify_after_cycle`'s rule.
+        if paper_trader is None:
+            try:
+                reconcile.record_venue_holdings(broker, repo, now_ts)
+            except Exception:  # noqa: BLE001 -- a diagnostic record must never cost a cycle
+                log_exception(logger, "agent.venue_holdings_failed")
+
         cycle_result = LoopResult(
             ts=now_ts,
             skipped=False,

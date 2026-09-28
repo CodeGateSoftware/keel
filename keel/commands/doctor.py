@@ -32,7 +32,7 @@ import re
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
-from decimal import ROUND_HALF_UP, Decimal
+from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any
 
@@ -1500,6 +1500,139 @@ def unbooked_exit_findings(
     ]
 
 
+def ledger_drift_findings(
+    ledger_by_product: dict[str, Decimal],
+    orders_by_product: dict[str, Decimal],
+    increments: dict[str, Decimal | None],
+) -> list[Finding]:
+    """The positions ledger against the orders log, per product (#799 proposal 3; plan R2).
+
+    #799's stranded PAXG fill logged only a `preview_failed` -- "a harmless pre-trade hiccup".
+    This is the check that would have named it: a filled BUY with no tranche makes the orders
+    log hold more than the ledger. Tolerance is one base increment, because a venue that takes
+    its fee in the base asset leaves exactly that kind of dust (#667). Unknown increment means
+    exact equality -- no tolerance may be invented.
+
+    A product absent from one side reads as ZERO there, not as "skip": a filled BUY whose
+    tranche was never written has no ledger key at all, and that absence IS the #799 shape.
+
+    Beside `ledger.unbooked_exit` rather than under a `sleeve.*` name (plan R2): it covers every
+    open tranche, DCA or not. WARN, not FAIL -- the deployment is trading; what is wrong is the
+    books, and which side is wrong is a human's call.
+    """
+    drifted: list[tuple[str, Decimal, Decimal]] = []
+    for product in sorted(set(ledger_by_product) | set(orders_by_product)):
+        ledger = ledger_by_product.get(product, Decimal("0"))
+        orders = orders_by_product.get(product, Decimal("0"))
+        tolerance = increments.get(product) or Decimal("0")
+        if abs(ledger - orders) > tolerance:
+            drifted.append((product, ledger, orders))
+    if not drifted:
+        return [
+            Finding(
+                "ledger.drift",
+                OK,
+                "the positions ledger matches the orders log",
+                "-",
+                "-",
+            )
+        ]
+    detail = "; ".join(
+        f"{product}: orders say {orders}, ledger says {ledger}"
+        for product, ledger, orders in drifted
+    )
+    return [
+        Finding(
+            "ledger.drift",
+            WARN,
+            f"{len(drifted)} product(s) where the ledger and the orders log disagree",
+            detail + " -- a filled entry with no tranche (#799) or an unbooked sale",
+            "inspect the console's Positions view and `keel orders list`; record the missing "
+            "tranche or the out-of-band close by hand (#798 tracks a command for it)",
+            products=tuple(product for product, _, _ in drifted),
+        )
+    ]
+
+
+def _venue_total(record: Any) -> Decimal | None:
+    """The recorded venue total as a finite `Decimal`, or `None` when there is none to read."""
+    if not isinstance(record, dict):
+        return None
+    try:
+        total = Decimal(str(record.get("total")))
+    except InvalidOperation, TypeError, ValueError:
+        return None
+    return total if total.is_finite() else None
+
+
+def venue_drift_findings(
+    ledger_by_product: dict[str, Decimal],
+    venue: dict[str, Any],
+    *,
+    increments: dict[str, Decimal | None] | None = None,
+) -> list[Finding]:
+    """The positions ledger against what the VENUE says it holds, per product (#798; plan R3).
+
+    #798's shape: a sale made on the venue out of band leaves keel counting the BUY. Both keel
+    tables agree with each other -- `ledger.drift` sees nothing -- and only the account knows. The
+    venue side is the `venue_holding:<product>` record `reconcile.record_venue_holdings` writes
+    each live cycle (`{"total", "observed_at"}`), because doctor holds no broker. It can be up to
+    a cycle stale, which is why a WARN prints the date it was observed.
+
+    One direction only: the ledger holding MORE than the venue. The venue holding more is coins
+    the operator owns outside keel, which is theirs and not drift. Tolerance is one base
+    increment (`increments`, the cached `base_increment:` record), for the fee-in-base dust
+    reason `ledger.drift` gives (#667); unknown or omitted means exact comparison.
+
+    No observation for a HELD product is a WARN, never OK: "the venue was never asked" or "the
+    venue named no account for it" is unknown, and unknown must not read as agreement before a
+    sale is sized from the ledger (spec §9). A paper profile never records one -- its caller
+    passes an empty ledger there, so this returns the OK sentinel (#881).
+
+    WARN, not FAIL, for `balance.drift`'s reason: every cause (a transfer, a sale, a fee) may be
+    legitimate; what is wrong is that the books disagree with the account.
+    """
+    tolerances = increments or {}
+    drifted: list[tuple[str, str]] = []
+    for product in sorted(ledger_by_product):
+        ledger = ledger_by_product[product]
+        record = venue.get(product)
+        total = _venue_total(record)
+        if total is None:
+            drifted.append((product, f"{product}: no venue observation"))
+            continue
+        if ledger - total > (tolerances.get(product) or Decimal("0")):
+            observed = record.get("observed_at") if isinstance(record, dict) else None
+            when = _utc_date(int(observed)) if isinstance(observed, int) else "unknown"
+            drifted.append(
+                (product, f"{product}: ledger {ledger} > venue {total} (observed {when})")
+            )
+    if not drifted:
+        return [
+            Finding(
+                "ledger.venue_drift",
+                OK,
+                "the venue holds at least what the positions ledger says",
+                "-",
+                "-",
+            )
+        ]
+    return [
+        Finding(
+            "ledger.venue_drift",
+            WARN,
+            f"{len(drifted)} product(s) where the ledger holds more than the venue confirms",
+            "; ".join(text for _, text in drifted)
+            + " -- an out-of-band sale or transfer (#798), or a venue holding never observed; "
+            "the rails still count what the ledger says",
+            "check the venue's holding; if it was sold or moved out of band, record the close "
+            "by hand (#798 tracks a command for it); if no holding is observed, let a live "
+            "cycle record one",
+            products=tuple(product for product, _ in drifted),
+        )
+    ]
+
+
 def position_watch_findings(
     open_positions: list[dict[str, Any]],
     all_rules: list[dict[str, Any]],
@@ -1537,12 +1670,14 @@ def position_watch_findings(
       on live cycles) -- every clause here is unconditionally true for every stopped paper
       tranche, so without the skip this finding WARNs on every one of them, always.
 
-    `pending_sells` maps a product to its `pending` SELL order ids that NO open tranche names as
-    its `bracket_order_id`. That is the shape R5 (#799) leaves when `place_bracket`'s
-    `place_order` raised after the row was written: the venue's state is unknown, a bracket may
-    already be resting, and the tranche still reads "no resting bracket". For those products the
-    fix line says to reconcile the pending order first, never "place one at the venue" -- doctor
-    must not invite a second bracket over one that may exist, which would double-commit the base.
+    `pending_sells` maps a product to its RESTING (`executor.RESTING_STATUSES`) SELL order ids
+    that NO open tranche names as its `bracket_order_id`. That is the shape R5 (#799) leaves
+    when `place_bracket`'s `place_order` raised after the row was written: the venue's state is
+    unknown, a bracket may already be resting, and the tranche still reads "no resting bracket".
+    For those products the fix line says to reconcile the pending order first, never "place one
+    at the venue" -- doctor must not invite a second bracket over one that may exist, which would
+    double-commit the base. Products WITHOUT such an order keep the ordinary advice in the same
+    line (`_unprotected_fix`).
 
     WARN, never FAIL: holding spot without a stop can be a human's choice (PAXG since
     2026-09-22). What was wrong is that nobody was told, and FAIL would halt cycles over a state
@@ -1669,20 +1804,31 @@ def position_watch_findings(
 
 def _unprotected_fix(products: tuple[str, ...], pending_sells: dict[str, list[int]]) -> str:
     """The fix line for `position.unprotected` (R5, #799): a pending SELL nothing links to may be
-    a bracket already resting at the venue, so it is reconciled BEFORE anyone places another."""
+    a bracket already resting at the venue, so it is reconciled BEFORE anyone places another.
+
+    PER PRODUCT. The reconcile-first advice covers only the products that HAVE such an order; the
+    others still get "place one at the venue or close the tranche". When both kinds are present
+    the two parts are joined with ` | ` (`data.feed_scope`'s separator), and the plain part names
+    its products, because it no longer applies to every product the finding lists. When only one
+    kind is present the line is that one part, unchanged."""
+    plain_advice = "doctor cannot re-place a bracket; place one at the venue or close the tranche"
     unknown = [
         f"{product} order {order_id}"
         for product in products
         for order_id in pending_sells.get(product, [])
     ]
+    plain = [product for product in products if not pending_sells.get(product)]
     if not unknown:
-        return "doctor cannot re-place a bracket; place one at the venue or close the tranche"
-    return (
+        return plain_advice
+    reconcile_first = (
         "reconcile the pending order first ("
         + ", ".join(unknown)
         + "): its placement state is unknown and it may already be resting at the venue -- "
         "do not place another bracket until it is resolved"
     )
+    if not plain:
+        return reconcile_first
+    return f"{reconcile_first} | {', '.join(plain)}: {plain_advice}"
 
 
 def doctor_exit_code(findings: list[Finding]) -> int:
@@ -1764,15 +1910,66 @@ def _admissibility_rows(
 
 
 def _unlinked_pending_sells(repo: Any) -> dict[str, list[int]]:
-    """`pending` live SELL orders, by product, that no OPEN tranche names as its bracket -- the
-    rows whose venue state R5 (#799) says is unknown. A repo read only."""
+    """RESTING live SELL orders, by product, that no OPEN tranche names as its bracket. A repo
+    read only.
+
+    `executor.RESTING_STATUSES`, not `"pending"` alone -- the tuple the reconcile sweep polls and
+    the cancel-before-place paths clear, aliased rather than restated for the reason
+    `reconcile._POLLED_STATUSES` gives. A `pending` row is R5's (#799) unknown state: the venue
+    may or may not hold it. A `partially_filled` row is known to be working at the venue, which
+    is the same hazard with more certainty: placing another bracket beside it would double-commit
+    the base. Either way the fix line must say "reconcile it first", never "place one"."""
+    from keel.execution.executor import RESTING_STATUSES
+
     linked = repo.open_bracket_order_ids()
     out: dict[str, list[int]] = {}
-    for order in repo.get_orders(mode="live", status="pending"):
-        if order.get("side") != "SELL" or order["id"] in linked:
-            continue
-        out.setdefault(str(order["product_id"]), []).append(int(order["id"]))
-    return out
+    for status in RESTING_STATUSES:
+        for order in repo.get_orders(mode="live", status=status):
+            if order.get("side") != "SELL" or order["id"] in linked:
+                continue
+            out.setdefault(str(order["product_id"]), []).append(int(order["id"]))
+    return {product: sorted(ids) for product, ids in out.items()}
+
+
+def _order_mode(config: Any) -> str:
+    """The `orders.mode` this profile's own fills carry -- the same derivation `agent.py` uses
+    for `rule_status`: a paper profile fills `mode="paper"`, every other mode fills live."""
+    return "paper" if config.auto_trade.mode == "paper" else "live"
+
+
+def _ledger_drift_inputs(
+    repo: Any, config: Any
+) -> tuple[dict[str, Decimal], dict[str, Decimal], dict[str, Decimal | None]]:
+    """`ledger_drift_findings`' three inputs, from repo reads only (plan Task 3.1).
+
+    Products: every open tranche's, plus every product with a filled order in this profile's
+    own mode -- the latter is `repo.held_products()` on a live profile, and it is what finds
+    #799's shape, a fill with NO tranche. The orders side reads the SAME mode as the fills
+    (`sleeve.orders_qty`), never `executor._held_position`, which is live-only by design and
+    would read zero behind every paper tranche (#881). The tolerance is the cached
+    `base_increment:` record `_base_increment_for` writes, coerced the way that function
+    coerces it; absent means `None`, exact equality. **Never the broker** -- doctor has none.
+    """
+    from keel.execution import executor as executor_mod
+    from keel.execution import sleeve
+
+    mode = _order_mode(config)
+    products = {str(p["product_id"]) for p in repo.get_open_positions()} | {
+        str(o["product_id"]) for o in repo.get_orders(mode=mode, status="filled")
+    }
+    ledger: dict[str, Decimal] = {}
+    orders: dict[str, Decimal] = {}
+    increments: dict[str, Decimal | None] = {}
+    for product in sorted(products):
+        ledger[product] = sleeve.ledger_qty(repo.get_open_positions(product))
+        orders[product] = sleeve.orders_qty(repo, product, mode)
+        record = repo.get_state(f"{executor_mod.BASE_INCREMENT_PREFIX}{product}")
+        increments[product] = (
+            executor_mod._coerce_increment(record.get("increment"))
+            if isinstance(record, dict)
+            else None
+        )
+    return ledger, orders, increments
 
 
 def gather_findings(repo: Any, config: Any, log_lines: Iterable[str], now_ts: int) -> list[Finding]:
@@ -1905,6 +2102,22 @@ def gather_findings(repo: Any, config: Any, log_lines: Iterable[str], now_ts: in
         },
         managed_status="paper" if config.auto_trade.mode == "paper" else "live",
         pending_sells=_unlinked_pending_sells(repo),
+    )
+    # #799 proposal 3 (plan R2): the ledger against the orders log, in this profile's own mode.
+    ledger_by_product, orders_by_product, increments = _ledger_drift_inputs(repo, config)
+    findings += ledger_drift_findings(ledger_by_product, orders_by_product, increments)
+    # #798 (plan R3): the ledger against the venue holding the LIVE cycle records. Only products
+    # with an open tranche are compared -- a product the orders log knows and the ledger does
+    # not is `ledger.drift`'s. A paper profile never records a venue holding (there is no venue),
+    # so it passes an empty ledger and reads the OK sentinel rather than "no observation" (#881).
+    held = {product: qty for product, qty in ledger_by_product.items() if qty > 0}
+    findings += venue_drift_findings(
+        {} if _order_mode(config) == "paper" else held,
+        {
+            key[len(reconcile_mod.VENUE_HOLDING_PREFIX) :]: repo.get_state(key)
+            for key in repo.get_state_keys(reconcile_mod.VENUE_HOLDING_PREFIX)
+        },
+        increments=increments,
     )
 
     from keel.data import freshness as freshness_mod
