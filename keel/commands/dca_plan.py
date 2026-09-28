@@ -263,7 +263,13 @@ def _weights_by_asset(raw: Mapping[str, Decimal], source: str) -> dict[str, Deci
             f"{source} has keys that collide once uppercased -- {detail} -- fix the config; "
             "nothing was silently dropped"
         )
-    return {key.upper(): Decimal(str(w)) for key, w in raw.items()}
+    parsed = {key: Decimal(str(w)) for key, w in raw.items()}
+    # A `.nan` / `.inf` weight passes `load_config`; refused here, naming the key, rather than
+    # as an `InvalidOperation` traceback from the `<= 0` comparison downstream.
+    non_finite = sorted(key for key, w in parsed.items() if not w.is_finite())
+    if non_finite:
+        raise DcaPlanError(f"{source} has a non-finite weight for {', '.join(non_finite)}")
+    return {key.upper(): w for key, w in parsed.items()}
 
 
 def select_universe(
@@ -280,7 +286,10 @@ def select_universe(
     routes through, never a laxer copy. READ-ONLY: this writes nothing.
     """
     quote = config.quote_currency
-    allowlist = [asset.upper() for asset in config.allowlist]
+    # #849: the allowlist names assets, so a repeat (`[BTC, ETH, btc]` passes `load_config`) is
+    # the SAME asset -- one allocation, one buy, one rule. `dict.fromkeys` keeps first-seen order;
+    # nothing is dropped, because a repeat carries no weight of its own.
+    allowlist = list(dict.fromkeys(asset.upper() for asset in config.allowlist))
     weights = _weights_by_asset(config.target_weights, "target_weights")
     admitted = {
         sp.asset.upper(): sp for sp in build_screen_report(repo, config, screen_fn).screened

@@ -408,6 +408,36 @@ def test_weight_keys_are_matched_case_insensitively(valid_config_path: Path) -> 
     assert universe.excluded == ()
 
 
+def test_a_repeated_allowlist_entry_is_one_asset_not_a_double_share(
+    valid_config_path: Path,
+) -> None:
+    """#849: `allowlist: [BTC, ETH, btc, PAXG]` passes `load_config` as-is. The allowlist names
+    assets, so a repeat (in any case) is the SAME asset: one allocation, one buy, one rule --
+    never a doubled weight or two BTC-USD candidates. The plan must match the worked example
+    exactly, as if BTC were listed once."""
+    config = _config(valid_config_path, allowlist=("BTC", "ETH", "btc", "PAXG"))
+    universe = select_universe(_repo(), config, screen_fn=_screen())
+    assert [a.asset for a in universe.allocations] == ["BTC", "ETH", "PAXG"]
+    assert sum(a.weight for a in universe.allocations) == Decimal("1")
+    assert [asset for asset, _ in universe.editable] == ["BTC", "ETH", "PAXG"]
+
+    plan = _plan(valid_config_path, allowlist=("BTC", "ETH", "btc", "PAXG"))
+    assert [(b.asset, b.per_buy_usd) for b in plan.buys] == [
+        ("BTC", Decimal("41.39")),
+        ("ETH", Decimal("31.04")),
+        ("PAXG", Decimal("31.04")),
+    ]
+
+
+def test_a_non_finite_target_weight_is_refused_cleanly(valid_config_path: Path) -> None:
+    """A `.nan` / `.inf` weight in YAML passes `load_config`; it must be a `DcaPlanError` naming
+    the key, not an `InvalidOperation` traceback from the `<= 0` comparison."""
+    for bad in ("NaN", "Infinity"):
+        config = _config(valid_config_path, target_weights={"BTC": Decimal(bad)})
+        with pytest.raises(DcaPlanError, match="target_weights.*BTC"):
+            select_universe(_repo(), config, screen_fn=_screen())
+
+
 def test_case_colliding_target_weights_are_refused_not_silently_dropped(
     valid_config_path: Path,
 ) -> None:
