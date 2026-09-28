@@ -1802,6 +1802,69 @@ def test_dca_plan_screen_cache_keys_on_both_config_and_db_path(
     assert builds["n"] == 2, "a different config_path sharing a cache must still be a MISS"
 
 
+def test_dca_plan_screen_cache_misses_when_the_allowlist_changes_within_the_ttl(
+    deployment: tuple[str, str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#873: `load_config` re-reads config.yaml on every request, so an operator who adds an
+    asset to the allowlist at the SAME path must not be told, for up to 5 minutes, that it was
+    "not screened". The screen depends on the allowlist and the quote currency, so the key
+    carries both: the second read below is a MISS and admits PAXG."""
+    db_path, config_path = deployment
+    full = Path(config_path).read_text()
+    without_paxg = full.replace("  - PAXG\n", "", 1).replace("  PAXG: 0.30\n", "", 1)
+    assert without_paxg.count("PAXG") == full.count("PAXG") - 2, "the fixture edit did not apply"
+    without_paxg = without_paxg.replace("  BTC: 0.40\n", "  BTC: 0.70\n", 1)
+    Path(config_path).write_text(without_paxg)
+    cfg = _screen_cache_cfg(db_path, config_path)
+    asked = _admit_everything(monkeypatch)
+    builds = _counting_build_screen_report(monkeypatch)
+    query: web_api.Query = {"budget": ["1e3"], "buffer": ["0.1"]}
+
+    first = web_api.read_dca_plan(cfg, query, None, 1_700_000_000)
+    assert [row["asset"] for row in first["buys"]] == ["BTC", "ETH"]
+    assert builds["n"] == 1
+
+    Path(config_path).write_text(full)
+    asked.clear()
+    second = web_api.read_dca_plan(cfg, query, None, 1_700_000_000 + 60)
+    assert builds["n"] == 2, "an allowlist change at the same config path must be a MISS"
+    assert "PAXG-USD" in asked, "the rebuilt screen never asked about the new asset"
+    assert [row["asset"] for row in second["buys"]] == ["BTC", "ETH", "PAXG"]
+
+
+def test_dca_plan_cache_hit_still_reads_the_budget_and_the_rules_fresh(
+    deployment: tuple[str, str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#856 review: ONLY the screen is cached. Within the TTL, a changed budget and a DCA rule
+    added to the database both reach the plan, while the screen is still a HIT -- a regression
+    that cached the built plan (or the rule list) with the screen fails here."""
+    from keel.data.repository import Repository
+    from tests.commands.test_dca_plan import _insert_dca
+
+    db_path, config_path = deployment
+    cfg = _screen_cache_cfg(db_path, config_path)
+    _admit_everything(monkeypatch)
+    builds = _counting_build_screen_report(monkeypatch)
+
+    first = web_api.read_dca_plan(cfg, {"budget": ["1e3"], "buffer": ["0.1"]}, None, 1_700_000_000)
+    assert first["existing"] == []
+    assert first["summary"]["budget"]["value"] == "1000"
+
+    conn = connect(db_path)
+    rule_id = _insert_dca(Repository(conn), "SOL-USD", "live", budget="10")
+    conn.commit()
+    conn.close()
+
+    second = web_api.read_dca_plan(
+        cfg, {"budget": ["600"], "buffer": ["0.1"]}, None, 1_700_000_000 + 60
+    )
+    assert builds["n"] == 1, "the screen must still be a HIT for this test to mean anything"
+    assert second["summary"]["budget"]["value"] == "600"
+    assert [(row["rule_id"], row["product_id"], row["status"]) for row in second["existing"]] == [
+        (str(rule_id), "SOL-USD", "live")
+    ]
+
+
 def test_screen_cache_key_isolation() -> None:
     """`ScreenCache` itself, isolated from the DCA plan entirely: a different key -- either half
     of it -- is a separate entry, and the SAME key at the SAME instant never rebuilds."""

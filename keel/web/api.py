@@ -36,7 +36,7 @@ from __future__ import annotations
 
 import threading
 import time
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Hashable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -816,6 +816,12 @@ class ScreenCache:
     hot-reloaded `ServeConfig`, sharing one `ScreenCache` across two deployments still gets two
     entries rather than one deployment's screen answering for another's.
 
+    **And on what the screen reads from the config (#873).** `read_dca_plan` re-reads
+    config.yaml on every request, so the same path can name a new allowlist a minute later. The
+    caller's key therefore also carries the screened product ids and the quote currency --
+    exactly the inputs `build_screen_report` takes from the config -- so an asset added at the
+    same path is screened on the next read, never reported "not screened" for a whole TTL.
+
     **Holds no connection and no repository.** A `ScreenReport` is a frozen dataclass of
     `MarketFacts`/`ScreenResult` rows -- plain data, read once and never re-touched by this cache.
     `build()` is a closure the CALLER makes from its OWN per-request repo and connection
@@ -840,10 +846,10 @@ class ScreenCache:
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
-        self._entries: dict[tuple[str, str], _ScreenCacheEntry] = {}
+        self._entries: dict[tuple[Hashable, ...], _ScreenCacheEntry] = {}
 
     def get_or_build(
-        self, key: tuple[str, str], now_ts: int, build: Callable[[], Any]
+        self, key: tuple[Hashable, ...], now_ts: int, build: Callable[[], Any]
     ) -> tuple[Any, int]:
         """`(report, age_seconds)` for `key` as of `now_ts`.
 
@@ -893,6 +899,7 @@ def read_dca_plan(cfg: ServeConfig, query: Query, _state: Any, now_ts: int) -> d
     request exactly as before; only the screen itself is stale for up to 5 minutes, and the
     payload's `screen_age` says so.
     """
+    from keel.commands._products import _default_sim_products
     from keel.commands.admission import build_screen_report
     from keel.commands.assets import screen_product  # resolved per call: one patch point
     from keel.commands.dca_plan import (
@@ -918,7 +925,12 @@ def read_dca_plan(cfg: ServeConfig, query: Query, _state: Any, now_ts: int) -> d
     repo = open_repo(cfg.db_path)
     try:
         screen_report, screen_age_seconds = cfg.screen_cache.get_or_build(
-            (cfg.config_path, cfg.db_path),
+            (
+                cfg.config_path,
+                cfg.db_path,
+                config.quote_currency,
+                tuple(_default_sim_products(config)),
+            ),
             now_ts,
             lambda: build_screen_report(repo, config, screen_product),
         )
