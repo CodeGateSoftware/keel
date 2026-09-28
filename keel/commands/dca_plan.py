@@ -18,6 +18,7 @@ It writes `candidate` rows through `keel.commands.rules.add_rule_row` and nothin
 
 from __future__ import annotations
 
+import inspect
 import json
 import shlex
 import sqlite3
@@ -38,10 +39,26 @@ from keel.data.repository import Repository
 # Rail 1's own key function, as `keel/commands/rules.py` imports it: an existing rule's asset is
 # read the way the rails read it, so "already has a DCA rule" cannot disagree with them.
 from keel.execution.guards import _asset as _asset_of
+from keel.strategy.rules.dca import Dca
+
+#: The default `Dca.__init__` itself uses for `budget_usd`, read from its signature -- not a
+#: re-typed literal, and without touching the rule class. A stored row missing `budget_usd`
+#: (`existing_dca_rules`) is built by `agent.build_rule_from_params` with exactly this default.
+DCA_DEFAULT_BUDGET_USD = Decimal(str(inspect.signature(Dca).parameters["budget_usd"].default))
 
 #: Average days per month (365.25 / 12 = 30.4375): the per-buy formula's month.
 MONTH_DAYS = Decimal("365.25") / Decimal("12")
 DEFAULT_CADENCE_DAYS = 7
+
+_CENT = Decimal("0.01")
+
+#: An operator-typed budget above this is not a realistic monthly USD figure. Quantizing a
+#: `Decimal` to cents needs (integer digits + 2) <= the context's precision (28 by default);
+#: past that, `.quantize()` raises `decimal.InvalidOperation` instead of rounding -- exactly
+#: what `--budget 1e30` did (defect, review of #846): a raw traceback instead of a clean usage
+#: error. This bound is refused well before that ceiling, at a figure no real monthly DCA budget
+#: could reach.
+MAX_BUDGET_USD = Decimal("1e12")
 
 
 class DcaPlanError(ValueError):
@@ -73,6 +90,11 @@ def parse_plan_inputs(
     budget_usd = _decimal(budget, "budget")
     if budget_usd <= 0:
         raise DcaPlanError(f"budget must be positive, got {budget!r}")
+    if budget_usd > MAX_BUDGET_USD:
+        raise DcaPlanError(
+            f"budget {budget!r} is not a realistic monthly USD amount (over "
+            f"{format(MAX_BUDGET_USD, ',f')}) -- refused before it could break Decimal rounding"
+        )
     buffer = _decimal(buffer_pct, "buffer-pct")
     if not (Decimal("0") <= buffer < Decimal("1")):
         raise DcaPlanError(
@@ -164,6 +186,10 @@ class ExistingDcaRule:
     #: `dip_bonus_pct > 0` gets a warning instead, since #843 sizes a live DCA buy from the rule's
     #: own `budget_usd` context and the dip bonus can push a single buy above that figure.
     dip_bonus_pct: Decimal
+    #: True when the stored params carry no `budget_usd` and `budget_usd` above is
+    #: `DCA_DEFAULT_BUDGET_USD`, the figure the rule would be built with -- inferred, not stored,
+    #: so a live row like this gets its own named warning (review of #846).
+    budget_inferred: bool = False
 
 
 @dataclass(frozen=True)
@@ -192,6 +218,14 @@ def existing_dca_rules(repo: Repository) -> tuple[ExistingDcaRule, ...]:
             continue
         params = row["params"] or {}
         product = str(params.get("product_id", ""))
+        # A row missing `budget_usd` entirely (legacy/malformed) is built by
+        # `agent.build_rule_from_params` with `Dca.__init__`'s own default --
+        # `DCA_DEFAULT_BUDGET_USD` -- not $0 (review of #846: $0 undercounted a live row's R7
+        # commitment) and not `config.dca.budget_usd` (the executor's fallback, reached only when
+        # a setup carries no `size_usd` at all -- never true of a `Dca` rule's own buy).
+        raw_budget = params.get("budget_usd")
+        budget_inferred = raw_budget is None
+        budget_usd = DCA_DEFAULT_BUDGET_USD if budget_inferred else Decimal(str(raw_budget))
         found.append(
             ExistingDcaRule(
                 rule_id=int(row["id"]),
@@ -201,12 +235,35 @@ def existing_dca_rules(repo: Repository) -> tuple[ExistingDcaRule, ...]:
                 asset=_asset_of(product).upper(),
                 product_id=product,
                 status=str(row["status"]),
-                budget_usd=Decimal(str(params.get("budget_usd", "0"))),
+                budget_usd=budget_usd,
                 cadence_days=int(params.get("cadence_days", DEFAULT_CADENCE_DAYS)),
                 dip_bonus_pct=Decimal(str(params.get("dip_bonus_pct", "0"))),
+                budget_inferred=budget_inferred,
             )
         )
     return tuple(found)
+
+
+def _weights_by_asset(raw: Mapping[str, Decimal], source: str) -> dict[str, Decimal]:
+    """Uppercase every key, refusing -- never silently dropping (#848) -- when two keys collide
+    only by case. `{"btc": .9, "BTC": .1}` uppercased by a plain dict comprehension lets
+    whichever key iterates last overwrite the other, and the loser's weight vanishes with
+    nothing said: exactly the silent-drop class R4 (`not_on_allowlist`) exists to prevent for
+    every OTHER way a weight can disappear. Both callers below (`target_weights`, the `[E]`
+    override) share this one guard so neither can drop a weight the other one catches."""
+    by_upper: dict[str, list[str]] = {}
+    for key in raw:
+        by_upper.setdefault(key.upper(), []).append(key)
+    collisions = {upper: keys for upper, keys in by_upper.items() if len(keys) > 1}
+    if collisions:
+        detail = "; ".join(
+            f"{upper} ({', '.join(sorted(keys))})" for upper, keys in sorted(collisions.items())
+        )
+        raise DcaPlanError(
+            f"{source} has keys that collide once uppercased -- {detail} -- fix the config; "
+            "nothing was silently dropped"
+        )
+    return {key.upper(): Decimal(str(w)) for key, w in raw.items()}
 
 
 def select_universe(
@@ -224,7 +281,7 @@ def select_universe(
     """
     quote = config.quote_currency
     allowlist = [asset.upper() for asset in config.allowlist]
-    weights = {asset.upper(): Decimal(str(w)) for asset, w in config.target_weights.items()}
+    weights = _weights_by_asset(config.target_weights, "target_weights")
     admitted = {
         sp.asset.upper(): sp for sp in build_screen_report(repo, config, screen_fn).screened
     }
@@ -236,7 +293,7 @@ def select_universe(
         for asset in allowlist
         if asset in admitted and admitted[asset].result.admitted and asset not in existing_by_asset
     ]
-    override = {asset.upper(): w for asset, w in (weights_override or {}).items()}
+    override = _weights_by_asset(weights_override or {}, "the edited weights")
     stray = sorted(set(override) - set(editable_assets))
     if stray:
         raise DcaPlanError(
@@ -308,7 +365,6 @@ def apply_command(
     return " ".join(parts)
 
 
-_CENT = Decimal("0.01")
 _HUNDRED = Decimal("100")
 
 #: keel records no venue minimum order size: `keel_broker_api.results.Instrument` carries none
@@ -355,8 +411,27 @@ class DcaPlan:
     #: sizes each DCA buy from the rule's own `setup.context["size_usd"]`
     #: (`keel/execution/executor.py::_dca_budget`), not from `config.dca.budget_usd` (R7,
     #: amended after #843; R9, which claimed the executor sizes every buy from the config figure,
-    #: is withdrawn -- that statement is no longer true of the money path).
+    #: is withdrawn -- that statement is no longer true of the money path). This is still the
+    #: AVERAGE-month figure shown to the operator; the warning that uses it is triggered by the
+    #: worst-case figures below instead (R7 amended again, #847).
     existing_live_monthly_usd: Decimal
+    #: R6 amended 2026-09-27, #847: rail 14 caps the UTC CALENDAR month
+    #: (`guards._monthly_buy_spend_usd`), not the 30.4375-day average the per-buy SIZING still
+    #: uses (unchanged). Every DCA rule in one plan shares one cadence and buys on the same days
+    #: (`epoch_day % cadence_days == 0`, `Dca.detect`), so the worst calendar month for that
+    #: cadence -- `_worst_month_buy_days` -- can hold more buys than the average-month `spend`
+    #: figure implies (5 for a 7-day cadence, e.g. a 31-day month phased on the 1st). This field
+    #: is that count.
+    worst_month_buy_days: int
+    #: The total spent, across every planned buy, on ONE cadence day -- exact: each addend
+    #: (`buy.per_buy_usd`) is already rounded down to cents, and summing introduces no further
+    #: rounding.
+    worst_month_cycle_usd: Decimal
+    #: `worst_month_cycle_usd x worst_month_buy_days` -- what the blocker check (R6) and the
+    #: renderer both use. This field IS the figure that was checked against the cap; the
+    #: renderer reuses it verbatim rather than recomputing, so the display can never show a
+    #: total larger than what was actually checked (R5's rule, extended to this figure by #847).
+    worst_month_spend_usd: Decimal
     blockers: tuple[str, ...]
     warnings: tuple[str, ...]
 
@@ -371,6 +446,24 @@ def _cents_down(value: Decimal) -> Decimal:
 
 def _usd(value: Decimal) -> str:
     return f"${format(value.quantize(_CENT), ',f')}"
+
+
+def _worst_month_buy_days(cadence_days: int) -> int:
+    """The most buy days a `cadence_days`-cadence schedule (`epoch_day % cadence_days == 0`,
+    `Dca.detect`'s own scheduling rule -- not this module's) can land inside any single UTC
+    calendar month, over every month length (28-31 days) and every phase the cadence can fall
+    into. Exact, computed from the scheduling rule itself (brute force over the small, bounded
+    space of month lengths and phases), not the 30.4375-day average `MONTH_DAYS` uses for
+    per-buy sizing -- rail 14 caps the CALENDAR month
+    (`keel/execution/guards.py::_monthly_buy_spend_usd`), so this is the figure a blocker must
+    compare against (#847). For a 7-day cadence this is 5 (a 31-day month phased on the 1st:
+    days 1, 8, 15, 22, 29)."""
+    worst = 0
+    for length in (28, 29, 30, 31):
+        for phase in range(min(cadence_days, length)):
+            hits = sum(1 for day in range(length) if day % cadence_days == phase)
+            worst = max(worst, hits)
+    return worst
 
 
 def build_dca_plan(
@@ -390,9 +483,16 @@ def build_dca_plan(
     CONFIGURED `fees.taker_pct` is rounded UP (R5). Blockers (R6, R8) make the plan
     unapprovable; warnings never do:
 
-    - R7 (amended after #843): each existing `live` DCA row's monthly commitment, at that rule's
-      OWN `budget_usd` -- not `config.dca.budget_usd` -- summed against this plan's spend and
-      rail 14's cap.
+    - R6 amended 2026-09-27, #847: the cap check compares the WORST UTC CALENDAR month for this
+      plan's cadence (`_worst_month_buy_days(cadence) x` the per-cycle total, `worst_month_*` on
+      `DcaPlan`) against rail 14's cap -- not the 30.4375-day average `spend` alone, because rail
+      14 caps the calendar month (`guards._monthly_buy_spend_usd`) and every rule in this plan
+      buys on the same days. Per-buy SIZING is unchanged; only the blocker's comparison moved.
+    - R7 (amended after #843, amended again by #847 for consistency): each existing `live` DCA
+      row's monthly commitment is still shown at that rule's OWN `budget_usd`, average-month
+      figure -- not `config.dca.budget_usd` -- but the WARNING is now triggered by the same
+      worst-calendar-month arithmetic as the blocker: this plan's worst month plus each live
+      row's own worst month (its own cadence), against the cap.
     - R7's dip-bonus corollary: a `live` row with `dip_bonus_pct > 0` can spend more than the
       commitment above on any given buy, so it gets its own warning naming the rule.
     - The minimum-order gap: keel does not know the venue's minimum order size
@@ -434,17 +534,31 @@ def build_dca_plan(
             )
     if not buys:
         blockers.append("no asset is eligible -- see the excluded list for each reason")
-    if cap.allowance_usd is not None and spend > cap.allowance_usd:
+
+    # R6, amended #847: the worst UTC CALENDAR month this cadence can land in, not the
+    # 30.4375-day average `spend` alone -- rail 14 caps the calendar month
+    # (`guards._monthly_buy_spend_usd`), and every buy in this plan shares one cadence and lands
+    # on the same days (`epoch_day % cadence_days == 0`). `worst_month_cycle_usd` sums buys that
+    # are ALREADY rounded down to cents, so this introduces no further rounding -- and the
+    # renderer reuses these exact fields rather than recomputing them (R5, extended).
+    worst_days = _worst_month_buy_days(cadence)
+    worst_month_cycle = sum((b.per_buy_usd for b in buys), Decimal("0"))
+    worst_month_spend = worst_month_cycle * worst_days
+    if cap.allowance_usd is not None and worst_month_spend > cap.allowance_usd:
         if cap.in_force:
             blockers.append(
-                f"planned spend {_usd(spend)} exceeds rail 14's monthly buy cap "
-                f"{_usd(cap.allowance_usd)} on {cap.venue}"
+                f"planned spend {_usd(spend)}/month; the worst calendar month for a "
+                f"{cadence}-day cadence holds {worst_days} buy day(s), which at "
+                f"{_usd(worst_month_cycle)} per cycle is {_usd(worst_month_spend)} -- that "
+                f"exceeds rail 14's monthly buy cap {_usd(cap.allowance_usd)} on {cap.venue}"
             )
         else:
             blockers.append(
                 f"rail 14's monthly buy cap on {cap.venue} is {_usd(cap.allowance_usd)} because "
-                f"{cap.degraded_reason}; planned spend is {_usd(spend)}. Run `keel subscription "
-                f"attest --venue {cap.venue} --tier <tier>` to restore it."
+                f"{cap.degraded_reason}; the worst calendar month for a {cadence}-day cadence "
+                f"would spend {_usd(worst_month_spend)} ({worst_days} buy day(s) x "
+                f"{_usd(worst_month_cycle)} per cycle). Run `keel subscription attest --venue "
+                f"{cap.venue} --tier <tier>` to restore it."
             )
 
     live_rules = [rule for rule in universe.existing if rule.status == "live"]
@@ -452,15 +566,33 @@ def build_dca_plan(
         (_cents_down(rule.budget_usd * MONTH_DAYS / rule.cadence_days) for rule in live_rules),
         Decimal("0"),
     )
+    # R7 amended #847, for consistency with R6: the TRIGGER compares worst calendar months too --
+    # this plan's own worst month plus each live row's own worst month, at its own cadence and
+    # its own budget_usd (exact: an integer count times an already-exact stored amount, no
+    # rounding). The DISPLAYED `live_monthly` figure above stays the average-month one operators
+    # already read this warning by.
+    live_worst_monthly = sum(
+        (rule.budget_usd * _worst_month_buy_days(rule.cadence_days) for rule in live_rules),
+        Decimal("0"),
+    )
     warnings: list[str] = [MIN_ORDER_UNKNOWN]
     allowance = cap.allowance_usd
-    if allowance is not None and live_monthly > 0 and spend + live_monthly > allowance:
+    combined_worst = worst_month_spend + live_worst_monthly
+    if allowance is not None and live_monthly > 0 and combined_worst > allowance:
         warnings.append(
             f"existing live DCA rules commit about {_usd(live_monthly)}/month, at each rule's "
-            f"own amount; with this plan's {_usd(spend)} that exceeds rail 14's monthly buy cap "
-            f"{_usd(allowance)}, which will veto buys once the month's total reaches it"
+            f"own amount; combined with this plan's worst calendar month total "
+            f"{_usd(worst_month_spend)}, the worst-case combined total is "
+            f"{_usd(combined_worst)}, which exceeds rail 14's monthly buy cap {_usd(allowance)}, "
+            "which will veto buys once the month's total reaches it"
         )
     for rule in live_rules:
+        if rule.budget_inferred:
+            warnings.append(
+                f"rule {rule.rule_id} ({rule.product_id}) has no stored budget_usd; its "
+                f"commitment above is counted at the Dca rule's default "
+                f"{_usd(DCA_DEFAULT_BUDGET_USD)} per buy, which is what the rule is built with"
+            )
         if rule.dip_bonus_pct > 0:
             warnings.append(
                 f"rule {rule.rule_id} ({rule.product_id}) has dip_bonus_pct "
@@ -489,6 +621,9 @@ def build_dca_plan(
         taker_pct=taker,
         taker_pct_display=taker * _HUNDRED,
         existing_live_monthly_usd=live_monthly,
+        worst_month_buy_days=worst_days,
+        worst_month_cycle_usd=worst_month_cycle,
+        worst_month_spend_usd=worst_month_spend,
         blockers=tuple(blockers),
         warnings=tuple(warnings),
     )
@@ -513,6 +648,11 @@ def render_dca_plan(plan: DcaPlan) -> list[str]:
         f"({_usd(plan.buffer_usd)} held back) -> spend {_usd(plan.spend_usd)}/month",
         f"  rail 14 monthly buy cap on {plan.cap.venue}: {cap}"
         + ("" if plan.cap.in_force else f" (because {plan.cap.degraded_reason})"),
+        # #847: shown right next to the cap, and reusing the plan's own fields verbatim -- never
+        # a total recomputed (and possibly larger) than what the blocker check actually used.
+        f"  checked against the cap: worst calendar month for a {inputs.cadence_days}-day "
+        f"cadence, {plan.worst_month_buy_days} buy day(s) x {_usd(plan.worst_month_cycle_usd)} "
+        f"per cycle = {_usd(plan.worst_month_spend_usd)}",
         f"  {RAIL14_NOTE}",
         "",
         "== Schedule ==",

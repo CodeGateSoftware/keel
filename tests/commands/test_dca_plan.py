@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import ast
 import sqlite3
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
 import pytest
@@ -88,6 +88,18 @@ def test_parse_plan_inputs_refuses_with_a_named_reason(
 def test_parse_plan_inputs_refuses_a_non_positive_cadence() -> None:
     with pytest.raises(DcaPlanError, match="cadence"):
         parse_plan_inputs("500", "0.1", cadence_days=0)
+
+
+def test_an_absurd_budget_is_refused_cleanly_not_a_decimal_crash() -> None:
+    """Defect (review of #846): `--budget 1e30` used to reach `Decimal.quantize` (cents,
+    28-digit default context) with more digits than the context allows, raising
+    `decimal.InvalidOperation` -- a raw traceback, not a usage error. `parse_plan_inputs` must
+    refuse it before it ever reaches a `quantize` call."""
+    with pytest.raises(DcaPlanError, match="budget"):
+        parse_plan_inputs("1e30", "0.1")
+    # Not vacuous: unpatched, this is exactly the crash being refused against.
+    with pytest.raises(InvalidOperation):
+        Decimal("1e30").quantize(Decimal("0.01"))
 
 
 def test_parse_weight() -> None:
@@ -310,6 +322,55 @@ def test_an_existing_rules_dip_bonus_pct_is_carried(valid_config_path: Path) -> 
     assert universe.existing[0].dip_bonus_pct == Decimal("2")
 
 
+def test_a_stored_rule_missing_budget_usd_is_counted_at_the_rules_default_and_named(
+    valid_config_path: Path,
+) -> None:
+    """Defect (review of #846): a legacy row whose params lack `budget_usd` used to read as $0,
+    undercounting a live rule's R7 commitment. `agent.build_rule_from_params` would construct
+    that row with `Dca.__init__`'s own default, so the plan counts it at THAT default -- read
+    from the constructor's signature, not a re-typed literal and not a change to the rule class
+    -- and says so in one named warning, because the figure is inferred, not stored."""
+    import inspect
+
+    from keel.commands.dca_plan import existing_dca_rules
+    from keel.strategy.rules.dca import Dca
+
+    constructor_default = inspect.signature(Dca).parameters["budget_usd"].default
+    repo = _repo()
+    rule_id = repo.insert_rule(
+        "dca",
+        {"product_id": "BTC-USD", "cadence_days": 7, "dip_bonus_pct": "0", "lookback_days": 90},
+        status="live",
+        now_ts=NOW_TS,
+    )
+    _insert_dca(repo, "SOL-USD", "live", budget="40")  # stores budget_usd: no warning for it
+
+    by_id = {rule.rule_id: rule for rule in existing_dca_rules(repo)}
+    assert by_id[rule_id].budget_usd == constructor_default == Decimal("50")
+
+    # Counted at $50 in R7's commitment, not $0: 50 x 30.4375/7 = 217.41 (down), plus SOL's
+    # 40 x 30.4375/7 = 173.92 (down).
+    plan = _plan(valid_config_path, repo)
+    assert plan.existing_live_monthly_usd == Decimal("217.41") + Decimal("173.92")
+    named = [w for w in plan.warnings if "no stored budget_usd" in w]
+    assert len(named) == 1
+    assert named[0].startswith(f"rule {rule_id} (BTC-USD) has no stored budget_usd")
+
+
+@pytest.mark.parametrize(
+    ("cadence", "expected"),
+    [(1, 31), (2, 16), (7, 5), (10, 4), (14, 3), (28, 2), (30, 2), (31, 1), (45, 1)],
+)
+def test_worst_month_buy_days_is_the_most_cadence_days_any_calendar_month_holds(
+    cadence: int, expected: int
+) -> None:
+    """R6 amended (#847): the most `epoch_day % cadence == 0` days any 28-31-day UTC calendar
+    month can contain -- ceil(31 / cadence) for every cadence up to 31, and 1 beyond."""
+    from keel.commands.dca_plan import _worst_month_buy_days
+
+    assert _worst_month_buy_days(cadence) == expected
+
+
 def test_every_reason_that_applies_is_named(valid_config_path: Path) -> None:
     repo = _repo()
     _insert_dca(repo, "BTC-USD", "candidate")
@@ -345,6 +406,37 @@ def test_weight_keys_are_matched_case_insensitively(valid_config_path: Path) -> 
     universe = select_universe(_repo(), config, screen_fn=_screen())
     assert [a.asset for a in universe.allocations] == ["BTC", "ETH", "PAXG"]
     assert universe.excluded == ()
+
+
+def test_case_colliding_target_weights_are_refused_not_silently_dropped(
+    valid_config_path: Path,
+) -> None:
+    """#848: `{"btc": .9, "BTC": .1}` uppercase-collide. The old code built `{asset.upper(): w
+    for asset, w in ...}` over the dict in iteration order, so BTC's weight silently became
+    whichever key came last (0.1), and the 0.9 vanished with no line saying so -- the exact
+    silent-drop class #198/R4 exists to prevent for every OTHER kind of dropped weight. This
+    must refuse loudly instead, naming both colliding keys."""
+    config = _config(
+        valid_config_path,
+        target_weights={"btc": Decimal("0.9"), "BTC": Decimal("0.1"), "ETH": Decimal("0.5")},
+    )
+    with pytest.raises(DcaPlanError) as excinfo:
+        select_universe(_repo(), config, screen_fn=_screen())
+    message = str(excinfo.value)
+    assert "btc" in message
+    assert "BTC" in message
+
+
+def test_non_colliding_mixed_case_weights_still_work(valid_config_path: Path) -> None:
+    """The collision guard must not refuse the ordinary case (one spelling per asset) that
+    `test_weight_keys_are_matched_case_insensitively` already pins -- this is the negative case
+    for the SAME guard, run through `build_dca_plan` rather than `select_universe` directly."""
+    config = _config(
+        valid_config_path,
+        target_weights={"btc": Decimal("0.4"), "Eth": Decimal("0.3"), "PAXG": Decimal("0.3")},
+    )
+    universe = select_universe(_repo(), config, screen_fn=_screen())
+    assert [a.asset for a in universe.allocations] == ["BTC", "ETH", "PAXG"]
 
 
 def test_editable_assets_are_admitted_allowlisted_and_without_a_dca_rule(
@@ -405,7 +497,10 @@ def _plan(
     valid_config_path: Path,
     repo: Repository | None = None,
     *,
-    cap: str | None = "500",
+    # #847: 600 clears the worst calendar month's 5 x $103.47 = $517.35 for the default
+    # BTC/ETH/PAXG .4/.3/.3 weights (or any renormalised subset of them, which sums to the same
+    # total) -- tests exercising THAT exact defect pass their own `cap` explicitly.
+    cap: str | None = "600",
     rejected: tuple[str, ...] = (),
     budget: str = "500",
     buffer: str = "0.1",
@@ -427,7 +522,10 @@ def _plan(
 
 
 def test_the_worked_example(valid_config_path: Path) -> None:
-    plan = _plan(valid_config_path)
+    """#847: at the cap this worked example was originally written against ($500), the plan is
+    now a BLOCKER, not approvable -- see `test_the_worked_examples_worst_month_blocks_the_500_cap`
+    below for why. The per-buy math this test exists to pin is unchanged."""
+    plan = _plan(valid_config_path, cap="500")
     assert plan.spend_usd == Decimal("450.00")
     assert plan.buffer_usd == Decimal("50.00")
     assert [
@@ -444,6 +542,37 @@ def test_the_worked_example(valid_config_path: Path) -> None:
     assert plan.est_monthly_fees_usd == Decimal("5.40")
     assert plan.taker_pct == Decimal("0.012")
     assert plan.taker_pct_display == Decimal("1.200")
+    assert not plan.approvable
+
+
+def test_the_worked_examples_worst_month_blocks_the_500_cap(valid_config_path: Path) -> None:
+    """#847 (defect, review of #846): rail 14 caps the UTC CALENDAR month
+    (`guards._monthly_buy_spend_usd`), not an average 30.4375-day month. Every DCA rule buys on
+    the same days (`epoch_day % cadence_days == 0`, `Dca.detect`), so a 7-day cadence's worst
+    calendar month holds 5 buy days (31-day month, phase aligned on the 1st: days 1/8/15/22/29).
+    The worked example's per-cycle total is $41.39 + $31.04 + $31.04 = $103.47/week; 5 x $103.47
+    = $517.35, which exceeds the $500 cap even though the average-month `spend` ($450) does not."""
+    plan = _plan(valid_config_path, cap="500")
+    assert plan.worst_month_buy_days == 5
+    assert plan.worst_month_cycle_usd == Decimal("103.47")
+    assert plan.worst_month_spend_usd == Decimal("517.35")
+    assert not plan.approvable
+    (blocker,) = [b for b in plan.blockers if "rail 14" in b]
+    assert blocker == (
+        "planned spend $450.00/month; the worst calendar month for a 7-day cadence holds 5 buy "
+        "day(s), which at $103.47 per cycle is $517.35 -- that exceeds rail 14's monthly buy cap "
+        "$500.00 on coinbase"
+    )
+
+
+def test_a_worst_month_that_fits_the_cap_is_still_approvable(valid_config_path: Path) -> None:
+    """The other half of #847: the SAME worst-case figures, against a cap that actually clears
+    them ($520 > $517.35), are not a blocker. Proves the fix compares the worst month correctly
+    in both directions, not just as a stricter-always veto."""
+    plan = _plan(valid_config_path, cap="520")
+    assert plan.worst_month_buy_days == 5
+    assert plan.worst_month_cycle_usd == Decimal("103.47")
+    assert plan.worst_month_spend_usd == Decimal("517.35")
     assert plan.approvable, plan.blockers
 
 
@@ -525,9 +654,12 @@ def test_existing_live_dca_spend_is_warned_against_the_cap_at_each_rules_own_amo
 ) -> None:
     """R7 amended (#843): a live row's commitment is that rule's OWN `budget_usd` -- what the
     live executor actually spends per buy since #843 -- not `config.dca.budget_usd`. BTC live
-    weekly 40: 40 x 30.4375/7 = 173.9285... -> 173.92 (down). Planned spend (ETH/PAXG only,
-    since BTC already has a rule) is 450; 450 + 173.92 = 623.92 > the 500 cap: a WARNING, not a
-    blocker (rail 14 only ever blocks the order actually placed, not a forecast)."""
+    weekly 40: 40 x 30.4375/7 = 173.9285... -> 173.92 (down), the average-month figure still
+    shown. The WARNING TRIGGER itself is worst-case (#847, for consistency with the blocker):
+    this plan's own worst month (ETH/PAXG only, since BTC already has a rule) is $517.40, and
+    BTC's own worst month is 40 x 5 = $200.00; combined $717.40 exceeds the $600 cap used here
+    (chosen so the plan itself, at $517.40, stays under it and this stays a WARNING, not a
+    blocker -- rail 14 only ever blocks the order actually placed, not a forecast)."""
     repo = _repo()
     _insert_dca(repo, "BTC-USD", "live", budget="40")
     _insert_dca(repo, "SOL-USD", "candidate", budget="40")  # not live: no commitment
@@ -535,7 +667,7 @@ def test_existing_live_dca_spend_is_warned_against_the_cap_at_each_rules_own_amo
     assert plan.existing_live_monthly_usd == Decimal("173.92")
     assert plan.approvable, plan.blockers
     (warning,) = [w for w in plan.warnings if "173.92" in w]
-    assert "500" in warning
+    assert "600" in warning
 
 
 def test_two_live_dca_rules_commitments_sum(valid_config_path: Path) -> None:
@@ -668,6 +800,13 @@ def test_the_rendered_plan_states_rail_14_is_a_buy_cap_and_never_fee_free(
 ) -> None:
     lines = render_dca_plan(_plan(valid_config_path))
     assert sum(RAIL14_NOTE in line for line in lines) == 1
+    # #847: the output says the WORST calendar month is what was checked against the cap, on
+    # exactly one line, carrying the plan's own checked figures verbatim.
+    (checked,) = [line for line in lines if "worst calendar month" in line]
+    assert (
+        checked == "  checked against the cap: worst calendar month for a 7-day cadence, "
+        "5 buy day(s) x $103.47 per cycle = $517.35"
+    )
     assert not any("fee-free" in line.lower() for line in lines)
     assert not any("max_exposure_usd" in line for line in lines)
 

@@ -90,15 +90,21 @@ def dca_plan_cmd(ctx: click.Context, budget: str, buffer_pct: str, cadence_days:
     weights: dict[str, Decimal] | None = None
 
     while True:
-        plan = build_dca_plan(
-            repo,
-            config,
-            inputs,
-            venue=venue,
-            now_ts=int(time.time()),
-            screen_fn=screen_product,
-            weights_override=weights,
-        )
+        try:
+            plan = build_dca_plan(
+                repo,
+                config,
+                inputs,
+                venue=venue,
+                now_ts=int(time.time()),
+                screen_fn=screen_product,
+                weights_override=weights,
+            )
+        except DcaPlanError as exc:
+            # `DcaPlanError`'s own docstring: "the message is shown verbatim" -- a config-level
+            # refusal (case-colliding `target_weights`, #848) or a stray `[E]` edit must reach
+            # the operator as a clean error, not an uncaught traceback out of the CLI.
+            raise click.ClickException(str(exc)) from exc
         for line in render_dca_plan(plan):
             click.echo(line)
         if not interactive:

@@ -35,10 +35,18 @@ def _repo(db: Path) -> Repository:
     return Repository(conn)
 
 
+#: #847: the default $500/0.1 budget/buffer's worst calendar month is $517.35 (5 x $103.47,
+#: BTC/ETH/PAXG .4/.3/.3) or $517.40 (5 x $103.48, any renormalised 2-of-3 subset of the same
+#: total) -- both exceed a $500 cap. 600 clears either, so this fixture's happy-path tests (about
+#: CLI plumbing, not the cap defect itself) stay approvable; `test_dca_plan.py` pins the $500 cap
+#: defect directly.
+_ROOMY_CAP = Decimal("600")
+
+
 @pytest.fixture
 def deployment(tmp_path: Path, valid_config_path: Path, monkeypatch: pytest.MonkeyPatch):
     db = tmp_path / "t.db"
-    attest_subscription(_repo(db), now_ts=int(time.time()), free_volume_usd=Decimal("500"))
+    attest_subscription(_repo(db), now_ts=int(time.time()), free_volume_usd=_ROOMY_CAP)
     monkeypatch.setattr(dca_cli, "screen_product", _screen())
     return db, valid_config_path
 
@@ -147,7 +155,7 @@ def test_the_screen_fn_is_called_once_per_allowlisted_product(
     the reader: an empty fixture that never gets called would pass every other test in this file
     by vacuum. VALID_CONFIG_YAML's allowlist is BTC/ETH/PAXG -- exactly three products."""
     db = tmp_path / "t.db"
-    attest_subscription(_repo(db), now_ts=int(time.time()), free_volume_usd=Decimal("500"))
+    attest_subscription(_repo(db), now_ts=int(time.time()), free_volume_usd=_ROOMY_CAP)
     calls: list[str] = []
     real = _screen()
 
@@ -219,6 +227,27 @@ def test_edit_renormalises_and_reshows_before_approval(deployment, monkeypatch) 
     assert {Decimal(r["params"]["budget_usd"]) for r in rows} == {Decimal("51.74")}
 
 
+def test_edit_reprompts_on_a_bad_weight_and_keeps_the_valid_one(deployment, monkeypatch) -> None:
+    """`keel/commands/dca.py:155` -- `_edit_weights`'s `except DcaPlanError` branch had no test.
+    BTC gets an invalid weight ("-1") first: the loop must re-issue the SAME prompt (`_edit_weights`
+    stays on BTC, it does not advance to ETH) and echo `parse_weight`'s reason, before accepting
+    a valid one ("1") and moving on."""
+    monkeypatch.setattr(_common, "_is_interactive", lambda: True)
+    result = _run(deployment, "--budget", "500", "--buffer-pct", "0.1", input="E\n-1\n1\n1\n0\nY\n")
+    assert result.exit_code == 0, result.output
+    assert "weight for BTC must be 0 or more, got '-1'" in result.output
+    # The prompt itself (not the error line, which also contains "weight for BTC") was re-issued
+    # for BTC, not skipped past to ETH:
+    assert result.output.count("weight for BTC [") == 2
+    assert result.output.count("weight for ETH [") == 1
+    rows = _repo(deployment[0]).get_rules()
+    assert {r["params"]["product_id"] for r in rows} == {"BTC-USD", "ETH-USD"}
+    # The valid re-entered weight (1, not the rejected -1) is what was actually used: BTC/ETH
+    # renormalise to 50/50, same per-buy figure `test_edit_renormalises_and_reshows_before_approval`
+    # pins for the identical 1/1/0 split.
+    assert {Decimal(r["params"]["budget_usd"]) for r in rows} == {Decimal("51.74")}
+
+
 def test_a_blocked_plan_at_a_tty_does_not_offer_approve(deployment, monkeypatch) -> None:
     monkeypatch.setattr(_common, "_is_interactive", lambda: True)
     result = _run(deployment, "--budget", "5000", "--buffer-pct", "0", input="Y\nN\n")
@@ -232,6 +261,51 @@ def test_bad_inputs_are_click_usage_errors(deployment) -> None:
     result = _run(deployment, "--budget", "500", "--buffer-pct", "10")
     assert result.exit_code == 2
     assert "0.1 means" in result.output
+
+
+def test_case_colliding_target_weights_are_a_clean_error_not_a_crash(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#848: a config with `btc:` and `BTC:` both set used to reach `build_dca_plan` uncaught
+    (`DcaPlanError` was never a `click.ClickException`), crashing with a raw traceback instead of
+    the clean, verbatim-message error `DcaPlanError`'s own docstring promises."""
+    from tests.conftest import VALID_CONFIG_YAML
+
+    db = tmp_path / "t.db"
+    attest_subscription(_repo(db), now_ts=int(time.time()), free_volume_usd=_ROOMY_CAP)
+    monkeypatch.setattr(dca_cli, "screen_product", _screen())
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(VALID_CONFIG_YAML.replace("BTC: 0.40", "btc: 0.40\n  BTC: 0.05"))
+
+    result = CliRunner().invoke(
+        cli,
+        [
+            "--db",
+            str(db),
+            "--config",
+            str(config_path),
+            "dca",
+            "plan",
+            "--budget",
+            "500",
+            "--buffer-pct",
+            "0.1",
+        ],
+    )
+    assert result.exit_code == 1, result.output
+    assert result.exception is None or isinstance(result.exception, SystemExit)
+    assert "Traceback" not in result.output
+    assert "collide" in result.output
+    assert "btc" in result.output and "BTC" in result.output
+
+
+def test_an_absurd_budget_is_a_click_usage_error_not_a_crash(deployment) -> None:
+    """Defect (review of #846): `--budget 1e30` used to reach `Decimal.quantize` and raise
+    `decimal.InvalidOperation` -- a bare traceback out of the CLI, not `click.BadParameter`."""
+    result = _run(deployment, "--budget", "1e30", "--buffer-pct", "0.1")
+    assert result.exit_code == 2, result.output
+    assert "InvalidOperation" not in result.output
+    assert "budget" in result.output.lower()
 
 
 def test_buffer_pct_is_required(deployment) -> None:
