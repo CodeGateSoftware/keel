@@ -138,6 +138,48 @@ def _functions_calling_attr(
     return found
 
 
+_EXECUTOR_MODULE = "keel.execution.executor"
+
+#: Every executor function that reaches `_run_order`, by any name a caller could import.
+_ORDER_REACHING_NAMES = SECOND_LEVEL_NAMES | {"_run_order", "_roll_stop"}
+
+
+def _executor_bypasses(tree: ast.AST, module: str) -> list[str]:
+    """The two shapes that reach an order path WITHOUT spelling `executor.<name>`, which is all
+    `_functions_calling_attr` can see: `from keel.execution.executor import <order-reaching
+    name>`, and a call through any OTHER name the module binds to the executor module. An alias
+    used only for constants (`doctor.py`'s `executor_mod`) is not an offender."""
+    offenders: list[str] = []
+    aliases: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom) and node.module == _EXECUTOR_MODULE:
+            offenders += [
+                f"{module}: imports {a.name} from {_EXECUTOR_MODULE}"
+                for a in node.names
+                if a.name in _ORDER_REACHING_NAMES
+            ]
+        elif isinstance(node, ast.ImportFrom) and node.module == "keel.execution":
+            aliases |= {a.asname for a in node.names if a.name == "executor" and a.asname}
+        elif isinstance(node, ast.Import):
+            aliases |= {a.asname for a in node.names if a.name == _EXECUTOR_MODULE and a.asname}
+    aliases.discard("executor")
+    for func in ast.walk(tree):
+        if not isinstance(func, ast.FunctionDef | ast.AsyncFunctionDef):
+            continue
+        for node in ast.walk(func):
+            if (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id in aliases
+                and node.func.attr in _ORDER_REACHING_NAMES
+            ):
+                offenders.append(
+                    f"{module}: {func.name} calls {node.func.value.id}.{node.func.attr}"
+                )
+    return offenders
+
+
 def test_only_run_order_calls_place_order() -> None:
     assert _functions_calling({"place_order"}) == PLACEMENT_CALLERS
 
@@ -157,10 +199,7 @@ def test_the_scan_is_false_capable() -> None:
 
 def test_the_attr_scan_does_not_confuse_executor_execute_with_conn_execute() -> None:
     tree = ast.parse(
-        "def sneaky():\n"
-        "    conn.execute('SELECT 1')\n"
-        "def honest():\n"
-        "    executor.execute(1)\n"
+        "def sneaky():\n    conn.execute('SELECT 1')\ndef honest():\n    executor.execute(1)\n"
     )
     assert _calls_via_attr(tree, "m", "executor", {"execute"}) == {("m", "honest")}
 
@@ -189,4 +228,39 @@ def test_the_browser_and_mcp_name_no_sell_side_operation() -> None:
                     and node.value.id == "executor"
                 ):
                     offenders.append(f"{_module_of(path)}: executor.reduce")
+    assert offenders == []
+
+
+def test_the_import_scan_catches_a_direct_import_and_an_alias() -> None:
+    tree = ast.parse(
+        "from keel.execution.executor import scale_out\n"
+        "from keel.execution import executor as ex\n"
+        "import keel.execution.executor as ex2\n"
+        "def sneaky():\n"
+        "    scale_out(1)\n"
+        "    ex.execute(1)\n"
+        "    ex2.place_bracket(1)\n"
+        "def harmless():\n"
+        "    ex.BALANCE_DRIFT_PREFIX\n"
+    )
+    assert _executor_bypasses(tree, "m") == [
+        "m: imports scale_out from keel.execution.executor",
+        "m: sneaky calls ex.execute",
+        "m: sneaky calls ex2.place_bracket",
+    ]
+
+
+def test_no_module_reaches_the_executor_order_paths_under_another_name() -> None:
+    """`SECOND_LEVEL_CALLERS` is scanned as `executor.<name>`. Importing an order-reaching
+    function by name, or binding the module under an alias (`doctor.py` has `executor_mod`),
+    would call the same function where that scan cannot see it -- so both shapes are pinned
+    shut here, and the only way to reach them from outside `executor.py` stays the scanned one.
+    """
+    offenders: list[str] = []
+    for path in sorted(glob.glob(os.path.join(_ROOT, "keel", "**", "*.py"), recursive=True)):
+        module = _module_of(path)
+        if module == "keel.execution.executor":
+            continue
+        with open(path, encoding="utf-8") as fh:
+            offenders += _executor_bypasses(ast.parse(fh.read()), module)
     assert offenders == []
