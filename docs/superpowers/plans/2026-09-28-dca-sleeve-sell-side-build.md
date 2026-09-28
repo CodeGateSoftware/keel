@@ -258,9 +258,9 @@ Each ruling is stated as `what — why — cost if wrong`.
 - **R33** (added in review round 1, #882). `guards._open_exposure_by_asset` (Task 4.0) contributes zero notional for any PRODUCT whose net filled quantity is `<= 0`, instead of its net notional, regardless of the prices the closing legs traded at.
   - Why: the function nets BUY/SELL **notional**, which is the right figure for a position still partly held. It is the wrong figure for one closed in full at a different price than its entry: PAXG tranche 3 closed at a real loss (4673.23 -> 4400) leaves a $3.61 notional residual that is not exposure, because zero units are held. Left unfixed, P4's own acceptance test cannot pass and #798's phantom exposure survives any loss-making close, declared or ordinary.
   - Cost if wrong: exposure rails 4/5/6 could under- or over-state a closed product's contribution to its asset bucket. The fix only changes behaviour when a product's net qty is `<= 0`; every still-open product nets by notional exactly as before, pinned by `test_a_partial_close_still_nets_by_notional`.
-- **R34** (added in review round 1, #883; refined in round 2). `executor.reduce`'s confirm branch (Task 18.1) asks the typed-yes gate BEFORE it cancels the resting protective bracket, by wrapping the caller's `confirm_fn` rather than calling `_clear_resting_bracket` directly ahead of `_run_order`. A leg that does not close the position in full re-brackets the remainder afterward, via `place_bracket`, the same choreography `scale_out` (#502) uses. The crash-ledger `unbracketed:<product>` record that protects a mid-flight cancel/re-bracket is written INSIDE that same wrapped closure, after `confirm_fn` returns true and before the cancel it guards -- not earlier -- so a decline writes nothing there to leave stale.
-  - Why: the original draft cancelled the bracket unconditionally before `_run_order` (and therefore before the human's answer, which `_run_order` asks internally). A decline, or no TTY, left a stopped tranche naked at the exchange with no `unbracketed:` record -- the cancel had already happened and nothing said so. `execute()`'s own EXIT path has the same ordering today (pre-existing, out of scope here); `reduce()` is new code and need not repeat it. Round 1's fix reordered the cancel correctly but still wrote the crash-ledger record unconditionally, before the confirm gate ran -- round 2 found the three `test_883_*` tests could not pass as drafted: the record was never cleared on a decline, the fixture never seeded a filled BUY order for `_held_position` to find (so `protecting_remainder` was always false), and the placement counts omitted the SELL leg's own `_run_order` call. All three are fixed in Task 18.1: the record moves inside `_confirm_then_cancel`, `_bracketed` seeds a matching filled BUY order, and the two placement tests count 2 and 3 calls, not 1 and 2.
-  - Cost if wrong: a declined or failed confirm now leaves the bracket resting rather than cancelled, which is the safe direction; a partial confirmed sale is followed by a second `place_bracket` call the venue must accept, the same call `scale_out` already makes routinely. Had round 2's three issues gone unfixed, the tests meant to prove R34 would themselves not pass, so the ruling would be undemonstrated rather than wrong.
+- **R34** (added in review round 1, #883; refined in rounds 2 and 3). `executor.reduce`'s confirm branch (Task 18.1) asks the typed-yes gate BEFORE it cancels the resting protective bracket, by wrapping the caller's `confirm_fn` rather than calling `_clear_resting_bracket` directly ahead of `_run_order`. A leg that does not close the position in full re-brackets the remainder afterward, via `place_bracket`, the same choreography `scale_out` (#502) uses -- including repointing the surviving tranche's `bracket_order_id` at the new bracket, the step round 2's fix omitted. The crash-ledger `unbracketed:<product>` record that protects a mid-flight cancel/re-bracket is written INSIDE that same wrapped closure, after `confirm_fn` returns true and before the cancel it guards -- not earlier -- so a decline writes nothing there to leave stale; it is now written whenever `open_stop`/`open_target` exist, not only when the leg is partial, so a full close is covered too. A failure after the cancel is labelled by WHO refused: `declined` only when the operator said no before the exchange was touched; `failed` when the cancel itself failed or the venue rejected the SELL after a genuine yes.
+  - Why: the original draft cancelled the bracket unconditionally before `_run_order` (and therefore before the human's answer, which `_run_order` asks internally). A decline, or no TTY, left a stopped tranche naked at the exchange with no `unbracketed:` record -- the cancel had already happened and nothing said so. `execute()`'s own EXIT path has the same ordering today (pre-existing, out of scope here); `reduce()` is new code and need not repeat it. Round 1's fix reordered the cancel correctly but still wrote the crash-ledger record unconditionally, before the confirm gate ran -- round 2 found the three `test_883_*` tests could not pass as drafted: the record was never cleared on a decline, the fixture never seeded a filled BUY order for `_held_position` to find (so `protecting_remainder` was always false), and the placement counts omitted the SELL leg's own `_run_order` call. All three are fixed in Task 18.1: the record moves inside `_confirm_then_cancel`, `_bracketed` seeds a matching filled BUY order, and the two placement tests count 2 and 3 calls, not 1 and 2. Round 3 found two further gaps, both in Task 18.1: (a) the successful-partial-leg path never called `repo.set_position_bracket`, so a filled remainder bracket had no tranche pointing at it and `reconcile.exit_without_position_context` fired on every fill, WARNing `position.unprotected` every cycle after; (b) gating the crash-ledger write on `protecting_remainder` (partial only) meant a full close whose SELL the venue rejected after the cancel left the position naked with NO retry record at all, and the result was mislabelled "declined at the confirm gate" even though the operator said yes and the venue, not the operator, refused. Both are fixed: the record now writes whenever levels exist (and a fully successful full close clears it explicitly, since `place_bracket` -- its only other clearer -- is never called on that path), and the `reduce` result's `decision` distinguishes `declined` (operator said no, or the window/rule-status gate refused first) from `failed` (the cancel or the placement itself failed after a genuine yes).
+  - Cost if wrong: a declined or failed confirm now leaves the bracket resting rather than cancelled, which is the safe direction; a partial confirmed sale is followed by a second `place_bracket` call the venue must accept, the same call `scale_out` already makes routinely. Had round 2's three issues gone unfixed, the tests meant to prove R34 would themselves not pass, so the ruling would be undemonstrated rather than wrong. Had round 3's gaps gone unfixed: an orphaned tranche pointer would have kept warning `position.unprotected` every cycle after every partial confirmed sale, forever, with no crash involved at all; and a rejected full-close SELL would have left a live, undetected naked position, invisible to both the sweep (no record to read) and the operator (a label that reads as their own decision, not a fault).
 
 ---
 
@@ -1041,6 +1041,8 @@ def position_watch_findings(
 
   Add a test to `tests/commands/test_doctor.py` beside the existing change-counter read-only test. The new test runs `gather_findings` on a repo seeded with PAXG tranche 3, and asserts the two names are present and that the change counter is unchanged.
 
+  **#886: add `"position.unmanaged"` and `"position.unprotected"` to the exact-set assertion.** `tests/commands/test_doctor.py:603`'s `test_gather_findings_covers_every_check_over_a_seeded_db` asserts `{f.name for f in findings} == {...}` -- the COMPLETE set of finding names, not a subset. Wiring `position_watch_findings` into `gather_findings` above adds two names `gather_findings` now returns that this literal does not yet list, which turns the equality false and this existing test red. Add both names to the set literal. Verify the exact current set in the worktree before editing (`sed -n '/^def test_gather_findings_covers_every_check_over_a_seeded_db/,/^def /p' tests/commands/test_doctor.py`) rather than assuming the list above is still current -- later PRs in this plan (P3, P10, P15) each add to the same literal, and it must always be edited against what is actually there at the time, not this plan's snapshot of it.
+
   **Add a paper-profile test.** `tests/commands/test_doctor.py`'s own `gather_findings` tests already build their repo with `_seeded_repo(tmp_path / "keel.db")` and their config with `load_config(valid_config_path)` (both defined/imported at the top of that file). Seed a repo with an open tranche carrying `initial_stop=Decimal("90000")` and `bracket_order_id=None` (`repo.open_position(...)`, matching what a paper fill actually writes -- see #881 above) and a `status="paper"` rule for the same product (never `"live"`), take `config = load_config(valid_config_path)` and derive a paper config from it with `dataclasses.replace(config, auto_trade=dataclasses.replace(config.auto_trade, mode="paper"))` (`AutoTradeConfig`/`Config` are both frozen dataclasses, `packages/keel-core/keel_core/config.py`). Assert `gather_findings(repo, paper_config, [], now_ts)` reports BOTH `position.unmanaged` and `position.unprotected` as `OK`. Before this fix, `position.unmanaged` WARNs (`managed_status` hardcoded to `"live"`) and, separately, `position.unprotected` WARNs too (the tranche has a stop, no bracket, and no retry record, and nothing before #881's fix knew it was looking at paper) -- the test must fail red on both counts first, and stay green on both after.
 
 - [ ] **Step 5: Run the tests, run `--json`, then commit.**
@@ -1263,6 +1265,8 @@ def ledger_drift_findings(
 
   **Add a paper-profile test** to `tests/commands/test_doctor.py`, beside P2's: seed a repo with an open paper-mode tranche whose backing order is inserted with `mode="paper"` (not `"live"`), take a paper `config` the same way P2's test does (`dataclasses.replace(config, auto_trade=dataclasses.replace(config.auto_trade, mode="paper"))`), and assert `gather_findings` reports `ledger.drift` as `OK`. Before this fix, `orders_by_product` built from `_held_position` (always `mode="live"`) sees zero orders against a non-zero ledger and WARNs; the test must fail red for that reason first.
 
+  **#886: add `"ledger.drift"` to the exact-set assertion.** Wiring `ledger_drift_findings` into `gather_findings` adds a name `test_gather_findings_covers_every_check_over_a_seeded_db` (`tests/commands/test_doctor.py:603`) does not yet list in its `{f.name for f in findings} == {...}` literal, turning that existing test red. Add `"ledger.drift"` to the set. Check the literal's actual current contents first -- P2's task above may already have added its own two names to the same set.
+
 - [ ] **Step 4: Run the tests, then commit.** Run: `uv run pytest tests/execution/test_sleeve.py tests/commands/test_doctor_ledger_drift.py tests/commands/test_doctor.py -q`. Expected: PASS.
 
 ```bash
@@ -1362,6 +1366,7 @@ def test_no_observation_reports_unknown_not_ok() -> None:
   - **On a paper profile** (`config.auto_trade.mode == "paper"`), `record_venue_holdings` never runs (the `if paper_trader is None:` guard two bullets up), so `venue_holding:` state is permanently empty BY DESIGN, not by omission -- there is no real venue holding to reconcile a paper tranche against. Without a guard, every open paper tranche would WARN `ledger.venue_drift` "no venue observation" on every cycle (#881). Pass an empty `ledger_by_product` (`{}`) to `venue_drift_findings` when `config.auto_trade.mode == "paper"`, so it returns its `OK` sentinel instead of iterating products it can never have an observation for.
   - Add a `tests/test_agent.py` test that a live `run_once` with an open tranche writes `venue_holding:<product>`, and that a paper `run_once` writes none.
   - **Add a paper-profile wiring test** to `tests/commands/test_doctor.py`, beside P2's and Task 3.1's: seed a repo with an open tranche and NO `venue_holding:` state record, take a paper `config` the same way (`auto_trade.mode="paper"`), and assert `gather_findings` reports `ledger.venue_drift` as `OK`. Before this fix, the empty `venue` dict plus a non-empty `ledger_by_product` WARNs "no venue observation"; the test must fail red for that reason first.
+  - **#886: add `"ledger.venue_drift"` to the exact-set assertion.** Wiring `venue_drift_findings` into `gather_findings` adds a name `test_gather_findings_covers_every_check_over_a_seeded_db` (`tests/commands/test_doctor.py:603`) does not yet list, turning that existing test red. Add `"ledger.venue_drift"` to its `{f.name for f in findings} == {...}` set, alongside `"ledger.drift"` (Task 3.1, above) and P2's two names -- check the literal's actual current contents first.
 
 - [ ] **Step 4: Run the tests, the suite, then commit.**
 
@@ -3594,6 +3599,8 @@ def test_a_sleeve_sell_rule_does_not_count_as_managing_a_position(tmp_path, vali
 
   `agent.RULE_REGISTRY.get(row["kind"])` returns `None` for a kind the registry does not recognise, and `promotion.promotion_class_of(None)` returns `DEFAULT_CLASS` (its own `getattr(rule, "promotion_class", DEFAULT_CLASS)` fallback) rather than raising -- so an unrecognised kind is kept, not silently dropped from `status_by_product`'s visibility the way `row["kind"] in agent.RULE_REGISTRY` would have dropped it. Pass `non_sell_rules` as the `all_rules` argument in place of the raw `repo.get_rules()` call already in `gather_findings` (P2 Task 2.1, Step 4); `managed_status=` stays exactly as P2 wired it, unchanged by this task.
 
+  **The missing import.** `promotion` is `keel.strategy.promotion` (verified against the module's actual path; `promotion_class_of` and the module-level constants this task reads all live there, not in `keel.execution`). `gather_findings` does not import it yet -- add `from keel.strategy import promotion` to the function's own local-import block (`keel/commands/doctor.py`, inside `gather_findings`, beside the existing `from keel import agent` a few lines above the P2 wiring this task edits), matching where Task 9.2's `seedable_kinds` already imports the same module the same way (`from keel.strategy import promotion`, local to the function rather than top-of-file).
+
   Update `position_watch_findings`' docstring: the "P9 adds the exclusion" sentence becomes present tense.
 
 - [ ] **Step 4: Run the tests, then commit.**
@@ -3701,7 +3708,8 @@ def test_a_floor_below_half_the_close_protects_nothing() -> None:
 - [ ] **Step 3: Implement.**
   - The round-trip wording is "two taker legs at the venue's fee", with no number.
   - The latest close comes from `repo.get_candles(product, ONE_DAY)[-1].close`, and is omitted when there is none. The finding is not judged without a close.
-- [ ] **Step 4: Run the tests and the doctor read-only test, then commit.**
+  - **#886: add `"sleeve.buy_and_sell_same_asset"` and `"sleeve.price_floor_stale"` to the exact-set assertion.** Wiring `sleeve_rule_findings` into `gather_findings` adds two names `test_gather_findings_covers_every_check_over_a_seeded_db` (`tests/commands/test_doctor.py:603`) does not yet list, turning that existing test red. Add both to its `{f.name for f in findings} == {...}` set, beside the names P2 and P3 added -- check the literal's actual current contents first.
+- [ ] **Step 4: Run the tests and the doctor read-only test, then commit.** Run: `uv run pytest tests/commands/test_doctor_sleeve_rules.py tests/commands/test_doctor.py -q`. Expected: PASS.
 
 ```bash
 git add keel/commands/ tests/commands/
@@ -4599,7 +4607,8 @@ def test_exit_preview_prints_levels_and_writes_nothing(deployment, monkeypatch) 
   The notification wording follows the event's level: `near` and `breached` are worded as warnings, and `clear` as a recovery. The write list stays `[NOTIFIED_WINDOWS_KEY]`.
 - [ ] **Step 2: Run the tests to see them fail** with `PYTHONPATH="$PWD:$PWD/packages/keel-core" uv run python -m pytest ...`.
 - [ ] **Step 3: Implement.**
-- [ ] **Step 4: Run the suite with the same `PYTHONPATH`, then commit.**
+  - **#886: add `"sleeve.exit_watch"` to the exact-set assertion.** Wiring `exit_watch_findings` into `gather_findings` adds a name `test_gather_findings_covers_every_check_over_a_seeded_db` (`tests/commands/test_doctor.py:603`) does not yet list, turning that existing test red. Add `"sleeve.exit_watch"` to its `{f.name for f in findings} == {...}` set, beside the names P2, P3 and P10 added -- check the literal's actual current contents first.
+- [ ] **Step 4: Run the suite with the same `PYTHONPATH`, then commit.** Expected: PASS.
 
 ```bash
 git add keel/ packages/keel-core/ tests/
@@ -4882,6 +4891,24 @@ def _bracketed(repo, broker, config, *, qty="0.002", stop="95000", target="13000
     return holding
 
 
+def _confirm_recording_cancel_state(broker, *, answer=True):
+    """A `confirm_fn` that answers `answer` but first RECORDS whether `broker.cancel_calls` is
+    already non-empty -- pinning the R34 ordering property (confirm asked BEFORE the cancel
+    runs) directly, independent of any call-count or remainder side effect. Round 3: without
+    this, a confirmed test (B or C below) cannot go red against a re-introduced
+    unconditional-cancel-before-confirm bug, because for a confirm that always answers `True`
+    the cancel happens either way and every call-count and `cancel_calls`-truthiness assertion
+    is satisfied regardless of ordering.
+    """
+    seen: dict[str, list] = {"cancel_calls_at_confirm_time": None}
+
+    def _confirm(preview):
+        seen["cancel_calls_at_confirm_time"] = list(broker.cancel_calls)
+        return answer
+
+    return _confirm, seen
+
+
 def test_883_a_declined_confirm_leaves_the_resting_bracket_untouched(repo) -> None:  # noqa: F811
     """#883: `_clear_resting_bracket` used to run BEFORE the typed-yes gate, so a "no" (or no
     TTY) left a stopped tranche naked with no `unbracketed:` record -- the cancel had already
@@ -4918,11 +4945,17 @@ def test_883_a_partial_confirmed_leg_re_brackets_the_remainder_like_scale_out(re
     broker = FakeBroker()
     _bracketed(repo, broker, config, qty="0.002", stop="95000", target="130000")  # holds 0.002
     repo.set_sells_window(True, now_ts=0, expires_ts=NOW_TS + 3600)
+    confirm_fn, seen = _confirm_recording_cancel_state(broker, answer=True)
     result = executor.reduce(_red(qty="0.001"), broker=broker, repo=repo, config=config,
                              holding=sleeve.holding_of(repo, "BTC-USD"), costs=COSTS, rule_id=7,
                              rule_status="live", now_ts=NOW_TS, execution="confirm",
-                             confirm_fn=lambda preview: True)
+                             confirm_fn=confirm_fn)
     assert result.decision == "placed"
+    assert seen["cancel_calls_at_confirm_time"] == [], (
+        "the cancel must not have run yet when confirm_fn was asked -- a call-count or "
+        "cancel_calls-truthiness assertion alone cannot tell this apart from a naive ordering, "
+        "because confirm answers True here either way (#883 round 3)"
+    )
     assert broker.cancel_calls, "the original bracket had to be cancelled to sell against it"
     # Three `place_order` calls total: the original bracket (fixture setup), the SELL leg
     # itself (`reduce`'s own `_run_order` call -- this is what makes `result.decision ==
@@ -4937,9 +4970,43 @@ def test_883_a_partial_confirmed_leg_re_brackets_the_remainder_like_scale_out(re
     assert len(resting) == 1, "the old bracket is gone; exactly the new, smaller one rests"
 
 
+def test_883_a_partial_confirmed_leg_repoints_the_surviving_tranche_at_the_new_bracket(repo) -> None:  # noqa: F811
+    """#883 (round 3): `scale_out` repoints the tranche with
+    `repo.set_position_bracket(position["id"], bracket_order_id)` after it re-brackets the
+    remainder (`executor.py:2614`) -- Task 18.1's first draft re-bracketed but never repointed,
+    so the tranche kept naming the CANCELLED bracket. When the new bracket eventually filled,
+    `get_position_for_bracket` found nothing for it (`reconcile.exit_without_position_context`:
+    no `trade_outcomes` row, the tranche never closes), and `position.unprotected` WARNed every
+    cycle in the meantime even though a bracket really was resting."""
+    config = _config()
+    broker = FakeBroker()
+    _bracketed(repo, broker, config, qty="0.002", stop="95000", target="130000")
+    repo.set_sells_window(True, now_ts=0, expires_ts=NOW_TS + 3600)
+    result = executor.reduce(_red(qty="0.001"), broker=broker, repo=repo, config=config,
+                             holding=sleeve.holding_of(repo, "BTC-USD"), costs=COSTS, rule_id=7,
+                             rule_status="live", now_ts=NOW_TS, execution="confirm",
+                             confirm_fn=lambda preview: True)
+    assert result.decision == "placed"
+    (position,) = repo.get_open_positions("BTC-USD")
+    resting = [o for o in repo.get_orders(mode="live", product_id="BTC-USD", status="pending")
+              if o["side"] == "SELL"]
+    (new_bracket,) = resting
+    assert position["bracket_order_id"] == new_bracket["id"], (
+        "the tranche must point at the NEW bracket, not the one this leg cancelled"
+    )
+
+
 def test_883_a_full_close_does_not_attempt_to_re_bracket(repo) -> None:  # noqa: F811
     """The complement: a leg that closes the WHOLE bracketed position leaves nothing to
-    re-protect, and must not try -- `place_bracket` for qty 0 has no meaning."""
+    re-protect, and must not try -- `place_bracket` for qty 0 has no meaning.
+
+    #883 (round 3): a full close now writes the `unbracketed:` crash-ledger record too (Step 3
+    gates the write on `has_levels`, not on `protecting_remainder`, so a rejected full-close SELL
+    has a retry record to fall back on -- see the venue-rejection test below). A SUCCESSFUL full
+    close must not be the one path that record silently outlives forever: `place_bracket`, its
+    only other clearer, is never called when there is no remainder to re-bracket, so the success
+    path must clear it explicitly instead.
+    """
     config = _config()
     broker = FakeBroker()
     _bracketed(repo, broker, config, qty="0.002", stop="95000", target="130000")
@@ -4952,9 +5019,56 @@ def test_883_a_full_close_does_not_attempt_to_re_bracket(repo) -> None:  # noqa:
     # Two `place_order` calls total: the original bracket (fixture setup) and the SELL leg
     # itself. No remainder, so no third call for a new bracket.
     assert len(broker.place_calls) == 2
+    assert repo.get_state("unbracketed:BTC-USD") is None, (
+        "a successful full close must not leave the pre-cancel crash-ledger record standing "
+        "forever -- nothing will ever clear it otherwise, since place_bracket is never called"
+    )
     resting = [o for o in repo.get_orders(mode="live", product_id="BTC-USD", status="pending")
               if o["side"] == "SELL"]
     assert resting == []
+
+
+# Add `from keel_broker_api.results import PlaceResult` to this file's imports -- used below,
+# not yet imported here (`test_executor.py` already has it, at its own line 26).
+class _RejectsSecondPlacement(FakeBroker):
+    """The venue accepts the FIRST `place_order` -- `_bracketed`'s own resting-bracket setup --
+    and REJECTS every one after, WITHOUT raising. That is the shape of an ordinary placement
+    refusal (insufficient funds, a size out of band) that `_run_order`'s own
+    `place_result.success` already handles as `ExecutionResult(placed=False, ...)` -- distinct
+    from `_RefusingBroker` above, which models a scope error that RAISES."""
+
+    def place_order(self, spec, *, idempotency_key=None):  # noqa: ANN001, ANN202
+        if not self.place_calls:
+            return super().place_order(spec, idempotency_key=idempotency_key)
+        self.place_calls.append({"spec": spec})
+        self.events.append("place")
+        return PlaceResult(success=False, broker_order_id=None, reason="no funds")
+
+
+def test_883_a_venue_rejected_full_close_after_the_cancel_leaves_a_retry_record_and_is_not_mislabelled_a_decline(repo) -> None:  # noqa: F811
+    """#883 (round 3): a full close has `protecting_remainder == False` (the remainder is 0), so
+    the record used to be written only `if protecting_remainder:` -- nothing at all for a full
+    close. A SELL the venue then rejects, after the cancel already ran, left the position naked
+    with NO retry record for the sweep to read, and the result was mislabelled "declined at the
+    confirm gate" even though the operator said yes and the exchange, not the operator, refused.
+    """
+    config = _config()
+    broker = _RejectsSecondPlacement()
+    _bracketed(repo, broker, config, qty="0.002", stop="95000", target="130000")
+    repo.set_sells_window(True, now_ts=0, expires_ts=NOW_TS + 3600)
+    result = executor.reduce(_red(qty="0.002"), broker=broker, repo=repo, config=config,
+                             holding=sleeve.holding_of(repo, "BTC-USD"), costs=COSTS, rule_id=7,
+                             rule_status="live", now_ts=NOW_TS, execution="confirm",
+                             confirm_fn=lambda preview: True)
+    assert result.decision == "failed", "the operator said yes; the venue refused the order"
+    assert "declined at the confirm gate" not in result.reason
+    assert repo.get_state("unbracketed:BTC-USD") is not None, (
+        "the bracket is gone and the SELL never filled -- the retry record must survive so the "
+        "sweep re-brackets the position, sized off the ledger's still-full tranche"
+    )
+    resting = [o for o in repo.get_orders(mode="live", product_id="BTC-USD", status="pending")
+              if o["side"] == "SELL"]
+    assert resting == [], "the original bracket really is gone; nothing rests until the sweep heals it"
 ```
 
 ```python
@@ -4985,10 +5099,11 @@ def test_the_cycle_never_asks_reduce_to_confirm() -> None:
 
   Keep the pre-P18 set under a new name, `RUN_ORDER_CALLERS_BEFORE_P18`. The P1 test keeps using `RUN_ORDER_CALLERS`.
 
-- [ ] **Step 2: Run the tests to see them fail.** All of Step 1's tests fail with `AttributeError`/`TypeError` first (`executor.reduce` has no `execution=`/`confirm_fn=` branch yet -- P7 built preview only). Once the confirm branch exists but BEFORE it is built the way Step 3 describes, confirm each of the three `test_883_*` failure modes individually, in this order, so the fix that follows is proven necessary rather than assumed:
-  1. Against a NAIVE ordering that calls `_clear_resting_bracket` unconditionally before `_run_order` (the shape #883 originally flagged): all three `test_883_*` tests fail with the fixture's bracket already cancelled (`broker.cancel_calls` non-empty) before `confirm_fn` is even consulted.
+- [ ] **Step 2: Run the tests to see them fail.** All of Step 1's tests fail with `AttributeError`/`TypeError` first (`executor.reduce` has no `execution=`/`confirm_fn=` branch yet -- P7 built preview only). Once the confirm branch exists but BEFORE it is built the way Step 3 describes, confirm each of the four `test_883_*` failure modes individually, in this order, so the fix that follows is proven necessary rather than assumed:
+  1. Against the shape #883 originally flagged -- `_clear_resting_bracket` called unconditionally before `_run_order`, ahead of the confirm gate, and with NO remainder re-bracket logic at all yet (the very first draft, before any of Task 18.1's fixes exist): `test_883_a_declined_confirm_leaves_the_resting_bracket_untouched` fails as expected, on `broker.cancel_calls == []` (non-empty -- the cancel already ran before `confirm_fn` was ever consulted). **The other two do NOT fail the way an earlier draft of this plan claimed.** Both `test_883_a_partial_confirmed_leg_re_brackets_the_remainder_like_scale_out` and `test_883_a_full_close_does_not_attempt_to_re_bracket` answer `confirm_fn` with `True` unconditionally, so under this shape the cancel happens either way -- ordering makes no observable difference to a call that was always going to happen. The full-close test in fact PASSES outright: it makes no remainder-re-bracket assertion, and its two-call count (bracket + SELL leg) holds with or without the ordering fix. The partial test instead fails on `len(broker.place_calls) == 3` (actual: 2) -- there is no remainder re-bracket logic in this shape at all yet, not because of the cancel's timing. Neither of these two is a `cancel_calls` failure, which is why `_confirm_recording_cancel_state` (Step 1) exists: it is the ONE assertion, in the two confirmed-`True` tests, that is actually sensitive to the ordering bug on its own terms, independent of what remainder logic happens to be built at the time -- `seen["cancel_calls_at_confirm_time"] == []` fails under this shape for both B and C, where the incidental call-count/cancel_calls-truthiness assertions do not.
   2. Fix the ordering (wrap `confirm_fn` as Step 3 describes) but keep the crash-ledger write BEFORE the wrapped closure, unconditionally, as an earlier draft did: `test_883_a_declined_confirm_leaves_the_resting_bracket_untouched` now fails on its last assertion alone (`repo.get_state("unbracketed:BTC-USD") is None`) -- the write already ran before `confirm_fn` was ever called, so a decline never has anything to clear it.
   3. With that also fixed (Step 3's actual code, write inside `_confirm_then_cancel` after the yes), the two placement tests still fail on their `place_calls` counts unless they account for the SELL leg's own `_run_order` placement, not just the bracket calls -- confirm this by counting `broker.place_calls` before asserting the fixed numbers (2 and 3, not 1 and 2).
+  4. With the remainder re-bracket built but no tranche repoint, `test_883_a_partial_confirmed_leg_repoints_the_surviving_tranche_at_the_new_bracket` fails: `position["bracket_order_id"]` still names the CANCELLED bracket's id, not the new one. With the crash-ledger write still gated on `protecting_remainder`, `test_883_a_venue_rejected_full_close_after_the_cancel_leaves_a_retry_record_and_is_not_mislabelled_a_decline` fails on `repo.get_state("unbracketed:BTC-USD") is not None` (nothing was ever written for a full close) and, separately, on `result.decision == "failed"` (it reads `"declined"`, indistinguishable from an operator's own no). And, once the write is switched to `has_levels` but BEFORE the full-close success path is taught to clear it explicitly, `test_883_a_full_close_does_not_attempt_to_re_bracket`'s new last assertion (`repo.get_state("unbracketed:BTC-USD") is None`) itself goes red -- widening the write condition without also widening what clears it trades one gap (no record on a rejected full close) for another (a stale record after a successful one).
 
 - [ ] **Step 3: Implement the confirm branch.** After a clean `guards.check`:
   - If `execution == "confirm"` and not `sleeve.sells_released(repo, now_ts)`, record `declined` and return.
@@ -5011,22 +5126,39 @@ def test_the_cycle_never_asks_reduce_to_confirm() -> None:
     stop = repo.get_state(f"open_stop:{reduction.product_id}")
     target = repo.get_state(f"open_target:{reduction.product_id}")
     protecting_remainder = remainder > 0 and stop is not None and target is not None
+    has_levels = stop is not None and target is not None
 
     cancel_failed = False
+    operator_confirmed = False
 
     def _confirm_then_cancel(preview: Preview) -> bool:
-        nonlocal cancel_failed
+        nonlocal cancel_failed, operator_confirmed
         if confirm_fn is None or not confirm_fn(preview):
             return False
+        operator_confirmed = True
         # The crash ledger, same key and same reason as `scale_out`/`_roll_stop` (#519's
         # pattern) -- but written HERE, only once the operator has said yes, and BEFORE the
         # cancel that is about to run: if the process dies between this cancel and the
-        # re-bracket below, the next cycle's sweep must still be able to heal the remainder. A
+        # re-bracket below, the next cycle's sweep must still be able to heal the position. A
         # DECLINE returns out of this closure on the line above and never reaches this write --
         # #883 (round 2): an earlier draft wrote this record unconditionally, before the
         # confirm gate ran at all, so a decline left a stale record behind with nothing that
         # ever cleared it. It is written here, not earlier, precisely so a decline writes
         # nothing to clear.
+        #
+        # #883 (round 3): this used to be gated `if protecting_remainder:` -- true only for a
+        # PARTIAL leg. A FULL close has `remainder == 0`, so `protecting_remainder` is always
+        # False for one, and the old gate wrote NOTHING here for a full close -- a SELL the
+        # venue then rejected, after this cancel had already run, left the position naked with
+        # no retry record at all for the sweep to read. Gate on `has_levels` instead (there are
+        # `open_stop`/`open_target` to heal from), not on how much would be left if the SELL
+        # succeeds: `reconcile_unbracketed_positions` sizes the healing bracket from the
+        # `positions` ledger's own `qty` (`scale_out`'s own docstring makes this point, and it
+        # is why this record's `qty` field being sized for a SUCCESSFUL leg -- "the remainder"
+        # -- is harmless even when the leg then fails; the field is read for PRESENCE and for
+        # levels, never for sizing). The success path below (`not protecting_remainder`) clears
+        # this explicitly when a full close's SELL actually fills, since `place_bracket` -- the
+        # record's only other clearer -- is never called on that path.
         #
         # A stale record IS still possible after this point -- if the cancel below fails, or a
         # crash lands between here and the re-bracket -- but that is harmless for the reason
@@ -5037,7 +5169,7 @@ def test_the_cycle_never_asks_reduce_to_confirm() -> None:
         # `continue`s before it ever looks at `unbracketed:<product>`. (NOT the sweep's own
         # `if not intent: continue` a few lines below it, which only runs once
         # `_has_resting_bracket` has already said no bracket is resting.)
-        if protecting_remainder:
+        if has_levels:
             repo.set_state(f"{UNBRACKETED_PREFIX}{reduction.product_id}",
                            {"stop": stop, "target": target, "qty": remainder})
         if not _clear_resting_bracket(broker, repo, reduction.product_id, now_ts):
@@ -5052,8 +5184,15 @@ def test_the_cycle_never_asks_reduce_to_confirm() -> None:
     # checks the SOURCE SHAPE, not the logical flow, so the call must visibly sit behind the
     # gate even though it is unreachable any other way.
     if sleeve.sells_released(repo, now_ts):
+        # NOT `spec=spec` -- there is no `spec` in this function's scope (`reduce`'s preview
+        # branch, Task 7.2, calls `broker.preview_order(_order_spec(intent))` directly and never
+        # builds one it keeps around; `_run_order` is not a preview-branch caller). Passing an
+        # undefined name is simply a `NameError`. `spec` defaults to `None` in `_run_order`'s own
+        # signature, which then builds it internally with `_order_spec(intent)` -- exactly the
+        # call `scale_out` relies on with its own unspec'd `_run_order(intent, broker, repo,
+        # config, "autonomous", None, now_ts)` a few hundred lines up. Omit the keyword entirely.
         result = _run_order(intent, broker, repo, config, "confirm", _confirm_then_cancel,
-                            now_ts, spec=spec)
+                            now_ts)
     else:
         # Unreachable -- the early `not sleeve.sells_released(...)` return above already
         # guarantees this branch is never taken. Kept only so `_run_order`'s call sits behind
@@ -5062,15 +5201,33 @@ def test_the_cycle_never_asks_reduce_to_confirm() -> None:
         result = ExecutionResult(placed=False, order_id=None, vetoed_by=[], preview=None,
                                  reason="sells window closed between the two checks")
     if not result.placed:
-        reason = (
-            f"could not cancel the resting exit bracket for {reduction.product_id}"
-            if cancel_failed else "declined at the confirm gate"
-        )
+        # #883 (round 3): three different shapes reach here, and only ONE of them is actually a
+        # decline. (1) The operator said no, and `_confirm_then_cancel` returned False before
+        # ever touching the exchange -- `operator_confirmed` stays False. (2) The operator said
+        # yes, but the cancel itself failed (`cancel_failed`). (3) The operator said yes, the
+        # cancel succeeded, and the EXCHANGE then rejected the SELL (a guard veto, the spread
+        # gate, an ordinary broker refusal) -- `operator_confirmed` is True and `cancel_failed`
+        # is False. Case 3 used to fall through to the same "declined at the confirm gate" label
+        # as case 1, which misattributes an exchange refusal to the operator's own answer. Cases
+        # 2 and 3 share a `decision` of `"failed"` -- neither is a "no"; both are an attempt that
+        # did not complete -- and are told apart only by `reason`'s text, which names WHICH step
+        # failed.
+        if cancel_failed:
+            decision, reason = "failed", (
+                f"could not cancel the resting exit bracket for {reduction.product_id}"
+            )
+        elif not operator_confirmed:
+            decision, reason = "declined", "declined at the confirm gate"
+        else:
+            decision, reason = "failed", (
+                f"the venue rejected the sell for {reduction.product_id} after the resting "
+                f"bracket was already cancelled: {result.reason}"
+            )
         pid = sleeve.record_proposal(repo, reduction=leg, rule_id=rule_id,
                                      rule_status=rule_status, holding=holding, costs=costs,
-                                     decision="declined", rails=rails, expected_fee=fallback_fee,
+                                     decision=decision, rails=rails, expected_fee=fallback_fee,
                                      fee_source=costs.fee_source, legs=legs, now_ts=now_ts)
-        return ReduceResult(reduction.product_id, reduction.reason, pid, "declined", [], legs,
+        return ReduceResult(reduction.product_id, reduction.reason, pid, decision, [], legs,
                             reason)
     ```
 
@@ -5079,16 +5236,33 @@ def test_the_cycle_never_asks_reduce_to_confirm() -> None:
     - stamp `orders.confirmation = "confirm_sells"` with `repo.update_order(order_id, confirmation="confirm_sells")`, so a reader can tell which gate released it (spec §3.8);
     - when the order is `filled`, call `streak.book_exit(repo, config, product_id=..., exit_order=repo.get_order(order_id), sold_qty=streak.observed_sold_qty(order) or intent.qty, is_dca=None, now_ts=now_ts)`.
     - **Re-bracket the remainder, exactly as `scale_out` does (#883).** `if protecting_remainder:`
-      call `place_bracket(broker, repo, config, product_id=reduction.product_id, qty=remainder,
-      stop=stop, target=target, rule_name=reduction.reason, now_ts=now_ts, rule_id=rule_id)`
+      call `bracket_order_id = place_bracket(broker, repo, config, product_id=reduction.product_id,
+      qty=remainder, stop=stop, target=target, rule_name=reduction.reason, now_ts=now_ts,
+      rule_id=rule_id)`
       AFTER `book_exit`, for the same reason `scale_out` books before it re-places: the sweep
       that would otherwise heal from the crash-ledger record sizes a healing bracket off the
       `positions` ledger, which `book_exit` is what shrinks. `place_bracket` clears
       `unbracketed:<product>` on success and re-writes it (unchanged) on failure or veto,
-      logging CRITICAL either way (its own existing contract; nothing new needed here). When
-      `not protecting_remainder` (a full close, or a DCA tranche that was never bracketed),
-      skip this entirely -- there is nothing to re-place, and `place_bracket` for a zero or
-      unprotected remainder has no meaning.
+      logging CRITICAL either way (its own existing contract; nothing new needed here).
+      **Repoint the surviving tranche at the new bracket (#883 round 3).** When
+      `bracket_order_id is not None`, mirror `scale_out`'s own choreography exactly
+      (`executor.py:2614`): `for position in repo.get_open_positions(reduction.product_id):
+      repo.set_position_bracket(position["id"], bracket_order_id)`. Without this the tranche
+      keeps naming the CANCELLED bracket -- `get_position_for_bracket` finds nothing when the
+      new one eventually fills, `reconcile.exit_without_position_context` fires (no
+      `trade_outcomes` row, the tranche never closes), and `position.unprotected` WARNs on it
+      every cycle even though a bracket really is resting. When `not protecting_remainder` (a
+      full close, or a DCA tranche that was never bracketed), skip the re-bracket AND the
+      repoint entirely -- there is nothing to re-place, and `place_bracket` for a zero or
+      unprotected remainder has no meaning. **On that skip path, if the leg reaches here at all
+      it placed successfully** (an unplaced leg already returned above), so explicitly CLEAR the
+      crash-ledger record this same confirm just wrote: `if not protecting_remainder and
+      has_levels: repo.set_state(f"{UNBRACKETED_PREFIX}{reduction.product_id}", None)`. This
+      matters only for a FULL close (a DCA tranche has no `has_levels` and nothing was ever
+      written) -- `has_levels` made the write above unconditional on remainder size specifically
+      so a full close's rejected SELL leaves a retry record, and a full close's SUCCESSFUL SELL
+      must not then be the one case that record silently outlives, since `place_bracket` is the
+      record's only other clearer and this is the one branch that never calls it.
 - [ ] **Step 4: Run the tests, the invariants and the suite, then commit.**
 
 ### Task 18.2: `keel dca {distribute,trim,exit} --confirm <proposal-id>`, one gate function and one capability row
