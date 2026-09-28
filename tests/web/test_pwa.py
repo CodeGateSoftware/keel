@@ -817,3 +817,14 @@ def test_the_reconnect_field_never_navigates_to_a_pasted_origin() -> None:
         "the empty-token guard must come before the navigation, or a blank field reloads to a "
         "tokenless URL and lands straight back on the refusal"
     )
+
+
+def test_every_api_route_sits_under_the_prefix_the_worker_never_caches() -> None:
+    """The worker declines `/api/` wholesale; that only protects a route that lives under it."""
+    from keel.web import api as web_api
+
+    prefix = re.search(r'const API_PREFIX = "([^"]+)"', _sw_source())
+    assert prefix is not None
+    assert "/api/dca-plan" in web_api.API_ROUTES  # the population includes the new route
+    outside = [path for path in web_api.API_ROUTES if not path.startswith(prefix.group(1))]
+    assert outside == []

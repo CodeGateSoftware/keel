@@ -112,7 +112,7 @@ const ROUTES = [
   { name: "timeline", label: "Timeline", endpoints: ["timeline"] },
   { name: "insights", label: "Insights", endpoints: ["insights", "journal"] },
   { name: "research", label: "Research", endpoints: ["research/trials", "research/gauntlet", "research/slippage", "research/matrix"] },
-  { name: "rules", label: "Rules", endpoints: ["rules"] },
+  { name: "rules", label: "Rules", endpoints: ["rules", "dca-plan"] },
   { name: "venues", label: "Venues", endpoints: ["venues"] },
   { name: "gates", label: "Gates", endpoints: ["gates"] },
   { name: "plans", label: "Plans", endpoints: ["plans"] },
@@ -248,6 +248,18 @@ function paramsFor(endpoint) {
   const fresh = {};
   params.set(endpoint, fresh);
   return fresh;
+}
+
+// The DCA card's inputs come from this page's own address (`/rules?budget=500&buffer=0.1`): the
+// card is read-only and has no controls, so the address is the one input it takes (R16). Copied
+// once, at load, into that endpoint's query bag only -- the rule table's own `?sort=` stays out
+// of the address, per `params`' note.
+{
+  const page = new URLSearchParams(window.location.search);
+  for (const name of ["budget", "buffer"]) {
+    const given = page.get(name);
+    if (given !== null) paramsFor("dca-plan")[name] = given;
+  }
 }
 
 /**
@@ -546,7 +558,19 @@ function mount(route, readings) {
       matrix ? matrix.data : null,
     );
   }
-  if (route.name === "rules") return rulesView(data, primary.sort, onSort);
+  if (route.name === "rules") {
+    // The DCA proposal is SECONDARY, like the journal on `/insights`: a refused read (a malformed
+    // `?budget=`) leaves the rule ledger standing, and the card is handed the reading's `error`
+    // so it can say why rather than only that it could not read.
+    const planReading = readings[1];
+    return rulesView(
+      data,
+      primary.sort,
+      onSort,
+      planReading ? planReading.data : null,
+      planReading ? planReading.error : null,
+    );
+  }
   if (route.name === "venues") return venuesView(data, primary.sort, onSort);
   if (route.name === "gates") return gatesView(data);
   if (route.name === "plans") return plansView(data);

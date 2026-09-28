@@ -809,6 +809,20 @@ code,
 .stopped p { margin: 0 0 0.7rem; }
 .stopped .detail { color: var(--muted); font-size: 0.88rem; }
 
+/* The DCA proposal card's apply command: the one string on that card meant to leave it, for a
+ * terminal. Boxed and selectable like the recovery command below, never a control. */
+.dca-plan .dca-command {
+  display: block;
+  margin: 0.35rem 0 0.6rem;
+  padding: 0.5rem 0.7rem;
+  border: 1px solid var(--control-line);
+  border-radius: 4px;
+  background: var(--code-bg, rgba(127, 127, 127, 0.12));
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  user-select: all;
+  overflow-wrap: anywhere;
+}
+
 /* How to get in (#634 follow-up): the command that RECOVERS the address, set apart from the
  * detail prose rather than appended to it. The paragraph beside it runs five sentences, and a
  * command added as a sixth is a command nobody sees -- which is how two people who knew this

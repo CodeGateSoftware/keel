@@ -3197,12 +3197,16 @@ function gateCard(rule) {
  * are a disclosure of `key = value` rows instead, because `_rule_row_payload` stringifies each
  * value individually and a `repr` of a dict is a thing only a Python programmer can read.
  *
+ * Below the ledger sits the DCA proposal card (`dcaPlanCard`), from the page's second endpoint.
+ *
  * @param {any} data  `/api/rules`'s `data`.
  * @param {any} sort
  * @param {(column: string, direction: string) => void} onSort
+ * @param {any} [plan]  `/api/dca-plan`'s `data`, or `null` when that read failed.
+ * @param {any} [planError]  that read's `error`, or `null`.
  * @returns {DocumentFragment}
  */
-export function rulesView(data, sort, onSort) {
+export function rulesView(data, sort, onSort, plan, planError) {
   const fragment = document.createDocumentFragment();
   fragment.append(el("h1", undefined, "Rules"));
   fragment.append(el("p", "sub", "read-only · promotion happens in the CLI"));
@@ -3245,6 +3249,7 @@ export function rulesView(data, sort, onSort) {
     );
     for (const row of parameterised) fragment.append(paramsCard(row));
   }
+  fragment.append(dcaPlanCard(plan || null, planError || null));
   return fragment;
 }
 
@@ -3268,6 +3273,168 @@ function paramsCard(row) {
   }
   node.append(list);
   return node;
+}
+
+/**
+ * The DCA proposal (`/api/dca-plan`), as a card under the rules ledger.
+ *
+ * **Read-only, and structurally so.** There is no control on it: it builds no button, anchor or
+ * field to type in, and its one `table()` is drawn without a sort pair. The only way to apply the
+ * plan is the CLI command it shows, run at a terminal, where `[Y]` writes `candidate` rules. The
+ * browser performs no capability increase (`keel/capabilities.py`).
+ *
+ * Its inputs come from this page's own address (`/rules?budget=500&buffer=0.1`); `main.js`
+ * copies them into the endpoint's query. Without them the payload's `awaiting_budget` state says
+ * what to add. A refused read (a malformed budget, a config the service refuses) leaves the rules
+ * ledger standing and places the server's reason here, in the service's own words.
+ *
+ * "checked against the cap" is #847's figure: the worst UTC calendar month for the plan's
+ * cadence, which is what rail 14's cap was actually compared with -- the same sentence the CLI
+ * prints, written once by `dca_plan.worst_month_text`.
+ *
+ * @param {any} plan   `/api/dca-plan`'s `data`, or `null` when that read failed.
+ * @param {any} error  that read's `error`, or `null`.
+ * @returns {HTMLElement}
+ */
+export function dcaPlanCard(plan, error) {
+  const card = el("section", "card dca-plan");
+  card.append(heading("h-dca-plan", "DCA plan proposal"));
+  if (!plan) {
+    card.append(el("p", "note", "The DCA proposal could not be read."));
+    if (error) card.append(el("p", "note bad", plain(error.detail)));
+    return card;
+  }
+  const stateLine = el("p");
+  stateLine.append(field(plan.state));
+  card.append(stateLine);
+  card.append(
+    dcaPlanFigure("spend / month", plan.summary.spend),
+    dcaPlanFigure("budget", plan.summary.budget),
+    dcaPlanFigure("held back", plan.summary.buffer),
+    dcaPlanFigure("rail 14 monthly buy cap", plan.summary.cap),
+    dcaPlanFigure("checked against the cap", plan.cap_check),
+    dcaPlanFigure("planned / month", plan.summary.planned),
+    dcaPlanFigure("est. fees / month", plan.summary.fees),
+    dcaPlanFigure("fee rate", plan.fee_rate),
+    dcaPlanFigure("assets", plan.buy_count),
+  );
+  card.append(el("p", "note", plain(plan.cap_note)));
+  card.append(dcaPlanRows(plan));
+  card.append(
+    dcaPlanList(
+      "Excluded",
+      (plan.excluded || []).map(
+        /** @param {any} item */ (item) =>
+          [plain(item.asset), plain(item.reasons), plain(item.detail)]
+            .filter((part) => part !== "")
+            .join(" — "),
+      ),
+      "Nothing excluded.",
+    ),
+  );
+  card.append(
+    dcaPlanList(
+      "Existing DCA rules (unchanged)",
+      (plan.existing || []).map(
+        /** @param {any} rule */ (rule) => {
+          const line = el("span");
+          line.append(
+            ["rule", plain(rule.rule_id), plain(rule.product_id), plain(rule.status)].join(" "),
+            " · ",
+            field(rule.per_buy),
+            " ",
+            field(rule.cadence),
+          );
+          // The CLI's `(dip_bonus_pct X)` marker: this rule's buys can exceed `per_buy`.
+          const bonus = plain(rule.dip_bonus);
+          if (bonus !== "") line.append(" (", bonus, ")");
+          return line;
+        },
+      ),
+      "None.",
+    ),
+  );
+  card.append(dcaPlanList("Cannot approve", plan.blockers || [], "Nothing blocks it."));
+  card.append(dcaPlanList("Notes", plan.warnings || [], "None."));
+  card.append(el("h3", undefined, "To apply, at a terminal:"));
+  card.append(el("code", "dca-command", plain(plan.command)));
+  return card;
+}
+
+/**
+ * One label and one `Field`. Deliberately NOT `kv()`: `kv` turns a label naming a documented term
+ * into an outbound link (#539), and this card builds no anchor at all.
+ *
+ * @param {string} label
+ * @param {any} value
+ * @returns {HTMLElement}
+ */
+function dcaPlanFigure(label, value) {
+  const wrap = el("div", "kv");
+  const key = el("span", "k", label);
+  const holder = el("span", "v");
+  holder.append(field(value));
+  wrap.append(key, holder);
+  return wrap;
+}
+
+/**
+ * The per-asset schedule, one row per planned buy, in the order the service planned them.
+ *
+ * @param {any} plan
+ * @returns {HTMLElement}
+ */
+function dcaPlanRows(plan) {
+  return table(
+    "h-dca-plan",
+    [
+      { label: "asset", numeric: false },
+      { label: "weight", numeric: true },
+      { label: "cadence", numeric: false },
+      { label: "per buy", numeric: true },
+      { label: "monthly", numeric: true },
+      { label: "est. fee", numeric: true },
+      { label: "venue minimum", numeric: false },
+    ],
+    (plan.buys || []).map(
+      /** @param {any} row */ (row) => [
+        plain(row.asset),
+        row.weight,
+        row.cadence,
+        row.per_buy,
+        row.monthly,
+        row.fee,
+        row.min_order,
+      ],
+    ),
+    "No buys planned.",
+  );
+}
+
+/**
+ * A small heading over a bullet list -- the card's four lists. Each item is a string the server
+ * wrote or a node already built from one; either is appended as it is.
+ *
+ * @param {string} title
+ * @param {any[]} items
+ * @param {string} empty
+ * @returns {HTMLElement}
+ */
+function dcaPlanList(title, items, empty) {
+  const wrap = el("div");
+  wrap.append(el("h3", undefined, title));
+  if (items.length === 0) {
+    wrap.append(el("p", "empty", empty));
+    return wrap;
+  }
+  const list = el("ul");
+  for (const item of items) {
+    const entry = el("li");
+    entry.append(item);
+    list.append(entry);
+  }
+  wrap.append(list);
+  return wrap;
 }
 
 /**

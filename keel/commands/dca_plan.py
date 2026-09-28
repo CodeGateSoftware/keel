@@ -59,6 +59,8 @@ _CENT = Decimal("0.01")
 #: error. This bound is refused well before that ceiling, at a figure no real monthly DCA budget
 #: could reach.
 MAX_BUDGET_USD = Decimal("1e12")
+#: The finest input `_decimal` accepts: past this, a value is a typo or a probe, not money.
+MAX_DECIMAL_PLACES = 12
 
 
 class DcaPlanError(ValueError):
@@ -79,6 +81,15 @@ def _decimal(raw: str, name: str) -> Decimal:
         raise DcaPlanError(f"{name} {raw!r} is not a number") from exc
     if not value.is_finite():
         raise DcaPlanError(f"{name} {raw!r} is not a finite number")
+    # The WRITTEN exponent, not `normalize()`d: the default context clamps a tiny value there.
+    exponent = value.as_tuple().exponent
+    if isinstance(exponent, int) and exponent < -MAX_DECIMAL_PLACES:
+        # `format(x, "f")` would spell `1e-10000000` out as ten million digits, into the
+        # command and the card (review of #850) -- refused here, before anything formats it.
+        raise DcaPlanError(
+            f"{name} {raw!r} has more than {MAX_DECIMAL_PLACES} decimal places -- refused before "
+            "it could be spelled out"
+        )
     return value
 
 
@@ -646,6 +657,18 @@ RAIL14_NOTE = (
 )
 
 
+def worst_month_text(plan: DcaPlan) -> str:
+    """What rail 14's cap was checked against (R6, amended #847), as ONE sentence both
+    front-ends show: the CLI prints it after "checked against the cap:", and `/api/dca-plan`
+    sends it as the card's `cap_check` display. Built from the plan's own `worst_month_*` fields
+    verbatim, so neither front-end can show a total other than the one the blocker compared."""
+    return (
+        f"worst calendar month for a {plan.inputs.cadence_days}-day cadence, "
+        f"{plan.worst_month_buy_days} buy day(s) x {_usd(plan.worst_month_cycle_usd)} per cycle "
+        f"= {_usd(plan.worst_month_spend_usd)}"
+    )
+
+
 def render_dca_plan(plan: DcaPlan) -> list[str]:
     """The CLI's exact lines. Sections are `== Title ==` headers so the CLI and tests read them
     the same way."""
@@ -659,9 +682,7 @@ def render_dca_plan(plan: DcaPlan) -> list[str]:
         + ("" if plan.cap.in_force else f" (because {plan.cap.degraded_reason})"),
         # #847: shown right next to the cap, and reusing the plan's own fields verbatim -- never
         # a total recomputed (and possibly larger) than what the blocker check actually used.
-        f"  checked against the cap: worst calendar month for a {inputs.cadence_days}-day "
-        f"cadence, {plan.worst_month_buy_days} buy day(s) x {_usd(plan.worst_month_cycle_usd)} "
-        f"per cycle = {_usd(plan.worst_month_spend_usd)}",
+        f"  checked against the cap: {worst_month_text(plan)}",
         f"  {RAIL14_NOTE}",
         "",
         "== Schedule ==",

@@ -90,6 +90,22 @@ def test_parse_plan_inputs_refuses_a_non_positive_cadence() -> None:
         parse_plan_inputs("500", "0.1", cadence_days=0)
 
 
+@pytest.mark.parametrize(("budget", "buffer"), [("1e-10000000", "0.1"), ("500", "1e-10000000")])
+def test_an_input_with_an_absurd_exponent_is_refused_before_it_is_spelled_out(
+    budget: str, buffer: str
+) -> None:
+    """Review of #850: `format(x, "f")` spells `1e-10000000` out as ten million digits, into the
+    command and the card's `summary.budget` -- a 25-character query answered with 10-20 MB of
+    JSON. Refused at the one shared parse, so the CLI and the card refuse it alike."""
+    with pytest.raises(DcaPlanError, match="decimal places"):
+        parse_plan_inputs(budget, buffer)
+
+
+def test_twelve_decimal_places_are_still_accepted() -> None:
+    inputs = parse_plan_inputs("500.000000000001", "0.000000000001")
+    assert format(inputs.buffer_pct, "f") == "0.000000000001"
+
+
 def test_an_absurd_budget_is_refused_cleanly_not_a_decimal_crash() -> None:
     """Defect (review of #846): `--budget 1e30` used to reach `Decimal.quantize` (cents,
     28-digit default context) with more digits than the context allows, raising
@@ -819,6 +835,21 @@ def test_blockers_and_warnings_each_get_one_line(valid_config_path: Path) -> Non
     lines = render_dca_plan(plan)
     assert len(_section(lines, "Cannot approve")) == len(plan.blockers)
     assert len(_section(lines, "Notes")) == len(plan.warnings)
+
+
+def test_the_worst_month_sentence_is_one_text_shared_by_the_cli_and_the_card(
+    valid_config_path: Path,
+) -> None:
+    """#847's cap-check figure is shown by two front-ends: the CLI's line and the web card. ONE
+    service function writes the sentence, so the card cannot word (or total) it differently from
+    the line the terminal prints."""
+    plan = _plan(valid_config_path)
+    text = dca_mod.worst_month_text(plan)
+    assert text == (
+        "worst calendar month for a 7-day cadence, 5 buy day(s) x $103.47 per cycle = $517.35"
+    )
+    lines = render_dca_plan(plan)
+    assert lines.count("  checked against the cap: " + text) == 1
 
 
 def test_an_approvable_plan_has_no_cannot_approve_section(valid_config_path: Path) -> None:

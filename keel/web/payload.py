@@ -121,6 +121,7 @@ from keel.venue_readiness import VenueReadiness
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from keel.commands.activity import ActivityCycle, ActivityEvent, ActivityFeed
     from keel.commands.balances import AssetBalanceRow, BalancesReport
+    from keel.commands.dca_plan import BuyCap, DcaPlan
     from keel.commands.evidence_matrix import MatrixReport, MatrixRow
     from keel.commands.gauntlet import GauntletReport, GauntletRow
     from keel.commands.insights import (
@@ -3642,6 +3643,150 @@ def rules_payload(rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
     Read-only, and the page it mirrors says so out loud: promotion happens in the CLI, behind the
     TTY gate, and nothing this API serves can change a rule's status."""
     return {"rules": [_rule_row_payload(row) for row in rows]}
+
+
+# -- dca plan (the read-only proposal card on /rules) ----------------------------------------------
+
+#: The figures in the card's summary. Both states send every one of them (Rule 3).
+_DCA_SUMMARY_KEYS = ("budget", "buffer", "spend", "cap", "planned", "fees")
+
+
+def _dca_summary(plan: DcaPlan | None) -> dict[str, Field]:
+    if plan is None:
+        return {key: absent() for key in _DCA_SUMMARY_KEYS}
+    return {
+        "budget": money(plan.inputs.budget_usd),
+        "buffer": money(plan.buffer_usd),
+        "spend": money(plan.spend_usd),
+        "cap": _dca_cap_figure(plan.cap),
+        "planned": money(plan.planned_monthly_usd),
+        "fees": money(plan.est_monthly_fees_usd),
+    }
+
+
+def _dca_cap_figure(cap: BuyCap) -> Field:
+    """Rail 14's allowance as the CLI prints it: a degraded record keeps its (fallback) figure and
+    says why, `$0.00 (because no subscription has been attested)` -- the service puts that reason
+    in a blocker only when the worst month exceeds the cap, so the figure must carry it."""
+    if cap.allowance_usd is None:
+        return label("unlimited", state=NEUTRAL)
+    if cap.in_force:
+        return money(cap.allowance_usd, state=GOOD)
+    figure = money(cap.allowance_usd, state=BAD)
+    return {**figure, "display": f"{figure['display']} (because {cap.degraded_reason})"}
+
+
+def _dca_cap_check_state(cap: BuyCap, worst_month_usd: Decimal) -> str:
+    """Rule 3's judgement on #847's check, made here: over the cap is `bad`, within it `good`, and
+    an unlimited tier has nothing to exceed. A comparison, not arithmetic -- the total itself was
+    computed by the service and is placed verbatim."""
+    if cap.allowance_usd is None:
+        return NEUTRAL
+    return BAD if worst_month_usd > cap.allowance_usd else GOOD
+
+
+def _dca_cadence(days: int) -> Field:
+    return label(str(days), display=f"every {days} days")
+
+
+def dca_plan_awaiting_payload(*, command: str) -> dict[str, Any]:
+    """No budget asked for yet: the SAME keys as `dca_plan_payload`, every figure `absent()`, and
+    the command template -- a client reads one shape and never branches on it (Rule 3)."""
+    from keel.commands.dca_plan import RAIL14_NOTE
+
+    return {
+        "state": label(
+            "awaiting_budget",
+            display="add ?budget=<monthly USD>&buffer=<fraction> to this page's address",
+            state=UNKNOWN,
+        ),
+        "command": command,
+        "summary": _dca_summary(None),
+        "cap_check": absent(),
+        "fee_rate": absent(),
+        "cap_note": RAIL14_NOTE,
+        "buys": [],
+        "buy_count": count(0),
+        "excluded": [],
+        "existing": [],
+        "blockers": [],
+        "warnings": [],
+    }
+
+
+def dca_plan_payload(plan: DcaPlan, *, command: str) -> dict[str, Any]:
+    """`keel.commands.dca_plan.DcaPlan`, as JSON. Every figure was computed by the service --
+    `weight_pct`, `taker_pct_display`, `buy_count` and the `worst_month_*` fields exist so nothing
+    here multiplies or counts (Rules 2 and 6). READ-ONLY: the card carries the CLI command, and
+    nothing on this route can write (`api.py`'s header: not one route answers a POST).
+
+    `cap_check` is what rail 14's cap was actually compared against (R6, amended #847): the worst
+    UTC calendar month for the plan's cadence, in `worst_month_text`'s words -- the sentence the
+    CLI prints after "checked against the cap:" -- with the checked total as its `value`."""
+    from keel.commands.dca_plan import RAIL14_NOTE, REASON_TEXT, worst_month_text
+
+    return {
+        "state": (
+            label("ready", display="ready to apply from a terminal", state=GOOD)
+            if plan.approvable
+            else label("blocked", display="cannot be approved as it stands", state=BAD)
+        ),
+        "command": command,
+        "summary": _dca_summary(plan),
+        "cap_check": label(
+            _plain(plan.worst_month_spend_usd),
+            display=worst_month_text(plan),
+            state=_dca_cap_check_state(plan.cap, plan.worst_month_spend_usd),
+        ),
+        "fee_rate": label(
+            _plain(plan.taker_pct),
+            display=_trim(_plain(plan.taker_pct_display)) + "% (configured fees.taker_pct)",
+        ),
+        "cap_note": RAIL14_NOTE,
+        "buys": [
+            {
+                "asset": buy.asset,
+                "product_id": buy.product_id,
+                "weight": percent(buy.weight_pct, places=1),
+                "cadence": _dca_cadence(buy.cadence_days),
+                "per_buy": money(buy.per_buy_usd),
+                "monthly": money(buy.monthly_usd),
+                "fee": money(buy.est_monthly_fee_usd),
+                "min_order": (
+                    label("unknown", display="unknown to keel", state=UNKNOWN)
+                    if buy.min_order_usd is None
+                    else money(buy.min_order_usd)
+                ),
+            }
+            for buy in plan.buys
+        ],
+        "buy_count": count(plan.buy_count),
+        "excluded": [
+            {
+                "asset": item.asset,
+                "reasons": ", ".join(REASON_TEXT[reason] for reason in item.reasons),
+                "detail": item.detail,
+            }
+            for item in plan.excluded
+        ],
+        "existing": [
+            {
+                "rule_id": str(rule.rule_id),
+                "product_id": rule.product_id,
+                "status": rule.status,
+                "per_buy": money(rule.budget_usd),
+                "cadence": _dca_cadence(rule.cadence_days),
+                # The CLI's `(dip_bonus_pct X)` marker: such a rule's buys can exceed `per_buy`.
+                # Presentation-ready, "" when there is none (as `excluded[].detail`).
+                "dip_bonus": (
+                    f"dip_bonus_pct {rule.dip_bonus_pct}" if rule.dip_bonus_pct > 0 else ""
+                ),
+            }
+            for rule in plan.existing
+        ],
+        "blockers": list(plan.blockers),
+        "warnings": list(plan.warnings),
+    }
 
 
 # -- venues (#534) -------------------------------------------------------------------------------

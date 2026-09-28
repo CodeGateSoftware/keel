@@ -783,6 +783,56 @@ def read_rules(cfg: ServeConfig, _query: Query, _state: Any, _now_ts: int) -> di
     return payload.rules_payload(rows)
 
 
+def read_dca_plan(cfg: ServeConfig, query: Query, _state: Any, now_ts: int) -> dict[str, Any]:
+    """The DCA proposal card on `/rules`, from THE service the CLI calls
+    (`keel.commands.dca_plan.build_dca_plan`). READ-ONLY: it builds a plan and writes nothing;
+    applying it is `keel dca plan` at a terminal, and the payload carries that exact command.
+
+    No `budget` -> the awaiting shape (200: `test_every_route_answers_json_with_the_envelope`
+    requests every route bare). A malformed budget/buffer, or a budget without a buffer, is a
+    400 -- refused, never guessed, as `_sort_request` refuses an unknown column.
+
+    **Every `DcaPlanError` is a 400 `ApiRefusal`, including one `build_dca_plan` raises over the
+    CONFIG** (`target_weights` keys colliding by case, a non-finite weight). That is this
+    module's one way of saying "declined, and here is why" -- the CLI refuses the same error as a
+    clean message rather than a traceback, and a 500 here would read "That report could not be
+    built" over a message that already names the fix. The card shows the refusal's detail.
+    """
+    from keel.commands.assets import screen_product  # resolved per call: one patch point
+    from keel.commands.dca_plan import (
+        DcaPlanError,
+        apply_command,
+        build_dca_plan,
+        parse_plan_inputs,
+    )
+
+    budget, buffer = _first(query, "budget"), _first(query, "buffer")
+    if not budget:
+        # R17: the template names the served deployment as the filled command does.
+        return payload.dca_plan_awaiting_payload(
+            command=apply_command(None, config_path=cfg.config_path, db_path=cfg.db_path)
+        )
+    if not buffer:
+        raise ApiRefusal(400, "Bad plan input", "buffer is required with budget, e.g. buffer=0.1.")
+    try:
+        inputs = parse_plan_inputs(budget, buffer)
+    except DcaPlanError as exc:
+        raise ApiRefusal(400, "Bad plan input", str(exc)) from exc
+    config = load_config(cfg.config_path)
+    repo = open_repo(cfg.db_path)
+    try:
+        plan = build_dca_plan(
+            repo, config, inputs, venue=_bound_venue(cfg), now_ts=now_ts, screen_fn=screen_product
+        )
+    except DcaPlanError as exc:
+        raise ApiRefusal(400, "DCA plan refused", str(exc)) from exc
+    finally:
+        close_repo(repo)
+    return payload.dca_plan_payload(
+        plan, command=apply_command(inputs, config_path=cfg.config_path, db_path=cfg.db_path)
+    )
+
+
 def read_venues(cfg: ServeConfig, _query: Query, state: Any, _now_ts: int) -> dict[str, Any]:
     """Capability declarations (unchanged), plus this deployment's venue readiness (#233 PR4).
 
@@ -1051,6 +1101,9 @@ API_ROUTES: dict[str, ApiRoute] = {
         collection="rules",
         sortable=("id", "kind", "status", "created_at", "promoted_at", "demoted_at"),
     ),
+    # The DCA proposal card on /rules. GET only, like every route here, and no collection to sort:
+    # the schedule is in the order the allowlist names its assets.
+    "/api/dca-plan": ApiRoute(html_route="/rules", read=read_dca_plan),
     # #706. `needs_database=False`, and NO `collection`/`sortable`: there is nothing on this page
     # to sort. A tier table ordered by price is a shopping comparison, and the whole point of the
     # inversion is that these four rows are not four choices.
