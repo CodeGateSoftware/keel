@@ -783,9 +783,18 @@ def test_a_busy_day_over_the_per_day_cap_is_a_named_blocker(valid_config_path: P
     plan = _plan(
         valid_config_path, caps=replace_caps(valid_config_path, max_per_day_usd=Decimal("100"))
     )
-    assert not plan.approvable
-    (blocker,) = [b for b in plan.blockers if "rail 3" in b]
-    assert "103.47" in blocker and "100" in blocker
+    assert plan.blockers == (
+        dca_mod.per_day_cap_text(
+            worst_day_spend_usd=Decimal("103.47"),
+            worst_day_cycle_usd=Decimal("103.47"),
+            existing_live_daily_usd=Decimal("0"),
+            live_rule_count=0,
+            max_per_day_usd=Decimal("100"),
+        ),
+    )
+    # One sentence, shown by the CLI exactly as the plan carries it.
+    lines = dca_mod.render_dca_plan(plan)
+    assert lines.count(f"  ✗ {plan.blockers[0]}") == 1
 
 
 def test_a_busy_day_exactly_at_the_per_day_cap_is_approvable(valid_config_path: Path) -> None:
@@ -804,7 +813,15 @@ def test_a_busy_day_one_cent_over_the_per_day_cap_blocks(valid_config_path: Path
         valid_config_path,
         caps=replace_caps(valid_config_path, max_per_day_usd=Decimal("103.46")),
     )
-    assert [b for b in plan.blockers if "rail 3" in b]
+    assert plan.blockers == (
+        dca_mod.per_day_cap_text(
+            worst_day_spend_usd=Decimal("103.47"),
+            worst_day_cycle_usd=Decimal("103.47"),
+            existing_live_daily_usd=Decimal("0"),
+            live_rule_count=0,
+            max_per_day_usd=Decimal("103.46"),
+        ),
+    )
 
 
 def test_existing_live_dca_rules_push_the_busy_day_over_the_cap(valid_config_path: Path) -> None:
@@ -816,9 +833,15 @@ def test_existing_live_dca_rules_push_the_busy_day_over_the_cap(valid_config_pat
     plan = _plan(valid_config_path, repo, caps=caps)
     assert plan.existing_live_daily_usd == Decimal("200")
     assert plan.worst_day_spend_usd == Decimal("303.47")
-    assert not plan.approvable
-    (blocker,) = [b for b in plan.blockers if "rail 3" in b]
-    assert "303.47" in blocker and "300" in blocker and "1 existing" in blocker
+    assert plan.blockers == (
+        dca_mod.per_day_cap_text(
+            worst_day_spend_usd=Decimal("303.47"),
+            worst_day_cycle_usd=Decimal("103.47"),
+            existing_live_daily_usd=Decimal("200"),
+            live_rule_count=1,
+            max_per_day_usd=Decimal("300"),
+        ),
+    )
 
 
 def test_a_disabled_or_candidate_dca_rule_does_not_count_toward_the_busy_day(
@@ -861,11 +884,10 @@ def test_a_correlated_per_buy_over_the_correlated_size_cap_is_a_named_warning(
     assert eth.per_buy_usd > correlated_cap
     assert paxg.per_buy_usd > correlated_cap  # over the cap too, but PAXG is uncorrelated (gold)
 
-    warned_assets = {"BTC" for w in plan.warnings if "correlated-size cap" in w and "BTC" in w} | {
-        "ETH" for w in plan.warnings if "correlated-size cap" in w and "ETH" in w
-    }
-    assert warned_assets == {"BTC", "ETH"}
-    assert not any("PAXG" in w and "correlated-size cap" in w for w in plan.warnings)
+    expected = [dca_mod.correlated_size_text(b, correlated_cap) for b in (btc, eth)]
+    rail5 = [w for w in plan.warnings if w in expected]
+    assert rail5 == expected  # exactly BTC then ETH, once each; never PAXG
+    assert dca_mod.correlated_size_text(paxg, correlated_cap) not in plan.warnings
     assert plan.approvable, plan.blockers
 
 

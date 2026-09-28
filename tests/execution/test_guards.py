@@ -430,7 +430,7 @@ def test_rail6_never_gates_a_sell_whatever_the_order_class(repo, is_dca):
 
     result = check(intent, repo, config, NOW_TS)
 
-    assert "per_asset_concentration_cap" not in _keys(result)
+    assert _keys(result) == set()
     assert result.ok is True
 
 
