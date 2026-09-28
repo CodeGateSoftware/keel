@@ -29,10 +29,12 @@ from typing import Any
 import pytest
 from keel_broker_api.orders import BracketGTC, OrderSpec
 from keel_broker_api.results import PlaceResult
+from keel_core.telemetry import _FIELDS_ATTR
 
 from keel.data.repository import Repository
 from keel.execution import streak
 from keel.execution.executor import UNBRACKETED_PREFIX, place_bracket, scale_out
+from keel.types import Side
 from tests.execution.test_executor import (
     NOW_TS,
     FakeBroker,
@@ -275,6 +277,124 @@ def test_the_surviving_tranche_is_repointed_at_the_replacement_bracket(repo):  #
     assert result.bracket_order_id is not None
     assert result.bracket_order_id != old_bracket_id
     assert repo.get_position_for_bracket(result.bracket_order_id)["id"] == position_id
+
+
+class _RemainderBracketPlaceRaises(FakeBroker):
+    """The partial SELL fills and is booked; the REMAINDER's bracket previews, then
+    `place_order` raises -- the venue may or may not have accepted it (#799, plan R5, reached
+    here through `scale_out` rather than through a fresh entry)."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.sell_places = 0
+
+    def place_order(self, spec: OrderSpec, *, idempotency_key: str | None = None) -> PlaceResult:
+        if spec.side is Side.SELL:
+            self.sell_places += 1
+            if self.sell_places == 2:  # 1st SELL = the partial exit, 2nd = the remainder bracket
+                raise TimeoutError("read timed out")
+        return super().place_order(spec, idempotency_key=idempotency_key)
+
+
+def test_a_remainder_bracket_that_raises_leaves_the_venue_state_unknown(
+    repo,  # noqa: F811
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Issue #892. `place_bracket`, called here for the remainder, CLEARS the `unbracketed:`
+    record when `place_order` itself raises after the order row was written -- the venue may be
+    holding that bracket, so a surviving record would let the next sweep place a second one
+    against inventory the first may already commit. The CRITICAL that follows must say so
+    (`retry_scheduled=False`), not repeat the "record is retained" text that describes a plain
+    veto or rejection of the remainder's bracket.
+    """
+    broker = _RemainderBracketPlaceRaises()
+    _seed_bracketed_tranche(repo, broker)
+    broker.sell_places = 0  # `_seed_bracketed_tranche`'s own bracket placement must not count
+
+    with caplog.at_level(logging.CRITICAL):
+        result = scale_out(
+            broker,
+            repo,
+            _config(),
+            product_id=PRODUCT,
+            qty=Decimal("0.1"),
+            exit_price=TARGET,
+            rule_name="pullback_continuation",
+            now_ts=NOW_TS,
+        )
+
+    assert broker.sell_places == 2, "the remainder's bracket leg must actually have been reached"
+    assert result.bracket_order_id is None
+    # The partial SELL already filled before the remainder's bracket leg ran, and that fact must
+    # not be lost along with the bracket.
+    position = repo.get_open_positions(PRODUCT)[0]
+    assert position["qty"] == Decimal("0.1")
+    assert position["realized_qty"] == Decimal("0.1")
+    assert repo.get_state(f"{UNBRACKETED_PREFIX}{PRODUCT}") is None, (
+        "the venue may hold the remainder's bracket -- a surviving record would let the next "
+        "sweep place a second one against inventory the first may already commit"
+    )
+    [critical] = [r for r in caplog.records if r.getMessage() == "executor.position_unprotected"]
+    assert getattr(critical, _FIELDS_ATTR)["retry_scheduled"] is False
+
+
+class _RemainderBracketPlaceRejected(FakeBroker):
+    """The partial SELL fills and is booked; the REMAINDER's bracket previews, then
+    `place_order` is REJECTED by the venue (no raise, just `PlaceResult(success=False)`) --
+    the counterpart to `_RemainderBracketPlaceRaises` above. `place_bracket` (#892) treats a
+    plain rejection differently from a raise: it RE-WRITES the `unbracketed:` record instead of
+    clearing it, because nothing about the venue's state is unknown here."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.sell_places = 0
+
+    def place_order(self, spec: OrderSpec, *, idempotency_key: str | None = None) -> PlaceResult:
+        if spec.side is Side.SELL:
+            self.sell_places += 1
+            if self.sell_places == 2:  # 1st SELL = the partial exit, 2nd = the remainder bracket
+                self.events.append("place")
+                self.place_calls.append({"spec": spec})
+                return PlaceResult(success=False, broker_order_id=None, reason="no funds")
+        return super().place_order(spec, idempotency_key=idempotency_key)
+
+
+def test_a_remainder_bracket_that_is_rejected_schedules_a_retry(
+    repo,  # noqa: F811
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The counterpart to `test_a_remainder_bracket_that_raises_leaves_the_venue_state_unknown`
+    above, and the mutant it does not kill: `retry_scheduled = False` hardcoded on `scale_out`'s
+    CRITICAL leaves the whole suite green, because no test exercises the `retry_scheduled=True`
+    branch. Here the remainder's bracket is plainly REJECTED by the venue -- no raise,
+    `result.placed is False` -- so `place_bracket` RE-WRITES the `unbracketed:` record rather
+    than clearing it (#892), and the CRITICAL that follows must say `retry_scheduled=True` and
+    the record must actually survive for the next cycle's sweep to read.
+    """
+    broker = _RemainderBracketPlaceRejected()
+    _seed_bracketed_tranche(repo, broker)
+    broker.sell_places = 0  # `_seed_bracketed_tranche`'s own bracket placement must not count
+
+    with caplog.at_level(logging.CRITICAL):
+        result = scale_out(
+            broker,
+            repo,
+            _config(),
+            product_id=PRODUCT,
+            qty=Decimal("0.1"),
+            exit_price=TARGET,
+            rule_name="pullback_continuation",
+            now_ts=NOW_TS,
+        )
+
+    assert broker.sell_places == 2, "the remainder's bracket leg must actually have been reached"
+    assert result.bracket_order_id is None
+    assert repo.get_state(f"{UNBRACKETED_PREFIX}{PRODUCT}") is not None, (
+        "a plain rejection of the remainder's bracket must re-write the retry record so the "
+        "next cycle's sweep re-places it"
+    )
+    [critical] = [r for r in caplog.records if r.getMessage() == "executor.position_unprotected"]
+    assert getattr(critical, _FIELDS_ATTR)["retry_scheduled"] is True
 
 
 def test_a_bracket_that_cannot_be_cancelled_refuses_the_sell(repo):  # noqa: F811

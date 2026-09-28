@@ -303,10 +303,24 @@ def reconcile_unbracketed_positions(
 
         if new_id is None:
             # `place_bracket` has re-written the `unbracketed:` record on its way out, so the
-            # retry survives to the next cycle rather than being stranded here.
-            _escalate_unprotected_position(
-                position, qty, "bracket placement was vetoed or rejected again"
+            # retry survives to the next cycle rather than being stranded here -- except when
+            # `place_order` itself raised (#799, plan R5): the venue may hold that bracket, so
+            # `place_bracket` CLEARED the record and a human reconciles the `pending` row.
+            # Issue #892: read the record back rather than assume which of the two happened --
+            # both outcomes reach here as the same `new_id is None`.
+            retry_scheduled = (
+                repo.get_state(f"{executor.UNBRACKETED_PREFIX}{product_id}") is not None
             )
+            why = (
+                "bracket placement was vetoed or rejected again"
+                if retry_scheduled
+                else (
+                    "the bracket leg raised after its order row was written -- the venue's "
+                    "state is unknown, nothing will re-place it, and a human must reconcile the "
+                    "pending row"
+                )
+            )
+            _escalate_unprotected_position(position, qty, why, retry_scheduled)
             continue
 
         repo.set_position_bracket(position["id"], new_id)
@@ -482,7 +496,9 @@ def _has_resting_bracket(repo: Repository, position: dict[str, Any]) -> bool:
     return str(order["status"]) in {"pending", "filled", _PARTIALLY_FILLED}
 
 
-def _escalate_unprotected_position(position: dict[str, Any], qty: Decimal, why: str) -> None:
+def _escalate_unprotected_position(
+    position: dict[str, Any], qty: Decimal, why: str, retry_scheduled: bool
+) -> None:
     log_event(
         logger,
         logging.CRITICAL,
@@ -491,6 +507,7 @@ def _escalate_unprotected_position(position: dict[str, Any], qty: Decimal, why: 
         position_id=position["id"],
         held_qty=str(qty),
         reason=why,
+        retry_scheduled=retry_scheduled,
         detail=(
             "this tranche is held with NO protective stop at the exchange and a replacement "
             "could not be placed -- re-place one or close it before trading on"
@@ -524,14 +541,14 @@ def _rebracket_or_escalate(
     position = repo.get_position_for_bracket(row["id"])
     if position is None:
         qty, _avg_cost = _held_position(repo, product_id)
-        _escalate_unprotected(repo, row, qty, "no ledger tranche owns this bracket")
+        _escalate_unprotected(repo, row, qty, "no ledger tranche owns this bracket", False)
         return
     qty = position["qty"]
 
     stop = repo.get_state(f"open_stop:{product_id}")
     target = repo.get_state(f"open_target:{product_id}")
     if stop is None or target is None:
-        _escalate_unprotected(repo, row, qty, "no recorded stop/target to re-place from")
+        _escalate_unprotected(repo, row, qty, "no recorded stop/target to re-place from", False)
         return
 
     # The SAME per-order isolation the status fetch and `_record_fill` get. Placing an order
@@ -562,7 +579,21 @@ def _rebracket_or_escalate(
         new_id = None
 
     if new_id is None:
-        _escalate_unprotected(repo, row, qty, "replacement bracket was vetoed or rejected")
+        # Issue #892, mirroring `reconcile_unbracketed_positions` above: `place_bracket` clears
+        # the `unbracketed:` record instead of re-writing it when `place_order` itself raised
+        # (#799, plan R5) -- the venue may be holding that bracket. Read the record back rather
+        # than assume which of the two happened.
+        retry_scheduled = repo.get_state(f"{executor.UNBRACKETED_PREFIX}{product_id}") is not None
+        why = (
+            "replacement bracket was vetoed or rejected"
+            if retry_scheduled
+            else (
+                "the replacement bracket's leg raised after its order row was written -- the "
+                "venue's state is unknown, nothing will re-place it, and a human must reconcile "
+                "the pending row"
+            )
+        )
+        _escalate_unprotected(repo, row, qty, why, retry_scheduled)
         return
 
     # Re-point the tranche at its NEW bracket. Without this the tranche still names the dead
@@ -582,7 +613,9 @@ def _rebracket_or_escalate(
     )
 
 
-def _escalate_unprotected(repo: Repository, row: dict[str, Any], qty: Decimal, why: str) -> None:
+def _escalate_unprotected(
+    repo: Repository, row: dict[str, Any], qty: Decimal, why: str, retry_scheduled: bool
+) -> None:
     log_event(
         logger,
         logging.CRITICAL,
@@ -591,6 +624,7 @@ def _escalate_unprotected(repo: Repository, row: dict[str, Any], qty: Decimal, w
         order_id=row["id"],
         held_qty=str(qty),
         reason=why,
+        retry_scheduled=retry_scheduled,
         detail=(
             "the exit bracket is gone from the exchange and could not be replaced -- this "
             "position has NO protective stop. Re-place one or close it before trading on."
