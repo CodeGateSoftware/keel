@@ -26,7 +26,7 @@ from keel_broker_api.port import TradeScopeDenied
 from keel_broker_api.results import Balance, OrderStatus, PlaceResult, Preview
 from keel_core.quote_provenance import SYNTHETIC_ESTIMATE, UNPRICED, UNREADABLE, VENUE_QUOTED
 from keel_core.subscription import SubscriptionStatus
-from keel_core.telemetry import bind_venue, unbind_venue
+from keel_core.telemetry import _FIELDS_ATTR, bind_venue, unbind_venue
 from keel_core.trade_scope import READ_ONLY, TRADING, TradeScopeState
 
 from keel.config import (
@@ -1920,6 +1920,33 @@ def test_an_exit_records_its_venue_filled_size_after_re_polling(repo, pauses):
 
     assert repo.get_order(result.order_id)["filled_quantity"] == Decimal("0.01")
     assert broker.get_order_calls == 2
+
+
+def test_an_unobservable_exit_logs_exit_wording_with_side_sell(repo, caplog):
+    """#907 review: `fill_quantity_unobserved` also fires on a market SELL exit, but its detail
+    talked only about "bracket and tranche" -- entry-only language, on a sale. The sibling
+    `_record_observed_fill_quantity` docstring's rule is entry-only wording never leaks onto an
+    exit; this event broke it. The exit gets its own wording, and `side` is now a field so a log
+    reader can tell which without parsing the sentence."""
+
+    class _BlindBroker(FakeBroker):
+        def get_order(self, order_id: str) -> OrderStatus:
+            raise RuntimeError("status endpoint down")
+
+    _seed_filled_buy(repo, qty=Decimal("0.01"), price=Decimal("50000"))
+    broker = _BlindBroker()
+
+    with caplog.at_level(logging.WARNING):
+        result = execute(_exit_signal(), broker, repo, _config(), "autonomous", None, now_ts=NOW_TS)
+
+    assert result.placed is True
+    [warning] = _events(caplog, UNOBSERVED_EVENT)
+    fields = getattr(warning, _FIELDS_ATTR)
+    assert fields["side"] == Side.SELL
+    assert fields["detail"] == (
+        "the venue never reported this filled exit's sold size, so it is booked at the ORDERED "
+        "quantity; check the venue's fill for this order"
+    )
 
 
 def test_the_executors_terminal_statuses_are_reconciles() -> None:

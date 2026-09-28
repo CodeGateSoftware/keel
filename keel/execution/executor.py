@@ -1458,7 +1458,10 @@ def _upgrade_to_observed_economics(
     snapshot of an order still executing is not what was delivered, and the bracket and tranche
     sized from `filled_quantity` next must never be sized from a number the venue may still
     grow. When no terminal answer arrives, `filled_quantity` stays NULL -- "not observed", never
-    a guess -- and `executor.fill_quantity_unobserved` says so once.
+    a guess -- and `executor.fill_quantity_unobserved` says so once, carrying `side` as a field
+    and choosing its `detail` by it (#907 review): a BUY's bracket-and-tranche wording has no
+    referent on a market SELL exit, which takes this same path (`_record_observed_fill_quantity`
+    below runs it for both sides) and gets its own sentence instead.
     """
     get_order = getattr(broker, "get_order", None)
     native_id = place_result.broker_order_id
@@ -1481,6 +1484,21 @@ def _upgrade_to_observed_economics(
         and _record_observed_fill_quantity(repo, order_id, observed, intent, now_ts)
     )
     if not recorded:
+        # Entry-only wording, exactly the rule `_record_observed_fill_quantity` states for
+        # `executor.entry_partially_filled`: a market SELL exit takes this same unobserved path,
+        # and "bracket and tranche" is entry language that has no referent on a sale (#907
+        # review). `side` unknown (no `intent`) reads as an exit too -- silence about which side
+        # this was must not default to the entry sentence.
+        side = intent.side if intent is not None else None
+        detail = (
+            "the venue never reported this filled order's delivered size, so its bracket and "
+            "tranche are sized from the ORDERED quantity -- which overstates what is held by "
+            "the fee when the venue took it out of the quote (#900). Check the venue's fill for "
+            "this order"
+            if side == Side.BUY
+            else "the venue never reported this filled exit's sold size, so it is booked at the "
+            "ORDERED quantity; check the venue's fill for this order"
+        )
         log_event(
             logger,
             logging.WARNING,
@@ -1488,12 +1506,8 @@ def _upgrade_to_observed_economics(
             order_id=order_id,
             product=intent.product_id if intent is not None else None,
             status=observed.status if observed is not None else None,
-            detail=(
-                "the venue never reported this filled order's delivered size, so its bracket "
-                "and tranche are sized from the ORDERED quantity -- which overstates what is "
-                "held by the fee when the venue took it out of the quote (#900). Check the "
-                "venue's fill for this order"
-            ),
+            side=side,
+            detail=detail,
         )
     if observed is None:
         return
