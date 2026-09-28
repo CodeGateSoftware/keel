@@ -18,6 +18,7 @@ from keel_core.subscription import SubscriptionStatus
 
 from keel.commands import dca_plan as dca_mod
 from keel.commands.dca_plan import (
+    RAIL14_NOTE,
     DcaPlanError,
     ExcludedAsset,
     PlanInputs,
@@ -26,6 +27,7 @@ from keel.commands.dca_plan import (
     monthly_buy_cap,
     parse_plan_inputs,
     parse_weight,
+    render_dca_plan,
     select_universe,
 )
 from keel.compliance.screen import MarketFacts, ScreenResult
@@ -578,3 +580,90 @@ def test_even_daily_pacing_is_stated(valid_config_path: Path) -> None:
     attest_subscription(repo, now_ts=NOW_TS, free_volume_usd=Decimal("500"), pacing="even_daily")
     plan = _plan(valid_config_path, repo, cap=None)
     assert any("even_daily" in w for w in plan.warnings)
+
+
+# -- the terminal renderer, with rail 14's wording pinned (Task 4) -------------------------------
+
+
+def _section(lines: list[str], title: str) -> list[str]:
+    """The lines under a `== title ==` header, up to the next header."""
+    start = lines.index(f"== {title} ==")
+    rest = lines[start + 1 :]
+    end = next((i for i, line in enumerate(rest) if line.startswith("== ")), len(rest))
+    return [line for line in rest[:end] if line.strip()]
+
+
+def test_the_schedule_has_one_row_per_buy_carrying_its_figures(valid_config_path: Path) -> None:
+    plan = _plan(valid_config_path)
+    rows = _section(render_dca_plan(plan), "Schedule")
+    body = [row for row in rows if not row.lstrip().startswith(("asset", "total"))]
+    assert len(body) == plan.buy_count == 3
+    for row, buy in zip(body, plan.buys, strict=True):
+        cells = row.split()
+        assert cells[0] == buy.asset
+        assert "every 7 days" in row
+        assert f"${buy.per_buy_usd}" in row and f"${buy.monthly_usd}" in row
+    (total,) = [row for row in rows if row.lstrip().startswith("total")]
+    assert "$449.89" in total and "$5.40" in total
+
+
+def test_fees_are_labelled_as_the_configured_rate(valid_config_path: Path) -> None:
+    text = "\n".join(render_dca_plan(_plan(valid_config_path)))
+    assert "configured fees.taker_pct 1.2%" in text
+
+
+def test_every_excluded_asset_appears_once_with_its_reasons(valid_config_path: Path) -> None:
+    repo = _repo()
+    _insert_dca(repo, "BTC-USD", "live")
+    plan = _plan(valid_config_path, repo, rejected=("PAXG",))
+    rows = _section(render_dca_plan(plan), "Excluded")
+    assert len(rows) == len(plan.excluded) == 2
+    assert {row.split()[0] for row in rows} == {"BTC", "PAXG"}
+    btc = next(row for row in rows if row.split()[0] == "BTC")
+    assert "existing, unchanged" in btc
+
+
+def test_existing_rules_are_listed_unchanged(valid_config_path: Path) -> None:
+    repo = _repo()
+    rule_id = _insert_dca(repo, "BTC-USD", "live")
+    rows = _section(
+        render_dca_plan(_plan(valid_config_path, repo)), "Existing DCA rules (unchanged)"
+    )
+    assert len(rows) == 1 and rows[0].split()[0] == f"[{rule_id}]"
+
+
+def test_an_existing_rules_dip_bonus_is_shown_on_its_row(valid_config_path: Path) -> None:
+    """Coordinator addition: a live existing rule's row carries its dip bonus when it has one,
+    and the Notes section still has exactly one line per warning (the dip-bonus warning among
+    them). `[id]` stays the row's first whitespace cell."""
+    repo = _repo()
+    rule_id = _insert_dca(repo, "BTC-USD", "live", dip="2")
+    plan = _plan(valid_config_path, repo)
+    assert len(plan.warnings) >= 2  # min-order note AND the dip-bonus warning, non-vacuous
+    lines = render_dca_plan(plan)
+    existing_rows = _section(lines, "Existing DCA rules (unchanged)")
+    assert len(existing_rows) == len(plan.existing) == 1
+    (row,) = existing_rows
+    assert row.split()[0] == f"[{rule_id}]"
+    assert "dip_bonus_pct 2" in row
+    assert len(_section(lines, "Notes")) == len(plan.warnings)
+
+
+def test_blockers_and_warnings_each_get_one_line(valid_config_path: Path) -> None:
+    plan = _plan(valid_config_path, cap="400")
+    lines = render_dca_plan(plan)
+    assert len(_section(lines, "Cannot approve")) == len(plan.blockers)
+    assert len(_section(lines, "Notes")) == len(plan.warnings)
+
+
+def test_an_approvable_plan_has_no_cannot_approve_section(valid_config_path: Path) -> None:
+    assert "== Cannot approve ==" not in render_dca_plan(_plan(valid_config_path))
+
+
+def test_the_rendered_plan_states_rail_14_is_a_buy_cap_and_never_fee_free(
+    valid_config_path: Path,
+) -> None:
+    lines = render_dca_plan(_plan(valid_config_path))
+    assert sum(RAIL14_NOTE in line for line in lines) == 1
+    assert not any("fee-free" in line.lower() for line in lines)
+    assert not any("max_exposure_usd" in line for line in lines)

@@ -459,8 +459,9 @@ def build_dca_plan(
     for rule in live_rules:
         if rule.dip_bonus_pct > 0:
             warnings.append(
-                f"rule {rule.rule_id} ({rule.product_id}) has a dip bonus of "
-                f"{rule.dip_bonus_pct}%: its buys scale up on dips, so they can exceed both its "
+                f"rule {rule.rule_id} ({rule.product_id}) has dip_bonus_pct "
+                f"{rule.dip_bonus_pct}: each 1-point drawdown from its recent high adds "
+                f"{rule.dip_bonus_pct}% of its budget to a buy, so its buys can exceed both its "
                 "listed per-buy amount and the commitment shown above"
             )
     if cap.pacing == "even_daily":
@@ -487,3 +488,67 @@ def build_dca_plan(
         blockers=tuple(blockers),
         warnings=tuple(warnings),
     )
+
+
+#: Stated once per plan, verbatim (#836). The attested figure is a cap keel imposes on its own
+#: buying; Advanced Trade charges its fee on every order regardless.
+RAIL14_NOTE = (
+    "Rail 14 is a monthly BUY cap keel imposes on its own buying -- not a fee waiver: every "
+    "order pays the venue's fee."
+)
+
+
+def render_dca_plan(plan: DcaPlan) -> list[str]:
+    """The CLI's exact lines. Sections are `== Title ==` headers so the CLI and tests read them
+    the same way."""
+    inputs = plan.inputs
+    cap = "unlimited" if plan.cap.allowance_usd is None else _usd(plan.cap.allowance_usd)
+    lines = [
+        "== DCA plan ==",
+        f"  budget {_usd(inputs.budget_usd)}/month, buffer {format(inputs.buffer_pct, 'f')} "
+        f"({_usd(plan.buffer_usd)} held back) -> spend {_usd(plan.spend_usd)}/month",
+        f"  rail 14 monthly buy cap on {plan.cap.venue}: {cap}"
+        + ("" if plan.cap.in_force else f" (because {plan.cap.degraded_reason})"),
+        f"  {RAIL14_NOTE}",
+        "",
+        "== Schedule ==",
+        f"  {'asset':<8} {'weight':>7} {'cadence':<14} {'per buy':>10} {'monthly':>10} "
+        f"{'est. fee':>9}",
+    ]
+    for buy in plan.buys:
+        lines.append(
+            f"  {buy.asset:<8} {format(buy.weight_pct, 'f') + '%':>7} "
+            f"{'every ' + str(buy.cadence_days) + ' days':<14} {_usd(buy.per_buy_usd):>10} "
+            f"{_usd(buy.monthly_usd):>10} {_usd(buy.est_monthly_fee_usd):>9}"
+        )
+    lines.append(
+        f"  total {_usd(plan.planned_monthly_usd)}/month, est. fees "
+        f"{_usd(plan.est_monthly_fees_usd)}/month at the configured fees.taker_pct "
+        f"{_trim_pct(plan.taker_pct_display)}%"
+    )
+    if plan.excluded:
+        lines += ["", "== Excluded =="]
+        for item in plan.excluded:
+            reasons = ", ".join(REASON_TEXT[r] for r in item.reasons)
+            detail = f" ({item.detail})" if item.detail else ""
+            lines.append(f"  {item.asset} -- {reasons}{detail}")
+    if plan.existing:
+        lines += ["", "== Existing DCA rules (unchanged) =="]
+        for rule in plan.existing:
+            row = (
+                f"  [{rule.rule_id}] {rule.product_id} {rule.status} "
+                f"{_usd(rule.budget_usd)} every {rule.cadence_days} days"
+            )
+            if rule.dip_bonus_pct > 0:
+                row += f" (dip_bonus_pct {rule.dip_bonus_pct})"
+            lines.append(row)
+    if plan.blockers:
+        lines += ["", "== Cannot approve =="] + [f"  ✗ {b}" for b in plan.blockers]
+    lines += ["", "== Notes =="] + [f"  ! {w}" for w in plan.warnings]
+    return lines
+
+
+def _trim_pct(value: Decimal) -> str:
+    """`1.200` -> `1.2`; `format(..., "f")` keeps it exponent-free, and `.rstrip` only trims."""
+    text = format(value, "f")
+    return text.rstrip("0").rstrip(".") if "." in text else text
