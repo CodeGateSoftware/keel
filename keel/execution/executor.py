@@ -519,7 +519,9 @@ def _base_increment_for(
         ),
     }
     repo.set_state(key, record)
-    return increment
+    # Through the same coercion the cached path uses, so a fresh answer and a cached one can
+    # never disagree: `Instrument` refuses a non-positive increment but not an infinite one.
+    return _coerce_increment(increment)
 
 
 def _price_increment_for(
@@ -564,14 +566,21 @@ def _price_increment_for(
 
 
 def _coerce_increment(raw: object) -> Decimal | None:
-    """A positive `Decimal` from the venue's string, or `None` -- never raises."""
+    """A positive, FINITE `Decimal` from the venue's string, or `None` -- never raises.
+
+    Finite first, and the order matters twice over. `Infinity > 0` is true, and an infinite
+    increment then raises `decimal.InvalidOperation` inside `quantize_down` -- an
+    `ArithmeticError`, not a `ValueError` -- which is the #799 shape: a bracket leg raising after
+    the entry filled. And `NaN > 0` does not answer at all: it RAISES, which broke this function's
+    own "never raises" contract. A degenerate increment is UNKNOWN, like a missing one.
+    """
     if raw is None:
         return None
     try:
         value = Decimal(str(raw))
     except InvalidOperation, TypeError, ValueError:
         return None
-    return value if value > 0 else None
+    return value if value.is_finite() and value > 0 else None
 
 
 def _fetch_available_quote(broker: Any, quote_currency: str | None) -> Decimal | None:
@@ -2303,8 +2312,10 @@ def place_bracket(
     narrower than "this function never raises".** Its callers run it after an entry has already
     FILLED, so an exception escaping here costs a real position its ledger row. Two specific
     failure paths are guarded: spec construction is caught narrowly, `(BracketPricesUnplaceable,
-    ValueError)`, and everything `_run_order` can raise -- a venue refusal, `TradeScopeDenied`,
-    a network error -- is caught broadly around that one call. Both return `None`, and the stage
+    ArithmeticError, ValueError)` -- `ArithmeticError` because a quantize that cannot be computed
+    raises `decimal.InvalidOperation`, which is not a `ValueError` -- and everything
+    `_run_order` can raise -- a venue refusal, `TradeScopeDenied`, a network error -- is caught
+    broadly around that one call. Both return `None`, and the stage
     decides what is left behind:
 
     - before the bracket's `orders` row exists (the spec cannot be built, or `_run_order` raised
@@ -2362,7 +2373,7 @@ def place_bracket(
             _base_increment_for(broker, repo, product_id, now_ts),
             _price_increment_for(broker, repo, product_id, now_ts),
         )
-    except (BracketPricesUnplaceable, ValueError) as exc:
+    except (BracketPricesUnplaceable, ArithmeticError, ValueError) as exc:
         repo.set_state(
             f"{UNBRACKETED_PREFIX}{product_id}",
             {"stop": stop, "target": target, "qty": qty},
@@ -2949,7 +2960,7 @@ def _roll_stop(
             _base_increment_for(broker, repo, product_id, now_ts),
             _price_increment_for(broker, repo, product_id, now_ts),
         )
-    except (BracketPricesUnplaceable, ValueError) as exc:
+    except (BracketPricesUnplaceable, ArithmeticError, ValueError) as exc:
         log_event(
             logger,
             logging.CRITICAL,

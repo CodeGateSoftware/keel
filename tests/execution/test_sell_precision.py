@@ -251,3 +251,25 @@ def test_an_adapter_without_a_catalogue_read_is_unknown_not_a_crash() -> None:
             raise NotImplementedError("no catalogue read on this adapter")
 
     assert _base_increment_for(_Unwritten(), _Repo(), "XLM-USD", NOW) is None
+
+
+# -- a degenerate increment is UNKNOWN, never a number to quantize against (#799 follow-up) ----
+
+
+def test_a_non_finite_increment_from_the_venue_is_unknown() -> None:
+    """`Instrument` refuses a non-positive increment but not an infinite one (`Infinity > 0`).
+    Quantizing against it raises `decimal.InvalidOperation` -- not a `ValueError` -- which is
+    how a degenerate venue field would escape `place_bracket` after a filled entry (#799)."""
+    repo, broker = _Repo(), _Broker([{"product_id": "INF-USD", "base_increment": "Infinity"}])
+    assert _base_increment_for(broker, repo, "INF-USD", NOW) is None
+    assert broker.calls == 1, "the fixture must actually have been asked"
+
+
+@pytest.mark.parametrize("raw", ["Infinity", "-Infinity", "NaN", "sNaN"])
+def test_a_non_finite_cached_increment_is_unknown_and_never_raises(raw: str) -> None:
+    """The cached path too. `NaN > 0` RAISES `InvalidOperation`, so before this a NaN record
+    broke `_coerce_increment`'s own "never raises" contract."""
+    cached = {"base_increment:X-USD": {"increment": raw, "fetched_at": NOW}}
+    repo, broker = _Repo(cached), _Broker()
+    assert _base_increment_for(broker, repo, "X-USD", NOW) is None
+    assert broker.calls == 0, "a fresh record must be served from cache, not refetched"

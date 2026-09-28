@@ -5081,3 +5081,27 @@ def test_a_venue_holdings_write_that_raises_never_costs_the_cycle(repo, monkeypa
     assert calls == [90_000], "the patched writer must actually have been reached"
     assert result.skipped is False
     assert [r.getMessage() for r in caplog.records].count("agent.venue_holdings_failed") == 1
+
+
+def test_799_a_bracket_quantize_that_raises_still_records_the_tranche(repo, monkeypatch):
+    """The #799 shape through a different door: the entry fills, and building the bracket raises
+    `decimal.InvalidOperation` out of the QUANTIZE (an increment far finer than the context's
+    precision), not out of the preview. It is an `ArithmeticError`, not a `ValueError`, and the
+    tranche must still be recorded with the stop the rule computed."""
+    rule = _AlwaysEnterRule(PRODUCT)
+    _seed_rule(repo, monkeypatch, rule, status="live")
+    repo.set_state(
+        f"{executor.BASE_INCREMENT_PREFIX}{PRODUCT}",
+        {"increment": "1E-40", "quote_increment": "0.01", "fetched_at": 90_000},
+    )
+    broker = FakeBroker(series={(PRODUCT, Granularity.ONE_DAY): [_candle(0, "100")]})
+
+    run_once(broker, repo, _config(risk_pct=Decimal("0.0001")), now_ts=90_000)
+
+    [entry] = [o for o in repo.get_orders(mode="live") if o["side"] == Side.BUY.value]
+    assert entry["status"] == "filled"
+    assert [c["side"] for c in broker.place_calls] == [Side.BUY], "the bracket was never sent"
+    [tranche] = repo.get_open_positions(PRODUCT)
+    assert tranche["initial_stop"] == Decimal("95.00")
+    assert tranche["bracket_order_id"] is None
+    assert repo.get_state(f"{executor.UNBRACKETED_PREFIX}{PRODUCT}") is not None

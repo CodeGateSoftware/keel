@@ -10,7 +10,7 @@ holding the bracket.
 from __future__ import annotations
 
 import logging
-from decimal import InvalidOperation
+from decimal import Decimal, InvalidOperation
 
 import pytest
 from keel_broker_api.orders import OrderSpec
@@ -134,3 +134,97 @@ def test_a_bracket_that_places_still_returns_its_order_id(repo) -> None:  # noqa
     [bracket] = [o for o in repo.get_orders(mode="live") if o["side"] == "SELL"]
     assert result.bracket_order_id == bracket["id"]
     assert repo.get_state(f"{executor.UNBRACKETED_PREFIX}BTC-USD") is None
+
+
+# -- the spec build: an `ArithmeticError` is a bracket that cannot be BUILT (#799 follow-up) ----
+
+
+def _cache_increment(repo, increment: str) -> None:  # noqa: F811
+    """A FRESH cached `base_increment:` record, so the bracket leg reads it without asking the
+    venue. `quote_increment` is present so `_price_increment_for` does not refetch over it."""
+    repo.set_state(
+        f"{executor.BASE_INCREMENT_PREFIX}BTC-USD",
+        {"increment": increment, "quote_increment": "0.01", "fetched_at": NOW_TS},
+    )
+
+
+def test_a_non_finite_cached_increment_still_brackets_a_filled_entry(repo) -> None:  # noqa: F811
+    """`Infinity` is a degenerate venue field, and degenerate means UNKNOWN: the bracket goes
+    out unquantized, as it does for any unknown increment, rather than raising out of
+    `place_bracket` after the entry filled."""
+    _cache_increment(repo, "Infinity")
+    broker = FakeBroker()
+
+    result = executor.execute(_enter_signal(), broker, repo, _config(), "autonomous", now_ts=NOW_TS)
+
+    assert result.placed is True, "the entry FILLED -- reporting it unplaced loses the tranche"
+    assert [c["spec"].side for c in broker.place_calls] == [Side.BUY, Side.SELL]
+    [bracket] = [o for o in repo.get_orders(mode="live") if o["side"] == "SELL"]
+    assert result.bracket_order_id == bracket["id"]
+
+
+def test_an_arithmetic_error_building_the_bracket_downgrades_a_filled_entry(
+    repo,  # noqa: F811
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A finite, positive increment can still break the quantize: one far finer than the
+    context's 28-digit precision raises `InvalidOperation` (`DivisionImpossible`) from
+    `quantize_down`. That is an `ArithmeticError`, not a `ValueError`, and it is the same event
+    as a bracket the venue refuses: the entry keeps its tranche, and the retry record holds the
+    levels. Narrowing the spec-build `except` back to `ValueError` fails this test."""
+    _cache_increment(repo, "1E-40")
+    broker = FakeBroker()
+    signal = _enter_signal()
+
+    with caplog.at_level(logging.WARNING, logger="keel.execution.executor"):
+        result = executor.execute(signal, broker, repo, _config(), "autonomous", now_ts=NOW_TS)
+
+    assert result.placed is True, "the entry FILLED -- reporting it unplaced loses the tranche"
+    assert result.bracket_order_id is None
+    assert [c["spec"].side for c in broker.place_calls] == [Side.BUY], "no bracket was sent"
+    retry = repo.get_state(f"{executor.UNBRACKETED_PREFIX}BTC-USD")
+    assert retry is not None
+    assert (retry["stop"], retry["target"]) == (signal.setup.stop, signal.setup.target)
+    [warning] = _events(caplog, "executor.bracket_not_placed")
+    assert getattr(warning, _FIELDS_ATTR)["product"] == "BTC-USD"
+
+
+def test_an_arithmetic_error_building_a_roll_replacement_is_escalated_not_raised(
+    repo,  # noqa: F811
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """`_roll_stop` has the same spec-build `try`, and there the old bracket is ALREADY
+    cancelled: an exception escaping it skips the CRITICAL that says the position is naked."""
+    broker = FakeBroker()
+    old_id = executor.place_bracket(
+        broker,
+        repo,
+        _config(),
+        product_id="BTC-USD",
+        qty=Decimal("0.01"),
+        stop=Decimal("49000"),
+        target=Decimal("54000"),
+        rule_name="pullback_continuation",
+        now_ts=NOW_TS,
+    )
+    assert old_id is not None
+    _cache_increment(repo, "1E-40")
+
+    with caplog.at_level(logging.WARNING, logger="keel.execution.executor"):
+        new_id = executor.roll_stop_to(
+            broker,
+            repo,
+            _config(),
+            product_id="BTC-USD",
+            old_stop_order_id=old_id,
+            new_stop=Decimal("50000"),
+            qty=Decimal("0.01"),
+            rule_name="pullback_continuation",
+            now_ts=NOW_TS + 100,
+        )
+
+    assert new_id is None
+    assert broker.events == ["place", "cancel"], "cancelled, and no replacement was sent"
+    [critical] = _events(caplog, "executor.position_unprotected")
+    assert critical.levelno == logging.CRITICAL
+    assert getattr(critical, _FIELDS_ATTR)["cancelled_order_id"] == old_id
