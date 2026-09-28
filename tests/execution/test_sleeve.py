@@ -84,3 +84,61 @@ def test_orders_qty_counts_filled_rows_only() -> None:
     repo.insert_order(_order(mode="live", side=Side.BUY.value, qty=Decimal("0.001")))
     repo.insert_order(_order(mode="live", side=Side.BUY.value, qty=Decimal("7"), status="pending"))
     assert sleeve.orders_qty(repo, "BTC-USD", mode="live") == Decimal("0.001")
+
+
+# --- holding_of: the Holding over the positions ledger (#857, plan Task 5.4) ----------------
+
+
+def test_holding_of_is_the_ledger_and_its_qty_is_doctors_ledger_qty() -> None:
+    """Every OPEN tranche of the product, no rule filter (R8), oldest first -- the turtle row is
+    inserted first but opened later, so the order is the ledger's FIFO, not insertion order. A
+    closed tranche and another product's tranche are not part of it."""
+    repo = _repo()
+    turtle = repo.open_position(
+        product_id="BTC-USD",
+        rule_name="turtle_breakout",
+        opened_at=2,
+        qty=Decimal("0.0004"),
+        entry_fill=Decimal("110000"),
+        entry_fee=Decimal("0.5"),
+    )
+    dca = repo.open_position(
+        product_id="BTC-USD",
+        rule_name="dca",
+        opened_at=1,
+        qty=Decimal("0.0005"),
+        entry_fill=Decimal("100000"),
+        entry_fee=Decimal("0.45"),
+    )
+    closed = repo.open_position(
+        product_id="BTC-USD",
+        rule_name="dca",
+        opened_at=0,
+        qty=Decimal("1"),
+        entry_fill=Decimal("1"),
+        entry_fee=Decimal("0"),
+    )
+    repo.close_position(closed, closed_at=3)
+    repo.open_position(
+        product_id="PAXG-USD",
+        rule_name="dca",
+        opened_at=1,
+        qty=Decimal("1"),
+        entry_fill=Decimal("4000"),
+        entry_fee=Decimal("0"),
+    )
+
+    held = sleeve.holding_of(repo, "BTC-USD", mark=Decimal("120000"))
+
+    assert [(lot.position_id, lot.rule_name) for lot in held.lots] == [
+        (dca, "dca"),
+        (turtle, "turtle_breakout"),
+    ]
+    assert held.qty == sleeve.ledger_qty(repo.get_open_positions("BTC-USD"))
+    assert held.qty == Decimal("0.0009")
+    assert (held.product_id, held.mark) == ("BTC-USD", Decimal("120000"))
+
+
+def test_holding_of_a_product_with_no_open_tranche_is_empty() -> None:
+    held = sleeve.holding_of(_repo(), "BTC-USD")
+    assert (held.lots, held.qty, held.vwae, held.mark) == ((), Decimal("0"), None, None)
