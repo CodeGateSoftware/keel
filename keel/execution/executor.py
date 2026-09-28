@@ -1221,17 +1221,24 @@ def _run_order(
         # in the engine that hears it.
         #
         # Written BEFORE the re-raise, and that ordering is the whole mechanism. NOTHING upstream
-        # catches this: `agent.run_once` does not wrap `executor.execute`, and neither does the
-        # `run_loop` above it, so the exception leaves the process. (#233's design says a
-        # "cycle-survival handler" catches it -- that handler is `_manage_stops`' per-tranche
-        # one, which this path does not pass through. Verified against `agent.py`.) A write
-        # deferred to a caller would therefore never happen at all, which is precisely the state
-        # before this PR: the venue answered and nothing wrote it down.
+        # catches this except `place_bracket` for the bracket leg specifically (#799, R5): its
+        # broad `except Exception` around this same call swallows the re-raise on purpose,
+        # already having read this write via `_try_record_trade_scope_refuted` before doing so,
+        # so nothing is lost by the catch. Every OTHER caller is unguarded -- `agent.run_once`
+        # does not wrap `executor.execute`, and neither does the `run_loop` above it, so the
+        # exception leaves the process. (#233's design says a "cycle-survival handler" catches
+        # it -- that handler is `_manage_stops`' per-tranche one, which this path does not pass
+        # through. Verified against `agent.py`.) A write deferred to a caller would therefore
+        # never happen at all, which is precisely the state before this PR: the venue answered
+        # and nothing wrote it down.
         #
-        # The refusal still aborts the cycle, exactly as every other placement failure has
-        # always done -- deliberately unchanged here. But it now aborts it ONCE: the row this
-        # writes means the next cycle is vetoed cleanly by rail 20, with the venue's own words in
-        # `doctor`, instead of walking into the same refusal again every day.
+        # For every OTHER caller the refusal still aborts the cycle, exactly as every other
+        # placement failure has always done -- deliberately unchanged here. But it now aborts it
+        # ONCE: the row this writes means the next cycle is vetoed cleanly by rail 20, with the
+        # venue's own words in `doctor`, instead of walking into the same refusal again every
+        # day. For the bracket leg specifically, `place_bracket`'s catch means the cycle is NOT
+        # aborted -- the entry it already filled is not lost -- and the position downgrades to
+        # `unbracketed` instead (see `place_bracket`'s docstring).
         _try_record_trade_scope_refuted(repo, str(exc), now_ts, intent, order_id)
         _log_trade_scope_refusal(intent, order_id)
         raise
@@ -2292,17 +2299,28 @@ def place_bracket(
     now carries both prices -- rolling the stop means re-placing the bracket, and the target is
     no longer recoverable from a separate leg.
 
-    **It never raises for a bracket-leg failure (#799, plan R5).** Its callers run it after an
-    entry has already FILLED, so an exception here costs a real position its ledger row. Every
-    failure returns `None`, and the stage decides what is left behind:
+    **A bracket-LEG failure never raises past this function (#799, plan R5) -- but that is
+    narrower than "this function never raises".** Its callers run it after an entry has already
+    FILLED, so an exception escaping here costs a real position its ledger row. Two specific
+    failure paths are guarded: spec construction is caught narrowly, `(BracketPricesUnplaceable,
+    ValueError)`, and everything `_run_order` can raise -- a venue refusal, `TradeScopeDenied`,
+    a network error -- is caught broadly around that one call. Both return `None`, and the stage
+    decides what is left behind:
 
-    - before the bracket's `orders` row exists (the spec cannot be built, or the preview
-      raised): the `unbracketed:` retry record, exactly as for a veto or a venue refusal;
-    - after it exists (`place_order` raised, `TradeScopeDenied` included): NO retry record --
-      one already standing from an earlier attempt is CLEARED -- the `pending` row stays, and a
-      CRITICAL `executor.bracket_state_unknown` names it. The venue may be holding that bracket,
-      so a retry could double-commit the base; exits on the product fail closed on the row until
-      a human reconciles it.
+    - before the bracket's `orders` row exists (the spec cannot be built, or `_run_order` raised
+      before writing one): the `unbracketed:` retry record, exactly as for a veto or a venue
+      refusal;
+    - after it exists (`place_order` raised): NO retry record -- one already standing from an
+      earlier attempt is CLEARED -- the `pending` row stays, and a CRITICAL
+      `executor.bracket_state_unknown` names it. The venue may be holding that bracket, so a
+      retry could double-commit the base; exits on the product fail closed on the row until a
+      human reconciles it.
+
+    What is NOT guarded: the bookkeeping around both returns above -- the `repo.set_state` and
+    `log_event` calls that record which of the two happened -- runs outside either `try`/`except`.
+    A database failure there (a locked file, a disk error) raises out of this function exactly as
+    it would anywhere else in the module; only the bracket LEG itself -- the price math and the
+    venue call -- is swallowed.
     """
     # #667, and this is the site the fee-dust case actually bites: `qty` here is the size the
     # ENTRY was placed for, and a venue that takes its taker fee out of the received base leaves
@@ -2659,17 +2677,34 @@ def scale_out(
         rule_id=rule_id,  # #803 -- the resized bracket belongs to the same rule as the scale-out
     )
     if bracket_order_id is None:
+        # #892. `place_bracket` CLEARS the `unbracketed:` record on its way out when
+        # `place_order` itself raised (#799, plan R5) -- the venue may be holding that bracket,
+        # so it deliberately leaves no retry trigger behind. A plain veto or rejection, by
+        # contrast, re-writes the record so the next sweep retries. Reading the record back
+        # after the call is the only way this caller can tell which of the two happened -- it
+        # already returned, and both outcomes report the same `bracket_order_id is None`.
+        retry_scheduled = repo.get_state(f"{UNBRACKETED_PREFIX}{product_id}") is not None
+        detail = (
+            (
+                "the partial SELL filled but the REMAINDER's bracket was vetoed or rejected -- "
+                "the rest of the position has no protective stop at the exchange. The "
+                "unbracketed record is retained so the next cycle's sweep re-places it."
+            )
+            if retry_scheduled
+            else (
+                "the partial SELL filled but the REMAINDER's bracket leg raised after its order "
+                "row was written -- the venue may be holding it, so the bracket's state is "
+                "unknown. Nothing will re-place it; a human must reconcile the pending row."
+            )
+        )
         log_event(
             logger,
             logging.CRITICAL,
             "executor.position_unprotected",
             product=product_id,
             attempted_qty=str(remainder),
-            detail=(
-                "the partial SELL filled but the REMAINDER's bracket was vetoed or rejected -- "
-                "the rest of the position has no protective stop at the exchange. The "
-                "unbracketed record is retained so the next cycle's sweep re-places it."
-            ),
+            retry_scheduled=retry_scheduled,
+            detail=detail,
         )
     else:
         # Repoint the surviving tranche at the new bracket, for the reason `_roll_stop`

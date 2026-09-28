@@ -17,6 +17,7 @@ from typing import Any
 import pytest
 from keel_broker_api.orders import OrderSpec
 from keel_broker_api.results import Balance, OrderStatus, PlaceResult, Preview
+from keel_core.telemetry import _FIELDS_ATTR
 
 from keel.config import Caps, Config, MarketDataConfig, MoneyMgmtConfig
 from keel.data.db import connect, migrate
@@ -919,6 +920,10 @@ def test_a_vetoed_replacement_bracket_escalates_instead_of_going_quiet(repo, cap
 
     assert not broker.placed, "a kill-switched agent must not place a replacement"
     assert "reconcile.position_unprotected" in caplog.text
+    # A kill-switch veto never reaches `place_order`, so `place_bracket` re-writes the
+    # `unbracketed:` record exactly as a plain rejection would (issue #892) -- retryable.
+    [critical] = [r for r in caplog.records if r.getMessage() == "reconcile.position_unprotected"]
+    assert getattr(critical, _FIELDS_ATTR)["retry_scheduled"] is True
 
 
 def test_a_broker_error_while_re_bracketing_does_not_abandon_the_rest_of_the_pass(repo, caplog):
@@ -1247,7 +1252,12 @@ def test_a_dca_tranche_with_no_bracket_is_left_alone(repo, caplog):
 
 def test_a_tranche_that_still_cannot_be_bracketed_escalates_loudly(repo, caplog):
     """Second placement attempt, second refusal. The position is genuinely naked and a human has
-    to know -- this is the one state the whole pass exists to make impossible to sit in quietly."""
+    to know -- this is the one state the whole pass exists to make impossible to sit in quietly.
+
+    `retry_scheduled` is True here: a plain rejection re-writes the `unbracketed:` record (see
+    `test_a_tranche_that_could_not_be_bracketed_keeps_its_record_for_the_next_cycle`), so the
+    next sweep retries -- unlike the placement-state-unknown case below, issue #892.
+    """
     _seed_unbracketed_tranche(repo)
     _allow_orders(repo)
 
@@ -1257,6 +1267,8 @@ def test_a_tranche_that_still_cannot_be_bracketed_escalates_loudly(repo, caplog)
         )
 
     assert "reconcile.position_unprotected" in caplog.text
+    [critical] = [r for r in caplog.records if r.getMessage() == "reconcile.position_unprotected"]
+    assert getattr(critical, _FIELDS_ATTR)["retry_scheduled"] is True
 
 
 def test_a_tranche_that_could_not_be_bracketed_keeps_its_record_for_the_next_cycle(repo):
@@ -1301,6 +1313,8 @@ def test_a_retry_whose_placement_state_is_unknown_is_not_retried_again(repo, cap
     events = [r.getMessage() for r in caplog.records if r.levelno == logging.CRITICAL]
     assert events.count("executor.bracket_state_unknown") == 1
     assert events.count("reconcile.position_unprotected") == 1
+    [escalation] = [r for r in caplog.records if r.getMessage() == "reconcile.position_unprotected"]
+    assert getattr(escalation, _FIELDS_ATTR)["retry_scheduled"] is False
 
 
 def test_a_tranche_with_a_resting_bracket_is_left_alone(repo):
