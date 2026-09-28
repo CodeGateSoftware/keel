@@ -184,6 +184,63 @@ def test_a_paper_rule_manages_its_product_on_a_paper_profile() -> None:
     assert found["position.unmanaged"].products == ()
 
 
+#: #897: a LIVE dca rule on PAXG-USD, alongside the paper turtle rule that actually owns the
+#: tranche. `agent._handle_exits` resolves the owning rule by `r.name == position["rule_name"]`
+#: among the product's live rules -- a dca rule's `name` is `"dca"`, never `"turtle_breakout"`,
+#: and its `exit_signal` is always False, so this rule cannot close PAXG tranche 3 no matter its
+#: status.
+LIVE_PAXG_DCA_RULE = {
+    "id": 10,
+    "kind": "dca",
+    "status": "live",
+    "params": {"product_id": "PAXG-USD"},
+}
+
+
+def test_unmanaged_matches_on_kind_not_just_product() -> None:
+    """#897: a live dca rule on the same product must not mark a turtle_breakout tranche as
+    managed -- membership requires the rule's `kind` to match the tranche's `rule_name` too."""
+    found = _by_name(
+        position_watch_findings(
+            [PAXG_TRANCHE_3],
+            [LIVE_PAXG_DCA_RULE, PAXG_PAPER_TURTLE_RULE],
+            lambda p: False,
+            set(),
+        )
+    )
+    assert found["position.unmanaged"].status == WARN
+    assert found["position.unmanaged"].products == ("PAXG-USD",)
+    # the status named is the turtle rule's (paper), not the unrelated live dca rule's.
+    assert "(turtle_breakout, paper," in found["position.unmanaged"].detail
+    assert "(turtle_breakout, live," not in found["position.unmanaged"].detail
+
+
+def test_unprotected_detail_matches_on_kind_not_just_product() -> None:
+    """Same mixed shape as above: `position.unprotected`'s detail text must resolve status by
+    (product, kind) too, even though its membership test is unrelated to rule ownership."""
+    found = _by_name(
+        position_watch_findings(
+            [PAXG_TRANCHE_3],
+            [LIVE_PAXG_DCA_RULE, PAXG_PAPER_TURTLE_RULE],
+            lambda p: False,
+            set(),
+        )
+    )
+    assert found["position.unprotected"].status == WARN
+    assert "(turtle_breakout, paper," in found["position.unprotected"].detail
+    assert "(turtle_breakout, live," not in found["position.unprotected"].detail
+
+
+def test_headline_and_detail_name_the_managed_status_not_literal_live() -> None:
+    """#897 suggestion: on a paper profile the wording must say 'paper', not hardcode 'live' --
+    membership is already decided by `managed_status`, the prose should agree."""
+    found = _by_name(
+        position_watch_findings([PAXG_TRANCHE_3], [], lambda p: True, set(), managed_status="paper")
+    )
+    assert found["position.unmanaged"].status == WARN
+    assert "no paper rule" in found["position.unmanaged"].headline
+
+
 def test_the_resting_predicate_is_asked_about_each_stopped_tranche() -> None:
     """The predicate must actually be consulted, and per tranche -- a constant stand-in would
     make the bracket clause decorative."""

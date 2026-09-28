@@ -1515,11 +1515,17 @@ def position_watch_findings(
     channel without closing the exposure. These two are stated over the `positions` ledger,
     which cannot be silenced that way -- the table that knows a tranche is held still says open.
 
-    * `position.unmanaged` -- an open tranche whose PRODUCT has no `live` rule. Matched on
-      product, not `rule_id`, because every tranche before #803 has NULL there. A DCA tranche
-      whose rule was demoted is unmanaged too: unmanaged inventory is unmanaged with or without
-      a stop. Only ENTRY/EXIT rule kinds count: a `sleeve_sell` rule proposes and cannot exit,
-      so it manages nothing (plan Review Focus 5; P9 adds the exclusion and its test).
+    * `position.unmanaged` -- an open tranche whose (PRODUCT, KIND) has no `live` rule. Matched
+      on `(product_id, rule_name)`, not `rule_id`, because every tranche before #803 has NULL
+      there -- but product alone is not enough either (#897): `agent._handle_exits` resolves the
+      rule that owns a held tranche by `r.name == position["rule_name"]` among that product's
+      live rules, and `Rule.name` is the rules-table `kind`. A live `dca` rule on a product does
+      not exit a `turtle_breakout` tranche on that same product -- a dca rule's `exit_signal` is
+      always False -- so membership has to agree with what can actually close the tranche: kind
+      as well as product. A DCA tranche whose rule was demoted is unmanaged too: unmanaged
+      inventory is unmanaged with or without a stop. Only ENTRY/EXIT rule kinds count: a
+      `sleeve_sell` rule proposes and cannot exit, so it manages nothing (plan Review Focus 5; P9
+      adds the exclusion and its test).
     * `position.unprotected` -- an open tranche with a recorded `initial_stop > 0`, no resting
       bracket (`reconcile._has_resting_bracket`, passed in as `resting`), and no retry record.
       The third clause makes it the complement of the reconcile sweep, not a duplicate. DCA
@@ -1535,13 +1541,14 @@ def position_watch_findings(
     the operator already accepted.
 
     `all_rules` is every rule row, of any status -- not just `live` ones. Membership in
-    `managed` is decided by `status == managed_status` alone, but #811's first acceptance bullet
-    requires the `position.unmanaged` WARN to name the owning rule's CURRENT status (e.g.
-    `paper`), and a rule moved out of `managed_status` is exactly the row that produced the WARN
-    in the first place. Filtering the input to that status before it arrives here would throw
-    that row away before its status could be read. `status_by_product` resolves it from the full
-    set instead, taking the highest `id` when more than one rule has ever named a product, and
-    reporting `"no rule"` when none has.
+    `managed` is decided by `(product_id, kind) == (tranche.product_id, tranche.rule_name)` AND
+    `status == managed_status`, but #811's first acceptance bullet requires the
+    `position.unmanaged` WARN to name the owning rule's CURRENT status (e.g. `paper`), and a rule
+    moved out of `managed_status` is exactly the row that produced the WARN in the first place.
+    Filtering the input to that status before it arrives here would throw that row away before
+    its status could be read. `status_by_key` resolves it from the full set instead, keyed on
+    the same `(product_id, kind)` pair, taking the highest `id` when more than one rule has ever
+    named that pair, and reporting `"no rule"` when none has.
 
     `managed_status` defaults to `"live"`, the status a live profile promotes to. A PAPER
     profile promotes to `status="paper"` instead (`agent.py`'s own
@@ -1553,16 +1560,19 @@ def position_watch_findings(
     means the caller is looking at a paper deployment, and that is reason enough on its own to
     skip a finding whose every input clause a paper tranche satisfies unconditionally.
     """
-    managed = {
-        str((row.get("params") or {}).get("product_id"))
-        for row in all_rules
-        if row.get("status") == managed_status
-    }
-    status_by_product: dict[str, str] = {}
-    for row in sorted(all_rules, key=lambda r: r.get("id") or 0):
-        status_by_product[str((row.get("params") or {}).get("product_id"))] = str(row.get("status"))
 
-    unmanaged = [p for p in open_positions if str(p["product_id"]) not in managed]
+    def _rule_key(row: dict[str, Any]) -> tuple[str, str]:
+        return (str((row.get("params") or {}).get("product_id")), str(row.get("kind")))
+
+    def _tranche_key(p: dict[str, Any]) -> tuple[str, str]:
+        return (str(p["product_id"]), str(p["rule_name"]))
+
+    managed = {_rule_key(row) for row in all_rules if row.get("status") == managed_status}
+    status_by_key: dict[tuple[str, str], str] = {}
+    for row in sorted(all_rules, key=lambda r: r.get("id") or 0):
+        status_by_key[_rule_key(row)] = str(row.get("status"))
+
+    unmanaged = [p for p in open_positions if _tranche_key(p) not in managed]
     unprotected = (
         []
         if managed_status == "paper"
@@ -1578,7 +1588,7 @@ def position_watch_findings(
     def _describe(rows: list[dict[str, Any]], *, levels: bool) -> str:
         parts = []
         for p in rows:
-            status = status_by_product.get(str(p["product_id"]), "no rule")
+            status = status_by_key.get(_tranche_key(p), "no rule")
             text = (
                 f"{p['product_id']} tranche {p['id']} ({p['rule_name']}, {status}, qty {p['qty']})"
             )
@@ -1596,9 +1606,9 @@ def position_watch_findings(
             Finding(
                 "position.unmanaged",
                 WARN,
-                f"{len(unmanaged)} open tranche(s) on a product with no live rule",
+                f"{len(unmanaged)} open tranche(s) on a product with no {managed_status} rule",
                 _describe(unmanaged, levels=False)
-                + " -- no live rule evaluates these products, so no exit can fire",
+                + f" -- no {managed_status} rule evaluates these products, so no exit can fire",
                 "re-promote the owning rule, or close the tranche by hand "
                 "(`keel positions close <id>` once #798 ships)",
                 products=_products(unmanaged),
@@ -1606,7 +1616,13 @@ def position_watch_findings(
         )
     else:
         out.append(
-            Finding("position.unmanaged", OK, "every open tranche has a live rule", "-", "-")
+            Finding(
+                "position.unmanaged",
+                OK,
+                f"every open tranche has a {managed_status} rule",
+                "-",
+                "-",
+            )
         )
     if unprotected:
         out.append(
