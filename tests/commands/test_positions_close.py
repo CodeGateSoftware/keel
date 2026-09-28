@@ -6,6 +6,7 @@ places nothing. The CLI in front of it is gated by a typed `yes` at a terminal.
 
 from __future__ import annotations
 
+import json
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
@@ -621,13 +622,21 @@ def test_a_tranche_with_no_live_buy_is_refused_before_the_gate_asks(
 
 
 def _resting_sell(
-    repo: Repository, *, status: str = "pending", mode: str = "live", side: str = "SELL"
+    repo: Repository,
+    *,
+    status: str = "pending",
+    mode: str = "live",
+    side: str = "SELL",
+    venue_id: str | None = "venue-1",
 ) -> int:
+    """A SELL row as `place_bracket` leaves it: `raw_response` carries the venue's order id,
+    unless `venue_id=None` -- the R5 row whose placement raised after it was written."""
     return repo.insert_order(
         dict(
             mode=mode,
             product_id="PAXG-USD",
             side=side,
+            raw_response=None if venue_id is None else json.dumps({"order_id": venue_id}),
             order_type="bracket",
             qty=Decimal("0.0132"),
             status=status,
@@ -727,3 +736,51 @@ def test_a_resting_sell_is_refused_before_the_gate_asks(
     assert asked == []
     assert f"Error: {_refusal_for(other, 'pending')}" in result.output.splitlines()
     assert _written(_file_repo(db)) == before
+
+
+def test_a_sibling_tranche_own_bracket_does_not_block(repo: Repository) -> None:
+    """#903: an entry bracket is sized to ITS tranche (`execute` places it for `intent.qty`), so a
+    sibling's stop can only sell base the operator still holds. Refusing on it would push them
+    to `keel orders cancel` a stop they want, leaving the sibling naked. PAXG's mixed shape: an
+    unbracketed DCA lot beside a bracketed turtle lot."""
+    rule_id = repo.insert_rule("turtle_breakout", {"product_id": "PAXG-USD"}, status="live")
+    _buy(repo, rule_id, mode="live", qty="0.0232")
+    sibling_bracket = _resting_sell(repo)
+    sibling = repo.open_position(
+        product_id="PAXG-USD",
+        rule_name="turtle_breakout",
+        opened_at=1,
+        qty=Decimal("0.0132"),
+        entry_fill=Decimal("4673.23"),
+        entry_fee=Decimal("0"),
+        bracket_order_id=sibling_bracket,
+        rule_id=rule_id,
+    )
+    dca = _bare_tranche(repo, rule_id, qty="0.01", opened_at=2)
+
+    _close(repo, dca)
+
+    assert [p["id"] for p in repo.get_open_positions()] == [sibling]
+    bracket = repo.get_order(sibling_bracket)
+    assert bracket is not None and bracket["status"] == "pending"
+
+
+def test_a_resting_sell_with_no_venue_id_says_it_needs_reconciling_by_hand(
+    repo: Repository,
+) -> None:
+    """#904: a row whose placement raised after it was written (plan R5) carries no venue id, so
+    `keel orders cancel` can never cancel it and the reconcile sweep skips it. Naming that
+    command would send the operator in a circle; the refusal says what is actually true."""
+    pid = _tranche(repo)
+    orphan = _resting_sell(repo, venue_id=None)
+    before = _written(repo)
+
+    with pytest.raises(PositionCloseRefused) as refused:
+        _close(repo, pid)
+
+    assert str(refused.value) == (
+        f"PAXG-USD has a SELL (order {orphan}, pending) with no venue order id on record, so its "
+        "state at the venue is unknown and `keel orders cancel` cannot reach it; check the venue "
+        "and settle that row by hand before declaring this close"
+    )
+    assert _written(repo) == before

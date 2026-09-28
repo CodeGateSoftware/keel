@@ -40,7 +40,9 @@ put a write one import away from a browser surface. There is no `keel positions`
 a paper database would sit in front of rails that never saw its BUY. Refused, not translated.
 
 **No SELL may still be resting on the product (H4).** The tranche's own bracket, or any other
-live SELL in `executor.RESTING_STATUSES`, is refused by id with "cancel it first": this command
+live SELL in `executor.RESTING_STATUSES` except a sibling tranche's own bracket (sized to that
+sibling, #903), is refused by id with "cancel it first" (or "settle it by hand" when the row has
+no venue id to cancel by, #904): this command
 never touches the venue, so it cannot cancel the stop itself, and booking the close with the stop
 still working would leave keel a sale it may yet make of base the operator says is gone.
 
@@ -97,16 +99,26 @@ def _open_tranche(repo: Repository, position_id: int) -> dict[str, Any] | None:
 def _resting_sells(repo: Repository, position: dict[str, Any]) -> list[dict[str, Any]]:
     """Every SELL that may still execute against `position`'s product, oldest first: the
     tranche's own bracket if it is still resting, then any live SELL on the product in
-    `executor.RESTING_STATUSES` (a sibling's bracket, an exit mid-flight). `partially_filled` is
-    resting too (#446) -- its remainder is still working at the venue."""
+    `executor.RESTING_STATUSES` (an exit mid-flight, an orphaned stop). `partially_filled` is
+    resting too (#446) -- its remainder is still working at the venue.
+
+    EXCEPT another open tranche's own bracket (#903). An entry bracket is sized to ITS tranche
+    (`executor.execute` places it for `intent.qty`), so a sibling's stop can only sell base the
+    operator still holds. Refusing on it would send them to cancel a stop they want to keep, and
+    that cancel writes no retry record: the sibling would sit naked."""
     found: dict[int, dict[str, Any]] = {}
     bracket_id = position.get("bracket_order_id")
     bracket = repo.get_order(bracket_id) if bracket_id is not None else None
     if bracket is not None and bracket["status"] in executor.RESTING_STATUSES:
         found[bracket["id"]] = bracket
+    siblings = {
+        p["bracket_order_id"]
+        for p in repo.get_open_positions(position["product_id"])
+        if p["id"] != position["id"] and p.get("bracket_order_id") is not None
+    }
     for status in executor.RESTING_STATUSES:
         for row in repo.get_orders(mode="live", product_id=position["product_id"], status=status):
-            if str(row["side"]).upper() == Side.SELL.value:
+            if str(row["side"]).upper() == Side.SELL.value and row["id"] not in siblings:
                 found[row["id"]] = row
     return [found[order_id] for order_id in sorted(found)]
 
@@ -118,9 +130,11 @@ def declared_close_target(repo: Repository, config: Config, position_id: int) ->
     typed gate asks -- the gate's detail line is only worth reading if it names the real row.
 
     Refuses (H4) while ANY SELL may still execute on the product -- the tranche's own bracket if
-    it is still resting, or any live SELL in `executor.RESTING_STATUSES` -- naming the order to
-    cancel first. A declared close says the base is gone; a stop left resting against it would
-    either fail at the venue or, if the operator sold only part, sell more of what they kept.
+    it is still resting, or any live SELL in `executor.RESTING_STATUSES` that is not another open
+    tranche's own bracket (#903) -- naming the order to cancel first, or, for a row with no venue
+    id (#904), saying it must be settled by hand. A declared close says the base is gone; a stop
+    left resting against it would either fail at the venue or, if the operator sold only part,
+    sell more of what they kept.
     Nothing here cancels it: this command never touches the venue, so the operator does, with
     `keel orders cancel <id>`, and then declares the close.
 
@@ -145,6 +159,16 @@ def declared_close_target(repo: Repository, config: Config, position_id: int) ->
     resting = _resting_sells(repo, position)
     if resting:
         order = resting[0]
+        if executor._native_order_id(order) is None:
+            # #904: the R5 row -- written, then the placement raised. No venue id means
+            # `keel orders cancel` cannot reach it and the reconcile sweep skips it, so naming
+            # that command would send the operator in a circle.
+            raise PositionCloseRefused(
+                f"{product_id} has a SELL (order {order['id']}, {order['status']}) with no venue "
+                "order id on record, so its state at the venue is unknown and `keel orders "
+                "cancel` cannot reach it; check the venue and settle that row by hand before "
+                "declaring this close"
+            )
         raise PositionCloseRefused(
             f"{product_id} still has a SELL resting at the venue (order {order['id']}, "
             f"{order['status']}); cancel it first with `keel orders cancel {order['id']}` -- a "
