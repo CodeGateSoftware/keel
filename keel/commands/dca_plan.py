@@ -539,12 +539,15 @@ def per_day_cap_text(
 def correlated_size_text(buy: PlannedBuy, correlated_cap: Decimal) -> str:
     """Rail 5's warning (R22, #853) for one planned buy, as ONE sentence both front-ends show
     (`plan.warnings`, verbatim). A warning, not a blocker: the rail binds only while another
-    correlated asset already has exposure open, which a plan cannot see."""
+    correlated asset already has exposure open, which a plan cannot see. It must not say the
+    rail rarely binds: DCA never sells, so once any other correlated asset is held (a live DCA
+    rule's holding, or another planned buy after its first cycle) every buy this size is vetoed
+    (#871)."""
     return (
         f"{buy.asset}'s per-buy {_usd(buy.per_buy_usd)} exceeds the correlated-size cap "
         f"{_usd(correlated_cap)} (rail 5: max_per_order_usd x {CORRELATED_SIZE_SCALE}) -- "
-        "this only binds while another correlated asset already has exposure open, so it "
-        "may never veto a buy in practice, but a buy this large risks it"
+        "rail 5 vetoes a buy this size whenever another correlated asset has exposure open, "
+        "and DCA never sells, so once another correlated asset is held every such buy is vetoed"
     )
 
 
