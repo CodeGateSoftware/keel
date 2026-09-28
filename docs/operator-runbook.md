@@ -54,8 +54,8 @@ This is not a trading decision the system can veto; it is an account setting onl
 > read** is reduced by pending purification — `mark_to_market − build_report(transactions).
 > total_owed_usd` (`keel/execution/equity.py::sizing_equity`). Today that is the paper account's
 > balance-derived seed (`paper.starting_equity_usd == 0`), which then sizes every paper fill; the live
-> path sizes off `caps.max_exposure_usd` and DCA off `dca.budget_usd`, both operator constants immune
-> by construction. Note the boundary: the **drawdown/HWM rail-11 equity is deliberately NOT purified** —
+> path sizes off `caps.max_exposure_usd` and DCA off each rule's own `budget_usd` (with
+> `dca.budget_usd` as the fallback, #840), all operator constants immune by construction. Note the boundary: the **drawdown/HWM rail-11 equity is deliberately NOT purified** —
 > it measures what the account actually holds, and a breaker must trip on real value, not on a
 > post-obligation fiction. Discharging the owed amount (`keel purification` to see it) is still your
 > act; keep the imported transaction ledger current so the subtraction sees what actually accrued.

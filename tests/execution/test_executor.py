@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import sqlite3
 from decimal import Decimal
 from typing import Any
@@ -822,6 +823,346 @@ def test_dca_signal_exempt_from_averaging_into_losers_but_bound_by_allowlist(rep
 
     assert result.placed is False
     assert any(v.startswith("halal_allowlist") for v in result.vetoed_by)
+
+
+# -- DCA sizes from the RULE's amount, not the config's (#840) ---------------------------------
+#
+# The live book runs DCA rules at $40, $25 and $15 while `config.dca.budget_usd` is 50. Sizing
+# every buy from the config spent ~$978/month against the rules' ~$467 and rail 14's $500 cap.
+# `_config()` above sets `dca.budget_usd=50`, so every amount below is deliberately NOT 50: a
+# test that asserted 50 could not tell the rule's number from the config's.
+
+
+def _dca_signal_sized(size_usd: Any, *, include: bool = True) -> Signal:
+    """A DCA ENTER whose setup carries `size_usd` (or no such key when `include=False`), at an
+    entry of 50,000 -- the price `FakeBroker`'s book is quoted around."""
+    context: dict[str, Any] = {"order_class": "dca", "no_stop": True}
+    if include:
+        context["size_usd"] = size_usd
+    return _dca_signal(
+        setup=_setup(stop=Decimal("0"), target=Decimal("50000"), context=context),
+    )
+
+
+def _dca_sizing_events(caplog: pytest.LogCaptureFixture) -> list[dict[str, Any]]:
+    from keel_core.telemetry import _FIELDS_ATTR
+
+    return [
+        getattr(r, _FIELDS_ATTR) for r in caplog.records if r.getMessage() == "executor.dca_sized"
+    ]
+
+
+def test_live_dca_sizes_from_the_rules_size_usd_not_the_config_budget(repo, caplog):
+    """(a) A $25 rule on a $50 config places a $25 order: qty = 25 / 50,000 = 0.0005."""
+    broker = FakeBroker()
+
+    with caplog.at_level(logging.INFO, logger="keel.execution.executor"):
+        result = execute(
+            _dca_signal_sized(Decimal("25")),
+            broker,
+            repo,
+            _config(),
+            mode="autonomous",
+            now_ts=NOW_TS,
+        )
+
+    assert result.placed is True, result.vetoed_by
+    order = repo.get_order(result.order_id)
+    assert order["qty"] == Decimal("0.0005")
+    assert order["qty"] * Decimal("50000") == Decimal("25")
+    # Exactly one order went to the venue, and it is the $25 one.
+    assert len(broker.place_calls) == 1
+    assert broker.place_calls[0]["spec"].quote_size == Decimal("25")
+    # Which source sized it is recorded, once.
+    events = _dca_sizing_events(caplog)
+    assert len(events) == 1
+    assert events[0]["source"] == "rule"
+    assert Decimal(events[0]["budget_usd"]) == Decimal("25")
+
+
+@pytest.mark.parametrize(
+    ("size_usd", "expected"),
+    [
+        (25, Decimal("25")),  # an int -- goes through `Decimal(size_usd)`, not `str()`
+        (25.0, Decimal("25")),  # a float with an exact binary representation
+        # 0.1 is NOT exact in binary: `Decimal(0.1)` is
+        # 0.1000000000000000055511151231257827021181583404541015625. `_dca_budget` must go
+        # through `Decimal(str(size_usd))` for a float, or this asserts the wrong number.
+        (0.1, Decimal("0.1")),
+    ],
+    ids=["int", "float_exact", "float_inexact"],
+)
+def test_live_dca_sizes_from_an_int_or_float_size_usd(repo, caplog, size_usd, expected):
+    """(a') `_dca_budget` accepts an `int` or `float` `size_usd`, not just `Decimal` -- and a
+    float is converted via `str()` so `0.1` becomes the decimal a human meant."""
+    broker = FakeBroker()
+
+    with caplog.at_level(logging.INFO, logger="keel.execution.executor"):
+        result = execute(
+            _dca_signal_sized(size_usd),
+            broker,
+            repo,
+            _config(),
+            mode="autonomous",
+            now_ts=NOW_TS,
+        )
+
+    assert result.placed is True, result.vetoed_by
+    order = repo.get_order(result.order_id)
+    assert order["qty"] == expected / Decimal("50000")
+    assert len(broker.place_calls) == 1
+    assert broker.place_calls[0]["spec"].quote_size == expected
+    events = _dca_sizing_events(caplog)
+    assert len(events) == 1
+    assert events[0]["source"] == "rule"
+    assert Decimal(events[0]["budget_usd"]) == expected
+
+
+@pytest.mark.parametrize(
+    ("size_usd", "include"),
+    [
+        (None, False),  # key absent
+        (None, True),  # key present, value None
+    ],
+    ids=["absent", "none"],
+)
+def test_live_dca_falls_back_to_the_config_budget_when_size_usd_is_absent(
+    repo, caplog, size_usd, include
+):
+    """(b) `size_usd` ABSENT -- the key is missing, or present as `None` -- falls back to the
+    config's `dca.budget_usd` (50), and the fallback is recorded as such. A size_usd that is
+    PRESENT but not usable is a DIFFERENT case (orchestrator ruling 2026-09-27): see
+    `test_live_dca_skips_a_buy_whose_rule_computed_an_invalid_size_usd` below -- that one must
+    NOT fall back, or a rule meant to buy less would spend more."""
+    broker = FakeBroker()
+
+    with caplog.at_level(logging.INFO, logger="keel.execution.executor"):
+        result = execute(
+            _dca_signal_sized(size_usd, include=include),
+            broker,
+            repo,
+            _config(),
+            mode="autonomous",
+            now_ts=NOW_TS,
+        )
+
+    assert result.placed is True, result.vetoed_by
+    order = repo.get_order(result.order_id)
+    assert order["qty"] == Decimal("50") / Decimal("50000")
+    events = _dca_sizing_events(caplog)
+    assert len(events) == 1
+    assert events[0]["source"] == "config"
+    assert Decimal(events[0]["budget_usd"]) == Decimal("50")
+
+
+def _dca_size_invalid_events(caplog: pytest.LogCaptureFixture) -> list[dict[str, Any]]:
+    from keel_core.telemetry import _FIELDS_ATTR
+
+    return [
+        getattr(r, _FIELDS_ATTR)
+        for r in caplog.records
+        if r.getMessage() == "executor.dca_size_invalid"
+    ]
+
+
+@pytest.mark.parametrize(
+    "size_usd",
+    [
+        Decimal("0"),
+        Decimal("-25"),
+        Decimal("Infinity"),  # `> 0` alone passes it; see `commands/rules.py` (#840)
+        Decimal("NaN"),
+        "25",  # not a number
+        True,  # a bool is an int in Python; it is not an amount
+    ],
+    ids=["zero", "negative", "infinity", "nan", "string", "bool"],
+)
+def test_live_dca_skips_a_buy_whose_rule_computed_an_invalid_size_usd(repo, caplog, size_usd):
+    """(b') `size_usd` PRESENT but not usable must NEVER fall back to the config (orchestrator
+    ruling 2026-09-27): a rule that computed 0, a negative amount, a non-finite value, or
+    garbage meant to buy LESS -- or nothing -- and spending the config's larger, unrelated
+    `budget_usd` would spend MORE than the rule asked for. The buy is skipped instead: no
+    broker call (`NoNetworkBroker` proves it), no order row, and a WARNING logged."""
+    broker = NoNetworkBroker()
+
+    with caplog.at_level(logging.WARNING, logger="keel.execution.executor"):
+        result = execute(
+            _dca_signal_sized(size_usd),
+            broker,
+            repo,
+            _config(),
+            mode="autonomous",
+            now_ts=NOW_TS,
+        )
+
+    assert result.placed is False
+    assert result.order_id is None
+    assert result.vetoed_by == []
+    assert result.preview is None
+    assert result.reason == (
+        f"dca: rule computed an invalid size_usd={size_usd!r}; buy skipped, not sized from config"
+    )
+    assert repo.get_orders(mode="live") == []
+    events = _dca_size_invalid_events(caplog)
+    assert len(events) == 1
+    assert events[0]["product"] == "BTC-USD"
+    assert events[0]["rule"] == "dca"
+
+
+def test_a_dca_rules_detect_feeds_the_live_order_size_end_to_end(repo):
+    """(c) The context key is the one `Dca.detect` actually writes -- pinned by driving the real
+    rule, not by naming the key in a hand-built context. A $15 rule at a 30,000 close buys
+    15 / 30,000 = 0.0005, not the config's 50 / 30,000."""
+    from keel.strategy.rules.dca import Dca
+    from keel.types import Candle, Granularity
+
+    day = NOW_TS // 86_400
+    price = Decimal("30000")
+    candle = Candle(
+        ts=day * 86_400, open=price, high=price, low=price, close=price, volume=Decimal("1")
+    )
+    rule = Dca(product_id="BTC-USD", cadence_days=1, budget_usd=Decimal("15"))
+    setup = rule.detect({Granularity.ONE_DAY: [candle]})
+    assert setup is not None
+    signal = _dca_signal(setup=setup, rule_name=rule.name)
+    broker = FakeBroker(
+        preview={
+            "order_total": Decimal("15.00"),
+            "commission_total": Decimal("0"),
+            "quote_size": Decimal("15"),
+            "base_size": Decimal("0.0005"),
+            "best_bid": Decimal("29999"),
+            "best_ask": Decimal("30000"),
+        }
+    )
+
+    result = execute(signal, broker, repo, _config(), mode="autonomous", now_ts=NOW_TS)
+
+    assert result.placed is True, result.vetoed_by
+    order = repo.get_order(result.order_id)
+    assert order["qty"] == Decimal("0.0005")
+    assert order["qty"] * price == Decimal("15")
+
+
+def test_a_dip_scaled_dca_buy_spends_size_usd_not_the_rules_base_budget(repo):
+    """(c') `size_usd`, not the rule's `budget_usd`: they are equal when `dip_bonus_pct` is 0
+    (every live rule today), so only a dip tells them apart. $15 base, 25% below the 40,000
+    high, 1% extra per point -> 15 x 1.25 = $18.75 at 30,000 = 0.000625."""
+    from keel.strategy.rules.dca import Dca
+    from keel.types import Candle, Granularity
+
+    day = NOW_TS // 86_400
+    high, close = Decimal("40000"), Decimal("30000")
+    candles = [
+        Candle(
+            ts=(day - 1) * 86_400, open=high, high=high, low=high, close=high, volume=Decimal("1")
+        ),
+        Candle(
+            ts=day * 86_400, open=close, high=close, low=close, close=close, volume=Decimal("1")
+        ),
+    ]
+    rule = Dca(
+        product_id="BTC-USD",
+        cadence_days=1,
+        budget_usd=Decimal("15"),
+        dip_bonus_pct=Decimal("1"),
+    )
+    setup = rule.detect({Granularity.ONE_DAY: candles})
+    assert setup is not None
+    assert setup.context["budget_usd"] == Decimal("15")
+    assert setup.context["size_usd"] == Decimal("18.75")
+    broker = FakeBroker(
+        preview={
+            "order_total": Decimal("18.75"),
+            "commission_total": Decimal("0"),
+            "quote_size": Decimal("18.75"),
+            "base_size": Decimal("0.000625"),
+            "best_bid": Decimal("29999"),
+            "best_ask": Decimal("30000"),
+        }
+    )
+
+    result = execute(
+        _dca_signal(setup=setup, rule_name=rule.name),
+        broker,
+        repo,
+        _config(),
+        mode="autonomous",
+        now_ts=NOW_TS,
+    )
+
+    assert result.placed is True, result.vetoed_by
+    assert repo.get_order(result.order_id)["qty"] == Decimal("0.000625")
+    assert broker.place_calls[0]["spec"].quote_size == Decimal("18.75")
+
+
+def _seed_month_buy_spend(repo: Repository, usd: Decimal) -> None:
+    """A filled live ETH BUY this month worth `usd` -- rail 14's month-to-date figure. ETH, not
+    BTC, so the DCA order under test is not averaging into anything."""
+    repo.insert_order(
+        dict(
+            mode="live",
+            product_id="ETH-USD",
+            side=Side.BUY.value,
+            order_type="market",
+            qty=Decimal("1"),
+            limit_price=usd,
+            status="filled",
+            fee=Decimal("0"),
+            created_at=NOW_TS,
+            updated_at=NOW_TS,
+        )
+    )
+
+
+def _dca_intent_notional(repo: Repository, size_usd: Decimal) -> Decimal:
+    intent = executor._build_intent(_dca_signal_sized(size_usd), None, repo, _config(), NOW_TS)
+    assert intent is not None
+    return intent.notional
+
+
+def test_rail_14_sees_the_rules_true_notional_and_admits_a_25_dollar_buy_that_fits(repo):
+    """(e) $460 spent + a $25 DCA = $485, inside a $485 cap -> placed. Under the old sizing the
+    guard saw the config's $50 ($510) and vetoed a buy the rule never asked for."""
+    _attest(repo, free_volume_usd=Decimal("485"))
+    _seed_month_buy_spend(repo, Decimal("460"))
+    assert guards._monthly_buy_spend_usd(repo, NOW_TS) == Decimal("460")
+    assert _dca_intent_notional(repo, Decimal("25")) == Decimal("25")
+    broker = FakeBroker()
+
+    result = execute(
+        _dca_signal_sized(Decimal("25")), broker, repo, _config(), "autonomous", now_ts=NOW_TS
+    )
+
+    assert result.placed is True, result.vetoed_by
+    assert len(broker.place_calls) == 1
+
+
+def test_rail_14_still_vetoes_a_25_dollar_dca_buy_that_would_cross_the_cap(repo):
+    """(e) The rail is not loosened: $460 + $25 = $485 > a $480 cap -> vetoed, and the veto
+    names the rule's $25, not the config's $50."""
+    _attest(repo, free_volume_usd=Decimal("480"))
+    _seed_month_buy_spend(repo, Decimal("460"))
+    broker = FakeBroker()
+
+    result = execute(
+        _dca_signal_sized(Decimal("25")), broker, repo, _config(), "autonomous", now_ts=NOW_TS
+    )
+
+    assert result.placed is False
+    vetoes = [v for v in result.vetoed_by if v.startswith("monthly_subscription_allowance")]
+    assert len(vetoes) == 1
+    pattern = r"BUY spend (\S+) \+ (\S+) = (\S+) exceeds the allowance cap (\S+)"
+    match = re.search(pattern, vetoes[0])
+    assert match is not None, vetoes[0]
+    spent, notional, projected, cap = (Decimal(g) for g in match.groups())
+    assert (spent, notional, projected, cap) == (
+        Decimal("460"),
+        Decimal("25"),
+        Decimal("485"),
+        Decimal("480"),
+    )
+    assert broker.place_calls == []
 
 
 # -- EXIT signals ------------------------------------------------------------------------------

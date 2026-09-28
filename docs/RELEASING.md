@@ -82,12 +82,14 @@ A **fresh deployment** does not. `keel init` seeds every rule at `candidate` fro
 **constructor defaults**, so any parameter an operator tuned by hand silently reverts — a DCA rule
 deliberately set to `budget_usd: 25` comes back as the built-in `50`, unpromoted, on a box that
 otherwise looks correctly provisioned. Nothing errors. (A worked example, not a description of
-today's deployment: the live DCA rule is now `50`, deliberately matching both the constructor
-default and `config.dca.budget_usd`, which is the value the live executor actually spends. That
-coincidence means the value alone can no longer prove the rule wasn't reseeded — `keel init`'s
-default and the operator's intended value are now the same number. `test_committed_manifest_is_valid`
+today's deployment.) This matters for money, not just
+bookkeeping: since #840 the live executor spends each **rule's** `budget_usd` (the `size_usd` its
+setup carries), with `config.dca.budget_usd` only as the fallback — so a reseeded $15 rule that
+comes back at `50` really does spend $50 a buy. A rule whose intended value happens to equal the
+constructor default cannot prove by its value alone that it wasn't reseeded, since `keel init`'s
+default and the operator's intended value are then the same number. `test_committed_manifest_is_valid`
 in `tests/test_rule_manifest.py` covers the gap by also asserting every committed rule's *status*
-is `live`, since `keel init` always seeds at `candidate` regardless of what the params say.)
+is `live`, since `keel init` always seeds at `candidate` regardless of what the params say.
 
 `deploy/live-rules.json` is the committed record of the live deployment's rule set, so that state
 is a diff in a PR rather than a fact stored on one laptop:

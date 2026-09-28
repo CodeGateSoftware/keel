@@ -3194,6 +3194,104 @@ def test_paper_enter_sizes_off_paper_equity(repo):
     assert orders[0]["qty"] != Decimal("1"), "must not fill the old fixed 1-unit qty"
 
 
+def test_paper_dca_fill_is_sized_from_the_rules_amount_not_the_config_budget(repo):
+    """(#840) Paper sizes through the same `executor._build_intent` as live, so a $15 DCA rule
+    on a $50 config fills $15 on paper too -- live, paper and the account sim agree. Driven by
+    the real `Dca.detect`, so the context key it writes is the one being read."""
+    from keel.strategy.paper import PaperTrader
+
+    trader = PaperTrader(repo)
+    trader.seed_cash(Decimal("30000"), now_ts=1_000)
+    repo.set_state("last_feed_ts", 90_000)
+    config = _paper_config()
+    assert config.dca.budget_usd == Decimal("50")
+    price = Decimal("30")
+    candle = Candle(ts=0, open=price, high=price, low=price, close=price, volume=Decimal("1"))
+    rule = Dca(product_id=PRODUCT, cadence_days=1, budget_usd=Decimal("15"))
+    setup = rule.detect({Granularity.ONE_DAY: [candle]})
+    assert setup is not None
+    signal = Signal(
+        rule_name=rule.name,
+        product_id=PRODUCT,
+        action=Action.ENTER,
+        side=Side.BUY,
+        setup=setup,
+        cts_score=0,
+        entry_technique="market",
+        ts=setup.ts,
+    )
+
+    result = agent._paper_enter(
+        trader, signal, repo, config, now_ts=90_000, paper_equity=Decimal("30000")
+    )
+
+    assert result.placed, result
+    orders = repo.get_orders(mode="paper")
+    assert len(orders) == 1
+    assert orders[0]["qty"] == Decimal("0.5")  # 15 / 30, not 50 / 30
+    assert orders[0]["qty"] * price == Decimal("15")
+
+
+@pytest.mark.parametrize(
+    "size_usd",
+    [Decimal("0"), Decimal("-15"), Decimal("Infinity"), Decimal("NaN"), "15", True],
+    ids=["zero", "negative", "infinity", "nan", "string", "bool"],
+)
+def test_paper_dca_skips_a_buy_whose_rule_computed_an_invalid_size_usd(repo, caplog, size_usd):
+    """`_paper_enter` must skip a DCA buy the same way the live path does when the rule's
+    `size_usd` is PRESENT but not usable (orchestrator ruling 2026-09-27): falling back to
+    `config.dca.budget_usd` here would spend more than a rule that computed 0, a negative
+    amount, non-finite, or garbage ever asked for. `executor._build_intent` raises
+    `DcaSizeInvalid`; `_paper_enter` must catch it, place nothing, and report the skip."""
+    from keel.strategy.paper import PaperTrader
+
+    trader = PaperTrader(repo)
+    trader.seed_cash(Decimal("30000"), now_ts=1_000)
+    repo.set_state("last_feed_ts", 90_000)
+    config = _paper_config()
+    assert config.dca.budget_usd == Decimal("50")
+    signal = Signal(
+        rule_name="dca",
+        product_id=PRODUCT,
+        action=Action.ENTER,
+        side=Side.BUY,
+        setup=Setup(
+            product_id=PRODUCT,
+            direction="long",
+            entry=Decimal("30"),
+            stop=Decimal("0"),
+            target=Decimal("30"),
+            context={"order_class": "dca", "no_stop": True, "size_usd": size_usd},
+            ts=90_000,
+        ),
+        cts_score=0,
+        entry_technique="market",
+        ts=90_000,
+    )
+
+    with caplog.at_level(logging.WARNING, logger="keel.agent"):
+        result = agent._paper_enter(
+            trader, signal, repo, config, now_ts=90_000, paper_equity=Decimal("30000")
+        )
+
+    assert result.placed is False
+    assert result.order_id is None
+    assert result.vetoed_by == []
+    assert result.reason == (
+        f"paper: dca: rule computed an invalid size_usd={size_usd!r}; buy skipped, "
+        "not sized from config"
+    )
+    assert repo.get_orders(mode="paper") == []
+    events = [
+        getattr(r, _FIELDS_ATTR)
+        for r in caplog.records
+        if r.getMessage() == "agent.paper_dca_size_invalid"
+    ]
+    assert len(events) == 1
+    assert events[0]["product"] == PRODUCT
+    assert events[0]["rule"] == "dca"
+
+
 def test_paper_mode_never_runs_the_entry_spread_gate(repo):
     """#350's max-spread gate is live-path ONLY: paper fills are synthetic and see no book, so
     `_paper_enter` never previews an order and the gate (fail-closed on an unreadable book for

@@ -148,6 +148,34 @@ class MoneyMgmtConfig:
 
 @dataclass(frozen=True)
 class DcaConfig:
+    """The `dca:` block. `budget_usd` is a FALLBACK, not what a DCA buy spends (#840), and it
+    fills in ONLY when a setup's `size_usd` is ABSENT -- the key missing, or explicitly `None`.
+
+    Every DCA buy -- live (`execution.executor._build_intent`), paper (the same function, via
+    `agent._paper_enter`) and the account sim (`sim.portfolio_sim._process_dca_signals`) -- is
+    sized from the RULE's own amount, the `size_usd` that `Dca.detect` puts in its setup's
+    context (`budget_usd x (1 + dip bonus)`). All three paths share one predicate
+    (`execution.executor._dca_budget`), so "usable" means the same thing everywhere:
+
+    - `size_usd` ABSENT (missing, or `None`) -> falls back to `budget_usd` here. Live and paper
+      log this as `executor.dca_sized` with `source="config"` (emitted from `_build_intent`,
+      which both call); the sim's `_process_dca_signals` calls `_dca_budget` directly and does
+      not log this case.
+    - `size_usd` PRESENT but not a positive, finite number (zero, negative, `NaN`/`Infinity`, a
+      `bool`, or anything not a number at all) -> does NOT fall back. The buy is SKIPPED instead
+      (no order placed, no position opened). Live and paper log a WARNING for this
+      (`executor.execute`'s `executor.dca_size_invalid`, `agent._paper_enter`'s
+      `agent.paper_dca_size_invalid`); the sim skips silently -- a bare `continue`, no log.
+
+    That asymmetry is deliberate (orchestrator ruling 2026-09-27): a rule that computed an
+    invalid `size_usd` meant to buy LESS, or not at all, and falling back to this shared config
+    value in that case would spend MORE than the rule ever asked for -- a rule meant to buy
+    less must never spend more. Only a setup that carries no opinion at all (no `size_usd`) gets
+    this config's opinion instead. Until 2026-09-27 live spent this value on every buy and
+    ignored the rule's; the operator reversed that after finding every DCA rule was spending
+    this one shared value rather than its own tuned budget.
+    """
+
     budget_usd: Decimal = Decimal("0")
     cadence_days: int = 7
 

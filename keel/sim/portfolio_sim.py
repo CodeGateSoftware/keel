@@ -85,6 +85,7 @@ from decimal import Decimal
 from keel.analysis import regime
 from keel.config import Config
 from keel.execution import sizing
+from keel.execution.executor import DcaSizeInvalid, _dca_budget
 from keel.execution.guards import _asset, _utc_day_bounds, _utc_month_bounds
 from keel.sim.account import OpenIntent, OpenPosition, SimAccount
 from keel.strategy import engine, indicators_cts
@@ -699,9 +700,16 @@ def _process_dca_signals(
         decided.add(key)
 
         try:
-            budget = setup.context.get("size_usd") or config.dca.budget_usd
+            # Shares `executor._dca_budget` with the live and paper paths rather than
+            # re-deriving the same predicate here (orchestrator ruling 2026-09-27): `size_usd`
+            # ABSENT (missing or `None`) falls back to `config.dca.budget_usd`; a `size_usd`
+            # that is PRESENT but not usable (0, negative, non-finite, a bool, non-numeric)
+            # raises `DcaSizeInvalid` instead, and this cycle's decision is SKIPPED (`continue`)
+            # rather than sized from a config value the rule never referenced -- exactly like
+            # the live/paper skip, so all three paths agree on what "usable" means.
+            budget, _source = _dca_budget(setup.context, config.dca.budget_usd)
             qty = sizing.dca_size(budget, setup.entry)
-        except ValueError:
+        except DcaSizeInvalid, ValueError:
             continue
 
         notional = sizing.spend(qty, setup.entry)

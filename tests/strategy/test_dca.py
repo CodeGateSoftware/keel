@@ -178,6 +178,18 @@ class TestDcaValidation:
         with pytest.raises(ValueError):
             Dca(product_id="BTC-USD", budget_usd=Decimal("0"))
 
+    def test_rejects_negative_dip_bonus(self) -> None:
+        """A negative `dip_bonus_pct` would SHRINK the budget as price drops -- the inverse of
+        what "dip bonus" means, and the executor treats a shrunk `size_usd` as invalid and skips
+        the buy rather than resizing it (orchestrator ruling 2026-09-27), so a negative value here
+        would silently turn every dip into a skipped buy instead of a scaled-up one."""
+        with pytest.raises(ValueError):
+            Dca(product_id="BTC-USD", dip_bonus_pct=Decimal("-1"))
+
+    def test_allows_zero_dip_bonus(self) -> None:
+        """0 is the documented default (dip-scaling disabled) and must stay allowed."""
+        Dca(product_id="BTC-USD", dip_bonus_pct=Decimal("0"))
+
 
 _HOUR = 3_600
 
