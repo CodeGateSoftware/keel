@@ -2490,3 +2490,91 @@ def test_rail_name_is_the_leading_clause_of_a_violation(violation: str, rail: st
     names the rail, not the arithmetic. A detail with a second colon still splits once, and the
     routing gate's bare tokens are their own name."""
     assert guards.rail_name(violation) == rail
+
+
+# -- a fully closed product releases all of its exposure (#798, R33) ---------------------------
+
+
+def test_a_fully_closed_position_reads_zero_exposure_even_at_a_loss(repo: Repository) -> None:
+    """#798/#882: a close that exits the FULL held quantity releases all of it, whatever price
+    the exit happened at. Net NOTIONAL (BUY $61.69 - SELL $58.08 = $3.61) is not zero when the
+    exit priced below the entry -- but net QUANTITY is exactly zero, and a fully closed product
+    carries no exposure left to measure. These are PAXG tranche 3's own numbers (#811)."""
+    _seed_filled_order(
+        repo,
+        product_id="PAXG-USD",
+        side=Side.BUY,
+        qty=Decimal("0.0132"),
+        price=Decimal("4673.23"),
+        created_at=NOW_TS - 86_400,
+    )
+    _seed_filled_order(
+        repo,
+        product_id="PAXG-USD",
+        side=Side.SELL,
+        qty=Decimal("0.0132"),
+        price=Decimal("4400"),
+        created_at=NOW_TS,
+    )
+    assert "PAXG" not in guards._open_exposure_by_asset(repo)
+
+
+def test_a_partial_close_still_nets_by_notional(repo: Repository) -> None:
+    """Pinned so the fix above cannot regress the existing behaviour: a position only PARTLY
+    closed (net qty still > 0) keeps netting by notional, dust and all."""
+    _seed_filled_order(
+        repo,
+        product_id="PAXG-USD",
+        side=Side.BUY,
+        qty=Decimal("0.02"),
+        price=Decimal("4673.23"),
+        created_at=NOW_TS - 86_400,
+    )
+    _seed_filled_order(
+        repo,
+        product_id="PAXG-USD",
+        side=Side.SELL,
+        qty=Decimal("0.0132"),
+        price=Decimal("4400"),
+        created_at=NOW_TS,
+    )
+    exposure = guards._open_exposure_by_asset(repo)
+    assert exposure == {
+        "PAXG": Decimal("0.02") * Decimal("4673.23") - Decimal("0.0132") * Decimal("4400")
+    }
+
+
+def test_a_product_closed_at_a_gain_cannot_shrink_a_sibling_product_in_its_bucket(
+    repo: Repository,
+) -> None:
+    """The one other place the per-product grouping changes the figure, pinned so it is a
+    decision rather than an accident: a spot product closed IN FULL at a gain nets to NEGATIVE
+    notional, and the flat sum let that negative eat into whatever else shares its asset bucket
+    -- here an unparseable ADA BUY that is counted by design. Zero units are held, so the gain
+    is not exposure in either direction, and the bucket keeps the sibling's full figure: the
+    closed direction for a cap."""
+    _seed_filled_order(
+        repo,
+        product_id="ADA-USD",
+        side=Side.BUY,
+        qty=Decimal("100"),
+        price=Decimal("1"),
+        created_at=NOW_TS - 86_400,
+    )
+    _seed_filled_order(
+        repo,
+        product_id="ADA-USD",
+        side=Side.SELL,
+        qty=Decimal("100"),
+        price=Decimal("3"),
+        created_at=NOW_TS,
+    )
+    _seed_filled_order(
+        repo,
+        product_id="ADA-28AUG26-CDE",
+        side=Side.BUY,
+        qty=Decimal("1"),
+        price=Decimal("500"),
+        created_at=NOW_TS,
+    )
+    assert guards._open_exposure_by_asset(repo) == {"ADA": Decimal("500")}

@@ -397,8 +397,24 @@ def _open_exposure_by_asset(repo: Repository) -> dict[str, Decimal]:
     never should have granted. A partially-filled SELL (a partly-executed exit bracket) really
     sold its `filled_quantity`, so it releases that much and NO more: releasing the ordered
     size would hand back cap the venue has not returned while the remainder still rests.
+
+    **A fully (or over-) closed PRODUCT contributes zero, not its net notional (#798, #882).**
+    Both sides above count at each row's OWN price, which is right for a position still partly
+    held -- the remaining notional really is what is still at risk. It is wrong once the position
+    is FULLY closed: a close at any price other than the entry leaves a notional residual (a real
+    gain or loss) that is not exposure, because zero units are held. PAXG tranche 3 bought 0.0132
+    at 4673.23 and a close at 4400 nets to $3.61 of "exposure" nobody holds a unit of -- a
+    phantom that keeps rails 4/5/6 vetoing, which is #798 surviving its own fix. Net QUANTITY,
+    not notional, is what decides "closed": tracked per PRODUCT (never mixed across a
+    futures/spot pair in the same asset bucket -- their units are not comparable), a product
+    whose BUY qty minus SELL qty is `<= 0` contributes nothing to its asset bucket, whatever its
+    net notional says. That cuts both ways and both are the closed direction: a loss no longer
+    leaves a positive residual, and a gain no longer leaves a NEGATIVE one that ate into a
+    sibling product's figure in the same bucket. A product still net-long nets by notional
+    exactly as before; grouping by product first changes nothing there.
     """
     exposure: dict[str, Decimal] = {}
+    per_product: dict[str, dict[str, Any]] = {}
     rows: list[dict[str, Any]] = []
     for status in _OBSERVED_FILL_STATUSES:
         rows.extend(repo.get_orders(mode="live", status=status))
@@ -420,12 +436,22 @@ def _open_exposure_by_asset(repo: Repository) -> dict[str, Decimal]:
             )
             if not counted:
                 continue
-        asset = _asset(product_id)
         amount = _order_notional(order)
+        qty = order.get("filled_quantity") or order.get("qty") or Decimal("0")
+        bucket = per_product.setdefault(
+            str(product_id),
+            {"asset": _asset(product_id), "notional": Decimal("0"), "qty": Decimal("0")},
+        )
         if side == Side.BUY.value:
-            exposure[asset] = exposure.get(asset, Decimal("0")) + amount
+            bucket["notional"] += amount
+            bucket["qty"] += qty
         elif side == Side.SELL.value:
-            exposure[asset] = exposure.get(asset, Decimal("0")) - amount
+            bucket["notional"] -= amount
+            bucket["qty"] -= qty
+    for bucket in per_product.values():
+        if bucket["qty"] > 0:
+            asset = bucket["asset"]
+            exposure[asset] = exposure.get(asset, Decimal("0")) + bucket["notional"]
     return {asset: amt for asset, amt in exposure.items() if amt > 0}
 
 
