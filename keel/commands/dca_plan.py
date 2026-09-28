@@ -59,6 +59,8 @@ _CENT = Decimal("0.01")
 #: error. This bound is refused well before that ceiling, at a figure no real monthly DCA budget
 #: could reach.
 MAX_BUDGET_USD = Decimal("1e12")
+#: The finest input `_decimal` accepts: past this, a value is a typo or a probe, not money.
+MAX_DECIMAL_PLACES = 12
 
 
 class DcaPlanError(ValueError):
@@ -79,6 +81,15 @@ def _decimal(raw: str, name: str) -> Decimal:
         raise DcaPlanError(f"{name} {raw!r} is not a number") from exc
     if not value.is_finite():
         raise DcaPlanError(f"{name} {raw!r} is not a finite number")
+    # The WRITTEN exponent, not `normalize()`d: the default context clamps a tiny value there.
+    exponent = value.as_tuple().exponent
+    if isinstance(exponent, int) and exponent < -MAX_DECIMAL_PLACES:
+        # `format(x, "f")` would spell `1e-10000000` out as ten million digits, into the
+        # command and the card (review of #850) -- refused here, before anything formats it.
+        raise DcaPlanError(
+            f"{name} {raw!r} has more than {MAX_DECIMAL_PLACES} decimal places -- refused before "
+            "it could be spelled out"
+        )
     return value
 
 

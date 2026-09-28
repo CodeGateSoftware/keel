@@ -2078,6 +2078,18 @@ def test_an_unattested_cap_is_judged_bad(valid_config_path: Path) -> None:
     assert body["state"]["value"] == "blocked"
 
 
+def test_a_degraded_cap_says_why_as_the_cli_does(valid_config_path: Path) -> None:
+    """Review of #850: the CLI prints `$0.00 (because no subscription has been attested)`; the
+    card must carry the same reason, in the cap figure itself -- the service puts it in a blocker
+    only when the worst month exceeds the cap."""
+    plan = _dca_plan(valid_config_path, cap=None)
+    assert plan.cap.degraded_reason != ""  # the fixture reached the degraded branch
+    cap = payload.dca_plan_payload(plan, command="x")["summary"]["cap"]
+    assert cap["display"] == f"$0.00 (because {plan.cap.degraded_reason})"
+    assert plan.cap.allowance_usd is not None
+    assert cap["value"] == format(plan.cap.allowance_usd, "f") and cap["state"] == "bad"
+
+
 def test_an_existing_dca_rule_is_sent_as_a_row(valid_config_path: Path) -> None:
     from keel.commands.dca_plan import build_dca_plan, parse_plan_inputs
     from tests.commands.test_dca_plan import NOW_TS as DCA_NOW_TS
@@ -2100,7 +2112,31 @@ def test_an_existing_dca_rule_is_sent_as_a_row(valid_config_path: Path) -> None:
         "status": "candidate",
         "per_buy": payload.money(Decimal("40")),
         "cadence": payload.label("7", display="every 7 days"),
+        "dip_bonus": "",
     }
+
+
+def test_an_existing_rules_dip_bonus_is_sent_as_the_cli_prints_it(valid_config_path: Path) -> None:
+    """Review of #850: the CLI marks the row `(dip_bonus_pct X)`, since such a rule's buys can
+    exceed its flat per-buy amount; the card's row must say so too."""
+    from keel.commands.dca_plan import build_dca_plan, parse_plan_inputs
+    from tests.commands.test_dca_plan import NOW_TS as DCA_NOW_TS
+    from tests.commands.test_dca_plan import _config, _insert_dca, _repo, _screen
+
+    repo = _repo()
+    _insert_dca(repo, "ETH-USD", "candidate", budget="40", dip="2.5")
+    plan = build_dca_plan(
+        repo,
+        _config(valid_config_path),
+        parse_plan_inputs("500", "0.1"),
+        venue="coinbase",
+        now_ts=DCA_NOW_TS,
+        screen_fn=_screen(),
+    )
+    (rule,) = plan.existing
+    assert rule.dip_bonus_pct == Decimal("2.5")  # the fixture's bonus reached the plan
+    (row,) = payload.dca_plan_payload(plan, command="x")["existing"]
+    assert row["dip_bonus"] == "dip_bonus_pct 2.5"
 
 
 def test_no_dca_wire_value_is_a_json_number_and_none_says_fee_free(

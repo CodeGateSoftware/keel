@@ -3654,19 +3654,26 @@ _DCA_SUMMARY_KEYS = ("budget", "buffer", "spend", "cap", "planned", "fees")
 def _dca_summary(plan: DcaPlan | None) -> dict[str, Field]:
     if plan is None:
         return {key: absent() for key in _DCA_SUMMARY_KEYS}
-    cap = plan.cap.allowance_usd
     return {
         "budget": money(plan.inputs.budget_usd),
         "buffer": money(plan.buffer_usd),
         "spend": money(plan.spend_usd),
-        "cap": (
-            label("unlimited", state=NEUTRAL)
-            if cap is None
-            else money(cap, state=GOOD if plan.cap.in_force else BAD)
-        ),
+        "cap": _dca_cap_figure(plan.cap),
         "planned": money(plan.planned_monthly_usd),
         "fees": money(plan.est_monthly_fees_usd),
     }
+
+
+def _dca_cap_figure(cap: BuyCap) -> Field:
+    """Rail 14's allowance as the CLI prints it: a degraded record keeps its (fallback) figure and
+    says why, `$0.00 (because no subscription has been attested)` -- the service puts that reason
+    in a blocker only when the worst month exceeds the cap, so the figure must carry it."""
+    if cap.allowance_usd is None:
+        return label("unlimited", state=NEUTRAL)
+    if cap.in_force:
+        return money(cap.allowance_usd, state=GOOD)
+    figure = money(cap.allowance_usd, state=BAD)
+    return {**figure, "display": f"{figure['display']} (because {cap.degraded_reason})"}
 
 
 def _dca_cap_check_state(cap: BuyCap, worst_month_usd: Decimal) -> str:
@@ -3769,6 +3776,11 @@ def dca_plan_payload(plan: DcaPlan, *, command: str) -> dict[str, Any]:
                 "status": rule.status,
                 "per_buy": money(rule.budget_usd),
                 "cadence": _dca_cadence(rule.cadence_days),
+                # The CLI's `(dip_bonus_pct X)` marker: such a rule's buys can exceed `per_buy`.
+                # Presentation-ready, "" when there is none (as `excluded[].detail`).
+                "dip_bonus": (
+                    f"dip_bonus_pct {rule.dip_bonus_pct}" if rule.dip_bonus_pct > 0 else ""
+                ),
             }
             for rule in plan.existing
         ],

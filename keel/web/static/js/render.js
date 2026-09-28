@@ -3345,6 +3345,9 @@ export function dcaPlanCard(plan, error) {
             " ",
             field(rule.cadence),
           );
+          // The CLI's `(dip_bonus_pct X)` marker: this rule's buys can exceed `per_buy`.
+          const bonus = plain(rule.dip_bonus);
+          if (bonus !== "") line.append(" (", bonus, ")");
           return line;
         },
       ),

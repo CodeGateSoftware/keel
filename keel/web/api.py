@@ -808,7 +808,10 @@ def read_dca_plan(cfg: ServeConfig, query: Query, _state: Any, now_ts: int) -> d
 
     budget, buffer = _first(query, "budget"), _first(query, "buffer")
     if not budget:
-        return payload.dca_plan_awaiting_payload(command=apply_command(None))
+        # R17: the template names the served deployment as the filled command does.
+        return payload.dca_plan_awaiting_payload(
+            command=apply_command(None, config_path=cfg.config_path, db_path=cfg.db_path)
+        )
     if not buffer:
         raise ApiRefusal(400, "Bad plan input", "buffer is required with budget, e.g. buffer=0.1.")
     try:

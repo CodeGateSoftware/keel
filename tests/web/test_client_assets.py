@@ -1986,6 +1986,25 @@ def test_every_row_key_a_view_reads_is_a_key_its_endpoint_sends(
         assert not missing, f"{view} reads {sorted(missing)}; {endpoint} does not send them"
 
 
+def test_the_dca_card_places_every_key_an_existing_rule_row_sends(
+    running,  # type: ignore[no-untyped-def]
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The reverse of the row-key scan, for the existing-rules list: a key the served row sends
+    and the card never reads fails here. Review of #850: `dip_bonus` -- the CLI's
+    `(dip_bonus_pct X)` marker -- was on neither side."""
+    _seed_for("dca_plan", running.db_path, monkeypatch)
+    status, _headers, body = _request(running, _DCA_PLAN_ASKED, cookie=_session(running))
+    assert status == 200
+    rows = json.loads(body)["data"]["existing"]
+    assert len(rows) == 1, rows  # the seeder's ETH rule reached the served payload
+    sent = set(rows[0])
+    assert "dip_bonus" in sent and len(sent) >= 6, sorted(sent)
+    reads = _row_reads("dcaPlanCard").get(("plan", "existing"), set())
+    assert reads, "the scan found no existing-row reads -- it would pass against any payload"
+    assert sent == reads, f"sent but never placed: {sorted(sent - reads)}"
+
+
 def test_every_mapped_collection_is_either_checked_or_named() -> None:
     """No mapped collection may be silently uncovered.
 

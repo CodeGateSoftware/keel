@@ -90,6 +90,22 @@ def test_parse_plan_inputs_refuses_a_non_positive_cadence() -> None:
         parse_plan_inputs("500", "0.1", cadence_days=0)
 
 
+@pytest.mark.parametrize(("budget", "buffer"), [("1e-10000000", "0.1"), ("500", "1e-10000000")])
+def test_an_input_with_an_absurd_exponent_is_refused_before_it_is_spelled_out(
+    budget: str, buffer: str
+) -> None:
+    """Review of #850: `format(x, "f")` spells `1e-10000000` out as ten million digits, into the
+    command and the card's `summary.budget` -- a 25-character query answered with 10-20 MB of
+    JSON. Refused at the one shared parse, so the CLI and the card refuse it alike."""
+    with pytest.raises(DcaPlanError, match="decimal places"):
+        parse_plan_inputs(budget, buffer)
+
+
+def test_twelve_decimal_places_are_still_accepted() -> None:
+    inputs = parse_plan_inputs("500.000000000001", "0.000000000001")
+    assert format(inputs.buffer_pct, "f") == "0.000000000001"
+
+
 def test_an_absurd_budget_is_refused_cleanly_not_a_decimal_crash() -> None:
     """Defect (review of #846): `--budget 1e30` used to reach `Decimal.quantize` (cents,
     28-digit default context) with more digits than the context allows, raising

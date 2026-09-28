@@ -1590,7 +1590,13 @@ def test_dca_plan_without_a_budget_answers_the_awaiting_state(
     assert status == 200
     data = document["data"]
     assert data["state"]["value"] == "awaiting_budget"
-    assert data["command"] == "keel dca plan --budget <monthly USD> --buffer-pct <fraction>"
+    # R17: the template names the served deployment too -- filled in and run elsewhere, it must
+    # still plan against THIS config and database, never the default one.
+    command = data["command"]
+    assert command.startswith("keel --config ")
+    assert command.endswith(" dca plan --budget <monthly USD> --buffer-pct <fraction>")
+    assert command.split().count("--config") == 1 and command.split().count("--db") == 1
+    assert running.config_path in command and running.db_path in command
     assert data["buys"] == []
 
 
