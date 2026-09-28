@@ -157,11 +157,15 @@ class DcaConfig:
     context (`budget_usd x (1 + dip bonus)`). All three paths share one predicate
     (`execution.executor._dca_budget`), so "usable" means the same thing everywhere:
 
-    - `size_usd` ABSENT (missing, or `None`) -> falls back to `budget_usd` here, logged as
-      `executor.dca_sized` with `source="config"`.
+    - `size_usd` ABSENT (missing, or `None`) -> falls back to `budget_usd` here. Live and paper
+      log this as `executor.dca_sized` with `source="config"` (emitted from `_build_intent`,
+      which both call); the sim's `_process_dca_signals` calls `_dca_budget` directly and does
+      not log this case.
     - `size_usd` PRESENT but not a positive, finite number (zero, negative, `NaN`/`Infinity`, a
       `bool`, or anything not a number at all) -> does NOT fall back. The buy is SKIPPED instead
-      (a WARNING logged, no order placed, no position opened), on every path alike.
+      (no order placed, no position opened). Live and paper log a WARNING for this
+      (`executor.execute`'s `executor.dca_size_invalid`, `agent._paper_enter`'s
+      `agent.paper_dca_size_invalid`); the sim skips silently -- a bare `continue`, no log.
 
     That asymmetry is deliberate (orchestrator ruling 2026-09-27): a rule that computed an
     invalid `size_usd` meant to buy LESS, or not at all, and falling back to this shared config

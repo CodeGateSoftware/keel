@@ -160,9 +160,9 @@ def test_committed_manifest_is_valid(tmp_path: Path) -> None:
     # config -- letting an operator tune one rule's budget away from the shared config value is
     # exactly what #840 made possible. Requiring the manifest to agree with the config would break
     # the moment that divergence is actually used, so this test no longer asserts that agreement.
-    # Right now `deploy/live-rules.json` defines a single DCA rule, at $50 -- matching this
-    # config's value -- but that coincidence is what assertion (2) below pins down explicitly,
-    # not a fact this test takes for granted or asserts on its own.
+    # Right now `deploy/live-rules.json` defines a single DCA rule, at $50 -- matching `Dca`'s
+    # constructor default -- but that coincidence is what assertion (2) below pins down
+    # explicitly, not a fact this test takes for granted or asserts on its own.
     #
     # What is still true, and still worth guarding: `deploy/live-rules.json`'s DCA params are,
     # right now, EXACTLY `Dca.__init__`'s constructor defaults (see `keel/strategy/rules/dca.py`).
