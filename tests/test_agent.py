@@ -5105,3 +5105,64 @@ def test_799_a_bracket_quantize_that_raises_still_records_the_tranche(repo, monk
     assert tranche["initial_stop"] == Decimal("95.00")
     assert tranche["bracket_order_id"] is None
     assert repo.get_state(f"{executor.UNBRACKETED_PREFIX}{PRODUCT}") is not None
+
+
+# -- #899: the venue-holdings record must reflect THIS cycle's own entries -------------------
+
+
+class _LedgerTrackingBroker(FakeBroker):
+    """`FakeBroker` whose BTC balance always agrees with keel's own books: `total` is the sum of
+    the `qty` of every filled `live` BUY order in `repo`, read fresh on every call. So the venue
+    and the ledger can never disagree in this test -- it is not about drift, it is about WHETHER
+    `record_venue_holdings` is read before or after this cycle's entry has been booked.
+    """
+
+    def __init__(self, *args: Any, repo: Repository, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self._repo = repo
+        self.get_balances_calls = 0
+
+    def get_balances(self) -> list[Balance]:
+        self.get_balances_calls += 1
+        total = sum(
+            (
+                order["qty"]
+                for order in self._repo.get_orders(mode="live")
+                if order["side"] == Side.BUY.value and order["status"] == "filled"
+            ),
+            Decimal("0"),
+        )
+        return [*super().get_balances(), Balance(currency="BTC", available=total, total=total)]
+
+
+def test_899_a_live_cycle_records_venue_holdings_after_this_cycles_entries(repo, monkeypatch):
+    """#899: the wrapped `record_venue_holdings` call ran BEFORE the cycle's entries, so a cycle
+    that opens a fresh tranche recorded the account as it stood before the fill -- the ledger
+    then holds the new tranche and the venue record does not, and doctor's `ledger.venue_drift`
+    WARNs until the NEXT live cycle (a day on this deployment). The record must instead reflect
+    the account as this cycle LEAVES it, entries included.
+    """
+    from keel.commands import doctor
+
+    rule = _AlwaysEnterRule(PRODUCT)
+    _seed_rule(repo, monkeypatch, rule, status="live")
+    broker = _LedgerTrackingBroker(
+        repo=repo, series={(PRODUCT, Granularity.ONE_DAY): [_candle(0, "100")]}
+    )
+
+    # A small risk budget, `test_799_a_throwing_bracket_preview_still_records_the_tranche`'s
+    # reason: the default 1% of this fake's $1M balance sizes past rail 2 and is vetoed before
+    # ever reaching a fill.
+    run_once(broker, repo, _config(risk_pct=Decimal("0.0001")), now_ts=90_000)
+
+    assert broker.get_balances_calls >= 1, "the fixture must actually have reached the venue read"
+    tranches = repo.get_open_positions(PRODUCT)
+    assert len(tranches) == 1, "exactly one tranche must have been opened"
+    [tranche] = tranches
+
+    ledger = {PRODUCT: tranche["qty"]}
+    venue = {PRODUCT: repo.get_state(f"venue_holding:{PRODUCT}")}
+
+    [finding] = doctor.venue_drift_findings(ledger, venue)
+    assert finding.status == doctor.OK, finding.detail
+    assert Decimal(venue[PRODUCT]["total"]) == ledger[PRODUCT]
