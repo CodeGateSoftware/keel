@@ -1439,3 +1439,126 @@ def test_a_sold_out_product_is_not_re_bracketed(repo):
     reconcile.reconcile_unbracketed_positions(broker, repo, _config(), now_ts=NOW)
 
     assert not broker.placed
+
+
+# -- the per-cycle venue-holdings record `ledger.venue_drift` reads (#798, plan R3) -----------
+
+
+class _BalancesRaise:
+    """`get_balances()` raises -- the venue is unreachable when `record_venue_holdings` polls."""
+
+    def __init__(self) -> None:
+        self.get_balances_calls = 0
+
+    def get_balances(self) -> list[Balance]:
+        self.get_balances_calls += 1
+        raise RuntimeError("network error")
+
+
+class _Balances:
+    """Exactly the balance rows given -- no quote legs, no counting surprises."""
+
+    def __init__(self, *rows: Balance) -> None:
+        self._rows = list(rows)
+        self.get_balances_calls = 0
+
+    def get_balances(self) -> list[Balance]:
+        self.get_balances_calls += 1
+        return list(self._rows)
+
+
+def _held_tranche(repo: Repository, product_id: str = "BTC-USD") -> None:
+    repo.open_position(
+        product_id=product_id,
+        rule_name="dca",
+        opened_at=1,
+        qty=Decimal("0.001"),
+        entry_fill=Decimal("100000"),
+        entry_fee=Decimal("0.3"),
+    )
+
+
+def test_record_venue_holdings_writes_the_venue_total_for_each_held_product(repo):
+    from tests.execution.test_sell_clamp import HeldBroker
+
+    _held_tranche(repo)
+    broker = HeldBroker("BTC", available=Decimal("0.0007"), total=Decimal("0.0009"))
+
+    recorded = reconcile.record_venue_holdings(broker, repo, NOW)
+
+    assert recorded == {"BTC-USD": Decimal("0.0009")}, "TOTAL, never available (#667)"
+    assert repo.get_state("venue_holding:BTC-USD") == {"total": "0.0009", "observed_at": NOW}
+    assert broker.get_balances_calls == 1, "one balance read per cycle, not one per product"
+
+
+def test_one_balance_read_serves_every_held_product(repo):
+    _held_tranche(repo, "BTC-USD")
+    _held_tranche(repo, "PAXG-USD")
+    broker = _Balances(
+        Balance(currency="BTC", available=Decimal("0"), total=Decimal("0.001")),
+        Balance(currency="paxg", available=Decimal("0"), total=Decimal("0.0132")),
+    )
+
+    recorded = reconcile.record_venue_holdings(broker, repo, NOW)
+
+    assert recorded == {"BTC-USD": Decimal("0.001"), "PAXG-USD": Decimal("0.0132")}
+    assert broker.get_balances_calls == 1
+    assert sorted(repo.get_state_keys(reconcile.VENUE_HOLDING_PREFIX)) == [
+        "venue_holding:BTC-USD",
+        "venue_holding:PAXG-USD",
+    ]
+
+
+def test_an_unreadable_balance_writes_nothing_rather_than_zero(repo):
+    _held_tranche(repo)
+    broker = _BalancesRaise()
+
+    assert reconcile.record_venue_holdings(broker, repo, NOW) == {}
+    assert broker.get_balances_calls == 1, "the fixture must actually have been asked"
+    assert repo.get_state("venue_holding:BTC-USD") is None
+
+
+def test_an_unreadable_balance_leaves_the_last_observation_standing(repo):
+    """A failed read says nothing about the holding, so it must not erase what the last good
+    read said -- the record carries its own `observed_at`, which is how its age is told."""
+    _held_tranche(repo)
+    earlier = {"total": "0.001", "observed_at": NOW - 3600}
+    repo.set_state("venue_holding:BTC-USD", earlier)
+
+    reconcile.record_venue_holdings(_BalancesRaise(), repo, NOW)
+
+    assert repo.get_state("venue_holding:BTC-USD") == earlier
+
+
+def test_a_readable_balance_with_no_row_for_the_product_clears_the_record(repo):
+    """The venue answered and named no account for the base: that is UNKNOWN, not zero
+    (`executor._held_base`'s rule), so nothing is written -- and the previous observation is
+    CLEARED, because it is no longer the latest thing the venue said. Left standing, a stale
+    total from before a full out-of-band sale (#798) would read as agreement forever."""
+    _held_tranche(repo)
+    repo.set_state("venue_holding:BTC-USD", {"total": "0.001", "observed_at": NOW - 3600})
+    broker = _Balances(Balance(currency="USD", available=Decimal("5"), total=Decimal("5")))
+
+    assert reconcile.record_venue_holdings(broker, repo, NOW) == {}
+    assert broker.get_balances_calls == 1
+    assert repo.get_state("venue_holding:BTC-USD") is None
+
+
+def test_only_products_with_an_open_tranche_are_recorded(repo):
+    """The venue's other balances (quote currencies, coins keel never bought) are not keel's
+    to reconcile -- `ledger.venue_drift` compares HELD tranches only."""
+    _held_tranche(repo, "BTC-USD")
+    broker = _Balances(
+        Balance(currency="BTC", available=Decimal("0"), total=Decimal("0.001")),
+        Balance(currency="ETH", available=Decimal("2"), total=Decimal("2")),
+    )
+
+    assert reconcile.record_venue_holdings(broker, repo, NOW) == {"BTC-USD": Decimal("0.001")}
+    assert repo.get_state_keys(reconcile.VENUE_HOLDING_PREFIX) == ["venue_holding:BTC-USD"]
+
+
+def test_no_open_tranche_means_no_balance_read(repo):
+    broker = _Balances()
+
+    assert reconcile.record_venue_holdings(broker, repo, NOW) == {}
+    assert broker.get_balances_calls == 0, "nothing held, nothing to ask the venue"

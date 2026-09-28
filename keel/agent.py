@@ -1771,6 +1771,19 @@ def run_once(
         # already resting. Neither subsumes the other.)
         reconcile.sweep_orphan_brackets(broker, repo, now_ts)
 
+        # Then record what the venue holds of each product keel has a tranche in, for doctor's
+        # `ledger.venue_drift` (#798, plan R3): doctor holds no broker, so the cycle observes and
+        # doctor compares. One balance READ; nothing placed or cancelled. AFTER the three passes
+        # above, so it records the account as this cycle leaves it. LIVE cycles only -- paper has
+        # no venue account, and a paper cycle must not read the real one on its own behalf. And
+        # wrapped: `record_venue_holdings` already swallows a venue failure, but a diagnostic
+        # WRITE (a locked database) must not cost the cycle either -- `notify_after_cycle`'s rule.
+        if paper_trader is None:
+            try:
+                reconcile.record_venue_holdings(broker, repo, now_ts)
+            except Exception:  # noqa: BLE001 -- a diagnostic record must never cost a cycle
+                log_exception(logger, "agent.venue_holdings_failed")
+
         # Rail 11's inputs, refreshed BEFORE any entry this cycle. `poll_once` above has already
         # written the candles, so every product's latest price is readable here -- and it has to
         # be done now, not after the loop: `guards.check` reads these scalars from inside

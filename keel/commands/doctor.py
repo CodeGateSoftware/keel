@@ -32,7 +32,7 @@ import re
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
-from decimal import ROUND_HALF_UP, Decimal
+from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any
 
@@ -1555,6 +1555,84 @@ def ledger_drift_findings(
     ]
 
 
+def _venue_total(record: Any) -> Decimal | None:
+    """The recorded venue total as a finite `Decimal`, or `None` when there is none to read."""
+    if not isinstance(record, dict):
+        return None
+    try:
+        total = Decimal(str(record.get("total")))
+    except InvalidOperation, TypeError, ValueError:
+        return None
+    return total if total.is_finite() else None
+
+
+def venue_drift_findings(
+    ledger_by_product: dict[str, Decimal],
+    venue: dict[str, Any],
+    *,
+    increments: dict[str, Decimal | None] | None = None,
+) -> list[Finding]:
+    """The positions ledger against what the VENUE says it holds, per product (#798; plan R3).
+
+    #798's shape: a sale made on the venue out of band leaves keel counting the BUY. Both keel
+    tables agree with each other -- `ledger.drift` sees nothing -- and only the account knows. The
+    venue side is the `venue_holding:<product>` record `reconcile.record_venue_holdings` writes
+    each live cycle (`{"total", "observed_at"}`), because doctor holds no broker. It can be up to
+    a cycle stale, which is why a WARN prints the date it was observed.
+
+    One direction only: the ledger holding MORE than the venue. The venue holding more is coins
+    the operator owns outside keel, which is theirs and not drift. Tolerance is one base
+    increment (`increments`, the cached `base_increment:` record), for the fee-in-base dust
+    reason `ledger.drift` gives (#667); unknown or omitted means exact comparison.
+
+    No observation for a HELD product is a WARN, never OK: "the venue was never asked" or "the
+    venue named no account for it" is unknown, and unknown must not read as agreement before a
+    sale is sized from the ledger (spec §9). A paper profile never records one -- its caller
+    passes an empty ledger there, so this returns the OK sentinel (#881).
+
+    WARN, not FAIL, for `balance.drift`'s reason: every cause (a transfer, a sale, a fee) may be
+    legitimate; what is wrong is that the books disagree with the account.
+    """
+    tolerances = increments or {}
+    drifted: list[tuple[str, str]] = []
+    for product in sorted(ledger_by_product):
+        ledger = ledger_by_product[product]
+        record = venue.get(product)
+        total = _venue_total(record)
+        if total is None:
+            drifted.append((product, f"{product}: no venue observation"))
+            continue
+        if ledger - total > (tolerances.get(product) or Decimal("0")):
+            observed = record.get("observed_at") if isinstance(record, dict) else None
+            when = _utc_date(int(observed)) if isinstance(observed, int) else "unknown"
+            drifted.append(
+                (product, f"{product}: ledger {ledger} > venue {total} (observed {when})")
+            )
+    if not drifted:
+        return [
+            Finding(
+                "ledger.venue_drift",
+                OK,
+                "the venue holds at least what the positions ledger says",
+                "-",
+                "-",
+            )
+        ]
+    return [
+        Finding(
+            "ledger.venue_drift",
+            WARN,
+            f"{len(drifted)} product(s) where the ledger holds more than the venue confirms",
+            "; ".join(text for _, text in drifted)
+            + " -- an out-of-band sale or transfer (#798), or a venue holding never observed; "
+            "the rails still count what the ledger says",
+            "check the venue's holding; declare an out-of-band close with `keel positions close "
+            "<id>` once #798 ships, or let a live cycle record the holding if none is observed",
+            products=tuple(product for product, _ in drifted),
+        )
+    ]
+
+
 def position_watch_findings(
     open_positions: list[dict[str, Any]],
     all_rules: list[dict[str, Any]],
@@ -2003,7 +2081,21 @@ def gather_findings(repo: Any, config: Any, log_lines: Iterable[str], now_ts: in
         pending_sells=_unlinked_pending_sells(repo),
     )
     # #799 proposal 3 (plan R2): the ledger against the orders log, in this profile's own mode.
-    findings += ledger_drift_findings(*_ledger_drift_inputs(repo, config))
+    ledger_by_product, orders_by_product, increments = _ledger_drift_inputs(repo, config)
+    findings += ledger_drift_findings(ledger_by_product, orders_by_product, increments)
+    # #798 (plan R3): the ledger against the venue holding the LIVE cycle records. Only products
+    # with an open tranche are compared -- a product the orders log knows and the ledger does
+    # not is `ledger.drift`'s. A paper profile never records a venue holding (there is no venue),
+    # so it passes an empty ledger and reads the OK sentinel rather than "no observation" (#881).
+    held = {product: qty for product, qty in ledger_by_product.items() if qty > 0}
+    findings += venue_drift_findings(
+        {} if _order_mode(config) == "paper" else held,
+        {
+            key[len(reconcile_mod.VENUE_HOLDING_PREFIX) :]: repo.get_state(key)
+            for key in repo.get_state_keys(reconcile_mod.VENUE_HOLDING_PREFIX)
+        },
+        increments=increments,
+    )
 
     from keel.data import freshness as freshness_mod
 

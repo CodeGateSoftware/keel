@@ -56,7 +56,8 @@ from decimal import Decimal
 from typing import Any
 
 from keel_broker_api.results import OrderStatus
-from keel_core.telemetry import log_event, log_exception
+from keel_core.products import parse_spot_product_id
+from keel_core.telemetry import log_event, log_exception, log_venue_failure
 
 from keel.config import Config
 from keel.data.repository import Repository
@@ -454,6 +455,69 @@ def sweep_orphan_brackets(broker: Any, repo: Repository, now_ts: int) -> list[in
         )
 
     return cancelled
+
+
+#: `agent_state` key prefix for the venue's own holding of a product keel holds a tranche in
+#: (#798, plan R3): `{"total": str, "observed_at": int}`, written once per LIVE cycle by
+#: `record_venue_holdings` and read by `keel doctor`'s `ledger.venue_drift`. The same split as
+#: `orphan_bracket:` and `balance_drift:` -- the cycle holds the broker and writes; doctor holds
+#: none and reads.
+VENUE_HOLDING_PREFIX = "venue_holding:"
+
+
+def record_venue_holdings(broker: Any, repo: Repository, now_ts: int) -> dict[str, Decimal]:
+    """Record what the venue says the account holds of each product keel has an open tranche
+    in, and return it (#798, plan R3). READS balances and writes `agent_state`; it places and
+    cancels nothing.
+
+    **Why a record at all.** `ledger.venue_drift` is doctor's, and `doctor.gather_findings` has
+    no broker by design -- it is shared with `keel mcp` and pinned read-only. `cycle_balances`
+    (#719) stores only QUOTE currencies, and adding base legs there would feed `cash` readers
+    numbers they sum. So the cycle observes, and doctor compares.
+
+    **`Balance.total`, never `Balance.available` (#667)** -- the reason `_held_base` gives:
+    keel's own resting bracket commits the whole position, so `available` reads ~0 for exactly
+    the products keel protects, and every bracketed tranche would look sold.
+
+    ONE `get_balances()` call serves every product, and none is made when nothing is held. The
+    parse is `parse_spot_product_id`, the strict one, for `_held_base`'s reason: a loose
+    reduction of a futures id would match a real balance for an instrument keel does not hold.
+
+    What gets written, per held product:
+
+    * a matching balance row -> `{"total", "observed_at"}`;
+    * the venue ANSWERED but named no account for the base -> the previous record is CLEARED
+      and nothing is written. No row is UNKNOWN, not zero (`_held_base`'s rule), so no zero is
+      invented -- but the last observation is no longer the latest thing the venue said, and
+      left standing it would read as agreement long after a full out-of-band sale;
+    * the read FAILED -> nothing is touched: a failure says nothing about the holding, and the
+      standing record carries its own `observed_at`, which doctor prints.
+
+    Never raises for a venue failure (`log_venue_failure`, then `{}`). The caller in `run_once`
+    wraps it as well, because a diagnostic write must never cost a cycle.
+    """
+    held_products = sorted({str(p["product_id"]) for p in repo.get_open_positions()})
+    if not held_products:
+        return {}
+    try:
+        balances = broker.get_balances()
+    except Exception:
+        log_venue_failure(logger, "reconcile.venue_holdings_fetch_failed", products=held_products)
+        return {}
+    total_by_currency = {str(balance.currency).upper(): balance.total for balance in balances or []}
+
+    recorded: dict[str, Decimal] = {}
+    for product_id in held_products:
+        parsed = parse_spot_product_id(product_id)
+        key = f"{VENUE_HOLDING_PREFIX}{product_id}"
+        total = None if parsed is None else total_by_currency.get(parsed[0].upper())
+        if total is None:
+            if repo.get_state(key) is not None:
+                repo.set_state(key, None)
+            continue
+        repo.set_state(key, {"total": str(total), "observed_at": now_ts})
+        recorded[product_id] = total
+    return recorded
 
 
 def _orphan_threshold_held(

@@ -5011,3 +5011,73 @@ def test_the_cycle_sizes_against_available_never_total(repo: Repository) -> None
     assert parts.cash == Decimal("100"), "cash is the deployable leg, not the account total"
     by_currency = {c: (a, t) for c, a, t in parts.balances}
     assert by_currency["USDC"] == (Decimal("100"), Decimal("999"))
+
+
+# -- #798 / plan R3: the per-cycle venue-holdings record `ledger.venue_drift` reads -------------
+
+
+class _BaseHoldingBroker(FakeBroker):
+    """`FakeBroker` whose account also holds BTC, and which counts balance reads."""
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self.get_balances_calls = 0
+
+    def get_balances(self) -> list[Balance]:
+        self.get_balances_calls += 1
+        return [
+            *super().get_balances(),
+            Balance(currency="BTC", available=Decimal("0"), total=Decimal("0.0009")),
+        ]
+
+
+def _venue_holding_keys(repo: Repository) -> list[str]:
+    from keel.execution.reconcile import VENUE_HOLDING_PREFIX
+
+    return repo.get_state_keys(VENUE_HOLDING_PREFIX)
+
+
+def test_a_live_cycle_records_the_venue_holding_of_each_held_product(repo):
+    _seed_open_position(repo, PRODUCT, Decimal("0.001"), Decimal("100"), ts=1_000, rule_name="dca")
+    broker = _BaseHoldingBroker(series={(PRODUCT, Granularity.ONE_DAY): [_candle(0, "100")]})
+
+    run_once(broker, repo, _config(), now_ts=90_000)
+
+    assert repo.get_state(f"venue_holding:{PRODUCT}") == {"total": "0.0009", "observed_at": 90_000}
+
+
+def test_a_paper_cycle_records_no_venue_holding(repo):
+    """Paper has no venue account: `ledger.venue_drift` is OK on paper by design, and nothing
+    here may read the real account on a paper cycle's behalf."""
+    _seed_open_position(repo, PRODUCT, Decimal("0.001"), Decimal("100"), ts=1_000, rule_name="dca")
+    broker = _BaseHoldingBroker(series={(PRODUCT, Granularity.ONE_DAY): [_candle(0, "100")]})
+
+    run_once(
+        broker,
+        repo,
+        _paper_config(paper=PaperConfig(starting_equity_usd=Decimal("10000"))),
+        now_ts=90_000,
+    )
+
+    assert _venue_holding_keys(repo) == []
+
+
+def test_a_venue_holdings_write_that_raises_never_costs_the_cycle(repo, monkeypatch, caplog):
+    """A diagnostic write must never cost a cycle -- `notify_after_cycle`'s precedent."""
+    from keel.execution import reconcile
+
+    calls: list[int] = []
+
+    def _boom(broker: Any, repo: Any, now_ts: int) -> dict:
+        calls.append(now_ts)
+        raise RuntimeError("database is locked")
+
+    monkeypatch.setattr(reconcile, "record_venue_holdings", _boom)
+    broker = _BaseHoldingBroker(series={(PRODUCT, Granularity.ONE_DAY): [_candle(0, "100")]})
+
+    with caplog.at_level(logging.ERROR, logger="keel.agent"):
+        result = run_once(broker, repo, _config(), now_ts=90_000)
+
+    assert calls == [90_000], "the patched writer must actually have been reached"
+    assert result.skipped is False
+    assert [r.getMessage() for r in caplog.records].count("agent.venue_holdings_failed") == 1

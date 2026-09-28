@@ -622,6 +622,7 @@ def test_gather_findings_covers_every_check_over_a_seeded_db(tmp_path, valid_con
         "position.unmanaged",
         "position.unprotected",
         "ledger.drift",
+        "ledger.venue_drift",
         "data.missing",
         "data.stale",
         "data.gaps",
@@ -1601,3 +1602,93 @@ def test_gather_findings_hands_rail_17_both_of_its_keys(tmp_path, valid_config_p
     (rail17,) = [f for f in findings if f.name == "attest.withdrawals"]
     assert rail17.status == "fail"
     assert "suspend" in rail17.headline.lower()
+
+
+# -- ledger venue drift: the ledger against the venue's recorded holding (#798, plan R3) ----------
+
+
+def test_gather_findings_reads_the_venue_holding_record_the_cycle_writes(
+    tmp_path, valid_config_path
+) -> None:
+    """The wiring, keyed on the prefix `reconcile.record_venue_holdings` writes. A fabricated
+    out-of-band sale (the venue holds less than the ledger) WARNs before any sale is attempted
+    (spec §9 row 2); a holding that covers the ledger is OK -- so the record reached the finding."""
+    from keel.execution.reconcile import VENUE_HOLDING_PREFIX
+
+    config = _live(load_config(valid_config_path))
+    statuses = {}
+    for label, total in (("sold_out_of_band", "0.0004"), ("covered", "0.001")):
+        repo = _seeded_repo(tmp_path / f"{label}.db")
+        _open_tranche(repo, product="BTC-USD", qty="0.001")
+        repo.set_state(
+            f"{VENUE_HOLDING_PREFIX}BTC-USD", {"total": total, "observed_at": NOW - 3600}
+        )
+        finding = _named(gather_findings(repo, config, [], NOW), "ledger.venue_drift")
+        statuses[label] = (finding.status, finding.products)
+    assert statuses == {
+        "sold_out_of_band": ("warn", ("BTC-USD",)),
+        "covered": ("ok", ()),
+    }
+
+
+def test_gather_findings_uses_the_cached_increment_for_venue_dust(
+    tmp_path, valid_config_path
+) -> None:
+    """Fee-in-base dust (#667) is one increment, read from the same cached record `ledger.drift`
+    reads. The control without the record proves the record is what made it OK."""
+    from keel.execution.executor import BASE_INCREMENT_PREFIX
+    from keel.execution.reconcile import VENUE_HOLDING_PREFIX
+
+    config = _live(load_config(valid_config_path))
+    statuses = {}
+    for label, cached in (("cached", True), ("absent", False)):
+        repo = _seeded_repo(tmp_path / f"{label}.db")
+        _open_tranche(repo, product="BTC-USD", qty="0.001")
+        repo.set_state(
+            f"{VENUE_HOLDING_PREFIX}BTC-USD", {"total": "0.00099999", "observed_at": NOW}
+        )
+        if cached:
+            repo.set_state(
+                f"{BASE_INCREMENT_PREFIX}BTC-USD",
+                {"increment": "0.00000001", "fetched_at": NOW, "quote_increment": "0.01"},
+            )
+        statuses[label] = _named(
+            gather_findings(repo, config, [], NOW), "ledger.venue_drift"
+        ).status
+    assert statuses == {"cached": "ok", "absent": "warn"}
+
+
+def test_gather_findings_on_a_paper_profile_does_not_ask_for_a_venue_holding(
+    tmp_path, valid_config_path
+) -> None:
+    """#881: a paper cycle never records a venue holding (there is no venue), so every paper
+    tranche would WARN "no venue observation" forever. On a paper profile the finding is OK."""
+    repo = _seeded_repo(tmp_path / "keel.db")
+    _open_tranche(repo, product="BTC-USD", qty="0.001")
+    paper = _paper(load_config(valid_config_path))
+    live = _live(load_config(valid_config_path))
+
+    on_paper = _named(gather_findings(repo, paper, [], NOW), "ledger.venue_drift")
+    on_live = _named(gather_findings(repo, live, [], NOW), "ledger.venue_drift")
+
+    assert (on_paper.status, on_paper.products) == ("ok", ())
+    # the control: the same tranche with no record WARNs on a live profile
+    assert (on_live.status, on_live.products) == ("warn", ("BTC-USD",))
+
+
+def test_gather_findings_stays_read_only_with_venue_drift_to_report(
+    tmp_path, valid_config_path
+) -> None:
+    from keel.execution.reconcile import VENUE_HOLDING_PREFIX
+
+    repo = _seeded_repo(tmp_path / "keel.db")
+    _open_tranche(repo, product="BTC-USD", qty="0.001")
+    repo.set_state(f"{VENUE_HOLDING_PREFIX}BTC-USD", {"total": "0", "observed_at": NOW})
+    conn = repo._conn  # noqa: SLF001 -- total_changes IS the read-only proof
+    config = _live(load_config(valid_config_path))
+    before = conn.total_changes
+
+    finding = _named(gather_findings(repo, config, [], NOW), "ledger.venue_drift")
+
+    assert conn.total_changes == before, "gather_findings wrote to the database"
+    assert finding.products == ("BTC-USD",)

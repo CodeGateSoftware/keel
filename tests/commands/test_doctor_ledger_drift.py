@@ -79,3 +79,96 @@ def test_nothing_to_compare_is_one_ok_finding_with_no_products() -> None:
     """The OK sentinel, so the name stays in the report on an empty deployment (#886)."""
     [f] = ledger_drift_findings({}, {}, {})
     assert (f.name, f.status, f.products) == ("ledger.drift", OK, ())
+
+
+# -- ledger.venue_drift: the ledger against the venue's own holding (#798, plan R3) -------------
+
+
+def _venue_parts(detail: str) -> list[str]:
+    """The per-product clauses of a `ledger.venue_drift` detail, before its explanation."""
+    return detail.split(" -- ")[0].split("; ")
+
+
+def test_the_798_shape_the_ledger_holds_more_than_the_venue() -> None:
+    """An out-of-band venue sale (#798): keel still counts the BUY, the venue does not."""
+    from keel.commands.doctor import venue_drift_findings
+
+    [f] = venue_drift_findings(
+        {"BTC-USD": Decimal("0.001")},
+        {"BTC-USD": {"total": "0.0004", "observed_at": 1_700_000_000}},
+    )
+    assert f.name == "ledger.venue_drift" and f.status == WARN
+    assert f.products == ("BTC-USD",)
+    assert _venue_parts(f.detail) == ["BTC-USD: ledger 0.001 > venue 0.0004 (observed 2023-11-14)"]
+
+
+def test_the_venue_holding_more_than_the_ledger_is_not_this_finding() -> None:
+    """Coins the operator bought outside keel are theirs, not drift."""
+    from keel.commands.doctor import venue_drift_findings
+
+    [f] = venue_drift_findings(
+        {"BTC-USD": Decimal("0.001")}, {"BTC-USD": {"total": "0.002", "observed_at": 1}}
+    )
+    assert (f.status, f.products) == (OK, ())
+
+
+def test_no_observation_reports_unknown_not_ok() -> None:
+    from keel.commands.doctor import venue_drift_findings
+
+    [f] = venue_drift_findings({"BTC-USD": Decimal("0.001")}, {})
+    assert f.status == WARN
+    assert f.products == ("BTC-USD",)
+    assert _venue_parts(f.detail) == ["BTC-USD: no venue observation"]
+
+
+def test_drifted_and_unobserved_products_are_each_named_once() -> None:
+    from keel.commands.doctor import venue_drift_findings
+
+    [f] = venue_drift_findings(
+        {
+            "BTC-USD": Decimal("0.001"),
+            "ETH-USD": Decimal("1"),
+            "PAXG-USD": Decimal("0.0132"),
+        },
+        {
+            "BTC-USD": {"total": "0.001", "observed_at": 1_700_000_000},
+            "PAXG-USD": {"total": "0", "observed_at": 1_700_000_000},
+        },
+    )
+    assert f.products == ("ETH-USD", "PAXG-USD")
+    assert _venue_parts(f.detail) == [
+        "ETH-USD: no venue observation",
+        "PAXG-USD: ledger 0.0132 > venue 0 (observed 2023-11-14)",
+    ]
+
+
+def test_venue_dust_within_one_base_increment_is_not_drift() -> None:
+    """A venue that takes its fee in the base asset leaves the account one increment short of
+    the ledger on every fill (#667) -- the same tolerance `ledger.drift` allows, and for the
+    same reason. Unknown increment is exact comparison."""
+    from keel.commands.doctor import venue_drift_findings
+
+    ledger = {"BTC-USD": Decimal("0.001")}
+    venue = {"BTC-USD": {"total": "0.00099999", "observed_at": 1}}
+    [within] = venue_drift_findings(ledger, venue, increments={"BTC-USD": Decimal("0.00000001")})
+    [unknown] = venue_drift_findings(ledger, venue, increments={"BTC-USD": None})
+    assert within.status == OK
+    assert unknown.status == WARN
+
+
+def test_an_unparseable_venue_total_is_no_observation() -> None:
+    """The record is JSON from `agent_state`; a total that is not a number says nothing about
+    the holding, and must not raise out of doctor."""
+    from keel.commands.doctor import venue_drift_findings
+
+    [f] = venue_drift_findings(
+        {"BTC-USD": Decimal("0.001")}, {"BTC-USD": {"total": "nope", "observed_at": 1}}
+    )
+    assert _venue_parts(f.detail) == ["BTC-USD: no venue observation"]
+
+
+def test_nothing_held_is_one_ok_venue_finding() -> None:
+    from keel.commands.doctor import venue_drift_findings
+
+    [f] = venue_drift_findings({}, {"BTC-USD": {"total": "1", "observed_at": 1}})
+    assert (f.name, f.status, f.products) == ("ledger.venue_drift", OK, ())
