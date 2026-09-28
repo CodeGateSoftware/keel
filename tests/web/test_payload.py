@@ -1940,3 +1940,177 @@ def test_a_planned_tier_is_unknown_and_never_a_warning() -> None:
     planned = [row["status"] for row in rows if row["status"]["value"] == "planned"]
     assert len(planned) == 3
     assert {status["state"] for status in planned} == {"unknown"}
+
+
+# -- the DCA plan card (`/api/dca-plan`, read-only) -----------------------------------------------
+
+_DCA_KEYS = {
+    "state",
+    "command",
+    "summary",
+    "cap_check",
+    "fee_rate",
+    "cap_note",
+    "buys",
+    "buy_count",
+    "excluded",
+    "existing",
+    "blockers",
+    "warnings",
+}
+
+
+def _dca_plan(valid_config_path: Path, *, cap: str | None = "600", rejected: tuple[str, ...] = ()):
+    """A real `build_dca_plan` over conftest's VALID_CONFIG_YAML (BTC/ETH/PAXG at .4/.3/.3),
+    through the service's own test helpers -- the payload is checked against figures the SERVICE
+    computed, never against literals restated here."""
+    from keel.commands.dca_plan import build_dca_plan, parse_plan_inputs
+    from tests.commands.test_dca_plan import NOW_TS as DCA_NOW_TS
+    from tests.commands.test_dca_plan import _config, _repo, _screen
+    from tests.conftest import attest_subscription
+
+    repo = _repo()
+    if cap is not None:
+        attest_subscription(
+            repo,
+            now_ts=DCA_NOW_TS,
+            free_volume_usd=None if cap == "unlimited" else Decimal(cap),
+        )
+    return build_dca_plan(
+        repo,
+        _config(valid_config_path),
+        parse_plan_inputs("500", "0.1"),
+        venue="coinbase",
+        now_ts=DCA_NOW_TS,
+        screen_fn=_screen(*rejected),
+    )
+
+
+def test_the_dca_payload_has_one_shape_in_both_states(valid_config_path: Path) -> None:
+    """Rule 3: a client reads one shape and never branches on which state produced it."""
+    from keel.commands.dca_plan import apply_command
+
+    ready = payload.dca_plan_payload(_dca_plan(valid_config_path), command="keel dca plan ...")
+    awaiting = payload.dca_plan_awaiting_payload(command=apply_command(None))
+    assert set(ready) == set(awaiting) == _DCA_KEYS
+    assert set(ready["summary"]) == set(awaiting["summary"])
+    assert awaiting["state"]["value"] == "awaiting_budget"
+    assert awaiting["state"]["state"] == "unknown"
+    assert awaiting["buys"] == [] and awaiting["summary"]["spend"]["state"] == "unknown"
+    assert awaiting["cap_check"]["state"] == "unknown"
+
+
+def test_the_dca_payload_places_every_figure_the_plan_computed(valid_config_path: Path) -> None:
+    from keel.commands.dca_plan import RAIL14_NOTE, REASON_TEXT
+
+    plan = _dca_plan(valid_config_path, rejected=("PAXG",))
+    body = payload.dca_plan_payload(plan, command="keel dca plan --budget 500 --buffer-pct 0.1")
+    assert body["state"]["value"] == "ready" and body["state"]["state"] == "good"
+    assert body["buy_count"]["value"] == str(plan.buy_count) == "2"
+    # Pairings, row by row, against the plan's own buys -- never a count alone.
+    assert [row["asset"] for row in body["buys"]] == [b.asset for b in plan.buys] == ["BTC", "ETH"]
+    for row, buy in zip(body["buys"], plan.buys, strict=True):
+        assert row["product_id"] == buy.product_id
+        assert row["per_buy"]["value"] == format(buy.per_buy_usd, "f")
+        assert row["monthly"]["value"] == format(buy.monthly_usd, "f")
+        assert row["fee"]["value"] == format(buy.est_monthly_fee_usd, "f")
+        assert row["weight"]["display"] == format(buy.weight_pct, "f") + "%"
+        assert row["cadence"]["display"] == "every 7 days"
+        assert row["min_order"]["state"] == "unknown"
+    assert body["summary"]["spend"]["value"] == format(plan.spend_usd, "f") == "450.00"
+    assert body["summary"]["planned"]["value"] == format(plan.planned_monthly_usd, "f")
+    assert body["summary"]["fees"]["value"] == format(plan.est_monthly_fees_usd, "f")
+    assert plan.cap.allowance_usd is not None
+    assert body["summary"]["cap"]["value"] == format(plan.cap.allowance_usd, "f")
+    assert body["summary"]["cap"]["display"] == "$600.00"
+    assert body["summary"]["cap"]["state"] == "good"
+    assert body["fee_rate"]["display"] == "1.2% (configured fees.taker_pct)"
+    assert body["cap_note"] == RAIL14_NOTE
+    (excluded,) = body["excluded"]
+    (reason,) = plan.excluded[0].reasons
+    assert excluded["asset"] == "PAXG" and excluded["reasons"] == REASON_TEXT[reason]
+    assert body["warnings"] == list(plan.warnings)
+    assert body["blockers"] == []
+
+
+def test_the_dca_payload_carries_the_worst_month_cap_check(valid_config_path: Path) -> None:
+    """#847: the figure rail 14 is checked against is the WORST calendar month, and the card must
+    say so -- the same sentence the CLI prints, with the plan's own checked total as its value."""
+    from keel.commands.dca_plan import worst_month_text
+
+    fits = _dca_plan(valid_config_path, cap="600")
+    body = payload.dca_plan_payload(fits, command="x")
+    assert body["cap_check"]["display"] == worst_month_text(fits)
+    assert body["cap_check"]["value"] == format(fits.worst_month_spend_usd, "f") == "517.35"
+    assert body["cap_check"]["state"] == "good"
+
+    over = _dca_plan(valid_config_path, cap="500")
+    blocked = payload.dca_plan_payload(over, command="x")
+    assert blocked["cap_check"]["state"] == "bad"
+    assert blocked["cap_check"]["display"] == worst_month_text(over)
+
+
+def test_an_unlimited_cap_has_nothing_to_check_the_worst_month_against(
+    valid_config_path: Path,
+) -> None:
+    """An unlimited tier (`free_volume_usd=None`): the sentence is still shown, the cap reads
+    "unlimited", and the check is judged neither good nor bad -- there is nothing to exceed."""
+    from keel.commands.dca_plan import worst_month_text
+
+    plan = _dca_plan(valid_config_path, cap="unlimited")
+    assert plan.cap.allowance_usd is None  # the fixture reached the unlimited branch
+    body = payload.dca_plan_payload(plan, command="x")
+    assert body["cap_check"]["state"] == "neutral"
+    assert body["cap_check"]["display"] == worst_month_text(plan)
+    assert body["summary"]["cap"]["display"] == "unlimited"
+
+
+def test_a_blocked_plan_says_so_in_state(valid_config_path: Path) -> None:
+    plan = _dca_plan(valid_config_path, cap="100")
+    body = payload.dca_plan_payload(plan, command="x")
+    assert body["state"]["value"] == "blocked" and body["state"]["state"] == "bad"
+    assert body["blockers"] == list(plan.blockers) and len(body["blockers"]) == 1
+
+
+def test_an_unattested_cap_is_judged_bad(valid_config_path: Path) -> None:
+    body = payload.dca_plan_payload(_dca_plan(valid_config_path, cap=None), command="x")
+    assert body["summary"]["cap"]["state"] == "bad"
+    assert body["state"]["value"] == "blocked"
+
+
+def test_an_existing_dca_rule_is_sent_as_a_row(valid_config_path: Path) -> None:
+    from keel.commands.dca_plan import build_dca_plan, parse_plan_inputs
+    from tests.commands.test_dca_plan import NOW_TS as DCA_NOW_TS
+    from tests.commands.test_dca_plan import _config, _insert_dca, _repo, _screen
+
+    repo = _repo()
+    rule_id = _insert_dca(repo, "ETH-USD", "candidate", budget="40")
+    plan = build_dca_plan(
+        repo,
+        _config(valid_config_path),
+        parse_plan_inputs("500", "0.1"),
+        venue="coinbase",
+        now_ts=DCA_NOW_TS,
+        screen_fn=_screen(),
+    )
+    (row,) = payload.dca_plan_payload(plan, command="x")["existing"]
+    assert row == {
+        "rule_id": str(rule_id),
+        "product_id": "ETH-USD",
+        "status": "candidate",
+        "per_buy": payload.money(Decimal("40")),
+        "cadence": payload.label("7", display="every 7 days"),
+    }
+
+
+def test_no_dca_wire_value_is_a_json_number_and_none_says_fee_free(
+    valid_config_path: Path,
+) -> None:
+    from keel.commands.dca_plan import apply_command
+
+    for body in (
+        payload.dca_plan_payload(_dca_plan(valid_config_path, rejected=("PAXG",)), command="x"),
+        payload.dca_plan_awaiting_payload(command=apply_command(None)),
+    ):
+        assert _json_numbers(body) == []
+        assert "fee-free" not in json.dumps(body).lower()

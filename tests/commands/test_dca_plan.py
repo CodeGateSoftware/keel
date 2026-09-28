@@ -821,6 +821,21 @@ def test_blockers_and_warnings_each_get_one_line(valid_config_path: Path) -> Non
     assert len(_section(lines, "Notes")) == len(plan.warnings)
 
 
+def test_the_worst_month_sentence_is_one_text_shared_by_the_cli_and_the_card(
+    valid_config_path: Path,
+) -> None:
+    """#847's cap-check figure is shown by two front-ends: the CLI's line and the web card. ONE
+    service function writes the sentence, so the card cannot word (or total) it differently from
+    the line the terminal prints."""
+    plan = _plan(valid_config_path)
+    text = dca_mod.worst_month_text(plan)
+    assert text == (
+        "worst calendar month for a 7-day cadence, 5 buy day(s) x $103.47 per cycle = $517.35"
+    )
+    lines = render_dca_plan(plan)
+    assert lines.count("  checked against the cap: " + text) == 1
+
+
 def test_an_approvable_plan_has_no_cannot_approve_section(valid_config_path: Path) -> None:
     assert "== Cannot approve ==" not in render_dca_plan(_plan(valid_config_path))
 

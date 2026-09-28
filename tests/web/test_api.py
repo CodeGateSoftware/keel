@@ -68,6 +68,7 @@ API_ROUTES = (
     "/api/research/gauntlet",
     "/api/research/matrix",
     "/api/rules",
+    "/api/dca-plan",
     "/api/venues",
     "/api/gates",
     "/api/plans",
@@ -1559,3 +1560,123 @@ def test_no_reader_reads_the_clock_a_second_time() -> None:
     offenders = {name: calls for name, calls in _reader_clock_calls().items() if calls}
 
     assert offenders == {}, "these readers ignore the clock they were handed: " + repr(offenders)
+
+
+# -- /api/dca-plan: the read-only DCA proposal on /rules -------------------------------------------
+
+
+def _admit_everything(monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    """Patch THE admission screen at its module, recording each product it is asked about. The
+    reader imports `screen_product` per call, so the patch reaches it -- and the returned call log
+    is what proves that it did (an unreached patch would leave the log empty)."""
+    from keel.commands import assets
+    from tests.commands.test_dca_plan import _screen
+
+    calls: list[str] = []
+    fake = _screen()
+
+    def screen_fn(repo: Any, product: str, quote: str) -> Any:
+        calls.append(product)
+        return fake(repo, product, quote)
+
+    monkeypatch.setattr(assets, "screen_product", screen_fn)
+    return calls
+
+
+def test_dca_plan_without_a_budget_answers_the_awaiting_state(
+    running: web_server.ServeConfig,
+) -> None:
+    status, _headers, document = _json(running, "/api/dca-plan")
+    assert status == 200
+    data = document["data"]
+    assert data["state"]["value"] == "awaiting_budget"
+    assert data["command"] == "keel dca plan --budget <monthly USD> --buffer-pct <fraction>"
+    assert data["buys"] == []
+
+
+@pytest.mark.parametrize(
+    ("query", "needle"),
+    [
+        ("budget=abc&buffer=0.1", "is not a number"),
+        ("budget=500&buffer=10", "0.1 means"),
+        ("budget=500", "buffer is required"),
+        ("budget=NaN&buffer=0", "not a finite number"),
+        ("budget=-5&buffer=0.1", "budget must be positive"),
+    ],
+)
+def test_dca_plan_refuses_bad_input_with_a_400(
+    running: web_server.ServeConfig, query: str, needle: str
+) -> None:
+    """R15: refused, never guessed -- and in the service's own words, so the CLI and the card
+    refuse the same input the same way."""
+    status, _headers, document = _json(running, "/api/dca-plan?" + query)
+    assert status == 400, document
+    assert document["error"]["status"] == "400"
+    assert needle in document["error"]["detail"]
+
+
+def test_dca_plan_with_a_budget_serves_the_services_plan(
+    running: web_server.ServeConfig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Same service as the CLI: the reader calls `build_dca_plan` with THE screen, patched here
+    at its module so the route sees an admitted allowlist."""
+    calls = _admit_everything(monkeypatch)
+    status, _headers, document = _json(running, "/api/dca-plan?budget=1e3&buffer=0.1")
+    assert status == 200, document
+    assert calls, "the patched screen was never called -- the reader bound its own copy"
+    data = document["data"]
+    assert data["summary"]["spend"]["value"] == "900.00"
+    assert [row["asset"] for row in data["buys"]] == ["BTC", "ETH", "PAXG"]
+    # The fixture deployment has no attested subscription: the cap is the unsubscribed $0, so the
+    # plan is blocked, and the worst-month check says what it compared.
+    assert data["state"]["value"] == "blocked"
+    assert data["cap_check"]["display"].startswith("worst calendar month for a 7-day cadence")
+    assert data["cap_check"]["state"] == "bad"
+    # R17 + Review Focus 4: the exact command, no exponent, naming the served deployment first.
+    command = data["command"]
+    assert command.endswith(" dca plan --budget 1000 --buffer-pct 0.1")
+    assert command.startswith("keel --config ")
+    assert command.split().count("--config") == 1 and command.split().count("--db") == 1
+    assert running.config_path in command and running.db_path in command
+
+
+def test_dca_plan_turns_a_config_refusal_into_a_400_naming_it(
+    running: web_server.ServeConfig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A `DcaPlanError` from `build_dca_plan` itself -- `target_weights` keys colliding by case
+    (#848) -- is refused with the service's message, as the CLI refuses it, never a 500 traceback
+    and never a plan built from a silently dropped weight."""
+    _admit_everything(monkeypatch)
+    config = Path(running.config_path)
+    text = config.read_text()
+    assert "  BTC: 0.40\n" in text  # the edit below lands on the fixture's own weights block
+    config.write_text(text.replace("  BTC: 0.40\n", "  BTC: 0.40\n  btc: 0.10\n", 1))
+    status, _headers, document = _json(running, "/api/dca-plan?budget=500&buffer=0.1")
+    assert status == 400, document
+    assert "collide once uppercased" in document["error"]["detail"]
+
+
+def test_dca_plan_writes_nothing(
+    running: web_server.ServeConfig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls = _admit_everything(monkeypatch)
+    status, _headers, _document = _json(running, "/api/dca-plan?budget=500&buffer=0.1")
+    assert status == 200 and calls
+    conn = sqlite3.connect(running.db_path)
+    try:
+        assert conn.execute("SELECT COUNT(*) FROM rules").fetchone()[0] == 0
+    finally:
+        conn.close()
+
+
+def test_dca_plan_answers_no_post(running: web_server.ServeConfig) -> None:
+    """GET only: the card's write path is the CLI at a terminal. A POST with the client header
+    is refused like every other `/api/*` read."""
+    status, _headers, _body = _get(
+        running,
+        "/api/dca-plan?budget=500&buffer=0.1",
+        method="POST",
+        cookie=_session(running),
+        headers={"X-Keel-Client": "1"},
+    )
+    assert status == 404
