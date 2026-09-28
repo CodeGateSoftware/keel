@@ -1908,6 +1908,23 @@ def test_a_fill_never_seen_terminal_records_nothing_and_warns_once(repo, caplog,
     assert warning.levelno == logging.WARNING
 
 
+def test_a_fill_never_seen_terminal_keeps_the_estimated_price_and_fee(repo, pauses):
+    """Price and fee come from the SAME terminal observation as `filled_quantity`, or not at all
+    (#900 review). A running `OPEN` snapshot's average and fees describe part of an order still
+    executing; writing them would record a partial fee as the entry's whole fee -- the figure a
+    tranche's `entry_fee` and doctor's #900 fee band are then built from. The estimate stands."""
+    broker = _SettlingBroker(_status("OPEN", "0.4", price="50123", fees="0.2"))
+
+    result = execute(_enter_signal(), broker, repo, _config(), "autonomous", None, now_ts=NOW_TS)
+
+    order = repo.get_order(result.order_id)
+    assert (order["filled_quantity"], order["actual_fill"], order["fee"]) == (
+        None,
+        Decimal("50000"),
+        Decimal("0.30"),
+    )
+
+
 def test_an_exit_records_its_venue_filled_size_after_re_polling(repo, pauses):
     """BOTH sides (#900 S1): a market SELL is observed the same way, so the exit booking's
     `filled_quantity` preference has something to prefer."""

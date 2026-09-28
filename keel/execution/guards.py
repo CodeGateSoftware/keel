@@ -351,12 +351,27 @@ def _order_notional(order: dict[str, Any]) -> Decimal:
     `filled_quantity` when the venue's post-fill status was observable, so estimate-only rows
     (and rows older than the column, pre-v11) keep counting at their ordered size exactly as
     they did before #446.
+
+    **A BUY with an observed fill also counts its FEE (#900).** Since #900 every filled market
+    BUY carries the venue's delivered `filled_quantity`, and Coinbase Advanced takes a quote-
+    sized BUY's fee OUT of the quote: a $50 BUY with a $0.45 fee delivers $49.55 of base. What the
+    operator spent -- and what rails 3 and 14 cap -- is the full $50, which is exactly what the
+    ordered `qty x price` counted before #900. `filled_quantity x average + fee` restores that
+    figure from the observed side; it is also "what this order put into the account" on a venue
+    that charges the fee on top. Rails 4/5/6 read the same figure, so they too count what they
+    counted before -- conservative by the fee, never looser. NOT added on the `qty` fallback,
+    where the ordered quote already contains the fee, nor on a SELL, whose fee is deducted from
+    proceeds and releases nothing.
     """
-    qty = order.get("filled_quantity") or order.get("qty") or Decimal("0")
+    filled = order.get("filled_quantity")
+    qty = filled or order.get("qty") or Decimal("0")
     price = order.get("actual_fill") or order.get("limit_price") or order.get("expected_fill")
     if price is None:
         return Decimal("0")
-    return qty * price
+    notional = qty * price
+    if filled and order.get("side") == Side.BUY.value:
+        notional += order.get("fee") or Decimal("0")
+    return notional
 
 
 def _open_exposure_by_asset(repo: Repository) -> dict[str, Decimal]:

@@ -1454,7 +1454,8 @@ def _upgrade_to_observed_economics(
     cycle. This is a refinement of a number, not a safety gate.
 
     The status is re-read until the venue says it is done with the order (#900,
-    `FILL_OBSERVATION_PAUSES`). The QUANTITY is recorded only from that terminal answer: a
+    `FILL_OBSERVATION_PAUSES`). The quantity, price and fee are recorded only from that terminal
+    answer: a
     snapshot of an order still executing is not what was delivered, and the bracket and tranche
     sized from `filled_quantity` next must never be sized from a number the venue may still
     grow. When no terminal answer arrives, `filled_quantity` stays NULL -- "not observed", never
@@ -1509,7 +1510,10 @@ def _upgrade_to_observed_economics(
             side=side,
             detail=detail,
         )
-    if observed is None:
+    # #900 review: price and fee come from the SAME terminal observation as the quantity, or
+    # the estimates stand. A still-executing snapshot's average and fees describe only part of
+    # the order, and the fee recorded here becomes the tranche's `entry_fee`.
+    if observed is None or not terminal:
         return
     fill = observed.average_filled_price
     fees = observed.total_fees
