@@ -258,12 +258,12 @@ Each ruling is stated as `what — why — cost if wrong`.
 - **R33** (added in review round 1, #882). `guards._open_exposure_by_asset` (Task 4.0) contributes zero notional for any PRODUCT whose net filled quantity is `<= 0`, instead of its net notional, regardless of the prices the closing legs traded at.
   - Why: the function nets BUY/SELL **notional**, which is the right figure for a position still partly held. It is the wrong figure for one closed in full at a different price than its entry: PAXG tranche 3 closed at a real loss (4673.23 -> 4400) leaves a $3.61 notional residual that is not exposure, because zero units are held. Left unfixed, P4's own acceptance test cannot pass and #798's phantom exposure survives any loss-making close, declared or ordinary.
   - Cost if wrong: exposure rails 4/5/6 could under- or over-state a closed product's contribution to its asset bucket. The fix only changes behaviour when a product's net qty is `<= 0`; every still-open product nets by notional exactly as before, pinned by `test_a_partial_close_still_nets_by_notional`.
-- **R34** (added in review round 1, #883; refined in rounds 2, 3 and 4 (#887)). `executor.reduce`'s confirm branch (Task 18.1) asks the typed-yes gate BEFORE it cancels the resting protective bracket, by wrapping the caller's `confirm_fn` rather than calling `_clear_resting_bracket` directly ahead of `_run_order`. A leg that does not close the position in full re-brackets the remainder afterward, via `place_bracket`, the same choreography `scale_out` (#502) uses -- including repointing the surviving tranche's `bracket_order_id` at the new bracket, the step round 2's fix omitted. The crash-ledger `unbracketed:<product>` record that protects a mid-flight cancel/re-bracket is written INSIDE that same wrapped closure, after `confirm_fn` returns true and before the cancel it guards -- not earlier -- so a decline writes nothing there to leave stale; it is now written whenever `open_stop`/`open_target` exist, not only when the leg is partial, so a full close is covered too. A failure after the cancel is labelled by WHO refused: `declined` only when the operator said no before the exchange was touched; `failed` when the cancel itself failed or the venue rejected the SELL after a genuine yes. On the success path, what happens next is decided from `repo.get_open_positions`, not from the pre-sale `protecting_remainder`/`remainder` arithmetic: a true full close clears `position_rule:`/`open_stop:`/`open_target:`/`unbracketed:` together (round 4), and a "full close" the venue fills short rewrites the retry record from the ledger and logs CRITICAL instead of silently clearing it (round 4).
+- **R34** (added in review round 1, #883; refined in rounds 2, 3 and 4 (#887); refined again, #890). `executor.reduce`'s confirm branch (Task 18.1) asks the typed-yes gate BEFORE it cancels the resting protective bracket, by wrapping the caller's `confirm_fn` rather than calling `_clear_resting_bracket` directly ahead of `_run_order`. A leg that does not close the position in full re-brackets the remainder afterward, via `place_bracket`, the same choreography `scale_out` (#502) uses -- including repointing the surviving tranche's `bracket_order_id` at the new bracket, the step round 2's fix omitted, and, unlike `scale_out`, sized from the ledger's own post-`book_exit` qty rather than the pre-sale `remainder`, since this path's booking can differ from what was ordered (a short fill) in a way `scale_out`'s never does. The crash-ledger `unbracketed:<product>` record that protects a mid-flight cancel/re-bracket is written INSIDE that same wrapped closure, after `confirm_fn` returns true and before the cancel it guards -- not earlier -- so a decline writes nothing there to leave stale; it is now written whenever `open_stop`/`open_target` exist, not only when the leg is partial, so a full close is covered too. A failure after the cancel is labelled by WHO refused: `declined` only when the operator said no before the exchange was touched; `failed` when the cancel itself failed or the venue rejected the SELL after a genuine yes. On the success path, what happens next is decided from `repo.get_open_positions`, not from the pre-sale `protecting_remainder`/`remainder` arithmetic: a true full close clears `position_rule:`/`open_stop:`/`open_target:`/`unbracketed:` together (round 4), a bracketed "full close" the venue fills short rewrites the retry record from the ledger and logs CRITICAL instead of silently clearing it (round 4), and an ordinary partial sale of a tranche that was never bracketed logs neither (#890 -- the short-fill arm is now keyed on `has_levels`, not on `not protecting_remainder` alone, so it no longer also catches every unbracketed DCA sale).
   - Why: the original draft cancelled the bracket unconditionally before `_run_order` (and therefore before the human's answer, which `_run_order` asks internally). A decline, or no TTY, left a stopped tranche naked at the exchange with no `unbracketed:` record -- the cancel had already happened and nothing said so. `execute()`'s own EXIT path has the same ordering today (pre-existing, out of scope here); `reduce()` is new code and need not repeat it. Round 1's fix reordered the cancel correctly but still wrote the crash-ledger record unconditionally, before the confirm gate ran -- round 2 found the three `test_883_*` tests could not pass as drafted: the record was never cleared on a decline, the fixture never seeded a filled BUY order for `_held_position` to find (so `protecting_remainder` was always false), and the placement counts omitted the SELL leg's own `_run_order` call. All three are fixed in Task 18.1: the record moves inside `_confirm_then_cancel`, `_bracketed` seeds a matching filled BUY order, and the two placement tests count 2 and 3 calls, not 1 and 2. Round 3 found two further gaps, both in Task 18.1: (a) the successful-partial-leg path never called `repo.set_position_bracket`, so a filled remainder bracket had no tranche pointing at it and `reconcile.exit_without_position_context` fired on every fill, WARNing `position.unprotected` every cycle after; (b) gating the crash-ledger write on `protecting_remainder` (partial only) meant a full close whose SELL the venue rejected after the cancel left the position naked with NO retry record at all, and the result was mislabelled "declined at the confirm gate" even though the operator said yes and the venue, not the operator, refused. Both are fixed: the record now writes whenever levels exist (and a fully successful full close clears it explicitly, since `place_bracket` -- its only other clearer -- is never called on that path), and the `reduce` result's `decision` distinguishes `declined` (operator said no, or the window/rule-status gate refused first) from `failed` (the cancel or the placement itself failed after a genuine yes). Round 4 (#887) found the success path's own clear was too narrow twice over: it cleared only `unbracketed:` on a full close, leaving `position_rule:`/`open_stop:`/`open_target:` stale for the next entry to trip over (rail 9's `no_stop_widening`, `guards.py:657-664`); and it decided "full close" from the pre-sale remainder rather than from what `book_exit` actually left in the `positions` ledger, so a full-close SELL the venue filled short (#446) cleared the retry record for a remainder that was, in fact, still naked and unrecorded. Both are fixed by re-checking `repo.get_open_positions` after `book_exit`, mirroring `agent._handle_exits`'s own tail (`agent.py:950-987`) instead of trusting the pre-sale prediction.
   - Cost if wrong: a declined or failed confirm now leaves the bracket resting rather than cancelled, which is the safe direction; a partial confirmed sale is followed by a second `place_bracket` call the venue must accept, the same call `scale_out` already makes routinely. Had round 2's three issues gone unfixed, the tests meant to prove R34 would themselves not pass, so the ruling would be undemonstrated rather than wrong. Had round 3's gaps gone unfixed: an orphaned tranche pointer would have kept warning `position.unprotected` every cycle after every partial confirmed sale, forever, with no crash involved at all; and a rejected full-close SELL would have left a live, undetected naked position, invisible to both the sweep (no record to read) and the operator (a label that reads as their own decision, not a fault). Had round 4's gaps gone unfixed: every successful confirmed full close of a bracketed position would have left `open_stop:` behind, so rail 9 would veto the next entry on that product whose stop sat below the closed trade's; and a full-close SELL the venue filled short would have had its retry record cleared by the narrow success-path clear, leaving the remainder naked and unrecorded -- the exact silence `agent._handle_exits` already guards against on its own EXIT path.
-- **R35** (added in the #887 follow-up). `keel dca {distribute,trim,exit} --confirm <proposal-id>` (P18, Task 18.2) exits **0 only when `ReduceResult.decision == "placed"`**. Every other outcome -- `declined` (the operator's no, no TTY, a closed sells window, a `paper` rule) and `failed` (the cancel of the resting bracket failed, or the venue rejected the SELL after a genuine yes) alike -- exits **1**, by raising `click.ClickException(f"{result.decision}: {result.reason}")`. No new exit code is minted, and `declined` and `failed` are told apart by the message, not by the status.
-  - Why: exit 1 through `click.ClickException` is how every typed-confirmation refusal and every venue failure in `keel/commands` already ends -- `_common._require_interactive_confirmation` ("aborted (confirmation not given).", the very gate `sleeve_sale_gate` wraps), `orders cancel`'s "aborted." and its stranded-bracket error, and `subscription`/`rules`/`versions`' `ctx.exit(1)`. The only codes above 1 are `agent.DATA_NOT_READY_EXIT = 4` and `agent.MARKET_CLOCK_UNAVAILABLE_EXIT = 5`, and each exists for one named consumer (a day-stamping launchd wrapper that must tell "retry in an hour" from "done"). `--confirm` has no such consumer: it fails closed off a TTY, so no script or wrapper can ever read its status. A distinct code for `failed` would be a contract nobody reads. The state that matters after a `failed` -- a cancelled bracket, a naked position -- is carried where it is acted on: the `unbracketed:` retry record the sweep heals from, the CRITICAL log, `doctor`'s `position.unprotected`, and the message itself, which names the step that failed. `keel dca plan`'s `[N]` exits 0 ("cancelled: nothing written."), but that is a menu choice among offered actions, not the typed-yes gate refusing; `--confirm` reuses the gate, so it follows the gate.
-  - Cost if wrong: a future caller that wants to branch on decline versus failure by status alone cannot, and must read the message. Adding a distinct code for `failed` later is additive -- nothing that tests `!= 0` breaks. The opposite mistake (exit 0 on a decline) would make a refusal read as success to anything checking the status, which is why it is not taken.
+- **R35** (added in the #887 follow-up; extended, #890). `keel dca {distribute,trim,exit} --confirm <proposal-id>` (P18, Task 18.2) exits **0 only when a sale is actually placed** (`ReduceResult.decision == "placed"`, reached through `reduce`). Every other outcome exits **1** by raising `click.ClickException`, whether or not the call ever reaches `reduce`: a `declined` or `failed` `ReduceResult.decision` (the operator's no, no TTY, a closed sells window, a `paper` rule, the cancel of the resting bracket failing, or the venue rejecting the SELL after a genuine yes) via `f"{result.decision}: {result.reason}"`, and a refusal `_confirm_sale` raises BEFORE `reduce` is ever called -- the proposal no longer firing on the current book, a rule/verb kind mismatch, or a `paper` rule refused up front -- via its own message. No new exit code is minted anywhere on this path, and every non-zero outcome is told apart from another only by the message, never by the status.
+  - Why: exit 1 through `click.ClickException` is how every typed-confirmation refusal and every venue failure in `keel/commands` already ends -- `_common._require_interactive_confirmation` ("aborted (confirmation not given).", the very gate `sleeve_sale_gate` wraps), `orders cancel`'s "aborted." and its stranded-bracket error, and `subscription`/`rules`/`versions`' `ctx.exit(1)`. Every code above 1 in `keel/` serves one NAMED machine consumer, never a human reading a message: `install.py`'s `ctx.exit(2 if plan.needs_confirmation else 0)` (`install.py:362`) is read by a scripted installer deciding whether to re-run with `--yes`; `cli.py`'s `sys.exit(141)` (`cli.py:1706`) is the SIGPIPE convention for a reader that hung up; `agent.DATA_NOT_READY_EXIT = 4` and `agent.MARKET_CLOCK_UNAVAILABLE_EXIT = 5` exist for the day-stamping launchd wrapper that must tell "retry in an hour" from "done". `--confirm` has none of these: no installer scripts it, no wrapper retries it, and its reader is a human at a TTY who already gets the decision word in the message. A distinct code for `failed`, or for a refusal before `reduce`, would be a contract nobody reads. The state that matters after a `failed` -- a cancelled bracket, a naked position -- is carried where it is acted on: the `unbracketed:` retry record the sweep heals from, the CRITICAL log, `doctor`'s `position.unprotected`, and the message itself, which names the step that failed. `keel dca plan`'s `[N]` exits 0 ("cancelled: nothing written."), but that is a menu choice among offered actions, not the typed-yes gate refusing; `--confirm` reuses the gate, so it follows the gate, whether the refusal comes from the gate itself or from `_confirm_sale`'s own pre-`reduce` checks.
+  - Cost if wrong: a future caller that wants to branch on decline versus failure versus a pre-`reduce` refusal by status alone cannot, and must read the message. Adding a distinct code for any of them later is additive -- nothing that tests `!= 0` breaks. The opposite mistake (exit 0 on a decline, or on a proposal that no longer fires) would make a refusal read as success to anything checking the status, which is why it is not taken.
 
 ---
 
@@ -5214,6 +5214,53 @@ def test_887_a_short_filled_full_close_rewrites_the_retry_record_from_the_ledger
         r for r in caplog.records
         if r.getMessage() == "executor.reduce_left_an_unprotected_remainder"
     ], "a naked remainder was left behind SILENTLY"
+
+
+def test_887_a_partial_sale_of_an_unbracketed_dca_tranche_logs_no_critical(repo, caplog) -> None:  # noqa: F811
+    """#890: the short-fill `else` arm above used to be reached by `not protecting_remainder`
+    alone, with no `has_levels` check -- true for EVERY partial sale of a product with no
+    recorded `open_stop`/`open_target`, not only a short-filled one. A DCA tranche is never
+    bracketed, so a perfectly ordinary, fully-filled confirmed partial sale of one has
+    `has_levels` and `protecting_remainder` both `False`, `still_held` non-empty (0.001 of
+    0.002 remains), and the old gate logged a false CRITICAL
+    `executor.reduce_left_an_unprotected_remainder` plus a false `unbracketed:BTC-USD` record
+    for a position that was never bracketed to begin with -- nothing was left LESS protected
+    than it already was. Seeds the same way `_bracketed` seeds a bracketed position (`_held`
+    for the `positions` row, a matching filled BUY order for `_held_position` -- see that
+    fixture's own docstring), but never calls `place_bracket`, so no `open_stop`/`open_target`
+    are ever recorded and no bracket rests to cancel.
+    """
+    config = _config()
+    broker = FakeBroker()
+    holding = _held(repo, "0.002")
+    repo.insert_order(
+        dict(
+            mode="live",
+            product_id="BTC-USD",
+            side=Side.BUY.value,
+            order_type="market",
+            qty=D("0.002"),
+            limit_price=D("100000"),
+            status="filled",
+            fee=D("0.6"),
+            created_at=NOW_TS - 200,
+            updated_at=NOW_TS - 200,
+        )
+    )
+    repo.set_sells_window(True, now_ts=0, expires_ts=NOW_TS + 3600)
+    with caplog.at_level(logging.CRITICAL):
+        result = executor.reduce(_red(qty="0.001"), broker=broker, repo=repo, config=config,
+                                 holding=holding, costs=COSTS, rule_id=7, rule_status="live",
+                                 now_ts=NOW_TS, execution="confirm",
+                                 confirm_fn=lambda preview: True)
+    assert result.decision == "placed"
+    assert repo.get_state("unbracketed:BTC-USD") is None, (
+        "an unbracketed DCA tranche has nothing to heal -- no record should ever appear for it"
+    )
+    assert [
+        r for r in caplog.records
+        if r.getMessage() == "executor.reduce_left_an_unprotected_remainder"
+    ] == [], "an ordinary partial sale of an unbracketed DCA tranche must not log a false CRITICAL"
 ```
 
 ```python
@@ -5250,6 +5297,7 @@ def test_the_cycle_never_asks_reduce_to_confirm() -> None:
   3. With that also fixed (Step 3's actual code, write inside `_confirm_then_cancel` after the yes), the two placement tests still fail on their `place_calls` counts unless they account for the SELL leg's own `_run_order` placement, not just the bracket calls -- confirm this by counting `broker.place_calls` before asserting the fixed numbers (2 and 3, not 1 and 2).
   4. With the remainder re-bracket built but no tranche repoint, `test_883_a_partial_confirmed_leg_repoints_the_surviving_tranche_at_the_new_bracket` fails: `position["bracket_order_id"]` still names the CANCELLED bracket's id, not the new one. With the crash-ledger write still gated on `protecting_remainder`, `test_883_a_venue_rejected_full_close_after_the_cancel_leaves_a_retry_record_and_is_not_mislabelled_a_decline` fails on `repo.get_state("unbracketed:BTC-USD") is not None` (nothing was ever written for a full close) and, separately, on `result.decision == "failed"` (it reads `"declined"`, indistinguishable from an operator's own no). And, once the write is switched to `has_levels` but BEFORE the full-close success path is taught to clear it explicitly, `test_883_a_full_close_does_not_attempt_to_re_bracket`'s new last assertion (`repo.get_state("unbracketed:BTC-USD") is None`) itself goes red -- widening the write condition without also widening what clears it trades one gap (no record on a rejected full close) for another (a stale record after a successful one).
   5. (#887) With `test_883_a_full_close_does_not_attempt_to_re_bracket`'s own narrow clear (`if not protecting_remainder and has_levels: repo.set_state(..., None)`) in place but BEFORE it is replaced by Step 3's `still_held`-driven branch, `test_887_a_full_close_clears_position_rule_and_open_levels_too` fails on `repo.get_state("position_rule:BTC-USD") is None` -- the prior code never touched `position_rule:`/`open_stop:`/`open_target:` at all, only `unbracketed:`. And with that branch replaced but the short-fill `else` arm not yet added, `test_887_a_short_filled_full_close_rewrites_the_retry_record_from_the_ledger` fails on `repo.get_state("unbracketed:BTC-USD") == {...}` -- `protecting_remainder` was `False` (a full close was intended), so the prior code's `if protecting_remainder:` re-bracket never ran, and the `still_held`-is-empty branch does not apply either (`still_held` is non-empty after a short fill), so nothing rewrites the stale pre-sale record without the new `else` arm.
+  6. (#890) With that short-fill arm added but still gated on `not protecting_remainder` alone -- the shape #887 itself landed, with no `has_levels` check -- `test_887_a_partial_sale_of_an_unbracketed_dca_tranche_logs_no_critical` fails: its DCA tranche has no `open_stop`/`open_target`, so `has_levels` and `protecting_remainder` are both `False`, `still_held` is non-empty (0.001 of 0.002 remains after an ordinary, fully-filled confirmed partial sale), and the un-split `else` arm reaches the CRITICAL log and the `unbracketed:BTC-USD` write anyway, on `caplog.records == []` and, separately, on `repo.get_state("unbracketed:BTC-USD") is None`. Splitting that `else` into an `elif has_levels and remainder <= 0:` arm (the short-fill case) and a final `else` that writes nothing (this test's case) is what fixes it.
 
 - [ ] **Step 3: Implement the confirm branch.** After a clean `guards.check`:
   - If `execution == "confirm"` and not `sleeve.sells_released(repo, now_ts)`, record `declined` and return.
@@ -5375,8 +5423,23 @@ def test_the_cycle_never_asks_reduce_to_confirm() -> None:
             decision, reason = "declined", "declined at the confirm gate"
         else:
             # `has_levels` is False for a DCA tranche that never had a bracket: nothing was
-            # cancelled, and the reason must not claim otherwise.
-            after = (" after the resting bracket was already cancelled" if has_levels else "")
+            # cancelled, and the reason must not claim otherwise. Held question (#887
+            # follow-up): even when `has_levels` is True, `_clear_resting_bracket` returns
+            # `True` whether it actually cancelled a resting order OR found none to cancel
+            # (`executor.py:301-361` -- the loop over `RESTING_STATUSES` simply does not
+            # iterate when nothing is resting, and the function still returns `True` at its
+            # tail). `has_levels` can be stale True with nothing currently resting: a prior
+            # re-bracket attempt on this same product can have cancelled the old bracket and
+            # then had ITS OWN `place_bracket` call rejected -- that failure path
+            # (`executor.py:2356-2374`) records `unbracketed:<product>` but never clears
+            # `open_stop`/`open_target`, so a later `reduce` sees `has_levels` True with no
+            # bracket actually resting. Recomputing an accurate "did this call's own cancel
+            # touch a live order" flag would mean re-querying `RESTING_STATUSES` by side here,
+            # duplicating `_clear_resting_bracket`'s own filter rather than cheaply reusing it
+            # -- not worth it for a clause in a message. Word it so it stays true either way:
+            # "any resting bracket", not "the resting bracket", so a reader does not take it as
+            # proof one was actually there to cancel.
+            after = (" after any resting bracket was cancelled" if has_levels else "")
             decision, reason = "failed", (
                 f"the venue rejected the sell for {reduction.product_id}{after}: {result.reason}"
             )
@@ -5388,19 +5451,35 @@ def test_the_cycle_never_asks_reduce_to_confirm() -> None:
                             reason)
     ```
 
-  - On `placed`:
+  - On `placed` (`order_id = result.order_id`, bound here once so every read below -- the
+    proposal update, the `confirmation` stamp, `book_exit`, and the CRITICAL log inside the
+    LEDGER tail below -- can just say `order_id` rather than reaching back into `result`):
     - update the proposal: `decision="placed"`, `order_id`;
     - stamp `orders.confirmation = "confirm_sells"` with `repo.update_order(order_id, confirmation="confirm_sells")`, so a reader can tell which gate released it (spec §3.8);
     - when the order is `filled`, call `streak.book_exit(repo, config, product_id=..., exit_order=repo.get_order(order_id), sold_qty=streak.observed_sold_qty(order) or intent.qty, is_dca=None, now_ts=now_ts)`.
-    - **Re-bracket the remainder, exactly as `scale_out` does (#883).** `if protecting_remainder:`
-      call `bracket_order_id = place_bracket(broker, repo, config, product_id=reduction.product_id,
-      qty=remainder, stop=stop, target=target, rule_name=reduction.reason, now_ts=now_ts,
+    - **Re-bracket the remainder, exactly as `scale_out` does (#883), but sized from what the
+      LEDGER actually still holds after `book_exit`, not from the pre-sale `remainder` above
+      (held question, #887 follow-up).** `if protecting_remainder:` re-read the ledger now that
+      `book_exit` has posted -- `still_held_qty = sum((p["qty"] for p in
+      repo.get_open_positions(reduction.product_id)), Decimal("0"))` -- then call
+      `bracket_order_id = place_bracket(broker, repo, config, product_id=reduction.product_id,
+      qty=still_held_qty, stop=stop, target=target, rule_name=reduction.reason, now_ts=now_ts,
       rule_id=rule_id)`
       AFTER `book_exit`, for the same reason `scale_out` books before it re-places: the sweep
       that would otherwise heal from the crash-ledger record sizes a healing bracket off the
-      `positions` ledger, which `book_exit` is what shrinks. `place_bracket` clears
-      `unbracketed:<product>` on success and re-writes it (unchanged) on failure or veto,
-      logging CRITICAL either way (its own existing contract; nothing new needed here).
+      `positions` ledger, which `book_exit` is what shrinks. **This deliberately differs from
+      `scale_out`'s own re-bracket call, which sizes `qty=remainder` -- the PRE-SALE number
+      (`executor.py:2589`).** `scale_out` may do that safely because what it books and what it
+      predicts can never disagree: `_book_scale_out` always books the ORDERED `qty` outright,
+      never a short fill. `reduce`'s confirm branch is not that simple -- it books through
+      `streak.book_exit` with `sold_qty=streak.observed_sold_qty(order) or intent.qty` (the
+      bullet above), so a short-filled partial leg is an outcome this path already expects.
+      Bracketing at the stale, smaller pre-sale `remainder` would leave the unsold excess of a
+      short-filled partial leg naked with no record -- reading the ledger's own post-`book_exit`
+      qty here closes that gap the same way the LEDGER tail below closes it for a short-filled
+      FULL close. `place_bracket` clears `unbracketed:<product>` on success and re-writes it
+      (unchanged) on failure or veto, logging CRITICAL either way (its own existing contract;
+      nothing new needed here).
       **Repoint the surviving tranche at the new bracket (#883 round 3).** When
       `bracket_order_id is not None`, mirror `scale_out`'s own choreography exactly
       (`executor.py:2614`): `for position in repo.get_open_positions(reduction.product_id):
@@ -5411,7 +5490,11 @@ def test_the_cycle_never_asks_reduce_to_confirm() -> None:
       every cycle even though a bracket really is resting. When `not protecting_remainder` (a
       full close, or a DCA tranche that was never bracketed), skip the re-bracket AND the
       repoint entirely -- there is nothing to re-place, and `place_bracket` for a zero or
-      unprotected remainder has no meaning.
+      unprotected remainder has no meaning. `test_883_a_partial_confirmed_leg_re_brackets_the_remainder_like_scale_out`
+      still holds under this change: its leg is an ordinary full fill (`FakeBroker`, not the
+      short-filling one), so `still_held_qty`, read after `book_exit`, equals the pre-sale
+      `remainder` (0.001) exactly -- the test asserts `open_stop`/`open_target` and resting
+      counts, nothing that would distinguish the two sources of the bracket's size.
     - **#887: what happens next must come from the LEDGER, not from the pre-sale
       `protecting_remainder`/`remainder` arithmetic above -- mirror `agent._handle_exits`'s own
       tail exactly (`agent.py:950-987`), the same bookkeeping its own EXIT path already does
@@ -5437,36 +5520,52 @@ def test_the_cycle_never_asks_reduce_to_confirm() -> None:
       - **Elif `protecting_remainder`** -- the re-bracket branch above already owns this case in
         full: `place_bracket` re-wrote or cleared `unbracketed:<product>` on its own existing
         contract, and the tranche was repointed at the new bracket. Nothing further runs here.
-      - **Else** -- `protecting_remainder` was `False` (the pre-sale math expected this leg to
-        close the position outright, so no re-bracket was attempted above), yet `still_held` is
-        non-empty: the venue short-filled what was meant to be the full-close SELL (#446).
-        `book_exit` reduced the tranche rather than closing it, but the crash-ledger record
-        `_confirm_then_cancel` wrote before the cancel still describes the PRE-SALE numbers (a
-        zero remainder, or nothing at all when `has_levels` was false) -- stale either way, and
-        the retry record for a naked remainder must never simply disappear. Rewrite it from
-        what the ledger actually still holds, and log CRITICAL, exactly as
-        `agent._handle_exits` does for its own short-filled exit (`agent.py:950-974`):
+      - **Elif `has_levels and remainder <= 0`** -- `protecting_remainder` was `False` while
+        `has_levels` is `True`; with `still_held` already known non-empty (the first arm above
+        already took the empty case), the only way both of those hold at once is
+        `remainder <= 0` -- this leg was meant to be a bracketed FULL close, and the venue
+        instead filled it SHORT (#446). `book_exit` reduced the tranche rather than closing it,
+        but the crash-ledger record `_confirm_then_cancel` wrote before the cancel still
+        describes the PRE-SALE number (a zero remainder) -- stale, and the retry record for a
+        naked remainder must never simply disappear. Rewrite it from what the ledger actually
+        still holds, and log CRITICAL, exactly as `agent._handle_exits` does for its own
+        short-filled exit (`agent.py:950-974`), simplified because this arm's own guard already
+        proves levels exist -- no `if stop is not None and target is not None:` needed, and
+        `stop`/`target` are the same values read at the top of this function (`open_stop:`/
+        `open_target:` are untouched between there and here on this arm: `place_bracket` is
+        never called when `protecting_remainder` is `False`, so nothing could have changed
+        them):
 
         ```python
-        stop = repo.get_state(f"open_stop:{reduction.product_id}")
-        target = repo.get_state(f"open_target:{reduction.product_id}")
         naked_qty = sum((p["qty"] for p in still_held), Decimal("0"))
-        if stop is not None and target is not None:
-            repo.set_state(f"{UNBRACKETED_PREFIX}{reduction.product_id}",
-                           {"stop": stop, "target": target, "qty": naked_qty})
+        repo.set_state(f"{UNBRACKETED_PREFIX}{reduction.product_id}",
+                       {"stop": stop, "target": target, "qty": naked_qty})
         log_event(logger, logging.CRITICAL, "executor.reduce_left_an_unprotected_remainder",
                   product=reduction.product_id, order_id=order_id, remainder=str(naked_qty),
-                  healable=stop is not None and target is not None,
+                  healable=True,
                   detail="the venue filled this sleeve sell SHORT: part of the position is "
                          "still held, its protective bracket was cancelled to place the sale, "
                          "and nothing is resting at the exchange for it right now. The "
-                         "position state is retained so the next cycle can re-place from it; "
-                         "if `healable` is false there are no recorded levels and a human "
-                         "must close or protect the remainder")
+                         "position state is retained so the next cycle can re-place from it")
         ```
+      - **Else** -- `has_levels` is `False`. This is a DCA tranche, or any other holding that
+        never had a bracket, still (partly or wholly) held after the sale -- whether because
+        this leg was always an ordinary partial sale of it, filled in full as ordered, or
+        because the venue happened to short-fill it too. Either way nothing here was ever
+        protected, so the sale leaves nothing LESS protected than it already was: **no
+        CRITICAL, no crash-ledger write.** (#890: the defect this arm exists to fix. The prior
+        shape reached this branch on `not protecting_remainder` alone, with no `has_levels`
+        check -- true for EVERY partial sale of an unbracketed product, not only a short-filled
+        one, so an ordinary confirmed partial sale of a plain DCA tranche logged a false
+        CRITICAL `executor.reduce_left_an_unprotected_remainder` and a false `unbracketed:`
+        record for a position that was never bracketed to begin with. Splitting the prior
+        single `else` into the `has_levels` arm above and this one is the fix --
+        `test_887_a_partial_sale_of_an_unbracketed_dca_tranche_logs_no_critical`, Task 18.1 Step
+        1, pins it.)
 
-        `position_rule:` is left untouched on this path -- the product is still held, so
-        whatever owns it keeps owning it; only the fully-out branch above ever retires it.
+        `position_rule:` is left untouched on either of these last two arms -- the product is
+        still held, so whatever owns it keeps owning it; only the fully-out branch above ever
+        retires it.
 - [ ] **Step 4: Run the tests, the invariants and the suite, then commit.**
 
 ### Task 18.2: `keel dca {distribute,trim,exit} --confirm <proposal-id>`, one gate function and one capability row
@@ -5516,22 +5615,29 @@ def test_window_and_typed_yes_place_one_leg_and_link_the_proposal(deployment, mo
 ])
 def test_paper_rules_and_kind_mismatches_are_refused(deployment, monkeypatch, broker,
                                                      status, verb, needle):
+    """R35/#890: a refusal `_confirm_sale` raises before `reduce` is ever called is still exit
+    1, the same as a `declined`/`failed` `ReduceResult` -- `click.ClickException` all the way
+    down, so `exit_code` alone never tells a caller which kind of refusal this was."""
     monkeypatch.setattr(_common, "_is_interactive", lambda: True)
     _repo(deployment[0]).set_sells_window(True, now_ts=0, expires_ts=int(time.time()) + 3_600)
     pid = _seed_firing(deployment, status)
     result = _confirm(deployment, verb, pid, input="yes\n")
-    assert result.exit_code != 0 and needle in result.output and broker.place_calls == []
+    assert result.exit_code == 1 and needle in result.output and broker.place_calls == []
 
 
 def test_a_proposal_that_no_longer_fires_places_nothing(deployment, monkeypatch, broker):
+    """R35/#890: this refusal never reaches `reduce` at all -- `_confirm_sale` catches it first
+    -- but it still exits 1 via `click.ClickException`, exactly as a `ReduceResult.decision` of
+    `declined` or `failed` would."""
     monkeypatch.setattr(_common, "_is_interactive", lambda: True)
     repo = _repo(deployment[0])
     repo.set_sells_window(True, now_ts=0, expires_ts=int(time.time()) + 3_600)
     pid = _seed_firing(deployment, "live")
     repo._conn.execute("UPDATE rules SET params = json_set(params, '$.min_price_floor', '1e12')")
     repo._conn.commit()
-    out = _confirm(deployment, "distribute", pid, input="yes\n").output
-    assert f"proposal #{pid} no longer fires on the current book" in out
+    result = _confirm(deployment, "distribute", pid, input="yes\n")
+    assert result.exit_code == 1
+    assert f"proposal #{pid} no longer fires on the current book" in result.output
     assert broker.place_calls == []
 
 
@@ -5565,7 +5671,7 @@ def test_a_venue_rejected_sale_exits_1_and_says_failed_not_declined(deployment, 
   - `_confirm_sale` re-evaluates the proposal against the current book and rails (spec §3.5): it loads the rule by `proposal.rule_id`, rebuilds the `Holding` and the candles, and calls `reduce_signal`.
   - It then calls `executor.reduce(..., execution="confirm", confirm_fn=lambda p: sleeve_sale_gate(proposal, p))` with a live broker from `_build_broker`.
   - It renders `render_proposal` and the venue preview before the typed gate.
-  - **Exit codes (R35).** `placed` returns normally (exit 0). Any other `ReduceResult.decision` -- `declined` or `failed` -- raises `click.ClickException(f"{result.decision}: {result.reason}")`, so both exit 1 and the message leads with the decision word. Do not mint a new exit code for `failed`: the reason text already names the step that failed (Task 18.1's `reason` strings), and the retry record and CRITICAL log carry the state.
+  - **Exit codes (R35, extended #890).** `placed` returns normally (exit 0). Any other `ReduceResult.decision` -- `declined` or `failed` -- raises `click.ClickException(f"{result.decision}: {result.reason}")`, so both exit 1 and the message leads with the decision word. The same applies to every refusal `_confirm_sale` raises BEFORE it ever calls `reduce` -- the proposal no longer firing on the current book, a rule/verb kind mismatch, a `paper` rule refused up front -- each via its own `click.ClickException`, so `--confirm` exits 1 on every non-`placed` outcome regardless of whether `reduce` was reached. Do not mint a new exit code for `failed`, or for any pre-`reduce` refusal: the reason text already names the step that failed (Task 18.1's `reason` strings, or `_confirm_sale`'s own message), and the retry record and CRITICAL log carry the state.
   - The capability row:
 
 ```python
