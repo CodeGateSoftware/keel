@@ -260,9 +260,9 @@ product can hold both `dca` tranches and tranches opened by whichever rule curre
 which rule opened it, so a `Reduction`'s FIFO consumption can span a `dca` tranche and a
 non-`dca` one — on PAXG, for example, tranche 3 (turtle, §2.3) is the oldest row, so a
 `Reduction` that also reaches a DCA tranche consumes both. `streak.book_exit` as it exists today
-takes **one** `is_dca` bool for the whole call (`streak.py:179-259`), the same shape
-`_handle_exits` and `_book_paper_exit` use, deriving it from `positions[0]["rule_name"]` only
-(`agent.py:752`) — so calling it unchanged from `_handle_reductions` would book a mixed-tranche
+takes **one** `is_dca` bool for the whole call (`streak.py:179-259`). Its callers each pass a
+single flag: `_handle_exits` derives it from the owning rule (`is_dca = owning_rule.name == "dca"`,
+`agent.py:929`), and `_book_paper_exit` from `positions[0]["rule_name"]` (`agent.py:752`) — so calling it unchanged from `_handle_reductions` would book a mixed-tranche
 Reduction with a single flag, wrong for whichever tranche it does not match. **This design
 therefore extends `book_exit`'s `is_dca` parameter to accept `None`**, meaning "derive per leg
 from each consumed row's own `rule_name`" (each `position.get("rule_name") == "dca"`, the same
@@ -582,7 +582,9 @@ catch-up sale after a drawdown gate lifts is exactly the sale the gate exists to
 **Gates and audit.** §3.5 verbatim: `preview` records and notifies; `keel dca distribute
 --confirm <proposal-id>` places one at a TTY; `execution: auto` plus `keel autonomy on --sells`
 places unattended. Every proposal, placed or not, is a `sell_proposals` row; every fill is an
-`orders` row with `rule_kind="reverse_dca"` and a `trade_outcomes` row with `is_dca=1`.
+`orders` row with `rule_kind="reverse_dca"` and `trade_outcomes` rows booked per leg through
+`book_exit(is_dca=None)` (§3.2): `is_dca=1` for each DCA tranche consumed, `is_dca=0` for any
+non-`dca` tranche FIFO reaches (PAXG tranche 3, for example).
 
 **CLI.** `keel rules add --kind reverse_dca --product BTC-USD --params '{"cadence_days": 30,
 "target_usd": 100, "min_price_floor": 60000}'` writes a `candidate` row, validated by
@@ -607,7 +609,8 @@ the fallback; never a `Reduction` above `holding.qty − floor_qty`; no carry-fo
 daily candles; `describe()`/`build_rule_from_params` round trip; `rules add` refuses
 `target_usd ≤ 0`, `cadence_days ≤ 0`, a floor above the current close is *allowed* (it is a
 choice, not an error); the rule-conformance suite. Executor: `reduce` writes the proposal row and
-the order row, books FIFO with `is_dca=1`, respects rail 2 slicing, refuses when `available_base`
+the order row, books FIFO per leg with `is_dca=None` (a DCA leg books 1, a non-`dca` leg books 0 —
+tested on a mixed PAXG sleeve), respects rail 2 slicing, refuses when `available_base`
 is zero (rail 21). Sim: `sim.portfolio_sim._process_dca_signals` gains the reverse path, and
 `report.accumulation_table`'s `DcaSleeve` gains `distributed_usd`, `units_sold`,
 `realised_pnl`, `sell_fees`; a pinned run on gapless candles reproduces a hand computation; a
@@ -866,6 +869,6 @@ encodes (this repository keeps its rules in neighbouring docstrings).
 | Q7 | Does the exit monitor cover PAXG tranche 3? | **Yes, on transitions only.** The 2026-09-22 decision holds the position; it does not stop the level being reported when it changes state. No automatic sell. |
 | Q8 | Is a rebalancing trim a permitted sale kind under rail 10? | **Yes, as `band_rebalance`**, if it is ever built; not built now (§5). |
 | Q9 | Spend accumulation policy's 4th trial on a profit-take arm now? | **Not now.** The design is written so it can be pre-registered the day the operator wants it. |
-| Q10 | Is a sleeve sale a DCA outcome for rail 16? | **Yes, for a `Reduction`**, once `book_exit`'s per-leg `is_dca` derivation (§3.2, a required change in §11 PR 2) ships: each tranche a Reduction consumes is booked from its own `rule_name`, so a distribution can never trip the streak breaker even on a mixed sleeve. Before that change, `book_exit` has only the single-flag derivation `_handle_exits`/`_book_paper_exit` use, and a Reduction spanning a `dca` and a non-`dca` tranche would mis-book the mismatched leg the same way. Not true, and out of this design's scope, for `_handle_exits`'s pre-existing whole-position EXIT on a mixed-ownership product: it keeps one `is_dca` flag for the whole exit (§2.4, §3.2, #860), so a non-`dca` rule's exit on a product that also holds DCA tranches still books those units as a non-DCA outcome. Fixing that path is out of this design's scope but is a present-day gap, not one this design creates. |
+| Q10 | Is a sleeve sale a DCA outcome for rail 16? | **Yes, for a `Reduction`**, once `book_exit`'s per-leg `is_dca` derivation (§3.2, a required change in §11 PR 2) ships: each tranche a Reduction consumes is booked from its own `rule_name`, so a DCA-owned leg never counts toward the streak breaker. A non-`dca` leg that FIFO reaches (PAXG turtle tranche 3, the oldest row) is booked `is_dca=0`, and a loss on it **does** add to `consecutive_losses` — correctly, since it is a rule trade's outcome. An operator who wants distributions never to touch rule tranches sets `reverse_dca` to consume DCA tranches only (an open question for PR 3, default: FIFO across all tranches, booked honestly). Before that change, `book_exit` has only the single-flag derivation `_handle_exits`/`_book_paper_exit` use, and a Reduction spanning a `dca` and a non-`dca` tranche would mis-book the mismatched leg the same way. Not true, and out of this design's scope, for `_handle_exits`'s pre-existing whole-position EXIT on a mixed-ownership product: it keeps one `is_dca` flag for the whole exit (§2.4, §3.2, #860), so a non-`dca` rule's exit on a product that also holds DCA tranches still books those units as a non-DCA outcome. Fixing that path is out of this design's scope but is a present-day gap, not one this design creates. |
 | Q11 | Record a tax jurisdiction in config? | **Operator's call.** Without one, §8 stays a fee report; with one, lots are labelled and still nothing is advised. |
 | Q12 | Should a same-asset harvest (sell and buy back) ever be offered? | **No**, pending the fiqh finding in §8.3 being answered by someone entitled to answer it. |
