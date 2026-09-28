@@ -12,6 +12,14 @@ Trade, where every order pays the venue's fee. `monthly_buy_cap` reads the attes
 exactly as `keel/execution/guards.py` rail 14 does; `tests/commands/test_dca_plan.py` drives
 `guards.check` itself to prove the two agree.
 
+**DCA's aggregate bounds are rail 14 and available cash, not `max_exposure_usd`/
+`max_per_asset_pct` (#841/#853).** Rails 2 (per order), 3 (per day), 5 (correlated) and 13 (cash)
+still bind a DCA buy, and this plan checks the two rails it CAN evaluate offline: rail 3 (a
+BLOCKER: the busiest day every rule's cadence can coincide on, since `Dca.detect`'s scheduling
+carries no per-rule phase) and rail 5 (a WARNING: a per-buy above the correlated-size cap, using
+`guards.py`'s own `CORRELATED_SIZE_SCALE`/`UNCORRELATED_ASSETS`). Neither text may describe
+`max_exposure_usd` or `max_per_asset_pct` as a limit on DCA.
+
 **What this module never does:** promote, touch a `paper`/`live` row, or modify any existing rule.
 It writes `candidate` rows through `keel.commands.rules.add_rule_row` and nothing else.
 """
@@ -37,7 +45,10 @@ from keel.config import Config
 from keel.data.repository import Repository
 
 # Rail 1's own key function, as `keel/commands/rules.py` imports it: an existing rule's asset is
-# read the way the rails read it, so "already has a DCA rule" cannot disagree with them.
+# read the way the rails read it, so "already has a DCA rule" cannot disagree with them. Rail 5's
+# own constants (#853) so the correlated-size warning below computes the SAME cap the rail does,
+# never a re-typed copy that could drift from it.
+from keel.execution.guards import CORRELATED_SIZE_SCALE, UNCORRELATED_ASSETS
 from keel.execution.guards import _asset as _asset_of
 from keel.strategy.rules.dca import Dca
 
@@ -452,6 +463,22 @@ class DcaPlan:
     #: renderer reuses it verbatim rather than recomputing, so the display can never show a
     #: total larger than what was actually checked (R5's rule, extended to this figure by #847).
     worst_month_spend_usd: Decimal
+    #: R20 (#853): the busiest SINGLE DAY this plan's own buys can land on -- `Dca.detect`'s
+    #: scheduling rule (`epoch_day % cadence_days == 0`) has no per-rule phase/offset, so every
+    #: buy this plan schedules shares one cadence and therefore lands on the SAME days; the
+    #: worst single day for this plan alone is simply the sum of every planned `per_buy_usd`.
+    worst_day_cycle_usd: Decimal
+    #: R20: the total of every EXISTING `live` DCA rule's own per-buy amount (`budget_usd`, not
+    #: the average-month figure `existing_live_monthly_usd` shows). Because no rule's cadence
+    #: carries a phase either, a day exists where `epoch_day` is a multiple of every cadence
+    #: involved (e.g. their lcm) -- on it, this plan's rules AND every existing live rule buy at
+    #: once, whatever their individual cadences are.
+    existing_live_daily_usd: Decimal
+    #: `worst_day_cycle_usd + existing_live_daily_usd` -- the figure the rail 3 (per-day cap)
+    #: blocker (R20) compares against `caps.max_per_day_usd`. Rail 3 counts EVERY BUY placed
+    #: that day, not just DCA, but this plan only knows about DCA rules -- so this is a DCA-only
+    #: FLOOR on that day's total, and the blocker text says so rather than overclaiming.
+    worst_day_spend_usd: Decimal
     blockers: tuple[str, ...]
     warnings: tuple[str, ...]
 
@@ -582,6 +609,30 @@ def build_dca_plan(
             )
 
     live_rules = [rule for rule in universe.existing if rule.status == "live"]
+
+    # R20 (#853): rail 3 (`guards.py`'s per-day cap) counts EVERY BUY placed that day, and
+    # `Dca.detect`'s scheduling rule (`epoch_day % cadence_days == 0`) carries no per-rule phase
+    # or offset -- so a day exists where `epoch_day` is a multiple of every cadence involved (at
+    # worst, their lcm), and on it EVERY rule -- this plan's own buys and every existing LIVE DCA
+    # rule -- lands at once, regardless of how their individual cadences differ. The worst single
+    # day is therefore simply the sum of every planned per-buy plus every live rule's own per-buy
+    # (`budget_usd`, its per-hit amount -- not the average-month figure `live_monthly` computes
+    # below). This plan only knows about DCA rules, so the blocker is phrased as a DCA-only floor
+    # on that day's total, never a claim about the whole day's spend.
+    worst_day_cycle = sum((b.per_buy_usd for b in buys), Decimal("0"))
+    existing_live_daily = sum((rule.budget_usd for rule in live_rules), Decimal("0"))
+    worst_day_spend = worst_day_cycle + existing_live_daily
+    if worst_day_spend > config.caps.max_per_day_usd:
+        blockers.append(
+            "the busiest day every rule's cadence can coincide on -- no cadence carries a "
+            "phase, so a day exists where every rule buys at once -- would spend "
+            f"{_usd(worst_day_spend)} in DCA buys alone ({_usd(worst_day_cycle)} from this "
+            f"plan's own buys plus {_usd(existing_live_daily)} from {len(live_rules)} existing "
+            f"live DCA rule(s)); that exceeds caps.max_per_day_usd "
+            f"{_usd(config.caps.max_per_day_usd)} (rail 3), which counts every BUY placed that "
+            "day, not just DCA"
+        )
+
     live_monthly = sum(
         (_cents_down(rule.budget_usd * MONTH_DAYS / rule.cadence_days) for rule in live_rules),
         Decimal("0"),
@@ -626,6 +677,22 @@ def build_dca_plan(
             "month buy can be vetoed below the full-month figure shown"
         )
 
+    # R21 (#853): rail 5 (correlation-adjusted sizing) halves the per-order cap for a correlated
+    # asset WHILE another correlated asset already has exposure open (`guards.py`'s
+    # `CORRELATED_SIZE_SCALE`/`UNCORRELATED_ASSETS` -- imported, never re-typed, so this cannot
+    # drift from the rail). A plan has no live exposure to check, so a per-buy above that cap is
+    # a WARNING, not a blocker: it only ever binds conditionally, and names the asset(s) it would
+    # bind for.
+    correlated_cap = config.caps.max_per_order_usd * CORRELATED_SIZE_SCALE
+    for buy in buys:
+        if buy.asset not in UNCORRELATED_ASSETS and buy.per_buy_usd > correlated_cap:
+            warnings.append(
+                f"{buy.asset}'s per-buy {_usd(buy.per_buy_usd)} exceeds the correlated-size cap "
+                f"{_usd(correlated_cap)} (rail 5: max_per_order_usd x {CORRELATED_SIZE_SCALE}) -- "
+                "this only binds while another correlated asset already has exposure open, so it "
+                "may never veto a buy in practice, but a buy this large risks it"
+            )
+
     return DcaPlan(
         inputs=inputs,
         spend_usd=spend,
@@ -644,6 +711,9 @@ def build_dca_plan(
         worst_month_buy_days=worst_days,
         worst_month_cycle_usd=worst_month_cycle,
         worst_month_spend_usd=worst_month_spend,
+        worst_day_cycle_usd=worst_day_cycle,
+        existing_live_daily_usd=existing_live_daily,
+        worst_day_spend_usd=worst_day_spend,
         blockers=tuple(blockers),
         warnings=tuple(warnings),
     )

@@ -763,6 +763,119 @@ def test_even_daily_pacing_is_stated(valid_config_path: Path) -> None:
     assert any("even_daily" in w for w in plan.warnings)
 
 
+# -- rail 3 (#853): the busiest day every rule's cadence can coincide on is a BLOCKER ------------
+
+
+def test_the_worked_examples_busiest_day_is_the_sum_of_its_own_buys(
+    valid_config_path: Path,
+) -> None:
+    """The worked example's per-cycle total ($41.39 + $31.04 + $31.04 = $103.47) is also the
+    busiest single day, since none of the plan's own buys carries a phase offset -- they all
+    land on the same days."""
+    plan = _plan(valid_config_path)
+    assert plan.worst_day_cycle_usd == Decimal("103.47")
+    assert plan.existing_live_daily_usd == Decimal("0")
+    assert plan.worst_day_spend_usd == Decimal("103.47")
+    assert plan.approvable, plan.blockers
+
+
+def test_a_busy_day_over_the_per_day_cap_is_a_named_blocker(valid_config_path: Path) -> None:
+    plan = _plan(
+        valid_config_path, caps=replace_caps(valid_config_path, max_per_day_usd=Decimal("100"))
+    )
+    assert not plan.approvable
+    (blocker,) = [b for b in plan.blockers if "rail 3" in b]
+    assert "103.47" in blocker and "100" in blocker
+
+
+def test_a_busy_day_exactly_at_the_per_day_cap_is_approvable(valid_config_path: Path) -> None:
+    """Boundary: exactly at the cap passes."""
+    plan = _plan(
+        valid_config_path,
+        caps=replace_caps(valid_config_path, max_per_day_usd=Decimal("103.47")),
+    )
+    assert not [b for b in plan.blockers if "rail 3" in b]
+    assert plan.approvable, plan.blockers
+
+
+def test_a_busy_day_one_cent_over_the_per_day_cap_blocks(valid_config_path: Path) -> None:
+    """Boundary: one cent over the cap blocks."""
+    plan = _plan(
+        valid_config_path,
+        caps=replace_caps(valid_config_path, max_per_day_usd=Decimal("103.46")),
+    )
+    assert [b for b in plan.blockers if "rail 3" in b]
+
+
+def test_existing_live_dca_rules_push_the_busy_day_over_the_cap(valid_config_path: Path) -> None:
+    """An existing live rule's OWN per-buy amount (its `budget_usd`) is counted toward the
+    busiest-day figure, on top of this plan's own $103.47: 103.47 + 200 = 303.47 > 300."""
+    repo = _repo()
+    _insert_dca(repo, "SOL-USD", "live", budget="200")
+    caps = replace_caps(valid_config_path, max_per_day_usd=Decimal("300"))
+    plan = _plan(valid_config_path, repo, caps=caps)
+    assert plan.existing_live_daily_usd == Decimal("200")
+    assert plan.worst_day_spend_usd == Decimal("303.47")
+    assert not plan.approvable
+    (blocker,) = [b for b in plan.blockers if "rail 3" in b]
+    assert "303.47" in blocker and "300" in blocker and "1 existing" in blocker
+
+
+def test_a_disabled_or_candidate_dca_rule_does_not_count_toward_the_busy_day(
+    valid_config_path: Path,
+) -> None:
+    """Only LIVE rows spend real money on a cadence hit -- a candidate row is inert, matching
+    R7's `live_rules` filter."""
+    repo = _repo()
+    _insert_dca(repo, "SOL-USD", "candidate", budget="200")
+    caps = replace_caps(valid_config_path, max_per_day_usd=Decimal("300"))
+    plan = _plan(valid_config_path, repo, caps=caps)
+    assert plan.existing_live_daily_usd == Decimal("0")
+    assert plan.worst_day_spend_usd == Decimal("103.47")
+
+
+def test_rail3_blocker_does_not_claim_dca_is_the_whole_days_spend(valid_config_path: Path) -> None:
+    """Rail 3 counts every BUY that day, not just DCA -- the blocker must say so, not imply DCA
+    is the only spend rail 3 sees."""
+    plan = _plan(
+        valid_config_path, caps=replace_caps(valid_config_path, max_per_day_usd=Decimal("100"))
+    )
+    (blocker,) = [b for b in plan.blockers if "rail 3" in b]
+    assert "DCA" in blocker and "not just DCA" in blocker
+
+
+# -- rail 5 (#853): a per-buy above the correlated-size cap is a WARNING, naming the asset -------
+
+
+def test_a_correlated_per_buy_over_the_correlated_size_cap_is_a_named_warning(
+    valid_config_path: Path,
+) -> None:
+    from keel.execution.guards import CORRELATED_SIZE_SCALE
+
+    plan = _plan(valid_config_path, budget="1000", buffer="0", cap="2000")
+    correlated_cap = Decimal("100") * CORRELATED_SIZE_SCALE  # conftest's max_per_order_usd: 100
+    btc = next(b for b in plan.buys if b.asset == "BTC")
+    eth = next(b for b in plan.buys if b.asset == "ETH")
+    paxg = next(b for b in plan.buys if b.asset == "PAXG")
+    assert btc.per_buy_usd > correlated_cap
+    assert eth.per_buy_usd > correlated_cap
+    assert paxg.per_buy_usd > correlated_cap  # over the cap too, but PAXG is uncorrelated (gold)
+
+    warned_assets = {"BTC" for w in plan.warnings if "correlated-size cap" in w and "BTC" in w} | {
+        "ETH" for w in plan.warnings if "correlated-size cap" in w and "ETH" in w
+    }
+    assert warned_assets == {"BTC", "ETH"}
+    assert not any("PAXG" in w and "correlated-size cap" in w for w in plan.warnings)
+    assert plan.approvable, plan.blockers
+
+
+def test_no_correlated_size_warning_when_every_per_buy_is_under_the_cap(
+    valid_config_path: Path,
+) -> None:
+    plan = _plan(valid_config_path)  # the worked example: BTC $41.39 < correlated cap $50
+    assert not [w for w in plan.warnings if "correlated-size cap" in w]
+
+
 # -- the terminal renderer, with rail 14's wording pinned (Task 4) -------------------------------
 
 
