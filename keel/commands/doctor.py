@@ -1547,9 +1547,8 @@ def ledger_drift_findings(
             WARN,
             f"{len(drifted)} product(s) where the ledger and the orders log disagree",
             detail + " -- a filled entry with no tranche (#799) or an unbooked sale",
-            "inspect the console's Positions view and `keel orders list`; record a missing "
-            "tranche, or declare an out-of-band close (`keel positions close <id>` once #798 "
-            "ships)",
+            "inspect the console's Positions view and `keel orders list`; record the missing "
+            "tranche or the out-of-band close by hand (#798 tracks a command for it)",
             products=tuple(product for product, _, _ in drifted),
         )
     ]
@@ -1626,8 +1625,9 @@ def venue_drift_findings(
             "; ".join(text for _, text in drifted)
             + " -- an out-of-band sale or transfer (#798), or a venue holding never observed; "
             "the rails still count what the ledger says",
-            "check the venue's holding; declare an out-of-band close with `keel positions close "
-            "<id>` once #798 ships, or let a live cycle record the holding if none is observed",
+            "check the venue's holding; if it was sold or moved out of band, record the close "
+            "by hand (#798 tracks a command for it); if no holding is observed, let a live "
+            "cycle record one",
             products=tuple(product for product, _ in drifted),
         )
     ]
