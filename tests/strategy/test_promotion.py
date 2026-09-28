@@ -1152,3 +1152,16 @@ def test_should_demote_mirrors_the_floors_in_r() -> None:
     no_r.avg_win_r = None
     no_r.avg_loss_r = None
     assert should_demote(no_r, cfg) is True
+
+
+def test_sleeve_sell_is_recognised_and_is_never_a_backtest_floor() -> None:
+    """Plan R10: the conformance test reads `RECOGNISED_CLASSES`, so a sleeve-sell rule is not
+    flagged as a typo'd class -- and it never reaches `floor_for_class`, because a rule that has
+    no R must never be judged by a trade floor (P12 routes it to its own gate)."""
+    from keel.strategy import promotion
+
+    assert promotion.SLEEVE_SELL == "sleeve_sell"
+    assert promotion.RECOGNISED_CLASSES == frozenset(
+        {promotion.DEFAULT_CLASS, promotion.TREND_FOLLOW, promotion.SLEEVE_SELL}
+    )
+    assert promotion.SLEEVE_SELL not in promotion._CLASS_FLOORS

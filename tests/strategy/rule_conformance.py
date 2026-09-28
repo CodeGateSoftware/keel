@@ -240,9 +240,12 @@ class RuleConformanceTests:
         therefore not fail to promote; it would promote against the WRONG floor, forever,
         with nothing in the path ever saying so. This test is what makes that typo a failure
         here instead of a live floor quietly misapplied.
+
+        Read from `promotion.RECOGNISED_CLASSES` (plan R10), not from the floors table: a class
+        with its own gate (`sleeve_sell`) is recognised without having a floor.
         """
         rule = self.rule()
-        known: set[Any] = {promotion.DEFAULT_CLASS} | set(promotion._CLASS_FLOORS)
+        known: set[Any] = set(promotion.RECOGNISED_CLASSES)
         assert rule.promotion_class in known, (
             f"{rule.name}: promotion_class {rule.promotion_class!r} is not one of {sorted(known)} "
             f"-- floor_for_class() would silently apply the default floor instead"

@@ -227,3 +227,46 @@ class TestRule:
         rule = _TrivialRule()
         rule.rule_id = 7
         assert rule.rule_id == 7
+
+
+# --- the sell side's contract (#857, plan Task 5.2) ------------------------------------------
+
+
+def test_reduce_is_an_action() -> None:
+    assert Action.REDUCE.value == "REDUCE"
+
+
+def test_every_registered_rule_proposes_no_reduction_by_default() -> None:
+    """Adding the hook changes nothing for the rules that exist: every kind in the registry
+    inherits `reduce_signal`'s `None`, even over a real holding with candles in hand."""
+    from keel.agent import RULE_REGISTRY, build_rule_from_params
+    from keel.strategy.reduction import Holding, Lot, SellCosts
+
+    costs = SellCosts(Decimal("0.012"), Decimal("0.0005"), "fallback:config.fees.taker_pct")
+    holding = Holding(
+        "BTC-USD",
+        (Lot(1, "dca", 0, Decimal("0.001"), Decimal("100000"), Decimal("0.45")),),
+        mark=Decimal("120000"),
+    )
+    candles = {
+        Granularity.ONE_DAY: [
+            Candle(
+                ts=86_400 * i,
+                open=Decimal("100"),
+                high=Decimal("101"),
+                low=Decimal("99"),
+                close=Decimal("100"),
+                volume=Decimal("1"),
+            )
+            for i in range(30)
+        ]
+    }
+    kinds = sorted(RULE_REGISTRY)
+    assert len(kinds) >= 6, kinds
+    proposals = {
+        kind: build_rule_from_params(kind, {"product_id": "BTC-USD"}).reduce_signal(
+            holding, candles, costs
+        )
+        for kind in kinds
+    }
+    assert proposals == dict.fromkeys(kinds)
