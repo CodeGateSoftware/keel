@@ -9,6 +9,8 @@ from __future__ import annotations
 
 from decimal import Decimal
 
+import pytest
+
 from keel.data.db import connect, migrate
 from keel.data.repository import Repository
 from keel.execution import streak
@@ -229,3 +231,106 @@ def test_a_position_without_entry_fee_context_still_records() -> None:
         now_ts=NOW,
     )
     assert repo.get_trade_outcomes()[0]["pnl_net"] == Decimal("-1")
+
+
+# --- book_exit(is_dca=None): each FIFO leg by its own tranche (#857, #860; plan R9) ----------
+
+
+def _mixed_paxg(repo: Repository) -> None:
+    """PAXG's real shape: turtle tranche 3 is the OLDEST row, a DCA tranche sits behind it."""
+    repo.open_position(
+        product_id="PAXG-USD",
+        rule_name="turtle_breakout",
+        opened_at=1,
+        qty=Decimal("0.0132"),
+        entry_fill=Decimal("4673.23"),
+        entry_fee=Decimal("0.73"),
+    )
+    repo.open_position(
+        product_id="PAXG-USD",
+        rule_name="dca",
+        opened_at=2,
+        qty=Decimal("0.01"),
+        entry_fill=Decimal("4400"),
+        entry_fee=Decimal("0.40"),
+    )
+
+
+_PAXG_EXIT = {"id": 99, "actual_fill": Decimal("4300"), "fee": Decimal("0.20")}
+
+
+def test_a_mixed_paxg_sale_books_each_leg_by_its_own_tranche() -> None:
+    """#860 / spec Q10: FIFO reaches turtle tranche 3 first. With `is_dca=None` the turtle leg
+    is a RULE outcome (it counts toward rail 16) and the DCA leg is not. Both legs lose here, so
+    a single falsy flag would count two losses, not one."""
+    repo, config = _repo(), _config()
+    repo.set_state("consecutive_losses", 0)
+    _mixed_paxg(repo)
+
+    streak.book_exit(
+        repo,
+        config,
+        product_id="PAXG-USD",
+        exit_order=_PAXG_EXIT,
+        sold_qty=None,
+        is_dca=None,
+        now_ts=NOW,
+    )
+
+    outcomes = repo.get_trade_outcomes()
+    assert [(o["rule_name"], o["is_dca"]) for o in outcomes] == [
+        ("turtle_breakout", False),
+        ("dca", True),
+    ]
+    assert all(o["pnl_net"] < 0 for o in outcomes), "both legs lose; only one may count"
+    assert repo.get_state("consecutive_losses") == 1, "only the turtle loss counts"
+
+
+def test_a_partial_none_sale_stopping_inside_the_dca_tranche_books_only_the_turtle_leg() -> None:
+    """The leg the sale stops INSIDE is carried, not booked -- whatever its derived flag."""
+    repo, config = _repo(), _config()
+    repo.set_state("consecutive_losses", 0)
+    _mixed_paxg(repo)
+
+    streak.book_exit(
+        repo,
+        config,
+        product_id="PAXG-USD",
+        exit_order=_PAXG_EXIT,
+        sold_qty=Decimal("0.015"),
+        is_dca=None,
+        now_ts=NOW,
+    )
+
+    assert [(o["rule_name"], o["is_dca"]) for o in repo.get_trade_outcomes()] == [
+        ("turtle_breakout", False)
+    ]
+    [left] = repo.get_open_positions("PAXG-USD")
+    assert (left["rule_name"], left["qty"]) == ("dca", Decimal("0.0082"))
+    assert repo.get_state("consecutive_losses") == 1
+
+
+@pytest.mark.parametrize("flag", [True, False])
+def test_a_bool_flag_still_books_every_leg_with_that_flag(flag: bool) -> None:
+    """R9: existing callers pass a bool and see today's behaviour exactly -- the caller's flag
+    on every leg, whatever each tranche's own `rule_name` says."""
+    repo, config = _repo(), _config()
+    repo.set_state("consecutive_losses", 0)
+    _mixed_paxg(repo)
+
+    streak.book_exit(
+        repo,
+        config,
+        product_id="PAXG-USD",
+        exit_order=_PAXG_EXIT,
+        sold_qty=None,
+        is_dca=flag,
+        now_ts=NOW,
+    )
+
+    outcomes = repo.get_trade_outcomes()
+    assert [(o["rule_name"], o["is_dca"]) for o in outcomes] == [
+        ("turtle_breakout", flag),
+        ("dca", flag),
+    ]
+    assert repo.get_state("consecutive_losses") == (0 if flag else 2)

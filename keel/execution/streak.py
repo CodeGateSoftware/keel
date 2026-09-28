@@ -183,7 +183,7 @@ def book_exit(
     product_id: str,
     exit_order: dict[str, Any],
     sold_qty: Decimal | None,
-    is_dca: bool,
+    is_dca: bool | None,
     now_ts: int,
 ) -> None:
     """Attribute a sale of `sold_qty` across `product_id`'s open tranches, OLDEST FIRST.
@@ -206,6 +206,17 @@ def book_exit(
 
     A product with no ledger rows records nothing rather than guessing an entry price -- the
     same refusal `record_closed_trade` makes for a tranche with no `entry_fill`.
+
+    **`is_dca=None` derives the flag PER LEG** from each consumed tranche's own `rule_name`
+    (`== "dca"`), the field `record_closed_trade` already copies onto the outcome row (spec
+    §3.2, Q10; #860). It exists for a sleeve sale (`executor.reduce`, plan P7), whose FIFO walk
+    can span a mixed-ownership product -- PAXG's oldest row is turtle tranche 3 -- so one flag
+    for the whole call would mis-book whichever leg it does not match: a DCA leg counted toward
+    rail 16's streak, or a rule leg exempted from it. A `bool` keeps today's behaviour exactly,
+    the caller's flag on every leg, and the existing callers (`agent._close_tranches`, for
+    `_handle_exits` and `_book_paper_exit`, and `executor.scale_out`) deliberately still pass
+    one: #860's
+    whole-position EXIT on a mixed product is a pre-existing gap this does not change.
     """
     positions = repo.get_open_positions(product_id)
     if not positions:
@@ -248,6 +259,7 @@ def book_exit(
             apportioned += fee_share
 
         if leg_qty >= position["qty"]:
+            leg_is_dca = (position.get("rule_name") == "dca") if is_dca is None else is_dca
             record_closed_trade(
                 repo,
                 config,
@@ -256,7 +268,7 @@ def book_exit(
                 exit_fill=exit_fill,
                 exit_qty=leg_qty,
                 fees=fee_share,
-                is_dca=is_dca,
+                is_dca=leg_is_dca,
                 now_ts=now_ts,
             )
             repo.close_position(position["id"], closed_at=now_ts)
