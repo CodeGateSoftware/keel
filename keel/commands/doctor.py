@@ -1449,6 +1449,11 @@ def unbooked_exit_findings(
       every time a position was de-risked, which is how a check gets ignored.
     * The SELL must be at or after `opened_at`. A sale that closed an EARLIER tranche says
       nothing about one opened after it, and the ledger is FIFO so the ordering is meaningful.
+    * A DECLARED close (`order_type = 'out_of_band'`, `keel positions close <id>`, #798) is
+      EXCLUDED. It books the tranche the operator NAMED, in the same call that writes the row,
+      so it is booked by construction -- and it need not be the oldest: closing a newer lot by
+      hand leaves an older tranche open behind a later filled SELL, which is correct, and this
+      finding would otherwise WARN on it for as long as that tranche is held.
 
     Modes are pooled on purpose: paper is where this was found, but the invariant is not
     paper's -- `agent._open_tranche` writes the ledger for both, and an unbooked LIVE exit is
@@ -1458,9 +1463,15 @@ def unbooked_exit_findings(
     is lost is the EVIDENCE, and that is a state a human resolves by deciding whether to
     backfill, not a fault that should stop a cycle.
     """
+    # Lazy, like this module's other `keel.execution` imports: `positions_close` pulls in the
+    # executor, and importing doctor must not.
+    from keel.commands.positions_close import DECLARED_ORDER_TYPE
+
     sold_at_by_product: dict[str, list[int]] = {}
     for order in orders:
         if order.get("side") != "SELL" or order.get("status") != "filled":
+            continue
+        if order.get("order_type") == DECLARED_ORDER_TYPE:
             continue
         ts = order.get("created_at")
         if ts is None:
@@ -1547,8 +1558,10 @@ def ledger_drift_findings(
             WARN,
             f"{len(drifted)} product(s) where the ledger and the orders log disagree",
             detail + " -- a filled entry with no tranche (#799) or an unbooked sale",
-            "inspect the console's Positions view and `keel orders list`; record the missing "
-            "tranche or the out-of-band close by hand (#798 tracks a command for it)",
+            "inspect the console's Positions view and `keel orders list`: a filled entry with no "
+            "tranche needs its tranche recorded by hand (#799); a sale the orders log already "
+            "holds needs booking against its tranche by hand -- not `keel positions close`, "
+            "which would write a second SELL",
             products=tuple(product for product, _, _ in drifted),
         )
     ]
@@ -1625,8 +1638,8 @@ def venue_drift_findings(
             "; ".join(text for _, text in drifted)
             + " -- an out-of-band sale or transfer (#798), or a venue holding never observed; "
             "the rails still count what the ledger says",
-            "check the venue's holding; if it was sold or moved out of band, record the close "
-            "by hand (#798 tracks a command for it); if no holding is observed, let a live "
+            "check the venue's holding; if a tranche was sold on the venue by hand, record it "
+            "with `keel positions close <id> --price P`; if no holding is observed, let a live "
             "cycle record one",
             products=tuple(product for product, _ in drifted),
         )
@@ -1659,7 +1672,11 @@ def position_watch_findings(
       as well as product. A DCA tranche whose rule was demoted is unmanaged too: unmanaged
       inventory is unmanaged with or without a stop. Only ENTRY/EXIT rule kinds count: a
       `sleeve_sell` rule proposes and cannot exit, so it manages nothing (plan Review Focus 5; P9
-      adds the exclusion and its test).
+      adds the exclusion and its test). Its fix line names `keel positions close` only when
+      `managed_status != "paper"` (#902): `declared_close_target` refuses a declared close on
+      EVERY paper profile outright, so pointing a paper operator at that command sends them to a
+      write that can never succeed there -- the only real way out on paper is re-promoting the
+      rule.
     * `position.unprotected` -- an open tranche with a recorded `initial_stop > 0`, no resting
       bracket (`reconcile._has_resting_bracket`, passed in as `resting`), and no retry record.
       The third clause makes it the complement of the reconcile sweep, not a duplicate. DCA
@@ -1745,6 +1762,15 @@ def position_watch_findings(
 
     out: list[Finding] = []
     if unmanaged:
+        # `declared_close_target` refuses EVERY paper profile (#902): `keel positions close`
+        # cannot ever record a sale there, so a paper-profile fix line must not name it -- only
+        # the re-promote path applies when `managed_status == "paper"`.
+        unmanaged_fix = (
+            "re-promote the owning rule"
+            if managed_status == "paper"
+            else "re-promote the owning rule, or sell it on the venue and record that with "
+            "`keel positions close <id> --price P`"
+        )
         out.append(
             Finding(
                 "position.unmanaged",
@@ -1752,8 +1778,7 @@ def position_watch_findings(
                 f"{len(unmanaged)} open tranche(s) on a product with no {managed_status} rule",
                 _describe(unmanaged, levels=False)
                 + f" -- no {managed_status} rule evaluates these products, so no exit can fire",
-                "re-promote the owning rule, or close the tranche by hand "
-                "(`keel positions close <id>` once #798 ships)",
+                unmanaged_fix,
                 products=_products(unmanaged),
             )
         )

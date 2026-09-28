@@ -18,17 +18,18 @@ now is stronger than the one it replaced, and it is the one anyone actually care
   non-destructive steps -- so a first-run user on a machine with no terminal can create a
   deployment. "No POST at all" was a clean property that was also satisfied by a server which
   could not set anything up.
-* **Seven of the nine capability-increasing actions in `keel/capabilities.py` are unreachable
+* **Eight of the ten capability-increasing actions in `keel/capabilities.py` are unreachable
   from this package, and the other two are reachable only as the gate table declares them**,
   asserted by tests that scan this source rather than by inspection. The server cannot arm or
   spend, and it can release exactly two halts -- through `gates.TIER1_ACTIONS`, which holds the
   operations as REFERENCES so that the import and the call site are both visible to the scan. A
   dotted string would have been the one form no scan can see (#791).
 
-  Attesting, arming autonomy, rebasing the drawdown mark and replacing the binary remain
-  CLI-only, behind the TTY gate. The two halt releases are D3 (#436) arriving: a SECOND gate,
-  never a seam in the first -- `_is_interactive` is untouched and the CLI still needs a real
-  terminal. Nothing routes to the table yet; stage 2b wires `server.do_POST` to it.
+  Attesting, arming autonomy, rebasing the drawdown mark, declaring an out-of-band close and
+  replacing the binary remain CLI-only, behind the TTY gate. The two halt releases are D3 (#436)
+  arriving: a SECOND gate, never a seam in the first -- `_is_interactive` is untouched and the
+  CLI still needs a real terminal. Nothing routes to the table yet; stage 2b wires
+  `server.do_POST` to it.
 
   **Three scans, because the first one alone was hollow (#788).** It forbade this package from
   naming any `Capability.function` -- and those are the CLI COMMANDS, Click callbacks taking a
@@ -39,7 +40,7 @@ now is stronger than the one it replaced, and it is the one anyone actually care
 
   So the effects are scanned too, DERIVED from what each gated command actually calls rather than
   from a hand-written map that would go stale the way `capabilities.py` exists to prevent. And
-  because four of the nine do their work through a generic `repo.set_state(...)` that no
+  because four of the ten do their work through a generic `repo.set_state(...)` that no
   derivation can tell from any other write, a third scan states the posture directly: **this
   package calls none of the repository's writers.** `keel serve` reads. Everything it can change
   goes through `keel.commands.setup.ACTIONS`, which lives outside this package.

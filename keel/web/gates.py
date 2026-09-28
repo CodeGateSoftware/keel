@@ -1,4 +1,4 @@
-"""The browser gate: two of the nine capability-increasing actions, and what releases them.
+"""The browser gate: two of the ten capability-increasing actions, and what releases them.
 
 `keel/capabilities.py` has said since it was written that "#436's browser gate would be a second
 `Gate` here and a second value in `Capability.gate` -- which is the point of writing the

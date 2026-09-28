@@ -79,7 +79,7 @@ born inside the fence rather than moved into one later. Six walls:
    boundaries, then split on hyphens/underscores/spaces — so `armAutonomy`, `re-arm` and
    `arm_now` all expose the token `arm`), against `arm`, `release`, `resume`, `spend`,
    `attest`, `promote`, `update`, `reset`, `record`, `withdraw`, `autonomy`, `kill`, `trade`,
-   `execute`, `order_create`, `submit`, `place`. A description is what a model reads before
+   `execute`, `order_create`, `submit`, `place`, `close`. A description is what a model reads before
    choosing a tool; it must not advertise a write.
 2. **A registry mapping.** No `keel/mcp/*.py` references any #453 capability row's
    `module.function` — the gated actions are unreachable by name, not merely uncalled. And

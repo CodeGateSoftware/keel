@@ -803,6 +803,27 @@ def test_an_unbooked_LIVE_exit_warns_too() -> None:
     assert finding.status == "warn"
 
 
+def test_a_declared_close_of_a_newer_tranche_does_not_warn_on_the_older_one() -> None:
+    """`keel positions close <id>` (#798) books the tranche it NAMES, not FIFO: an operator who
+    sold their newest lot by hand closes that one, and the older tranche is still held. Its
+    `out_of_band` SELL is booked in the same call that writes it, so it is never an unbooked
+    exit -- and reading it as one would WARN on every older tranche the product still holds."""
+    (finding,) = unbooked_exit_findings(
+        [_tranche()], [_sell(mode="live", order_type="out_of_band")]
+    )
+    assert finding.status == "ok"
+
+
+def test_an_executed_sale_behind_the_same_tranche_still_warns() -> None:
+    """The exemption is the declared row's TYPE, not its mode or product: an ordinary filled
+    live SELL beside it is still read."""
+    (finding,) = unbooked_exit_findings(
+        [_tranche()],
+        [_sell(mode="live", order_type="out_of_band"), _sell(id=12, mode="live")],
+    )
+    assert finding.status == "warn"
+
+
 # -- ledger/venue balance drift (#667) -----------------------------------------------------------
 
 
@@ -1697,3 +1718,20 @@ def test_gather_findings_stays_read_only_with_venue_drift_to_report(
 
     assert conn.total_changes == before, "gather_findings wrote to the database"
     assert finding.products == ("BTC-USD",)
+
+
+def test_importing_doctor_does_not_import_the_executor() -> None:
+    """Doctor's `keel.execution` imports are lazy, inside the functions that need them: doctor is
+    shared with `keel mcp` and pinned read-only, and the order paths should not even be loaded by
+    asking it a question. Checked in a fresh interpreter, where nothing else has imported them."""
+    import subprocess
+    import sys
+
+    program = (
+        "import sys, keel.commands.doctor; "
+        "print('keel.execution.executor' in sys.modules, 'keel.agent' in sys.modules)"
+    )
+    out = subprocess.run(
+        [sys.executable, "-c", program], capture_output=True, text=True, check=True
+    ).stdout.split()
+    assert out == ["False", "False"]

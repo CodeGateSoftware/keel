@@ -21,7 +21,7 @@ as deliberate. #541 deleted the TUI and the console layer that was reachable onl
 and those four rows went with their call sites. `mirrors` stays on the dataclass: it describes a
 shape this registry must be able to express the moment a second front-end gates anything again.
 
-**Seven of the nine capability increases in this build are a CLI command run by a person at a
+**Eight of the ten capability increases in this build are a CLI command run by a person at a
 terminal, and the browser can perform none of those.** That is not a property of what the client
 draws -- "a client that hides a button is not a gate" -- it is a property of the server, which
 implements no verb that would reach one, asserted by scans over `keel/web/`'s own source.
@@ -94,7 +94,7 @@ BROWSER = Gate(
 #: **`BROWSER` is a SECOND gate and never a seam in the first.** `_is_interactive` is untouched,
 #: still has no env-var or flag override, and every CLI path still requires a real terminal. Two
 #: kinds of evidence for one fact -- a human, present, who meant this -- and the browser's kind
-#: is admitted for two actions out of nine.
+#: is admitted for two actions out of ten.
 GATES: tuple[Gate, ...] = (TTY, BROWSER)
 
 
@@ -211,6 +211,18 @@ CAPABILITIES: tuple[Capability, ...] = (
             "that until a human attested the account is cash-only spot. No venue exposes this "
             "field for spot (#666), so this statement is the ONLY thing that can release the "
             "rail, and nothing can check it"
+        ),
+    ),
+    Capability(
+        module="keel.commands.positions_close",
+        function="positions_close_gate",
+        surface="cli",
+        invocation="keel positions close <id> --price P",
+        increases=(
+            "a tranche keel still counts is recorded as sold out-of-band, so rails 4/5/6 stop "
+            "counting its notional -- measured exposure SHRINKS, which is headroom for new "
+            "entries. Nothing is placed; the operator is vouching for a sale the venue already "
+            "made, and a wrong `--price` books a wrong P&L row into rail 16's streak"
         ),
     ),
     Capability(
