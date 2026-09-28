@@ -47,7 +47,10 @@
   - a documented `_migrate_vNN_*` function that is idempotent via `PRAGMA table_info` or `IF NOT EXISTS`, with no backfill;
   - an entry in `_MIGRATIONS`;
   - a bump to `SCHEMA_VERSION`;
-  - tests in `tests/data/test_migrations.py`. The literal `== 21` (or `== db.SCHEMA_VERSION == 21`) is pinned in **eight** tests, not one: `test_fresh_database_is_stamped_at_the_current_version` (line 52), `test_v14_migration_bumps_the_stored_version` (627), `test_v15_migration_bumps_the_stored_version` (788), `test_an_existing_orders_table_gains_the_submit_book_by_ALTER` (890), `test_migration_to_v20_adds_the_columns_and_the_new_tables` (1050), `test_v19_database_gains_v20_columns_as_NULL_no_backfill` (1097), `test_v20_on_a_pre_v11_chain_does_not_duplicate_columns` (1168) and `test_a_v20_database_gains_rule_id_as_NULL_no_backfill` (1316). Every one of these relaxes to `stamped == db.SCHEMA_VERSION` (or `version == db.SCHEMA_VERSION`), because a database that migrates to head no longer lands on 21 once v22 exists. P6 Task 1 relaxes all eight in one step, and its own new v22 assertions are written against `db.SCHEMA_VERSION`, not the literal `22`, so P17's v23 bump does not repeat this exact break.
+  - tests in `tests/data/test_migrations.py`. The literal `== 21` (or `== db.SCHEMA_VERSION == 21`) is pinned in **eight** tests there, not one: `test_fresh_database_is_stamped_at_the_current_version` (line 52), `test_v14_migration_bumps_the_stored_version` (627), `test_v15_migration_bumps_the_stored_version` (788), `test_an_existing_orders_table_gains_the_submit_book_by_ALTER` (890), `test_migration_to_v20_adds_the_columns_and_the_new_tables` (1050), `test_v19_database_gains_v20_columns_as_NULL_no_backfill` (1097), `test_v20_on_a_pre_v11_chain_does_not_duplicate_columns` (1168) and `test_a_v20_database_gains_rule_id_as_NULL_no_backfill` (1316). Every one of these relaxes to `stamped == db.SCHEMA_VERSION` (or `version == db.SCHEMA_VERSION`), because a database that migrates to head no longer lands on 21 once v22 exists. P6 Task 1 relaxes all eight in one step, and its own new v22 assertions are written against `db.SCHEMA_VERSION`, not the literal `22`, so P17's v23 bump does not repeat this exact break.
+  - **Two more pins live outside `test_migrations.py`** (found by `grep -rn "SCHEMA_VERSION == 21" tests/` across the whole tree, which turns up exactly these two beyond the eight above — `tests/research/test_spread.py`'s `MONTHLY_BLOCK == 21` and `tests/mcp/test_tools.py`'s `len(...) == 21` are unrelated constants, not schema pins):
+    - `tests/data/test_db.py:110`, inside `test_schema_version_is_21` (line 106): `assert SCHEMA_VERSION == 21`. Its own docstring reads "Deliberate tripwire: bump this literal consciously on every schema change" — it is meant to go red on every bump, not to be relaxed. P6 Task 1 renames it to `test_schema_version_is_22` and bumps the literal to `22`; P17 Task 1 renames it again to `test_schema_version_is_23` and bumps it to `23`.
+    - `tests/data/test_trade_outcomes.py:42`, inside `test_schema_is_at_version_21`: `assert version == db.SCHEMA_VERSION == 21`. Unlike the tripwire, this one is an ordinary version-parity check with no docstring calling for a conscious bump, so P6 Task 1 relaxes it the same way as the eight above (`version == db.SCHEMA_VERSION`) and renames it to `test_schema_is_at_the_current_version` so the name doesn't go stale the next time the version moves.
 - **Commit trailer.** Every commit message ends with `Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>`. Every PR body ends with `🤖 Generated with [Claude Code](https://claude.com/claude-code)`.
 - **The spec's file names are wrong in one place.** `book_exit` lives in `keel/execution/streak.py`, not `keel/streak.py`.
 
@@ -255,9 +258,9 @@ Each ruling is stated as `what — why — cost if wrong`.
 - **R33** (added in review round 1, #882). `guards._open_exposure_by_asset` (Task 4.0) contributes zero notional for any PRODUCT whose net filled quantity is `<= 0`, instead of its net notional, regardless of the prices the closing legs traded at.
   - Why: the function nets BUY/SELL **notional**, which is the right figure for a position still partly held. It is the wrong figure for one closed in full at a different price than its entry: PAXG tranche 3 closed at a real loss (4673.23 -> 4400) leaves a $3.61 notional residual that is not exposure, because zero units are held. Left unfixed, P4's own acceptance test cannot pass and #798's phantom exposure survives any loss-making close, declared or ordinary.
   - Cost if wrong: exposure rails 4/5/6 could under- or over-state a closed product's contribution to its asset bucket. The fix only changes behaviour when a product's net qty is `<= 0`; every still-open product nets by notional exactly as before, pinned by `test_a_partial_close_still_nets_by_notional`.
-- **R34** (added in review round 1, #883). `executor.reduce`'s confirm branch (Task 18.1) asks the typed-yes gate BEFORE it cancels the resting protective bracket, by wrapping the caller's `confirm_fn` rather than calling `_clear_resting_bracket` directly ahead of `_run_order`. A leg that does not close the position in full re-brackets the remainder afterward, via `place_bracket`, the same choreography `scale_out` (#502) uses.
-  - Why: the original draft cancelled the bracket unconditionally before `_run_order` (and therefore before the human's answer, which `_run_order` asks internally). A decline, or no TTY, left a stopped tranche naked at the exchange with no `unbracketed:` record -- the cancel had already happened and nothing said so. `execute()`'s own EXIT path has the same ordering today (pre-existing, out of scope here); `reduce()` is new code and need not repeat it.
-  - Cost if wrong: a declined or failed confirm now leaves the bracket resting rather than cancelled, which is the safe direction; a partial confirmed sale is followed by a second `place_bracket` call the venue must accept, the same call `scale_out` already makes routinely.
+- **R34** (added in review round 1, #883; refined in round 2). `executor.reduce`'s confirm branch (Task 18.1) asks the typed-yes gate BEFORE it cancels the resting protective bracket, by wrapping the caller's `confirm_fn` rather than calling `_clear_resting_bracket` directly ahead of `_run_order`. A leg that does not close the position in full re-brackets the remainder afterward, via `place_bracket`, the same choreography `scale_out` (#502) uses. The crash-ledger `unbracketed:<product>` record that protects a mid-flight cancel/re-bracket is written INSIDE that same wrapped closure, after `confirm_fn` returns true and before the cancel it guards -- not earlier -- so a decline writes nothing there to leave stale.
+  - Why: the original draft cancelled the bracket unconditionally before `_run_order` (and therefore before the human's answer, which `_run_order` asks internally). A decline, or no TTY, left a stopped tranche naked at the exchange with no `unbracketed:` record -- the cancel had already happened and nothing said so. `execute()`'s own EXIT path has the same ordering today (pre-existing, out of scope here); `reduce()` is new code and need not repeat it. Round 1's fix reordered the cancel correctly but still wrote the crash-ledger record unconditionally, before the confirm gate ran -- round 2 found the three `test_883_*` tests could not pass as drafted: the record was never cleared on a decline, the fixture never seeded a filled BUY order for `_held_position` to find (so `protecting_remainder` was always false), and the placement counts omitted the SELL leg's own `_run_order` call. All three are fixed in Task 18.1: the record moves inside `_confirm_then_cancel`, `_bracketed` seeds a matching filled BUY order, and the two placement tests count 2 and 3 calls, not 1 and 2.
+  - Cost if wrong: a declined or failed confirm now leaves the bracket resting rather than cancelled, which is the safe direction; a partial confirmed sale is followed by a second `place_bracket` call the venue must accept, the same call `scale_out` already makes routinely. Had round 2's three issues gone unfixed, the tests meant to prove R34 would themselves not pass, so the ruling would be undemonstrated rather than wrong.
 
 ---
 
@@ -756,6 +759,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 - It returns exactly two findings, named `position.unmanaged` and `position.unprotected`. Each is `OK` or `WARN`, never `FAIL`, and has `products` populated when it warns (#642).
 - `all_rules` is every rule row regardless of status, not only `live` ones. #811's first acceptance bullet requires `position.unmanaged`'s WARN to name "the rule's current status" (e.g. `paper`) for the product it warns about, and a rule that owns a demoted tranche is, by definition, no longer `live` -- so the function cannot both filter its input to `live` and report the status of a row that filtering just removed. The `live`-only membership test still decides WHO is managed; a second lookup over the same `all_rules` list finds each unmanaged product's most recent rule (by `id`, if more than one rule ever named the product) to name its status, or reports "no rule" when none ever did.
 - `managed_status` is keyword-only, defaults to `"live"`, and is the status string that counts as "actively managed". A paper profile's engine promotes to `status="paper"`, never `"live"` (`agent.py`'s own `rule_status = "paper" if config.auto_trade.mode == "paper" else "live"`, line ~1700), so `get_rules("live")` -- and, before this fix, the hardcoded `"live"` comparison below -- is empty on every paper deployment, and every open paper tranche would WARN as unmanaged. `doctor.py`'s wiring (Step 4) passes `managed_status="paper"` on a paper profile.
+- **`position.unprotected` is skipped entirely (reported `OK`, no `products`) when `managed_status == "paper"`.** `_open_tranche` (`keel/agent.py:329`) records `initial_stop=signal.setup.stop` for a paper entry exactly as it does for a live one (`agent.py:2112`, both the paper and live branches of `_handle_entries` converge on the same `_open_tranche` call below the `if result.placed:` guard) -- but `_paper_enter` (`agent.py:767`) never places a bracket, so `result.bracket_order_id` stays `None` on every paper fill, and `_has_resting_bracket` (`reconcile.py:471`) returns `False` whenever `position["bracket_order_id"] is None`, before it ever reads an order. `reconcile_unbracketed_positions`, the only writer of an `unbracketed:` retry record, is driven off `reconcile_open_orders`'s broker poll and is never run for a paper cycle (`agent.py`'s own comment: "LIVE cycles only: paper entries place no exchange-side brackets"), so `retry_products` is always empty on paper too. Every clause `position.unprotected` tests (`initial_stop` set, not resting, no retry record) is therefore true of every stopped PAPER tranche by construction, not by exception -- there is no exchange-side bracket for a paper fill to ever have, so the finding has nothing true to say on a paper profile and is skipped rather than made to WARN forever.
 
 - [ ] **Step 1: Write the failing tests.**
 
@@ -858,6 +862,32 @@ def test_a_product_with_no_rule_at_all_names_that_in_the_status() -> None:
     found = _by_name(position_watch_findings([PAXG_TRANCHE_3], [], lambda p: True, set()))
     assert found["position.unmanaged"].status == WARN
     assert "no rule" in found["position.unmanaged"].detail
+
+
+def test_unprotected_is_skipped_on_a_paper_profile() -> None:
+    """#881, 4th finding: a paper fill never has a bracket to rest, so `resting` is always False
+    and there is never a retry record -- the exact same tranche this module WARNs on for a live
+    profile is normal on a paper one, every cycle. `managed_status="paper"` is how the caller
+    tells this function it is looking at a paper profile (`doctor.py`'s own wiring derives it
+    from `config.auto_trade.mode`), so the same signal that already fixes `position.unmanaged`
+    also has to silence `position.unprotected`."""
+    found = _by_name(
+        position_watch_findings(
+            [PAXG_TRANCHE_3], [PAXG_PAPER_TURTLE_RULE], lambda p: False, set(),
+            managed_status="paper",
+        )
+    )
+    assert found["position.unprotected"].status == OK
+    assert found["position.unprotected"].products == ()
+
+
+def test_unprotected_still_warns_on_a_live_profile_with_the_same_shape() -> None:
+    """Control for the test above: the paper skip must not silence the live-profile WARN this
+    finding exists for in the first place (#811's PAXG tranche 3 fixture)."""
+    found = _by_name(
+        position_watch_findings([PAXG_TRANCHE_3], [PAXG_PAPER_TURTLE_RULE], lambda p: False, set())
+    )
+    assert found["position.unprotected"].status == WARN
 ```
 
 - [ ] **Step 2: Run the tests to see them fail.** Run: `uv run pytest tests/commands/test_doctor_position_watch.py -v`. Expected: FAIL with `ImportError: cannot import name 'position_watch_findings'`.
@@ -888,7 +918,12 @@ def position_watch_findings(
     * `position.unprotected` -- an open tranche with a recorded `initial_stop > 0`, no resting
       bracket (`reconcile._has_resting_bracket`, passed in as `resting`), and no retry record.
       The third clause makes it the complement of the reconcile sweep, not a duplicate. DCA
-      (`initial_stop` absent) is excluded for the reason the sweep skips it silently.
+      (`initial_stop` absent) is excluded for the reason the sweep skips it silently. SKIPPED
+      ENTIRELY (reported `OK`) when `managed_status == "paper"` (#881): a paper fill never gets
+      a bracket (`_paper_enter` places none), so `resting` is always False, and paper never
+      writes an `unbracketed:` retry record either (`reconcile_unbracketed_positions` only runs
+      on live cycles) -- every clause here is unconditionally true for every stopped paper
+      tranche, so without the skip this finding WARNs on every one of them, always.
 
     WARN, never FAIL: holding spot without a stop can be a human's choice (PAXG since
     2026-09-22). What was wrong is that nobody was told, and FAIL would halt cycles over a state
@@ -908,7 +943,10 @@ def position_watch_findings(
     `rule_status = "paper" if config.auto_trade.mode == "paper" else "live"`), and never writes
     a `"live"` row, so a paper deployment calling this with the default would find `managed`
     permanently empty and WARN `position.unmanaged` on every open tranche it holds -- correctly
-    managed rules and all. The caller passes `managed_status="paper"` there.
+    managed rules and all. The caller passes `managed_status="paper"` there. The same value is
+    the paper-profile signal `position.unprotected` reads (#881): `managed_status == "paper"`
+    means the caller is looking at a paper deployment, and that is reason enough on its own to
+    skip a finding whose every input clause a paper tranche satisfies unconditionally.
     """
     managed = {
         str((row.get("params") or {}).get("product_id"))
@@ -920,7 +958,7 @@ def position_watch_findings(
         status_by_product[str((row.get("params") or {}).get("product_id"))] = str(row.get("status"))
 
     unmanaged = [p for p in open_positions if str(p["product_id"]) not in managed]
-    unprotected = [
+    unprotected = [] if managed_status == "paper" else [
         p
         for p in open_positions
         if (p.get("initial_stop") or 0) > 0
@@ -973,6 +1011,9 @@ def position_watch_findings(
                 products=_products(unprotected),
             )
         )
+    elif managed_status == "paper":
+        out.append(Finding("position.unprotected", OK, "paper fills place no exchange bracket "
+                           "by design; skipped (#881)", "-", "-"))
     else:
         out.append(Finding("position.unprotected", OK, "every stopped tranche is protected or "
                            "being retried", "-", "-"))
@@ -1000,7 +1041,7 @@ def position_watch_findings(
 
   Add a test to `tests/commands/test_doctor.py` beside the existing change-counter read-only test. The new test runs `gather_findings` on a repo seeded with PAXG tranche 3, and asserts the two names are present and that the change counter is unchanged.
 
-  **Add a paper-profile test.** `tests/commands/test_doctor.py`'s own `gather_findings` tests already build their repo with `_seeded_repo(tmp_path / "keel.db")` and their config with `load_config(valid_config_path)` (both defined/imported at the top of that file). Seed a repo with an open tranche (`repo.open_position(...)`) and a `status="paper"` rule for the same product (never `"live"`), take `config = load_config(valid_config_path)` and derive a paper config from it with `dataclasses.replace(config, auto_trade=dataclasses.replace(config.auto_trade, mode="paper"))` (`AutoTradeConfig`/`Config` are both frozen dataclasses, `packages/keel-core/keel_core/config.py`). Assert `gather_findings(repo, paper_config, [], now_ts)` reports `position.unmanaged` as `OK`. Before this fix (`managed_status` hardcoded to `"live"`), the same fixture WARNs; the test must fail red for that reason first.
+  **Add a paper-profile test.** `tests/commands/test_doctor.py`'s own `gather_findings` tests already build their repo with `_seeded_repo(tmp_path / "keel.db")` and their config with `load_config(valid_config_path)` (both defined/imported at the top of that file). Seed a repo with an open tranche carrying `initial_stop=Decimal("90000")` and `bracket_order_id=None` (`repo.open_position(...)`, matching what a paper fill actually writes -- see #881 above) and a `status="paper"` rule for the same product (never `"live"`), take `config = load_config(valid_config_path)` and derive a paper config from it with `dataclasses.replace(config, auto_trade=dataclasses.replace(config.auto_trade, mode="paper"))` (`AutoTradeConfig`/`Config` are both frozen dataclasses, `packages/keel-core/keel_core/config.py`). Assert `gather_findings(repo, paper_config, [], now_ts)` reports BOTH `position.unmanaged` and `position.unprotected` as `OK`. Before this fix, `position.unmanaged` WARNs (`managed_status` hardcoded to `"live"`) and, separately, `position.unprotected` WARNs too (the tranche has a stop, no bracket, and no retry record, and nothing before #881's fix knew it was looking at paper) -- the test must fail red on both counts first, and stay green on both after.
 
 - [ ] **Step 5: Run the tests, run `--json`, then commit.**
   - Run: `uv run pytest tests/commands/test_doctor_position_watch.py tests/commands/test_doctor.py -q`. Expected: PASS.
@@ -2158,6 +2199,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 **Files:**
 - Modify: `keel/data/db.py`: add the DDL after `positions`, `_migrate_v22_sell_proposals`, `_MIGRATIONS[22]`, and `SCHEMA_VERSION = 22`. Add `sell_proposals` to the module docstring's table list.
 - Test: `tests/data/test_migrations.py`. Append the v22 tests, and relax **all eight** `== 21` assertions (lines 52, 627, 788, 890, 1050, 1097, 1168, 1316 — see Global Constraints). All eight share the exact literal `== db.SCHEMA_VERSION == 21` (`assert version == db.SCHEMA_VERSION == 21` at line 52, `assert stamped == db.SCHEMA_VERSION == 21` at the other seven), so `sed -i '' 's/== db\.SCHEMA_VERSION == 21/== db.SCHEMA_VERSION/' tests/data/test_migrations.py` fixes all eight in one pass. Confirm with `grep -n '== 21' tests/data/test_migrations.py` that no hit remains.
+- Also modify `tests/data/test_db.py` (bump the deliberate tripwire) and `tests/data/test_trade_outcomes.py` (relax the ordinary pin) — see Global Constraints for why these two are treated differently. Confirm afterward with `grep -rn "SCHEMA_VERSION == 21\|schema_version_is_21" tests/` that the only remaining `21` literal in a schema-version context is the one this task deliberately leaves for P17 to bump (there is none — P6 leaves the tripwire at `22`).
 
 **Interfaces:**
 - Produces: the `sell_proposals` columns `id, ts, product_id, rule_id, rule_kind, rule_status, qty, expected_price, vwae, cost_basis, expected_gross, expected_fee, fee_source, expected_net_pnl, legs, trigger, rails, decision, superseded_by, order_id, reviewed_ts`.
@@ -2199,13 +2241,33 @@ def test_v22_is_idempotent() -> None:
     db.migrate(conn)
 ```
 
-- [ ] **Step 2: Run the tests to see them fail.** Run: `uv run pytest tests/data/test_migrations.py -k v22 -v`. Expected: FAIL. The table is absent, and `SCHEMA_VERSION == 21`. Then run the full file, `uv run pytest tests/data/test_migrations.py -q`: the eight tests pinned to the literal `21` (lines 52, 627, 788, 890, 1050, 1097, 1168, 1316) fail too, once `SCHEMA_VERSION` becomes 22 below — that is expected, and Step 3 relaxes them in the same commit.
+- [ ] **Step 2: Run the tests to see them fail.** Run: `uv run pytest tests/data/test_migrations.py -k v22 -v`. Expected: FAIL. The table is absent, and `SCHEMA_VERSION == 21`. Then run the full file, `uv run pytest tests/data/test_migrations.py -q`: the eight tests pinned to the literal `21` (lines 52, 627, 788, 890, 1050, 1097, 1168, 1316) fail too, once `SCHEMA_VERSION` becomes 22 below — that is expected, and Step 3 relaxes them in the same commit. Also run `uv run pytest tests/data/test_db.py -k schema_version -v` and `uv run pytest tests/data/test_trade_outcomes.py -k version -v`: both fail the same way (`SCHEMA_VERSION == 21` is now `22`) — Step 3 fixes both in the same commit.
 
 - [ ] **Step 3: Implement.** First relax the eight pre-existing `== 21` pins so the whole file can go green on v22, not just the new tests:
 
 ```bash
 sed -i '' 's/== db\.SCHEMA_VERSION == 21/== db.SCHEMA_VERSION/' tests/data/test_migrations.py
 grep -n '== 21' tests/data/test_migrations.py  # expect no output
+```
+
+  Then handle the two pins outside `test_migrations.py`, each differently (see Global Constraints):
+
+```bash
+# tests/data/test_db.py: the deliberate tripwire -- bump the literal, don't relax it, and
+# rename so the function name still matches the version it pins.
+sed -i '' \
+  -e 's/def test_schema_version_is_21/def test_schema_version_is_22/' \
+  -e 's/assert SCHEMA_VERSION == 21/assert SCHEMA_VERSION == 22/' \
+  tests/data/test_db.py
+
+# tests/data/test_trade_outcomes.py: an ordinary pin -- relax it like the eight above, and
+# rename it so it doesn't read as still asserting 21.
+sed -i '' \
+  -e 's/def test_schema_is_at_version_21/def test_schema_is_at_the_current_version/' \
+  -e 's/assert version == db\.SCHEMA_VERSION == 21/assert version == db.SCHEMA_VERSION/' \
+  tests/data/test_trade_outcomes.py
+
+grep -rn "SCHEMA_VERSION == 21\|schema_version_is_21\|schema_is_at_version_21" tests/  # expect no output
 ```
 
   Then add the DDL:
@@ -2258,10 +2320,10 @@ def _migrate_v22_sell_proposals(conn: sqlite3.Connection) -> None:
     """
 ```
 
-- [ ] **Step 4: Run the tests, the smoke test, then commit.** Run: `uv run pytest tests/data/test_migrations.py tests/test_migration_smoke.py tests/test_first_run_wizard.py tests/test_cli.py -k "migrat or schema" -q`. Expected: PASS.
+- [ ] **Step 4: Run the tests, the smoke test, then commit.** Run: `uv run pytest tests/data/test_migrations.py tests/data/test_db.py tests/data/test_trade_outcomes.py tests/test_migration_smoke.py tests/test_first_run_wizard.py tests/test_cli.py -k "migrat or schema" -q`. Expected: PASS.
 
 ```bash
-git add keel/data/db.py tests/data/test_migrations.py
+git add keel/data/db.py tests/data/test_migrations.py tests/data/test_db.py tests/data/test_trade_outcomes.py
 git commit -m "feat(db): v22 -- the sell_proposals table (#857)
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
@@ -2637,6 +2699,7 @@ from keel_broker_api.port import TradeScopeDenied
 from keel.execution import executor, guards, sleeve
 from keel.execution.guards import OrderIntent
 from keel.strategy.reduction import Holding, Lot, Reduction, SellCosts
+from keel.types import Side
 from tests.execution.test_executor import (  # noqa: F401
     NOW_TS, FakeBroker, NoNetworkBroker, _PreviewRefusingBroker, _config, repo,
 )
@@ -3483,37 +3546,53 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 
 ```python
 # added to tests/commands/test_doctor_position_watch.py's imports
+import dataclasses
+
 from keel.commands.doctor import gather_findings
 from keel.config import load_config
 from tests.commands.test_doctor import _seeded_repo
 
 
 def test_a_sleeve_sell_rule_does_not_count_as_managing_a_position(tmp_path, valid_config_path) -> None:
-    """A live reverse_dca on PAXG can only PROPOSE; #811's finding must still fire."""
+    """A live reverse_dca on PAXG can only PROPOSE; #811's finding must still fire.
+
+    #884: `valid_config_path` is `auto_trade.mode: paper` (`tests/conftest.py`). On that config,
+    `gather_findings` wires `managed_status="paper"`, and the PAXG rule this test inserts is
+    `status="live"` -- so it can NEVER count as managing PAXG-USD regardless of whether the
+    sleeve-sell exclusion exists: `position.unmanaged` WARNs either way, and the test cannot
+    tell Step 3's fix apart from no fix at all (it passes red-less, before the exclusion is
+    written). A LIVE config, derived from the fixture rather than swapping fixtures, makes the
+    inserted `status="live"` rule actually eligible to manage before the exclusion exists --
+    that is the red this test needs.
+    """
     repo = _seeded_repo(tmp_path / "keel.db")
     repo.open_position(product_id="PAXG-USD", rule_name="turtle_breakout", opened_at=1,
                        qty=Decimal("0.0132"), entry_fill=Decimal("4673.23"),
                        entry_fee=Decimal("0.73"), initial_stop=Decimal("4521.76"))
     repo.insert_rule("reverse_dca", {"product_id": "PAXG-USD", "target_usd": "10",
                                      "min_price_floor": "1"}, status="live")
-    config = load_config(valid_config_path)
+    paper_config = load_config(valid_config_path)
+    config = dataclasses.replace(
+        paper_config, auto_trade=dataclasses.replace(paper_config.auto_trade, mode="live")
+    )
     found = {f.name: f for f in gather_findings(repo, config, [], now_ts=10)}
     assert found["position.unmanaged"].status == WARN
 ```
 
-  `tests/commands/test_doctor.py` has no `_migrated_repo` or `_config` -- its `gather_findings` tests build the repo with `_seeded_repo(tmp_path / "keel.db")` and the config with `load_config(valid_config_path)` (both already defined/imported at the top of that file; `valid_config_path` is the same fixture parameter its other tests take). Import `_seeded_repo` and `load_config` from there rather than the names this snippet originally assumed.
+  `tests/commands/test_doctor.py` has no `_migrated_repo` or `_config` -- its `gather_findings` tests build the repo with `_seeded_repo(tmp_path / "keel.db")` and the config with `load_config(valid_config_path)` (both already defined/imported at the top of that file; `valid_config_path` is the same fixture parameter its other tests take). Import `_seeded_repo` and `load_config` from there rather than the names this snippet originally assumed. `AutoTradeConfig`/`Config` are frozen dataclasses (`packages/keel-core/keel_core/config.py`), the same shape P2's and P3's paper-profile tests already derive from with `dataclasses.replace`.
 
-- [ ] **Step 2: Run the test to see it fail.** Run: `uv run pytest tests/commands/test_doctor_position_watch.py -k sleeve -v`. Expected: FAIL (`OK`).
+- [ ] **Step 2: Run the test to see it fail.** Run: `uv run pytest tests/commands/test_doctor_position_watch.py -k sleeve -v`. Expected: FAIL -- `position.unmanaged` reports `OK`, because the reverse_dca rule's `status == "live"` still counts as managing PAXG-USD (no exclusion yet, and this test's LIVE config means that membership actually decides the outcome, unlike the pre-#884 version of this test).
 
-- [ ] **Step 3: Implement.** Filter the rule rows before the call:
+- [ ] **Step 3: Implement.** Filter the rule rows themselves by CLASS, not by status, before the call -- **#885: do not swap `repo.get_rules()` for `repo.get_rules("live")` here.** `repo.get_rules("live")` reverts round 1's P2 fix (#880/#881) two ways at once: a demoted rule (PAXG's rule 3, `status="paper"`) is dropped from the list entirely, so `position.unmanaged`'s WARN falls back to `"no rule"` instead of naming its status (#811 acceptance bullet 1); and on a paper profile, where `managed_status="paper"` but every rule the engine ever promotes also carries `status="paper"`, an all-`"live"` query returns nothing at all, so `managed` is permanently empty and every open paper tranche WARNs (#881's original bug, again). Both `status_by_product` and `managed` inside `position_watch_findings` need the FULL row set, of every status; only the SLEEVE_SELL-class rows should be missing from what this function receives, because those are the only rows this task means to make ineligible:
 
 ```python
-    live_managing = [
-        row for row in repo.get_rules("live")
-        if row["kind"] in agent.RULE_REGISTRY
-        and promotion.promotion_class_of(agent.RULE_REGISTRY[row["kind"]]) != promotion.SLEEVE_SELL
+    non_sell_rules = [
+        row for row in repo.get_rules()
+        if promotion.promotion_class_of(agent.RULE_REGISTRY.get(row["kind"])) != promotion.SLEEVE_SELL
     ]
 ```
+
+  `agent.RULE_REGISTRY.get(row["kind"])` returns `None` for a kind the registry does not recognise, and `promotion.promotion_class_of(None)` returns `DEFAULT_CLASS` (its own `getattr(rule, "promotion_class", DEFAULT_CLASS)` fallback) rather than raising -- so an unrecognised kind is kept, not silently dropped from `status_by_product`'s visibility the way `row["kind"] in agent.RULE_REGISTRY` would have dropped it. Pass `non_sell_rules` as the `all_rules` argument in place of the raw `repo.get_rules()` call already in `gather_findings` (P2 Task 2.1, Step 4); `managed_status=` stays exactly as P2 wired it, unchanged by this task.
 
   Update `position_watch_findings`' docstring: the "P9 adds the exclusion" sentence becomes present tense.
 
@@ -4620,7 +4699,7 @@ Merge P17 and P18 only when the operator decides to enable a confirmed sleeve sa
 
 **Files:**
 - Modify: `keel/data/db.py` (the `profile` DDL gains `sells_autonomous INTEGER NOT NULL DEFAULT 0` and `sells_until INTEGER`; add `_migrate_v23_profile_sells_window` with the `PRAGMA table_info` guard; set `SCHEMA_VERSION = 23`), `packages/keel-core/keel_core/types.py` (`Profile.sells_autonomous: bool = False`, `Profile.sells_until: int | None = None`, `is_autonomous_for_sells(now_ts) -> bool`), `keel/data/repository.py` (`get_profile` reads both; a new `set_sells_window(value, now_ts, expires_ts=None)` writes a `sells_window_set` audit event), `keel/data/audit.py` (`"sells_window_set": "profile"`)
-- Test: `tests/data/test_migrations.py`, `tests/core/test_types.py` (or wherever `Profile.is_autonomous` is tested; run `grep -rn "is_autonomous(" tests` to find it), `tests/data/test_repository.py`
+- Test: `tests/data/test_migrations.py`, `tests/core/test_types.py` (or wherever `Profile.is_autonomous` is tested; run `grep -rn "is_autonomous(" tests` to find it), `tests/data/test_repository.py`, `tests/data/test_db.py` (the deliberate tripwire — see Global Constraints and P6 Task 1, which last bumped it to 22)
 
 - [ ] **Step 1: Write the failing tests.**
 
@@ -4644,9 +4723,18 @@ def test_the_sells_window_lapses_like_autonomy() -> None:
     assert p.is_autonomous_for_sells(99) and not p.is_autonomous_for_sells(100)
 ```
 
-- [ ] **Step 2: Run the tests to see them fail** with `PYTHONPATH="$PWD:$PWD/packages/keel-core" uv run python -m pytest ...`.
+  Also bump the deliberate tripwire in `tests/data/test_db.py`, which P6 last left at 22:
+
+```bash
+sed -i '' \
+  -e 's/def test_schema_version_is_22/def test_schema_version_is_23/' \
+  -e 's/assert SCHEMA_VERSION == 22/assert SCHEMA_VERSION == 23/' \
+  tests/data/test_db.py
+```
+
+- [ ] **Step 2: Run the tests to see them fail** with `PYTHONPATH="$PWD:$PWD/packages/keel-core" uv run python -m pytest ...`. The new v23 tests fail for `AttributeError`/`is_autonomous_for_sells` reasons; `tests/data/test_db.py::test_schema_version_is_23` fails because `SCHEMA_VERSION` is still `22`.
 - [ ] **Step 3: Implement.** The migration docstring follows v7's reasoning: "no row means not armed ... seeding one would manufacture a consent record no human gave".
-- [ ] **Step 4: Run the tests, then commit.**
+- [ ] **Step 4: Run the tests, including `tests/data/test_db.py`, then commit.**
 
 ### Task 17.2: `keel autonomy on --sells`, `off`, and `show`
 
@@ -4757,8 +4845,36 @@ def test_a_declined_typed_gate_places_nothing(repo) -> None:  # noqa: F811
 def _bracketed(repo, broker, config, *, qty="0.002", stop="95000", target="130000"):
     """Open a position AND place a REAL resting protective bracket for it, via `place_bracket`
     itself -- the fixture `_clear_resting_bracket` actually has to cancel, not a hand-rolled
-    row. Returns the `Holding` `reduce` needs."""
+    row.
+
+    #883: `_held` alone only writes the `positions` ledger row `reduce`'s `holding` argument is
+    built from -- it inserts no `orders` row. But `reduce`'s remainder math (`protecting_remainder`
+    below, in Step 3) is computed from `_held_position` (`executor.py:897`), which reads FILLED
+    LIVE orders (`repo.get_orders(mode="live", ..., status="filled")`), not the `positions`
+    table. Without a matching filled BUY order, `_held_position` sees zero held, `remainder`
+    comes out negative, `protecting_remainder` is `False`, and nothing re-brackets -- not because
+    the code is wrong, but because the fixture never gave `_held_position` anything to find. So
+    this fixture seeds BOTH: the `positions` row (`_held`, for `holding_of`) and the FILLED BUY
+    order (for `_held_position`), at the same qty, the way a real filled entry would leave both
+    behind.
+
+    Returns the `Holding` `reduce` needs.
+    """
     holding = _held(repo, qty)
+    repo.insert_order(
+        dict(
+            mode="live",
+            product_id="BTC-USD",
+            side=Side.BUY.value,
+            order_type="market",
+            qty=D(qty),
+            limit_price=D("100000"),
+            status="filled",
+            fee=D("0.6"),
+            created_at=NOW_TS - 200,
+            updated_at=NOW_TS - 200,
+        )
+    )
     order_id = executor.place_bracket(broker, repo, config, product_id="BTC-USD", qty=D(qty),
                                       stop=D(stop), target=D(target), rule_name="turtle_breakout",
                                       now_ts=NOW_TS - 100)
@@ -4769,7 +4885,15 @@ def _bracketed(repo, broker, config, *, qty="0.002", stop="95000", target="13000
 def test_883_a_declined_confirm_leaves_the_resting_bracket_untouched(repo) -> None:  # noqa: F811
     """#883: `_clear_resting_bracket` used to run BEFORE the typed-yes gate, so a "no" (or no
     TTY) left a stopped tranche naked with no `unbracketed:` record -- the cancel had already
-    happened and nothing said so. The gate must be asked FIRST; the book is untouched on a no."""
+    happened and nothing said so. The gate must be asked FIRST; the book is untouched on a no.
+
+    Round 2: the retry record itself must not be written on a decline either. Step 3 writes it
+    only inside `_confirm_then_cancel`, AFTER `confirm_fn` returns True and BEFORE the cancel --
+    a decline returns out of that closure before that line runs, so nothing is ever written. (An
+    earlier draft wrote it unconditionally before the confirm gate ran at all, which failed this
+    exact assertion; see Step 3's docstring for why `reconcile._has_resting_bracket`, not the
+    sweep's `if not intent: continue`, is what would have made even that stale record harmless.)
+    """
     config = _config()
     broker = FakeBroker()
     _bracketed(repo, broker, config)
@@ -4800,9 +4924,11 @@ def test_883_a_partial_confirmed_leg_re_brackets_the_remainder_like_scale_out(re
                              confirm_fn=lambda preview: True)
     assert result.decision == "placed"
     assert broker.cancel_calls, "the original bracket had to be cancelled to sell against it"
-    # A NEW bracket for the remainder (0.001), at the SAME stop/target -- two `place_order`
-    # calls total: the original bracket (fixture setup) and the remainder's.
-    assert len(broker.place_calls) == 2
+    # Three `place_order` calls total: the original bracket (fixture setup), the SELL leg
+    # itself (`reduce`'s own `_run_order` call -- this is what makes `result.decision ==
+    # "placed"` true in the first place), and a NEW bracket for the remainder (0.001) at the
+    # SAME stop/target.
+    assert len(broker.place_calls) == 3
     assert repo.get_state("open_stop:BTC-USD") == D("95000")
     assert repo.get_state("open_target:BTC-USD") == D("130000")
     assert repo.get_state("unbracketed:BTC-USD") is None, "place_bracket clears it on success"
@@ -4823,9 +4949,9 @@ def test_883_a_full_close_does_not_attempt_to_re_bracket(repo) -> None:  # noqa:
                              rule_status="live", now_ts=NOW_TS, execution="confirm",
                              confirm_fn=lambda preview: True)
     assert result.decision == "placed"
-    # One `place_order` call total: the original bracket (fixture setup). No remainder, no
-    # second bracket.
-    assert len(broker.place_calls) == 1
+    # Two `place_order` calls total: the original bracket (fixture setup) and the SELL leg
+    # itself. No remainder, so no third call for a new bracket.
+    assert len(broker.place_calls) == 2
     resting = [o for o in repo.get_orders(mode="live", product_id="BTC-USD", status="pending")
               if o["side"] == "SELL"]
     assert resting == []
@@ -4859,7 +4985,10 @@ def test_the_cycle_never_asks_reduce_to_confirm() -> None:
 
   Keep the pre-P18 set under a new name, `RUN_ORDER_CALLERS_BEFORE_P18`. The P1 test keeps using `RUN_ORDER_CALLERS`.
 
-- [ ] **Step 2: Run the tests to see them fail.** The three `test_883_*` tests fail against the ORIGINAL ordering below with the fixture's bracket already cancelled (`broker.cancel_calls` non-empty) before `confirm_fn` is even consulted -- confirm that first, then implement the fix.
+- [ ] **Step 2: Run the tests to see them fail.** All of Step 1's tests fail with `AttributeError`/`TypeError` first (`executor.reduce` has no `execution=`/`confirm_fn=` branch yet -- P7 built preview only). Once the confirm branch exists but BEFORE it is built the way Step 3 describes, confirm each of the three `test_883_*` failure modes individually, in this order, so the fix that follows is proven necessary rather than assumed:
+  1. Against a NAIVE ordering that calls `_clear_resting_bracket` unconditionally before `_run_order` (the shape #883 originally flagged): all three `test_883_*` tests fail with the fixture's bracket already cancelled (`broker.cancel_calls` non-empty) before `confirm_fn` is even consulted.
+  2. Fix the ordering (wrap `confirm_fn` as Step 3 describes) but keep the crash-ledger write BEFORE the wrapped closure, unconditionally, as an earlier draft did: `test_883_a_declined_confirm_leaves_the_resting_bracket_untouched` now fails on its last assertion alone (`repo.get_state("unbracketed:BTC-USD") is None`) -- the write already ran before `confirm_fn` was ever called, so a decline never has anything to clear it.
+  3. With that also fixed (Step 3's actual code, write inside `_confirm_then_cancel` after the yes), the two placement tests still fail on their `place_calls` counts unless they account for the SELL leg's own `_run_order` placement, not just the bracket calls -- confirm this by counting `broker.place_calls` before asserting the fixed numbers (2 and 3, not 1 and 2).
 
 - [ ] **Step 3: Implement the confirm branch.** After a clean `guards.check`:
   - If `execution == "confirm"` and not `sleeve.sells_released(repo, now_ts)`, record `declined` and return.
@@ -4883,22 +5012,34 @@ def test_the_cycle_never_asks_reduce_to_confirm() -> None:
     target = repo.get_state(f"open_target:{reduction.product_id}")
     protecting_remainder = remainder > 0 and stop is not None and target is not None
 
-    # The crash ledger, BEFORE anything touches the exchange -- same key, same reason as
-    # `scale_out`/`_roll_stop` (#519's pattern). Written even before the confirm decision:
-    # if the process dies between a "yes" and the re-bracket below, the next cycle's sweep
-    # must still be able to heal the remainder. A decline or a failed cancel leaves the
-    # bracket resting, and the sweep's own `if not intent: continue` guard (#195) already
-    # skips any product whose bracket is still there, so a stale record here is harmless.
-    if protecting_remainder:
-        repo.set_state(f"{UNBRACKETED_PREFIX}{reduction.product_id}",
-                       {"stop": stop, "target": target, "qty": remainder})
-
     cancel_failed = False
 
     def _confirm_then_cancel(preview: Preview) -> bool:
         nonlocal cancel_failed
         if confirm_fn is None or not confirm_fn(preview):
             return False
+        # The crash ledger, same key and same reason as `scale_out`/`_roll_stop` (#519's
+        # pattern) -- but written HERE, only once the operator has said yes, and BEFORE the
+        # cancel that is about to run: if the process dies between this cancel and the
+        # re-bracket below, the next cycle's sweep must still be able to heal the remainder. A
+        # DECLINE returns out of this closure on the line above and never reaches this write --
+        # #883 (round 2): an earlier draft wrote this record unconditionally, before the
+        # confirm gate ran at all, so a decline left a stale record behind with nothing that
+        # ever cleared it. It is written here, not earlier, precisely so a decline writes
+        # nothing to clear.
+        #
+        # A stale record IS still possible after this point -- if the cancel below fails, or a
+        # crash lands between here and the re-bracket -- but that is harmless for the reason
+        # `reconcile.reconcile_unbracketed_positions` actually skips it: `_has_resting_bracket`
+        # (`reconcile.py:471`) is checked FIRST, before the retry record is even read
+        # (`reconcile.py:~261`), and a bracket that is still resting -- which is exactly what a
+        # failed cancel or an undone decline leaves -- makes that check true, so the sweep
+        # `continue`s before it ever looks at `unbracketed:<product>`. (NOT the sweep's own
+        # `if not intent: continue` a few lines below it, which only runs once
+        # `_has_resting_bracket` has already said no bracket is resting.)
+        if protecting_remainder:
+            repo.set_state(f"{UNBRACKETED_PREFIX}{reduction.product_id}",
+                           {"stop": stop, "target": target, "qty": remainder})
         if not _clear_resting_bracket(broker, repo, reduction.product_id, now_ts):
             cancel_failed = True
             return False
