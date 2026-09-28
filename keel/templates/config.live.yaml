@@ -45,8 +45,9 @@ caps:
   # than the exposure/concentration caps below. Left at their non-binding default here so
   # risk-sized rule orders ($400-24k typical) aren't silently rejected.
   # max_exposure_usd caps total open notional for RULE-trading buys only; DCA buys are exempt
-  # (#841) and bounded by rail 14's attested monthly buy cap instead. max_per_asset_pct (a
-  # fraction of max_exposure_usd) binds both.
+  # (#841) and bounded by rail 14's attested monthly buy cap and available cash instead.
+  # max_per_asset_pct (a fraction of max_exposure_usd) is likewise RULE-trading only -- DCA is
+  # exempt from it too (#853), for the same reason.
   max_exposure_usd: 5000
   max_per_asset_pct: 0.50
 

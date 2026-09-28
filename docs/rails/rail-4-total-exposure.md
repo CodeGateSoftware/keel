@@ -23,7 +23,7 @@ What the exemption does and does not change:
 | Rail | Rule-trading BUY | DCA BUY |
 |---|---|---|
 | 4 — total open exposure (`total_exposure_cap`) | binds | **exempt** (#841) |
-| 6 — per-asset concentration (`per_asset_concentration_cap`) | binds | binds |
+| 6 — per-asset concentration (`per_asset_concentration_cap`) | binds | **exempt** (#853, [rail-6-per-asset-concentration.md](rail-6-per-asset-concentration.md)) |
 | 14 — monthly buy cap (`monthly_subscription_allowance`) | binds | binds — the limit that bounds DCA |
 | 8 — no averaging into losers | binds | exempt (§8/§12.1) |
 | 11 — account-drawdown breaker | binds | exempt (§12.6) |
@@ -35,9 +35,11 @@ Two consequences worth knowing:
 - **DCA holdings still count toward the total.** A rule-trading entry sees the whole book,
   DCA lots included, so a growing DCA sleeve shrinks the room rule trades have under
   `max_exposure_usd`.
-- **Rail 6 still uses `max_exposure_usd`.** The per-asset limit is
-  `max_per_asset_pct × max_exposure_usd`, so `max_exposure_usd` still bounds DCA per asset,
-  just not in total.
+- **Rail 6 is exempt too, since #853.** A fixed per-asset ceiling would halt a single-asset
+  accumulation sleeve the same way a fixed total ceiling would (#841's reasoning, applied to the
+  per-asset case) — see [rail-6-per-asset-concentration.md](rail-6-per-asset-concentration.md).
+  Rail 14 (the venue plan's attested monthly buy cap) and available cash (rail 13) are DCA's
+  aggregate bounds now.
 
 `keel simulate` applies the same exemption (`SimAccount.can_open`), so a backtest models what
 live does.

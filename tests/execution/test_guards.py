@@ -376,34 +376,136 @@ def test_rail4_the_same_buy_without_is_dca_is_still_vetoed_by_total_exposure(rep
     assert _keys(result) == {"total_exposure_cap"}
 
 
-def test_rail6_dca_buy_over_the_per_asset_cap_is_still_vetoed_by_concentration(repo):
-    """Rail 6 still binds DCA (#841) -- and ONLY rail 6 fires here, though the same buy also
-    crosses `max_exposure_usd` (960 + 45 = 1005 > 1000; BTC 1005 > 0.6 * 1000)."""
+# -- rail 6: DCA is exempt too (#853) -- rail 14 and available cash bound DCA's aggregate spend,
+# not max_per_asset_pct ------------------------------------------------------------------------
+
+
+def test_rail6_dca_buy_over_the_per_asset_cap_is_not_vetoed_by_concentration(repo):
+    """The operator's decision (#853): DCA is exempt from rail 6 too, mirroring rail 4's #841
+    exemption. 960 open + 45 = 1005 > 1000 (0.1 * 10000, the per-asset limit); max_exposure_usd
+    is raised out of the way so rail 4 cannot also fire and mask what this test is about."""
     _seed_open_exposure(repo, product_id="BTC-USD", notional=Decimal("960"))
-    config = _config(max_exposure_usd=Decimal("1000"), max_per_asset_pct=Decimal("0.6"))
+    config = _config(max_exposure_usd=Decimal("10000"), max_per_asset_pct=Decimal("0.1"))
 
     result = check(_dca_intent(product_id="BTC-USD", notional=Decimal("45")), repo, config, NOW_TS)
+
+    assert result.violations == []
+    assert result.ok is True
+
+
+def test_rail6_the_same_buy_without_is_dca_is_still_vetoed_by_concentration(repo):
+    """The pairing to the test above: flip `is_dca` and nothing else, and rail 6 binds again.
+
+    This also proves DCA holdings still count toward the concentration figure a RULE-trading
+    entry sees: the 960 already open here was accumulated exactly as `_seed_open_exposure` seeds
+    it for the DCA-exempt test above -- the exemption is FROM being gated by rail 6, not a blind
+    spot in what it measures."""
+    _seed_open_exposure(repo, product_id="BTC-USD", notional=Decimal("960"))
+    config = _config(max_exposure_usd=Decimal("10000"), max_per_asset_pct=Decimal("0.1"))
+
+    result = check(
+        _dca_intent(product_id="BTC-USD", notional=Decimal("45"), is_dca=False),
+        repo,
+        config,
+        NOW_TS,
+    )
 
     assert result.ok is False
     assert _keys(result) == {"per_asset_concentration_cap"}
 
 
+@pytest.mark.parametrize("is_dca", [False, True])
+def test_rail6_never_gates_a_sell_whatever_the_order_class(repo, is_dca):
+    """A SELL reduces exposure; rail 6 has never read one, and the DCA exemption changes that
+    for neither class."""
+    _seed_open_exposure(repo, product_id="BTC-USD", notional=Decimal("2000"))
+    config = _config(max_exposure_usd=Decimal("10000"), max_per_asset_pct=Decimal("0.01"))
+    intent = _intent(
+        side=Side.SELL,
+        stop=None,
+        notional=Decimal("50"),
+        is_dca=is_dca,
+        rule_kind="target_harvest",
+    )
+
+    result = check(intent, repo, config, NOW_TS)
+
+    assert "per_asset_concentration_cap" not in _keys(result)
+    assert result.ok is True
+
+
 def test_rail14_dca_buy_over_the_monthly_cap_is_still_vetoed_when_exposure_is_also_over(repo):
-    """Rail 14 is now the binding DCA limit (#841): it still fires, and rail 4 no longer fires
-    beside it. PAXG 960 open (a prior month) + BTC 600 = 1560 > 1000; 600 > the attested 500."""
+    """Rail 14 is now (with rails 4 and 6 both exempt) the binding DCA limit: it still fires.
+    PAXG 960 open (a prior month) + BTC 600 = 1560 > 1000; 600 > the attested 500."""
     _attest(repo, free_volume_usd=Decimal("500"))
     _seed_open_exposure(repo, product_id="PAXG-USD", notional=Decimal("960"))
     config = _config(
         max_per_order_usd=Decimal("100000"),
         max_per_day_usd=Decimal("100000"),
         max_exposure_usd=Decimal("1000"),
-        max_per_asset_pct=Decimal("0.6"),  # BTC 600 <= 600: rail 6 stays out of the way
+        max_per_asset_pct=Decimal("0.6"),  # moot for DCA now (rail 6 exempt too), kept generous
     )
 
     result = check(_dca_intent(product_id="BTC-USD", notional=Decimal("600")), repo, config, NOW_TS)
 
     assert result.ok is False
     assert _keys(result) == {"monthly_subscription_allowance"}
+
+
+# -- rails 2, 3, 5, 13, 14 still bind a DCA buy (#853 only widens rails 4 and 6) -----------------
+
+
+def test_rail2_per_order_cap_still_binds_dca(repo):
+    intent = _dca_intent(notional=Decimal("150"))  # exceeds max_per_order_usd (100 default)
+
+    result = check(intent, repo, _config(), NOW_TS)
+
+    assert result.ok is False
+    assert _keys(result) == {"per_order_cap"}
+
+
+def test_rail3_per_day_cap_still_binds_dca(repo):
+    _seed_filled_order(
+        repo,
+        product_id="BTC-USD",
+        side=Side.BUY,
+        qty=Decimal("2.6"),
+        price=Decimal("100"),  # notional 260, spent earlier today
+        created_at=NOW_TS - 50,
+    )
+    intent = _dca_intent(notional=Decimal("50"))  # 260 + 50 = 310 > 300 day cap
+
+    result = check(intent, repo, _config(), NOW_TS)
+
+    assert result.ok is False
+    assert _keys(result) == {"per_day_cap"}
+
+
+def test_rail5_correlation_adjusted_sizing_still_binds_dca(repo):
+    _seed_filled_order(
+        repo,
+        product_id="ETH-USD",
+        side=Side.BUY,
+        qty=Decimal("2"),
+        price=Decimal("100"),  # 200 already open in a correlated asset
+        created_at=NOW_TS - 1_000_000,
+    )
+    # correlated cap = max_per_order_usd(100) * 0.5 = 50; 80 exceeds it
+    intent = _dca_intent(product_id="BTC-USD", notional=Decimal("80"))
+
+    result = check(intent, repo, _config(), NOW_TS)
+
+    assert result.ok is False
+    assert _keys(result) == {"correlation_adjusted_sizing"}
+
+
+def test_rail13_usdc_funding_still_binds_dca(repo):
+    intent = _dca_intent(available_quote=Decimal("0"), notional=Decimal("50"))
+
+    result = check(intent, repo, _config(), NOW_TS)
+
+    assert result.ok is False
+    assert _keys(result) == {"usdc_funding"}
 
 
 @pytest.mark.parametrize("is_dca", [False, True])

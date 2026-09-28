@@ -11,10 +11,12 @@ month, from the orders audit log, plus the order being placed — at the venue's
 The cap is a limit keel puts on its **own** buying. It is not a fee waiver, and nothing inside
 it is free: keel places its orders through **Coinbase Advanced Trade**, which charges its
 maker/taker schedule on every order whatever the cap says (#836). DCA is **not** exempt —
-recurring buys are exactly the spend this rail exists to cap. Since #841 this is the rail that
-**bounds DCA**: DCA BUYs are exempt from the total-exposure cap (rail 4,
-[rail-4-total-exposure.md](rail-4-total-exposure.md)), so the monthly buy cap here, together
-with per-asset concentration (rail 6), is what limits accumulation.
+recurring buys are exactly the spend this rail exists to cap. Since #841/#853 this is the rail
+that **bounds DCA's aggregate spend**: DCA BUYs are exempt from both the total-exposure cap
+(rail 4, [rail-4-total-exposure.md](rail-4-total-exposure.md)) and the per-asset concentration
+cap (rail 6, [rail-6-per-asset-concentration.md](rail-6-per-asset-concentration.md)), so the
+monthly buy cap here — together with available cash (rail 13's USDC-funding floor) — is what
+limits accumulation.
 
 > **Correction (2026-09-27, #836).** This page used to describe the cap as volume the venue
 > waives the taker fee on, and as *"the profitability boundary"*. That was wrong for keel's

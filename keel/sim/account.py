@@ -54,10 +54,13 @@ Deliberately NOT enforced here (outside the spend-cap subset, per the plan): the
 min-move/anti-scalping, no-averaging-into-losers, no-stop-widening, sell-only-on-rule,
 correlation-adjusted sizing, and stale-data/kill-switch -- those rails need state (an audit log,
 `agent_state`, a live feed) this pure ledger doesn't model. DCA is exempt from exactly the caps
-`guards.check` exempts it from among those enforced here: the total-exposure cap (#841 -- rail 14,
-the monthly allowance, bounds DCA instead) and the rail 11/16 breakers. Every other cap here --
-per-order, per-day, per-asset concentration, USDC-funding and the monthly allowance -- binds DCA,
-matching rail 14's explicit non-exemption for DCA spend.
+`guards.check` exempts it from among those enforced here: the total-exposure cap (#841) AND the
+per-asset concentration cap (#853 -- rail 14, the monthly allowance, and available cash bound DCA
+instead) and the rail 11/16 breakers. Every other cap here -- per-order, per-day, USDC-funding and
+the monthly allowance -- binds DCA, matching rail 14's explicit non-exemption for DCA spend. DCA
+holdings still count toward `_asset_notional`/`_total_notional`, so they still consume the
+headroom a RULE-trading entry sees under the exposure/concentration caps -- the exemption is FROM
+being gated by those caps for a DCA candidate, not a blind spot in what they measure.
 
 Two separate position slots (Issue #85): a single per-asset RULE-trade slot (`positions`, one
 open/close position per asset -- risk-defined entries from `pullback_continuation`,
@@ -295,10 +298,11 @@ class SimAccount:
     def can_open(self, intent: OpenIntent, config: Config, now_ts: int) -> tuple[bool, list[str]]:
         """Check `intent` against every spend cap, collecting *all* violations (no
         short-circuit), mirroring `execution.guards.check`. DCA is exempt from the total-exposure
-        cap and the rail 11/16 breakers, exactly as in `guards.check` (#841), and bound by every
-        other cap here (matches rail 14). This is the hard safety veto -- callers (e.g.
-        `sim.portfolio_sim`) that want to avoid tripping it should CLAMP a candidate notional down
-        to `max_affordable_notional` first, not weaken this check."""
+        cap (#841), the per-asset concentration cap (#853) and the rail 11/16 breakers, exactly
+        as in `guards.check`, and bound by every other cap here (matches rail 14). This is the
+        hard safety veto -- callers (e.g. `sim.portfolio_sim`) that want to avoid tripping it
+        should CLAMP a candidate notional down to `max_affordable_notional` first, not weaken
+        this check."""
         reasons: list[str] = []
 
         # per-order $ cap (optional -- non-binding by default, see keel.config.Caps)
@@ -329,11 +333,15 @@ class SimAccount:
                 f"{projected_exposure} exceeds max_exposure_usd {config.caps.max_exposure_usd}"
             )
 
-        # per-asset concentration cap (rule + DCA combined)
+        # per-asset concentration cap (rule + DCA combined in what it MEASURES) -- DCA exempt
+        # from being GATED by it, matching `guards.check`'s `is_buy and not intent.is_dca` gate
+        # on rail 6 (#853, mirroring rail 4's #841 exemption): rail 14 and available cash bound
+        # DCA's aggregate spend, not `max_per_asset_pct`. DCA lots still count in
+        # `_asset_notional`, so they still consume the headroom a RULE entry sees here.
         per_asset_limit = config.caps.max_per_asset_pct * config.caps.max_exposure_usd
         asset_exposure = self._asset_notional(intent.asset)
         projected_asset_exposure = asset_exposure + intent.notional
-        if projected_asset_exposure > per_asset_limit:
+        if not intent.is_dca and projected_asset_exposure > per_asset_limit:
             reasons.append(
                 f"per_asset_concentration_cap: {intent.asset} exposure "
                 f"{projected_asset_exposure} exceeds {config.caps.max_per_asset_pct} of "
