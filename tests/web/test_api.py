@@ -1855,6 +1855,16 @@ def test_dca_plan_cache_hit_still_reads_the_budget_and_the_rules_fresh(
     conn.commit()
     conn.close()
 
+    # The SAME query the page's poll repeats: a plan cached per query string would still answer
+    # with the stale, rule-less plan here.
+    same_query = web_api.read_dca_plan(
+        cfg, {"budget": ["1e3"], "buffer": ["0.1"]}, None, 1_700_000_000 + 30
+    )
+    assert builds["n"] == 1
+    assert [
+        (row["rule_id"], row["product_id"], row["status"]) for row in same_query["existing"]
+    ] == [(str(rule_id), "SOL-USD", "live")]
+
     second = web_api.read_dca_plan(
         cfg, {"budget": ["600"], "buffer": ["0.1"]}, None, 1_700_000_000 + 60
     )
