@@ -615,3 +615,115 @@ def test_a_tranche_with_no_live_buy_is_refused_before_the_gate_asks(
     assert result.exit_code != 0
     assert asked == []
     assert _written(_file_repo(db)) == before
+
+
+# -- H4: a resting SELL for the product must be cancelled first -------------------------------
+
+
+def _resting_sell(
+    repo: Repository, *, status: str = "pending", mode: str = "live", side: str = "SELL"
+) -> int:
+    return repo.insert_order(
+        dict(
+            mode=mode,
+            product_id="PAXG-USD",
+            side=side,
+            order_type="bracket",
+            qty=Decimal("0.0132"),
+            status=status,
+            fee=None,
+            expected_fill=Decimal("4521"),
+            confirmation="autonomous",
+            created_at=2,
+            updated_at=2,
+        )
+    )
+
+
+def _refusal_for(order_id: int, status: str) -> str:
+    return (
+        f"PAXG-USD still has a SELL resting at the venue (order {order_id}, {status}); cancel it "
+        f"first with `keel orders cancel {order_id}` -- a declared close must never leave a "
+        "stop that can sell base you already sold"
+    )
+
+
+@pytest.mark.parametrize(
+    "status,side",
+    [("pending", "SELL"), ("partially_filled", "SELL"), ("pending", "BUY")],
+)
+def test_a_tranche_whose_own_bracket_still_rests_is_refused(
+    repo: Repository, status: str, side: str
+) -> None:
+    """H4: the tranche names a bracket that is still working at the venue. Closing the tranche in
+    the ledger would leave that stop resting against base the operator says is gone -- and if
+    they only sold part of it, the stop could still fire and sell more. Cancel it first.
+
+    The BUY-sided row is the shape `orders.classify_cancel` guards against ("a row wearing the
+    BUY side while a position points at it as its protection"): the tranche's own link decides,
+    not the side the row happens to carry."""
+    bracket = _resting_sell(repo, status=status, side=side)
+    rule_id = repo.insert_rule("turtle_breakout", {"product_id": "PAXG-USD"}, status="live")
+    _buy(repo, rule_id, mode="live", qty="0.0132")
+    pid = repo.open_position(
+        product_id="PAXG-USD",
+        rule_name="turtle_breakout",
+        opened_at=1,
+        qty=Decimal("0.0132"),
+        entry_fill=Decimal("4673.23"),
+        entry_fee=Decimal("0"),
+        bracket_order_id=bracket,
+        rule_id=rule_id,
+    )
+    before = _written(repo)
+
+    with pytest.raises(PositionCloseRefused) as refused:
+        _close(repo, pid)
+
+    assert str(refused.value) == _refusal_for(bracket, status)
+    assert _written(repo) == before
+
+
+def test_any_resting_live_sell_on_the_product_is_refused(repo: Repository) -> None:
+    """Not only the tranche's own bracket: ANY live SELL still resting on the product -- a
+    sibling tranche's bracket, an exit mid-flight -- is a sale keel may yet make of base the
+    operator is declaring sold. Named, so the operator knows what to cancel."""
+    pid = _tranche(repo)
+    other = _resting_sell(repo)
+    before = _written(repo)
+
+    with pytest.raises(PositionCloseRefused) as refused:
+        _close(repo, pid)
+
+    assert str(refused.value) == _refusal_for(other, "pending")
+    assert _written(repo) == before
+
+
+@pytest.mark.parametrize("status,mode", [("canceled", "live"), ("pending", "paper")])
+def test_a_sell_that_is_not_resting_live_does_not_block(
+    repo: Repository, status: str, mode: str
+) -> None:
+    """A cancelled SELL sells nothing, and a paper row never reaches the venue."""
+    pid = _tranche(repo)
+    _resting_sell(repo, status=status, mode=mode)
+
+    _close(repo, pid)
+
+    assert repo.get_open_positions() == []
+
+
+def test_a_resting_sell_is_refused_before_the_gate_asks(
+    tmp_path: Path, live_config_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    asked: list[bool] = []
+    monkeypatch.setattr(_common, "_is_interactive", lambda: asked.append(True) or True)
+    db, pid = _seeded(tmp_path)
+    other = _resting_sell(_file_repo(db))
+    before = _written(_file_repo(db))
+
+    result = _invoke(db, live_config_path, pid, "--price", "4400", input="yes\n")
+
+    assert result.exit_code != 0
+    assert asked == []
+    assert f"Error: {_refusal_for(other, 'pending')}" in result.output.splitlines()
+    assert _written(_file_repo(db)) == before

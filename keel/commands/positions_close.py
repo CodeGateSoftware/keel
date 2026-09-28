@@ -39,6 +39,11 @@ put a write one import away from a browser surface. There is no `keel positions`
 **LIVE profiles only.** A paper profile has no venue to have sold on, and a `mode='live'` SELL in
 a paper database would sit in front of rails that never saw its BUY. Refused, not translated.
 
+**No SELL may still be resting on the product (H4).** The tranche's own bracket, or any other
+live SELL in `executor.RESTING_STATUSES`, is refused by id with "cancel it first": this command
+never touches the venue, so it cannot cancel the stop itself, and booking the close with the stop
+still working would leave keel a sale it may yet make of base the operator says is gone.
+
 **The tranche's product needs a live BUY behind it too (H1).** `positions` has no `mode` column,
 so a tranche opened while the profile was `paper` can still be sitting open, `qty > 0`, in a LIVE
 database -- nothing on the row says which era opened it. `declared_close_target` refuses to book
@@ -89,11 +94,35 @@ def _open_tranche(repo: Repository, position_id: int) -> dict[str, Any] | None:
     return next((p for p in repo.get_open_positions() if p["id"] == position_id), None)
 
 
+def _resting_sells(repo: Repository, position: dict[str, Any]) -> list[dict[str, Any]]:
+    """Every SELL that may still execute against `position`'s product, oldest first: the
+    tranche's own bracket if it is still resting, then any live SELL on the product in
+    `executor.RESTING_STATUSES` (a sibling's bracket, an exit mid-flight). `partially_filled` is
+    resting too (#446) -- its remainder is still working at the venue."""
+    found: dict[int, dict[str, Any]] = {}
+    bracket_id = position.get("bracket_order_id")
+    bracket = repo.get_order(bracket_id) if bracket_id is not None else None
+    if bracket is not None and bracket["status"] in executor.RESTING_STATUSES:
+        found[bracket["id"]] = bracket
+    for status in executor.RESTING_STATUSES:
+        for row in repo.get_orders(mode="live", product_id=position["product_id"], status=status):
+            if str(row["side"]).upper() == Side.SELL.value:
+                found[row["id"]] = row
+    return [found[order_id] for order_id in sorted(found)]
+
+
 def declared_close_target(repo: Repository, config: Config, position_id: int) -> dict[str, Any]:
     """The OPEN tranche a declared close would book, or `PositionCloseRefused`.
 
     Split out so the CLI can show the operator the tranche they are about to close BEFORE the
     typed gate asks -- the gate's detail line is only worth reading if it names the real row.
+
+    Refuses (H4) while ANY SELL may still execute on the product -- the tranche's own bracket if
+    it is still resting, or any live SELL in `executor.RESTING_STATUSES` -- naming the order to
+    cancel first. A declared close says the base is gone; a stop left resting against it would
+    either fail at the venue or, if the operator sold only part, sell more of what they kept.
+    Nothing here cancels it: this command never touches the venue, so the operator does, with
+    `keel orders cancel <id>`, and then declares the close.
 
     Also refuses (H1) when the product's LIVE net filled quantity in the orders log is less than
     this tranche's own `qty`. `positions` has no `mode` column: a tranche opened while the
@@ -113,6 +142,14 @@ def declared_close_target(repo: Repository, config: Config, position_id: int) ->
             f"tranche {position_id} is not open (see the console's Positions view)"
         )
     product_id = position["product_id"]
+    resting = _resting_sells(repo, position)
+    if resting:
+        order = resting[0]
+        raise PositionCloseRefused(
+            f"{product_id} still has a SELL resting at the venue (order {order['id']}, "
+            f"{order['status']}); cancel it first with `keel orders cancel {order['id']}` -- a "
+            "declared close must never leave a stop that can sell base you already sold"
+        )
     tranche_qty = position["qty"]
     live_qty = sleeve.orders_qty(repo, product_id, "live")
     if live_qty < tranche_qty:
