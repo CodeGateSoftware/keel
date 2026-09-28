@@ -856,7 +856,9 @@ class ScreenCache:
         with self._lock:
             entry = self._entries.get(key)
             if entry is not None and now_ts - entry.built_at_ts < self.TTL_SECONDS:
-                return entry.report, now_ts - entry.built_at_ts
+                # A request stamped before a later-stamped one built this entry (it waited on the
+                # lock) reads age 0, never a negative age.
+                return entry.report, max(0, now_ts - entry.built_at_ts)
             report = build()
             self._entries[key] = _ScreenCacheEntry(report, now_ts)
             return report, 0

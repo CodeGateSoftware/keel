@@ -1848,6 +1848,22 @@ def test_screen_cache_hit_and_miss_boundary() -> None:
     assert miss is not first and miss_age == 0
 
 
+def test_screen_cache_age_is_never_negative_for_a_request_stamped_before_the_build() -> None:
+    """`ThreadingHTTPServer` stamps `now_ts` when a request arrives, and a request can wait on the
+    lock while a LATER-stamped one builds the entry. Its age must read 0, never "-1s ago"."""
+    cache = web_api.ScreenCache()
+    calls = {"n": 0}
+
+    def build() -> object:
+        calls["n"] += 1
+        return object()
+
+    built, _ = cache.get_or_build(("c", "d"), 1_001, build)
+    earlier, earlier_age = cache.get_or_build(("c", "d"), 1_000, build)
+    assert calls["n"] == 1
+    assert earlier is built and earlier_age == 0
+
+
 def test_screen_cache_is_thread_safe_under_concurrent_misses(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
