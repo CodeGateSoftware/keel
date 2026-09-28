@@ -95,8 +95,11 @@ years to end ahead on one path and behind on most.
   that reads the `positions` ledger (§7).
 - Live rails as tracked in `config.live-sandbox.yaml`: `max_exposure_usd` 400,
   `max_per_order_usd` 200, `max_per_day_usd` 200, `max_per_asset_pct` 0.75 ($300). The DCA book
-  was 7 rules and about $213 at cost on 2026-09-27 (#842), BTC $151.81 at cost across three $50
-  buys (#819, #853).
+  was 7 rules and **$151.81 at cost** on 2026-09-27, all of it BTC across three $50 buys (#819,
+  #853); the other six rules had not bought yet. **$213 is not the DCA book**: it is the
+  account's total open exposure that day (#841/#842), because it also carries the PAXG turtle
+  tranche at about $61.70 at cost (#819: "BTC $151.81, PAXG about $61.70 at cost";
+  151.81 + 61.70 = 213.51) — `positions.id=3`, not DCA (§2.3 above, #811).
 
 ### 2.4 How a sell happens today
 
@@ -119,10 +122,19 @@ Consequences for this design:
   `strategy.engine` builds every entry with `side=BUY` unconditionally, and `exit_signal` is a
   boolean meaning "sell all". A rule kind whose *output* is "sell $100 of BTC" needs a new hook
   (§3.2).
-- **Ownership is single.** `position_rule:<product>` names one rule. A second live rule kind on
-  BTC-USD is never consulted by `_handle_exits`. For the DCA sleeve the owner is `dca`, whose
-  exit is hardcoded `False`, so today **no live path can sell a DCA tranche at all**. That is the
-  gap the five requests are really about.
+- **Ownership is single, and it is last-writer-wins.** `position_rule:<product>` names one rule,
+  and every placed ENTRY overwrites it (`agent.py:2103-2111`) with whichever rule most recently
+  opened a tranche on that product — it is not pinned to `dca`. **While `dca` is the last live
+  entrant on a product, no live path sells a DCA tranche**, because `Dca.exit_signal` is
+  hardcoded `False`. But if a second live rule kind later enters the same product, ownership
+  passes to it, and `_handle_exits` then asks *that* rule for `exit_signal`: on `True` its EXIT
+  sells the **whole** held quantity (`_build_intent`, `executor.py:880-897`) — DCA tranches
+  included, FIFO — and `_close_tranches` (`agent.py:926`) books the entire exit with **one**
+  `is_dca = owning_rule.name == "dca"` flag, so the DCA units it closed are recorded as a
+  non-DCA outcome that counts toward rail 16. This is a **present-day** hazard, not one this
+  design introduces: any product that ever hosts both a `dca` rule and another live rule kind
+  is exposed to it today, before a line of §3 ships. The gap is narrower than first stated, but
+  real, and §3.2, §3.3 and Q10 below account for products holding both rule and DCA tranches.
 - **Rail 2 gates sells too.** `per_order_cap` has no `is_buy` guard. The live cap is $200; BTC is
   $151.81 at cost and the per-asset limit is $300 (or unbounded after #853). A whole-sleeve sell
   above the per-order cap is **vetoed**, so any "sell it all" path must slice into legs of at
@@ -239,6 +251,18 @@ The engine step is `agent._handle_reductions(product_id, product_rules, ...)`, r
 asks every live rule on the product for `reduce_signal`, applies arbitration (§3.6), and hands at
 most one `Reduction` to `executor.reduce`.
 
+This step therefore sees the same mixed-ownership products as `_handle_exits` does (§2.4): a
+product can hold both `dca` tranches and tranches opened by whichever rule currently owns
+`position_rule:<product>`. That is not a new problem `_handle_reductions` creates — `Holding`
+(§3.3) sums every open tranche on the product regardless of which rule opened it, and
+`executor.reduce`'s `is_dca` is derived from the specific tranches a `Reduction` actually
+consumed, so a `Reduction`'s booking is correct even on a mixed sleeve. It is `_handle_exits`'s
+existing path that is not: `_close_tranches` takes one `is_dca` flag for the whole exit
+(`agent.py:926`), not one per tranche FIFO consumes, so a non-`dca` rule's exit on a mixed
+product mis-books any DCA tranches it closes as non-DCA (#860). This design does not fix that
+pre-existing path; it is named here so a sell-side rule promoted onto a product is not read as
+introducing the hazard.
+
 `executor.reduce` is `scale_out` without the bracket half: it builds a SELL `OrderIntent` with
 `rule_kind=reduction.reason`, `rule_id` threaded (#803), `is_dca=False` on the **intent** (no rail
 reads `is_dca` on a sell, so the flag is irrelevant there), sizes through `_clamped_sell_qty`
@@ -255,11 +279,17 @@ recorded (§3.8). The proposal is the product; the fill is optional.
 ### 3.3 Lots and average entry: the `positions` ledger is the truth
 
 `Holding` is computed by one pure function, `sleeve.holding_of(repo, product_id, marks)`, over
-the **open `positions` rows** for the product, never over `orders`:
+the **open `positions` rows** for the product, never over `orders`. It deliberately does not
+filter by `rule_name`: a mixed-ownership product (§2.4, §3.2) has one `Holding`, not one per
+owning rule, because a sell-side rule's job is the sleeve, not the entrant that happens to be
+recorded as owner today.
 
 - `qty` = Σ tranche `qty` (the quantity **still held**; `scale_out` already mutates it);
-- `cost_basis` = Σ (`qty_i · entry_fill_i` + `entry_fee_i · qty_i / original_qty_i`), entry fees
-  included so that break-even is honest;
+- `cost_basis` = Σ (`qty_i · entry_fill_i` + `entry_fee_i · qty_i / (qty_i + realized_qty_i)`),
+  `realized_qty_i` read as 0 when NULL; `qty_i + realized_qty_i` is the tranche's original size
+  (the #502 accumulators: `qty` is what is still held, `realized_qty` is what `scale_out` has
+  already sold — `positions` has no `original_qty` column), so a partly-scaled-out tranche still
+  prorates its entry fee correctly; entry fees are included so that break-even is honest;
 - `vwae` (volume-weighted average entry) = `cost_basis / qty`;
 - `tranches` = the rows, oldest first, because `book_exit` consumes them FIFO and any preview must
   show which tranche a sale would hit and what it would realise;
@@ -446,9 +476,12 @@ before they sell by hand. The rule kind and the `--confirm` path are specified s
 built later, but **no `profit_take` rule is promoted and no automatic trim ships** until a
 pre-registered trial says it helps. That trial would be **accumulation policy trial 4**: arm E
 "DCA plus profit-take at `gain_pct` over VWAE, `trim_pct` to cash" against A, judged on
-**drawdown** per #831 §6, at 1.2% and 0.9%, pre-registered in `trials-ledger.jsonl` before the
-run. **Cost if wrong:** if trimming does help, the operator forgoes it until the trial runs; the
-report still shows them when they could trim by hand. If it is built as an automatic seller and
+**drawdown** per #831 §6, at 1.2% and 0.9%, **pre-registered in the driver's docstring, committed
+before the run** — exactly as #830 and #831 were — and recorded in `trials-ledger.jsonl`
+(`a_priori`, `diagnostic_only`) when it runs; the ledger is the record of a run that happened, not
+where the registration happens. **Cost if wrong:** if trimming does help, the operator forgoes it
+until the trial runs; the report still shows them when they could trim by hand. If it is built
+as an automatic seller and
 is wrong, the sleeve pays two fees per cycle to underperform the baseline it exists to be.
 
 ## 5. Feature 2: contribution steering and band rebalancing
@@ -467,9 +500,12 @@ next cycle as a non-DCA BUY to the underweights by shortfall, meeting rails 4, 5
 **Fee drag, quantified.** Per rebalance event: sell leg fee (0.9% live, 1.2% sim) plus sell
 slippage, plus buy leg fee plus buy slippage, plus the buy's consumption of the month's rail-14
 cap. #831 measured $930 of fees over five years on the D arm at $500 a month (3.0% of deposits),
-for a lead that held on one path. At the live sleeve's scale (about $213), one full rebalance of a
-$30 overweight costs about $0.55 in fees and $0.30–$0.60 in slippage, and blocks $30 of the
-month's DCA cap.
+for a lead that held on one path. At the live DCA sleeve's scale ($151.81 at cost, all BTC,
+§2.3 — not the account's $213 total exposure), one full rebalance of a $30 overweight costs
+about $0.55 in fees (two legs at 0.9%) and, from #831's per-product `slippage_pct` rows (BTC
+0.05%, ETH 0.06%, SOL about 0.10%, XLM/LTC/ADA/LINK 0.25–0.38%, PAXG about 1.0%), about
+**$0.03–$0.23** in slippage when neither leg is PAXG, or about **$0.30–$0.40** when one leg is
+PAXG — and blocks $30 of the month's DCA cap.
 
 **Evidence status.** **Tested.** #831 arms C and D are these two features, and the request's
 "backtest against static DCA" has been run, pre-registered, with a bootstrap: neither is better
@@ -611,9 +647,12 @@ rails 8 and 11 so it keeps buying through the drawdown a stop would sell into; a
 `sleeve_exit` would sell the sleeve and the weekly `dca` would start rebuying it the next week,
 two fees apart. This is why v1 is alert-and-preview, never auto. (b) A 200-day SMA on an asset with
 less than 200 days of cached history is undefined: the arm reports `insufficient_history` and
-does not fire. (c) The monitor is silent because a cycle did not run: that is #811's
-`position.unmanaged` territory and stays there. (d) A transition flaps around a level: `near`
-has hysteresis (`warn_pct` in, `2 · warn_pct` out).
+does not fire. (c) The monitor is silent because a cycle did not run: that is the existing
+doctor finding `profile.cycled` (`keel/commands/doctor.py`, compares each profile's last cycle
+against a multiple of its own `cadence_sec`), which already exists and is not this design's to
+add. #811's `position.unmanaged` is a different failure — an open tranche whose product has no
+`live` rule at all (a demoted rule, not a missed cycle) — and stays where #811 puts it. (d) A
+transition flaps around a level: `near` has hysteresis (`warn_pct` in, `2 · warn_pct` out).
 
 **Tests.** Pure monitor: each arm at, above, below its level on hand-built candles; transition
 events fire once per transition and never per cycle; hysteresis; insufficient history;
@@ -649,9 +688,18 @@ settlement); report the net tax and fee benefit before proposing anything.
 From the `positions` ledger and the venue's previewed fee, per tranche and per product: quantity,
 entry fill, entry fee, FIFO cost basis, mark, **unrealised gain or loss**, the **realised** gain
 or loss a sale of `q` units would book, the sell fee, the slippage, the buy leg's fee and
-slippage into the target asset, and therefore the **fee cost** of a rotation. `keel pnl` already
-prints realised and unrealised per asset from average cost; a `--lots` view over tranches is a
-small extension.
+slippage into the target asset, and therefore the **fee cost** of a rotation.
+
+**Not a `keel pnl --lots` extension.** `keel pnl` computes FIFO realised P&L from the imported
+Coinbase CSV `transactions` table, and only its unrealised figure uses average cost
+(`keel/commands/pnl.py`'s module docstring: "FIFO, from imported transactions"); it reads
+neither `positions` nor `orders`. A per-tranche lots view over the `positions` ledger would be a
+**second data source** behind the same command name, not a small extension — and §3.3 already
+names `positions` as the sleeve's truth, distinct from the `orders`-derived average `executor`
+keeps. The honest path is to keep the two sources apart rather than reconcile them under one
+flag: the lots view is added as **`keel dca trim --preview --view lots`**, over the same
+`sleeve.holding_of` (§3.3) that §4's gain view and §5's bands view already extend, not as
+`keel pnl --lots`.
 
 ### 8.2 What keel cannot compute
 
@@ -681,9 +729,13 @@ that `docs/fiqh-basis.md` says has not happened, and does not build the buy-back
 ### 8.4 The fee arithmetic, which keel can report
 
 A rotation is two taker legs and two slippages: about **1.8%** at live rates, 2.4% at sim rates,
-plus per-product slippage on both sides (PAXG about 100 bp per leg). On a $30 ADA sleeve that
-has lost 40%, the rotation costs about $0.75–$1.20 to move $18 into BTC. The buy leg meets rail 8
-(a BTC buy below BTC's average cost is vetoed unless flagged DCA), rails 4/5/6, and **spends the
+plus per-product slippage on both sides (#831's `slippage_pct` rows: BTC 0.05%, ADA about
+0.25–0.27%, PAXG about 100 bp per leg — the highest in the universe). On a $30 ADA sleeve that
+has lost 40%, selling $18 of ADA and buying BTC costs about **$0.32** in fees (two legs, 0.9% of
+roughly $18 and roughly $17.8) plus about **$0.06** in slippage (ADA ≈0.26% of $18, BTC 0.05% of
+the proceeds) — about **$0.38** live in total, or about **$0.49** at the 1.2% sim rate. The buy
+leg meets rail 8 (a BTC buy below BTC's average cost is vetoed unless flagged DCA), rails 4/5/6,
+and **spends the
 month's rail-14 DCA cap**. The "underperforming altcoin" judgement is a **plan** decision the
 operator already makes in `keel dca plan` by setting a weight to zero; that stops the buying. What
 is missing for the selling is #798's `keel positions close`, so a hand sale at the venue is
@@ -694,9 +746,10 @@ admitted on weak evidence and the operator was told so (`config.live-sandbox.yam
 that argues for a plan change, not a sell rule.
 
 **Recommendation: don't build (yet).** Build the two read-only pieces it would need anyway:
-`keel pnl --lots` (per-tranche unrealised and hypothetical realised P&L with fee cost, labelled
-"not tax advice"), and #798's `keel positions close` so a manual rotation does not leave phantom
-exposure. Do not build `rotation` as a rule kind, and do not build a same-asset harvest at all
+`keel dca trim --preview --view lots` (per-tranche unrealised and hypothetical realised P&L with
+fee cost, over the `positions` ledger, labelled "not tax advice"), and #798's `keel positions
+close` so a manual rotation does not leave phantom exposure. Do not build `rotation` as a rule
+kind, and do not build a same-asset harvest at all
 until (a) a jurisdiction is on record, (b) the fiqh question in §8.3 is answered by someone
 entitled to answer it, and (c) the operator has decided the buy leg's treatment under rails 8 and
 14. **Cost if wrong:** the operator rotates by hand at the venue, which they can do today, and
@@ -716,6 +769,7 @@ keel's ledger drifts until `positions close` exists; the fee cost is the same ei
 | Sell released from a browser | no verb exists; `test_capabilities` scans `keel/web/` | nothing |
 | Sell placed unattended without a sells window | `Profile.is_autonomous_for_sells` | proposal `preview`, notification |
 | A monitor silenced by clearing a retry key (#811) | monitor reads `positions` only | unchanged alert |
+| **A non-`dca` rule owns a product that also holds `dca` tranches; its EXIT sells them too, booked non-DCA** (#860) | **Nowhere — a present-day gap this design does not fix**, not introduced by it | rail 16's streak counter sees the DCA units as a rule outcome |
 
 ## 10. Recommendations, in one table
 
@@ -725,7 +779,7 @@ keel's ledger drifts until `positions close` exists; the fee cost is the same ei
 | 2 | Steering and band rebalancing | `band_rebalance` | **don't build (yet)**; read-only bands view only | #831 arms C and D, pre-registered and bootstrapped: not better after fees; rails 8 and 14 on every redeploy | one path's +13.5% over five years if the bootstrap was wrong |
 | 3 | `reverse_dca` | `reverse_dca` | **build**, ships in `preview` | a spend plan, not an edge claim; bounded; forces the shared architecture | a bounded sale at a bad price; a round trip beside the weekly buy, reported |
 | 4 | Protective exit monitor | `sleeve_exit` | **preview-only**: monitor plus alerts; no automatic sell; after #811 and #799 | contradicts the sleeve's own thesis if automatic; #442, #830, #831 give it no support | a missed alert leaves the sleeve where it is today |
-| 5 | Rotation and tax-loss harvesting | `rotation` | **don't build (yet)**; build `keel pnl --lots` and #798's `positions close` | no jurisdiction on record; tax position uncomputable; fiqh finding on buy-backs; rails 8 and 14 on the buy leg | operator rotates by hand, as today |
+| 5 | Rotation and tax-loss harvesting | `rotation` | **don't build (yet)**; build `keel dca trim --preview --view lots` and #798's `positions close` | no jurisdiction on record; tax position uncomputable; fiqh finding on buy-backs; rails 8 and 14 on the buy leg | operator rotates by hand, as today |
 
 ## 11. Implementation plan, PR by PR
 
@@ -737,9 +791,11 @@ a filled entry before its bracket leg, downgrade a bracket failure to *open, unb
 Each PR is TDD, one concern, mypy and ruff clean, with the module docstring carrying the rule it
 encodes (this repository keeps its rules in neighbouring docstrings).
 
-1. **`sleeve.holding_of` and `keel pnl --lots`.** Pure module `keel/execution/sleeve.py`:
-   `Holding`, `holding_of`, `net_proceeds`, `fee_drag`; the two doctor findings
-   `sleeve.ledger_drift`, `sleeve.venue_drift`; `keel pnl --lots`. No sell path. Tests over
+1. **`sleeve.holding_of` and `keel dca trim --preview --view lots`.** Pure module
+   `keel/execution/sleeve.py`: `Holding`, `holding_of`, `net_proceeds`, `fee_drag`; the two
+   doctor findings `sleeve.ledger_drift`, `sleeve.venue_drift`; `keel dca trim --preview --view
+   lots` (over `positions`, kept separate from `keel pnl`'s FIFO-over-`transactions` report,
+   §8.1). No sell path. Tests over
    hand-built ledgers, including entry fees in the basis and the FIFO tranche a sale would hit.
 2. **`Action.REDUCE`, `Reduction`, `Rule.reduce_signal`, `executor.reduce`,
    `agent._handle_reductions`, `sell_proposals`.** The pipeline with arbitration, the sleeve
@@ -778,6 +834,6 @@ encodes (this repository keeps its rules in neighbouring docstrings).
 | Q7 | Does the exit monitor cover PAXG tranche 3? | **Yes, on transitions only.** The 2026-09-22 decision holds the position; it does not stop the level being reported when it changes state. No automatic sell. |
 | Q8 | Is a rebalancing trim a permitted sale kind under rail 10? | **Yes, as `band_rebalance`**, if it is ever built; not built now (§5). |
 | Q9 | Spend accumulation policy's 4th trial on a profit-take arm now? | **Not now.** The design is written so it can be pre-registered the day the operator wants it. |
-| Q10 | Is a sleeve sale a DCA outcome for rail 16? | **Yes**, derived from the tranches (`is_dca=1`), so a distribution can never trip the streak breaker. |
+| Q10 | Is a sleeve sale a DCA outcome for rail 16? | **Yes, for a `Reduction`**, derived per-tranche from the tranches it consumed (`is_dca=1`), so a distribution can never trip the streak breaker. Not yet true for `_handle_exits`'s pre-existing whole-position EXIT on a mixed-ownership product: it books one `is_dca` flag for the whole exit (§2.4, §3.2, #860), so a non-`dca` rule's exit on a product that also holds DCA tranches can still book those units as a non-DCA outcome. Fixing that is out of this design's scope but is a present-day gap, not one this design creates. |
 | Q11 | Record a tax jurisdiction in config? | **Operator's call.** Without one, §8 stays a fee report; with one, lots are labelled and still nothing is advised. |
 | Q12 | Should a same-asset harvest (sell and buy back) ever be offered? | **No**, pending the fiqh finding in §8.3 being answered by someone entitled to answer it. |
