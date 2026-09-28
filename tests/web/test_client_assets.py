@@ -1298,6 +1298,9 @@ _VIEW_ENDPOINTS: tuple[tuple[str, str, str], ...] = (
     ("researchView", "gauntlet", "/api/research/gauntlet"),
     ("researchView", "slippage", "/api/research/slippage"),
     ("rulesView", "data", "/api/rules"),
+    # The DCA proposal card on /rules. Read bare, the endpoint answers its awaiting shape, which
+    # carries every key the ready shape does (`payload.dca_plan_awaiting_payload`).
+    ("dcaPlanCard", "plan", "/api/dca-plan"),
     ("venuesView", "data", "/api/venues"),
     ("gatesView", "data", "/api/gates"),
 )
@@ -1768,6 +1771,10 @@ def _row_reads(view: str) -> dict[tuple[str, str], set[str]]:
     return found
 
 
+#: `/api/dca-plan` with the inputs the card takes from the page address. Bare, it answers the
+#: awaiting state, whose collections are empty by design.
+_DCA_PLAN_ASKED = "/api/dca-plan?budget=500&buffer=0.1"
+
 #: Which endpoint each mapped collection comes from, and how to give it a row.
 #:
 #: Hand-written like `_VIEW_ENDPOINTS` beside it, and for the same reason: a table derived from
@@ -1787,6 +1794,12 @@ _ROW_ENDPOINTS: tuple[tuple[str, str, str, str, str], ...] = (
     # `/api/journal`'s `notes`, and the seeder writes one entry through the repository because the
     # CLI writer refuses to run without a terminal.
     ("insightsView", "notes", "notes.entries", "/api/journal", "journal"),
+    # The DCA card's three collections. The endpoint is asked WITH a budget, and the `dca_plan`
+    # seeder admits BTC, rejects PAXG and gives ETH an existing DCA rule -- so each collection has
+    # a row, and each row the card maps is one the served payload actually built.
+    ("dcaPlanCard", "plan", "buys", _DCA_PLAN_ASKED, "dca_plan"),
+    ("dcaPlanCard", "plan", "excluded", _DCA_PLAN_ASKED, "dca_plan"),
+    ("dcaPlanCard", "plan", "existing", _DCA_PLAN_ASKED, "dca_plan"),
 )
 
 #: Mapped collections this test does NOT cover, each with the reason. Named rather than omitted:
@@ -1849,10 +1862,24 @@ def _seed_ledger(tmp_path: Path) -> None:
     )
 
 
-def _seed_for(kind: str, db_path: str) -> None:
+def _seed_for(kind: str, db_path: str, monkeypatch: pytest.MonkeyPatch) -> None:
     from tests.web.test_api import _seed_orders, _seed_positions, _seed_rules
 
-    if kind == "gauntlet":
+    if kind == "dca_plan":
+        # The admission screen, patched at its module (the reader resolves it per call), plus
+        # one existing `dca` rule written through the repository -- the card's three
+        # collections then each hold a row.
+        from keel.commands import assets
+        from keel.data.db import connect, migrate
+        from keel.data.repository import Repository
+        from tests.commands.test_dca_plan import _insert_dca, _screen
+
+        monkeypatch.setattr(assets, "screen_product", _screen("PAXG"))
+        conn = connect(db_path)
+        migrate(conn)
+        _insert_dca(Repository(conn), "ETH-USD", "candidate")
+        conn.close()
+    elif kind == "gauntlet":
         _seed_ledger(Path(db_path).parent)
     elif kind == "positions":
         _seed_positions(db_path, (("BTC-USD", "0.01", "50000"),))
@@ -1922,13 +1949,14 @@ def test_every_row_key_a_view_reads_is_a_key_its_endpoint_sends(
     endpoint: str,
     seed: str,
     running,  # type: ignore[no-untyped-def]
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """The check `_view_keys` declares out of scope, done one level down.
 
     Reverting `row.fallback` to `row.priced_from` in `slippageSection` -- the rename #725 made on
     both sides -- passes the whole web suite without this test and fails here.
     """
-    _seed_for(seed, running.db_path)
+    _seed_for(seed, running.db_path, monkeypatch)
 
     status, _headers, body = _request(running, endpoint, cookie=_session(running))
     assert status == 200, endpoint
@@ -2401,3 +2429,136 @@ def test_the_redeclaration_scan_can_fail() -> None:
         "function f() {\n  for (const c of a) {\n  }\n  for (const c of b) {\n  }\n}\n"
         "function g() {\n  const note = a;\n}\n"
     )
+
+
+# -- the DCA proposal card on /rules (read-only) --------------------------------------------------
+#
+# The card's refusal is a NEGATIVE -- no control that could apply the plan -- so, like the chip,
+# the banner and the plans view above, it is pinned against the parsed function bodies: tags on a
+# closed list, one `code` element paired with `plan.command`, and every key the endpoint sends
+# paired with a read of it.
+
+#: Every function that builds part of the card. The scans below read their bodies together.
+_DCA_CARD_FUNCTIONS = ("dcaPlanCard", "dcaPlanFigure", "dcaPlanRows", "dcaPlanList")
+
+#: The only element tags the card may build. `code` carries the CLI command; nothing on the list
+#: can take an action.
+_DCA_CARD_TAGS = {"section", "h2", "h3", "p", "code", "ul", "li", "span", "div"}
+
+
+def _dca_card_bodies() -> str:
+    source = _source("render.js")
+    return "\n".join(_function_body(source, name) for name in _DCA_CARD_FUNCTIONS)
+
+
+def test_the_dca_card_builds_only_non_interactive_elements() -> None:
+    """Structure, not substrings: every `el("<tag>"` the card makes is on a closed list, the list
+    holds nothing a reader can activate, and its one table is drawn without a sort pair."""
+    body = _dca_card_bodies()
+    tags = re.findall(r'\bel\("([a-z0-9]+)"', body)
+    assert len(tags) >= 8, f"the scan found {len(tags)} elements -- it would pass any card"
+    assert set(tags) <= _DCA_CARD_TAGS, sorted(set(tags) - _DCA_CARD_TAGS)
+    assert len(re.findall(r"\btable\(", body)) == 1, "the schedule is the card's one table"
+    assert "onSort" not in body and "sort:" not in body
+    for forbidden in _INTERACTIVE_TOKENS:
+        assert forbidden not in body, f"the DCA card builds something interactive: {forbidden}"
+
+
+def test_the_dca_card_scan_would_see_a_button() -> None:
+    """The premise of the scan above: a button added to the card's source is found by it."""
+    mutated = _source("render.js").replace(
+        "export function dcaPlanCard(plan, error) {",
+        'export function dcaPlanCard(plan, error) {\n  el("button", undefined, "Apply");',
+        1,
+    )
+    assert mutated != _source("render.js"), "the mutation did not apply"
+    tags = set(re.findall(r'\bel\("([a-z0-9]+)"', _function_body(mutated, "dcaPlanCard")))
+    assert "button" in tags and not tags <= _DCA_CARD_TAGS
+
+
+def test_the_dca_card_places_the_command_in_exactly_one_code_element() -> None:
+    """The pairing: one `code` element in the whole card, and it is filled from `plan.command`."""
+    body = _dca_card_bodies()
+    assert len(re.findall(r'\bel\("code"', body)) == 1
+    paired = re.findall(r'\bel\("code", "[a-z-]+", plain\(plan\.command\)\)', body)
+    assert len(paired) == 1, "the one code element is not the one filled from plan.command"
+
+
+def test_the_dca_card_renders_every_section_the_payload_sends(running) -> None:  # type: ignore[no-untyped-def]
+    """Derived from the served payload, not a list of literals: a key added to the wire and never
+    placed fails here -- the summary's figures one level down, including the worst-month check."""
+    status, _headers, body = _request(running, "/api/dca-plan", cookie=_session(running))
+    assert status == 200
+    data = json.loads(body)["data"]
+    keys = set(data)
+    summary = set(data["summary"])
+    assert "cap_check" in keys and len(keys) >= 10, sorted(keys)
+    assert len(summary) >= 6, sorted(summary)
+    reads = set(_view_keys("dcaPlanCard", "plan"))
+    for key in sorted(keys - {"summary"}):
+        assert any(read == key or read.startswith(key + ".") for read in reads), (
+            f"/api/dca-plan sends {key}; the card never places it"
+        )
+    for key in sorted(summary):
+        assert "summary." + key in reads, f"/api/dca-plan sends summary.{key}; never placed"
+
+
+def test_the_dca_card_labels_the_worst_month_check_as_what_the_cap_was_checked_against() -> None:
+    """#847: the figure beside the cap is the one the blocker compared, and the card says so in
+    the CLI's own words. Paired: exactly one figure reads `plan.cap_check`, under that label."""
+    figures = re.findall(r'dcaPlanFigure\("([^"]+)", (plan\.[a-z_.]+)\)', _dca_card_bodies())
+    assert len(figures) >= 8, figures
+    checks = [label for label, read in figures if read == "plan.cap_check"]
+    assert checks == ["checked against the cap"], figures
+
+
+def test_the_dca_card_states_a_failed_read_with_the_servers_reason() -> None:
+    """A 400 (a bad `?budget=`, a config refusal) leaves the rules table standing and says why:
+    the card is handed the reading's `error` and places its `detail`, the service's own words."""
+    body = _function_body(_source("render.js"), "dcaPlanCard")
+    assert body.count("plain(error.detail)") == 1
+    assert "if (!plan)" in body
+
+
+def test_the_rules_view_places_the_dca_card_exactly_once() -> None:
+    source = _source("render.js")
+    rules = _function_body(source, "rulesView")
+    assert rules.count("dcaPlanCard(") == 1
+    assert "dcaPlanCard(plan || null, planError || null)" in rules
+    # And nowhere else: one card, on one page.
+    assert _code_only(source).count("dcaPlanCard(") == 2  # the declaration and the one call
+
+
+def test_the_rules_view_reads_the_dca_plan_as_its_second_endpoint() -> None:
+    """The ROUTES row, which `_js_route_names` parses and
+    `test_the_python_and_javascript_route_tables_agree` pairs with the server's table."""
+    source = _source("main.js")
+    start = source.index("const ROUTES = [")
+    table_src = source[start : source.index("];", start)]
+    rows = [line.strip() for line in table_src.splitlines() if 'name: "rules"' in line]
+    assert rows == ['{ name: "rules", label: "Rules", endpoints: ["rules", "dca-plan"] },']
+
+
+def test_mount_hands_the_rules_view_the_dca_reading_data_and_error() -> None:
+    """The secondary reading's `data` AND `error` both reach the view -- `data` alone would turn
+    a 400 into a bare "could not be read" with the reason thrown away."""
+    code = _code_only(_source("main.js"))
+    calls = re.findall(r"rulesView\(([^;]*)\);", code)
+    assert len(calls) == 1, calls
+    args = re.sub(r"\s+", " ", calls[0]).strip().rstrip(",").strip()
+    assert args == (
+        "data, primary.sort, onSort, planReading ? planReading.data : null, "
+        "planReading ? planReading.error : null"
+    )
+    assert code.count("const planReading = readings[1];") == 1
+
+
+def test_the_page_address_seeds_only_the_dca_plan_query() -> None:
+    """R16: the card's inputs come from the page's own address, copied once into the
+    `dca-plan` endpoint's query bag only -- the names are a closed pair, and nothing else in the
+    client reads `location.search`."""
+    code = _comments_stripped(_source("main.js"))
+    assert code.count("window.location.search") == 1
+    names = re.findall(r"for \(const name of \[([^\]]*)\]\)", code)
+    assert names == ['"budget", "buffer"'], names
+    assert code.count('paramsFor("dca-plan")') == 1
