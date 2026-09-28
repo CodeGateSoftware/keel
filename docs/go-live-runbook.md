@@ -122,6 +122,11 @@ decision on the record rather than an oversight nobody re-examined.
 live-seeded rules in place afterwards."* They were left in place. **Reviewed 2026-08-08; kept
 deliberately.**
 
+> **Superseded 2026-09-27.** The live rule export of that date (`deploy/live-rules.json`, #855)
+> shows every `turtle_breakout` rule in `keel-live.db` — rules 1–5 and the DOGE turtle, rule 7 —
+> at `status = paper`. The only `live` rules are the seven DCA rules (6, 8–13). This exception is
+> no longer in force; the section below is kept as the record of why it existed.
+
 **Why they are kept.** `min_trades` is 100 *per rule*, and this strategy cannot reach it.
 Backtesting each rule over ~5.02 years of daily bars on 2026-08-08:
 

@@ -142,77 +142,48 @@ def test_committed_manifest_is_valid(tmp_path: Path) -> None:
     rebuilt = _rules(db)
     assert len(rebuilt) == len(json.loads(committed.read_text())["rules"])
     dca = [r for r in rebuilt if r["kind"] == "dca"]
-    assert len(dca) == 1, "the live DCA rule is missing from the manifest"
+    assert dca, "the live DCA rules are missing from the manifest"
 
-    # This used to pin the rule's budget at "25" with the rationale "must not revert to the
-    # default 50", then (still before #840) switched to an AGREEMENT assertion that the
-    # manifest's budget must equal `config.dca.budget_usd`. Both versions were reasoning about a
-    # world where the live executor sized DCA from `config.dca.budget_usd`
-    # (`execution/executor.py::_build_intent`) and ignored the RULE's `budget_usd` entirely --
-    # so the rule row could say 25, the config could say 50, and 50 is what moved live while the
-    # account simulator, which read the rule's value, modeled a position size live never took.
-    # AGREEMENT closed that gap by requiring the manifest and the config to match.
-    #
-    # #840 reverses which value is real: the live executor now spends the RULE's own `budget_usd`
-    # (the `size_usd` its setup carries -- see `_dca_budget`), and `config.dca.budget_usd` is only
-    # the FALLBACK for a setup whose `size_usd` is absent. The rule row is now the number that
-    # actually moves, live and in the sim alike, and it is MEANT to be free to diverge from the
-    # config -- letting an operator tune one rule's budget away from the shared config value is
-    # exactly what #840 made possible. Requiring the manifest to agree with the config would break
-    # the moment that divergence is actually used, so this test no longer asserts that agreement.
-    # Right now `deploy/live-rules.json` defines a single DCA rule, at $50 -- matching `Dca`'s
-    # constructor default -- but that coincidence is what assertion (2) below pins down
-    # explicitly, not a fact this test takes for granted or asserts on its own.
-    #
-    # What is still true, and still worth guarding: `deploy/live-rules.json`'s DCA params are,
-    # right now, EXACTLY `Dca.__init__`'s constructor defaults (see `keel/strategy/rules/dca.py`).
-    # That means the VALUE alone cannot prove this rule wasn't reseeded by a fresh `keel init`
-    # rather than deliberately provisioned, since the operator's intended value and `keel init`'s
-    # default are, today, the same number. Two assertions below make up for that: (1) status,
-    # which is the only thing that still can, and (2) a pinned check on the coincidence itself,
-    # so that if the operator ever moves the budget off the default, the value check regains its
-    # own power and (2) is what tells them so.
+    # History: this used to pin the single DCA rule's budget at "25", then an AGREEMENT with
+    # `config.dca.budget_usd`, then (after #840 made the live executor spend the RULE's own
+    # `budget_usd` -- see `_dca_budget`) a pinned COINCIDENCE that the one DCA rule's params equal
+    # `Dca`'s constructor defaults. #855 regenerated the manifest from the live DB: seven DCA rules
+    # (BTC $40/7d, ETH $25/7d, PAXG $25/14d, ADA/XLM/DOGE/FET $15/14d), none at the default $50,
+    # and the turtles at `paper`. So the coincidence no longer holds, and the assertions below say
+    # what IS true now.
     #
     # SCOPE: this asserts the COMMITTED FILE, not a deployment's database, so it catches a
     # reseeded box's state being COMMITTED -- not the reseed itself. `rule_manifest.py apply`
     # is what reports that drift against a live DB.
 
-    # (1) NOT SEED-SHAPED -- status is the only discriminator standing between "the operator's
-    # 50" and "keel init's 50" now that the manifest's budget is not checked against anything
-    # else. `keel init` always seeds fresh rules at `candidate` (`docs/RELEASING.md`), and
-    # nothing in this test path promotes them, so a reseeded box's manifest would show
-    # `candidate` even though its budget_usd matches the constructor default byte-for-byte. A
-    # correctly-provisioned deployment has every rule at `live`.
-    assert dca[0]["status"] == "live", (
-        "the live DCA rule is not status=live -- if this is a candidate, keel init likely "
-        "reseeded it from Dca's constructor defaults rather than preserving an operator's tuned "
-        "value, and nothing else here can catch that on its own (see comment)"
+    # (1) NOT SEED-SHAPED BY STATUS -- `keel init` always seeds fresh rules at `candidate`
+    # (`docs/RELEASING.md`), and nothing in this test path promotes them. A deliberately
+    # provisioned deployment has every DCA rule at `live` and no rule at `candidate`.
+    assert [r["status"] for r in dca] == ["live"] * len(dca), (
+        "a DCA rule in the committed manifest is not status=live -- if it is a candidate, keel "
+        "init likely reseeded it from Dca's constructor defaults rather than preserving an "
+        "operator's tuned value"
     )
     assert all(r["status"] != "candidate" for r in rebuilt), (
         "a rule in the committed live manifest is status=candidate -- that shape matches a fresh "
         "`keel init` reseed from constructor defaults, not a deliberately-provisioned deployment"
     )
 
-    # (2) THE COINCIDENCE IS PINNED, NOT ASSUMED -- assertion (1) only carries the weight it does
-    # because the operator's intended DCA params happen, today, to equal Dca's constructor
-    # defaults. Pin that equality explicitly instead of taking it on faith. If it ever stops
-    # being true -- e.g. the operator deliberately moves the budget off 50 -- THIS assertion is
-    # what fails, and failing here is good news dressed as a test failure: it means the
-    # manifest's value would now visibly differ from a reseed's, so the VALUE alone regains the
-    # power to catch a `keel init` revert, and the status check in (1) is no longer the last
-    # line of defense. Whoever hits this failure should update this comment, not just delete the
-    # assertion.
-    manifest_params = dca[0]["params"]
-    default_params = Dca(product_id=manifest_params["product_id"]).describe()["params"]
-    for key, expected in default_params.items():
-        if key == "product_id":
-            continue  # trivially equal -- it's the constructor arg we just passed in
-        assert Decimal(str(manifest_params[key])) == Decimal(str(expected)), (
-            f"deploy/live-rules.json's DCA {key} ({manifest_params[key]!r}) no longer matches "
-            f"Dca's constructor default ({expected!r}). Assertion (1) above still holds, but the "
-            "reasoning behind it -- that status is the ONLY thing distinguishing a deliberate "
-            "value from a reseeded default -- no longer applies to this parameter: a reseed "
-            "would now produce a visibly different value here, and THIS comparison catches that "
-            "on its own, without needing assertion (1)'s status check as the last line of "
-            "defense."
+    # (2) NOT SEED-SHAPED BY VALUE -- every live DCA rule's params differ from `Dca`'s constructor
+    # defaults on at least one key, so a reseed would show up as a VALUE change in this file, not
+    # only as a status change. If an operator ever deliberately sets a rule back to the defaults,
+    # this fails: status in (1) is then the only discriminator left for that rule. Update this
+    # comment when you relax it, do not just delete the assertion.
+    for rule in dca:
+        params = rule["params"]
+        default_params = Dca(product_id=params["product_id"]).describe()["params"]
+        differing = sorted(
+            key
+            for key, expected in default_params.items()
+            if key != "product_id" and Decimal(str(params[key])) != Decimal(str(expected))
+        )
+        assert differing, (
+            f"deploy/live-rules.json's {params['product_id']} DCA rule equals Dca's constructor "
+            "defaults on every param, so only its status distinguishes it from a `keel init` "
+            "reseed (see comment)"
         )

@@ -88,8 +88,9 @@ setup carries), with `config.dca.budget_usd` only as the fallback — so a resee
 comes back at `50` really does spend $50 a buy. A rule whose intended value happens to equal the
 constructor default cannot prove by its value alone that it wasn't reseeded, since `keel init`'s
 default and the operator's intended value are then the same number. `test_committed_manifest_is_valid`
-in `tests/test_rule_manifest.py` covers the gap by also asserting every committed rule's *status*
-is `live`, since `keel init` always seeds at `candidate` regardless of what the params say.
+in `tests/test_rule_manifest.py` covers the gap by also asserting every committed DCA rule's
+*status* is `live` and that no committed rule is `candidate`, since `keel init` always seeds at
+`candidate` regardless of what the params say.
 
 `deploy/live-rules.json` is the committed record of the live deployment's rule set, so that state
 is a diff in a PR rather than a fact stored on one laptop:
