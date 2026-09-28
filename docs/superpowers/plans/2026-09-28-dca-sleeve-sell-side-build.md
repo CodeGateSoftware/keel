@@ -5223,9 +5223,10 @@ def test_887_a_partial_sale_of_an_unbracketed_dca_tranche_logs_no_critical(repo,
     bracketed, so a perfectly ordinary, fully-filled confirmed partial sale of one has
     `has_levels` and `protecting_remainder` both `False`, `still_held` non-empty (0.001 of
     0.002 remains), and the old gate logged a false CRITICAL
-    `executor.reduce_left_an_unprotected_remainder` plus a false `unbracketed:BTC-USD` record
-    for a position that was never bracketed to begin with -- nothing was left LESS protected
-    than it already was. Seeds the same way `_bracketed` seeds a bracketed position (`_held`
+    `executor.reduce_left_an_unprotected_remainder` for a position that was never bracketed to
+    begin with -- the `unbracketed:BTC-USD` write was already gated separately on `stop`/
+    `target` being set, so it never fired; nothing was left LESS protected than it already was.
+    Seeds the same way `_bracketed` seeds a bracketed position (`_held`
     for the `positions` row, a matching filled BUY order for `_held_position` -- see that
     fixture's own docstring), but never calls `place_bracket`, so no `open_stop`/`open_target`
     are ever recorded and no bracket rests to cancel.
@@ -5297,7 +5298,7 @@ def test_the_cycle_never_asks_reduce_to_confirm() -> None:
   3. With that also fixed (Step 3's actual code, write inside `_confirm_then_cancel` after the yes), the two placement tests still fail on their `place_calls` counts unless they account for the SELL leg's own `_run_order` placement, not just the bracket calls -- confirm this by counting `broker.place_calls` before asserting the fixed numbers (2 and 3, not 1 and 2).
   4. With the remainder re-bracket built but no tranche repoint, `test_883_a_partial_confirmed_leg_repoints_the_surviving_tranche_at_the_new_bracket` fails: `position["bracket_order_id"]` still names the CANCELLED bracket's id, not the new one. With the crash-ledger write still gated on `protecting_remainder`, `test_883_a_venue_rejected_full_close_after_the_cancel_leaves_a_retry_record_and_is_not_mislabelled_a_decline` fails on `repo.get_state("unbracketed:BTC-USD") is not None` (nothing was ever written for a full close) and, separately, on `result.decision == "failed"` (it reads `"declined"`, indistinguishable from an operator's own no). And, once the write is switched to `has_levels` but BEFORE the full-close success path is taught to clear it explicitly, `test_883_a_full_close_does_not_attempt_to_re_bracket`'s new last assertion (`repo.get_state("unbracketed:BTC-USD") is None`) itself goes red -- widening the write condition without also widening what clears it trades one gap (no record on a rejected full close) for another (a stale record after a successful one).
   5. (#887) With `test_883_a_full_close_does_not_attempt_to_re_bracket`'s own narrow clear (`if not protecting_remainder and has_levels: repo.set_state(..., None)`) in place but BEFORE it is replaced by Step 3's `still_held`-driven branch, `test_887_a_full_close_clears_position_rule_and_open_levels_too` fails on `repo.get_state("position_rule:BTC-USD") is None` -- the prior code never touched `position_rule:`/`open_stop:`/`open_target:` at all, only `unbracketed:`. And with that branch replaced but the short-fill `else` arm not yet added, `test_887_a_short_filled_full_close_rewrites_the_retry_record_from_the_ledger` fails on `repo.get_state("unbracketed:BTC-USD") == {...}` -- `protecting_remainder` was `False` (a full close was intended), so the prior code's `if protecting_remainder:` re-bracket never ran, and the `still_held`-is-empty branch does not apply either (`still_held` is non-empty after a short fill), so nothing rewrites the stale pre-sale record without the new `else` arm.
-  6. (#890) With that short-fill arm added but still gated on `not protecting_remainder` alone -- the shape #887 itself landed, with no `has_levels` check -- `test_887_a_partial_sale_of_an_unbracketed_dca_tranche_logs_no_critical` fails: its DCA tranche has no `open_stop`/`open_target`, so `has_levels` and `protecting_remainder` are both `False`, `still_held` is non-empty (0.001 of 0.002 remains after an ordinary, fully-filled confirmed partial sale), and the un-split `else` arm reaches the CRITICAL log and the `unbracketed:BTC-USD` write anyway, on `caplog.records == []` and, separately, on `repo.get_state("unbracketed:BTC-USD") is None`. Splitting that `else` into an `elif has_levels and remainder <= 0:` arm (the short-fill case) and a final `else` that writes nothing (this test's case) is what fixes it.
+  6. (#890) With that short-fill arm added but still gated on `not protecting_remainder` alone -- the shape #887 itself landed, with no `has_levels` check -- `test_887_a_partial_sale_of_an_unbracketed_dca_tranche_logs_no_critical` fails: its DCA tranche has no `open_stop`/`open_target`, so `has_levels` and `protecting_remainder` are both `False`, `still_held` is non-empty (0.001 of 0.002 remains after an ordinary, fully-filled confirmed partial sale), and the un-split `else` arm reaches the CRITICAL log anyway, on `caplog.records == []` alone. The `unbracketed:BTC-USD` write in that same shape was already its own `if stop is not None and target is not None:` clause, which stays False for an unbracketed DCA tranche either way, so `repo.get_state("unbracketed:BTC-USD") is None` was never the failing assertion. Splitting that `else` into an `elif has_levels and remainder <= 0:` arm (the short-fill case) and a final `else` that writes nothing (this test's case) is what fixes it.
 
 - [ ] **Step 3: Implement the confirm branch.** After a clean `guards.check`:
   - If `execution == "confirm"` and not `sleeve.sells_released(repo, now_ts)`, record `declined` and return.
@@ -5456,7 +5457,7 @@ def test_the_cycle_never_asks_reduce_to_confirm() -> None:
     LEDGER tail below -- can just say `order_id` rather than reaching back into `result`):
     - update the proposal: `decision="placed"`, `order_id`;
     - stamp `orders.confirmation = "confirm_sells"` with `repo.update_order(order_id, confirmation="confirm_sells")`, so a reader can tell which gate released it (spec §3.8);
-    - when the order is `filled`, call `streak.book_exit(repo, config, product_id=..., exit_order=repo.get_order(order_id), sold_qty=streak.observed_sold_qty(order) or intent.qty, is_dca=None, now_ts=now_ts)`.
+    - when the order is `filled`, bind `exit_order = repo.get_order(order_id)` once and call `streak.book_exit(repo, config, product_id=..., exit_order=exit_order, sold_qty=streak.observed_sold_qty(exit_order) or intent.qty, is_dca=None, now_ts=now_ts)`.
     - **Re-bracket the remainder, exactly as `scale_out` does (#883), but sized from what the
       LEDGER actually still holds after `book_exit`, not from the pre-sale `remainder` above
       (held question, #887 follow-up).** `if protecting_remainder:` re-read the ledger now that
@@ -5469,13 +5470,19 @@ def test_the_cycle_never_asks_reduce_to_confirm() -> None:
       that would otherwise heal from the crash-ledger record sizes a healing bracket off the
       `positions` ledger, which `book_exit` is what shrinks. **This deliberately differs from
       `scale_out`'s own re-bracket call, which sizes `qty=remainder` -- the PRE-SALE number
-      (`executor.py:2589`).** `scale_out` may do that safely because what it books and what it
-      predicts can never disagree: `_book_scale_out` always books the ORDERED `qty` outright,
-      never a short fill. `reduce`'s confirm branch is not that simple -- it books through
-      `streak.book_exit` with `sold_qty=streak.observed_sold_qty(order) or intent.qty` (the
-      bullet above), so a short-filled partial leg is an outcome this path already expects.
-      Bracketing at the stale, smaller pre-sale `remainder` would leave the unsold excess of a
-      short-filled partial leg naked with no record -- reading the ledger's own post-`book_exit`
+      (`executor.py:2589`).** That is not because `scale_out` is safe from a short fill:
+      `_book_scale_out` books `exit_order.get("filled_quantity") or exit_order["qty"]`
+      (`executor.py:2661`), and its own docstring says a scale-out the venue fills short must
+      reduce the tranche by what actually sold. `scale_out`'s pre-sale `qty=remainder` bracket
+      has that same gap on main today -- hold 0.002, scale out 0.001, the venue fills 0.0006,
+      the ledger holds 0.0014, the bracket covers only 0.001, and `place_bracket` only clamps
+      down, so 0.0004 goes naked and unrecorded. That gap is pre-existing, out of scope for
+      this plan, and tracked in #893. `reduce`'s confirm branch sizes from the ledger instead
+      because a short fill can leave MORE held than the pre-sale `remainder` predicted: it
+      books through `streak.book_exit` with `sold_qty=streak.observed_sold_qty(exit_order) or
+      intent.qty` (the bullet above), so bracketing at the stale, smaller pre-sale `remainder`
+      would leave the unsold excess of a short-filled partial leg naked with no record --
+      reading the ledger's own post-`book_exit`
       qty here closes that gap the same way the LEDGER tail below closes it for a short-filled
       FULL close. `place_bracket` clears `unbracketed:<product>` on success and re-writes it
       (unchanged) on failure or veto, logging CRITICAL either way (its own existing contract;
@@ -5557,8 +5564,10 @@ def test_the_cycle_never_asks_reduce_to_confirm() -> None:
         shape reached this branch on `not protecting_remainder` alone, with no `has_levels`
         check -- true for EVERY partial sale of an unbracketed product, not only a short-filled
         one, so an ordinary confirmed partial sale of a plain DCA tranche logged a false
-        CRITICAL `executor.reduce_left_an_unprotected_remainder` and a false `unbracketed:`
-        record for a position that was never bracketed to begin with. Splitting the prior
+        CRITICAL `executor.reduce_left_an_unprotected_remainder` for a position that was never
+        bracketed to begin with -- the `unbracketed:` write itself was already gated
+        separately on `stop`/`target` being set, so it never actually wrote a false record;
+        only the CRITICAL log was spurious. Splitting the prior
         single `else` into the `has_levels` arm above and this one is the fix --
         `test_887_a_partial_sale_of_an_unbracketed_dca_tranche_logs_no_critical`, Task 18.1 Step
         1, pins it.)
@@ -5586,7 +5595,8 @@ def _confirm(deployment, verb, pid, input=None):
 def test_off_a_tty_confirm_places_nothing(deployment, monkeypatch, broker) -> None:
     monkeypatch.setattr(_common, "_is_interactive", lambda: False)
     pid = _seed_firing(deployment, "live")
-    assert _confirm(deployment, "distribute", pid).exit_code != 0
+    result = _confirm(deployment, "distribute", pid)
+    assert result.exit_code == 1, result.output  # R35: no TTY refuses, same as any other refusal
     assert broker.place_calls == []
 
 
@@ -5594,8 +5604,10 @@ def test_without_the_sells_window_confirm_says_how_to_arm_it(deployment, monkeyp
     monkeypatch.setattr(_common, "_is_interactive", lambda: True)
     _repo(deployment[0]).set_autonomous(True, now_ts=0)  # global autonomy is NOT enough (S1)
     pid = _seed_firing(deployment, "live")
-    out = _confirm(deployment, "distribute", pid, input="yes\n").output
-    assert "keel autonomy on --sells --for-hours 1" in out and broker.place_calls == []
+    result = _confirm(deployment, "distribute", pid, input="yes\n")
+    assert result.exit_code == 1, result.output  # R35: a closed sells window refuses too
+    assert "keel autonomy on --sells --for-hours 1" in result.output
+    assert broker.place_calls == []
 
 
 def test_window_and_typed_yes_place_one_leg_and_link_the_proposal(deployment, monkeypatch, broker):
