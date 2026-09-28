@@ -193,12 +193,65 @@ def test_exposure_cap_rejects_over_cap():
     )
     config = _config(max_exposure_usd=Decimal("1000"), max_per_asset_pct=Decimal("1"))
 
+    # A RULE entry: DCA is exempt from this cap (#841), see the tests below.
     ok, reasons = acc.can_open(
-        _intent(asset="BTC", notional=Decimal("45")), config, DAY0
+        _intent(asset="BTC", notional=Decimal("45"), is_dca=False, rule_kind="pullback"),
+        config,
+        DAY0,
     )  # 960+45=1005>1000
 
     assert ok is False
     assert any("total_exposure_cap" in r for r in reasons)
+
+
+def _account_with_open_exposure(asset: str, notional: Decimal) -> SimAccount:
+    acc = SimAccount(Decimal("0"), Decimal("0"))
+    acc.deposit(Decimal("100000"), DAY0)
+    acc.open(
+        _intent(asset=asset, notional=notional, is_dca=False, rule_kind="pullback_continuation"),
+        fill_price=Decimal("100"),
+        now_ts=DAY0 - 1_000_000,
+    )
+    return acc
+
+
+def test_a_dca_buy_over_max_exposure_is_not_vetoed_by_the_exposure_cap():
+    """Sim parity with `guards.check` (#841): rail 14 bounds DCA, not `max_exposure_usd`, so
+    `keel simulate` must not veto the DCA buy that live now places. 960 + 45 = 1005 > 1000."""
+    acc = _account_with_open_exposure("ETH", Decimal("960"))
+    config = _config(max_exposure_usd=Decimal("1000"), max_per_asset_pct=Decimal("0.6"))
+
+    ok, reasons = acc.can_open(_intent(asset="BTC", notional=Decimal("45")), config, DAY0)
+
+    assert reasons == []
+    assert ok is True
+
+
+def test_a_rule_buy_over_max_exposure_is_still_vetoed_by_the_exposure_cap():
+    """The pairing to the test above: the same buy as a RULE entry still trips the cap."""
+    acc = _account_with_open_exposure("ETH", Decimal("960"))
+    config = _config(max_exposure_usd=Decimal("1000"), max_per_asset_pct=Decimal("0.6"))
+
+    ok, reasons = acc.can_open(
+        _intent(asset="BTC", notional=Decimal("45"), is_dca=False, rule_kind="pullback"),
+        config,
+        DAY0,
+    )
+
+    assert ok is False
+    assert [r.split(":", 1)[0] for r in reasons] == ["total_exposure_cap"]
+
+
+def test_a_dca_buy_over_the_per_asset_cap_is_vetoed_by_concentration_only():
+    """Concentration still binds DCA (#841), and it is the ONLY veto though the buy also
+    crosses `max_exposure_usd` (BTC 960 + 45 = 1005 > 1000 and > 0.6 * 1000)."""
+    acc = _account_with_open_exposure("BTC", Decimal("960"))
+    config = _config(max_exposure_usd=Decimal("1000"), max_per_asset_pct=Decimal("0.6"))
+
+    ok, reasons = acc.can_open(_intent(asset="BTC", notional=Decimal("45")), config, DAY0)
+
+    assert ok is False
+    assert [r.split(":", 1)[0] for r in reasons] == ["per_asset_concentration_cap"]
 
 
 # -- per-asset concentration cap -------------------------------------------------------------------
@@ -597,13 +650,22 @@ def test_close_frees_up_exposure_for_a_subsequent_open(sim_config):
         Decimal("100"),
         DAY0,
     )
-    # fully deployed against the exposure cap -- a second open should be blocked
-    blocked, _ = acc.can_open(_intent(asset="ETH", notional=Decimal("1")), config, DAY0)
+    # fully deployed against the exposure cap -- a second RULE open should be blocked (a DCA
+    # buy would not be: DCA is exempt from the exposure cap, #841)
+    blocked, _ = acc.can_open(
+        _intent(asset="ETH", notional=Decimal("1"), is_dca=False, rule_kind="pullback"),
+        config,
+        DAY0,
+    )
     assert blocked is False
 
     acc.close("BTC", fill_price=Decimal("100"), now_ts=DAY0)
 
-    allowed, reasons = acc.can_open(_intent(asset="ETH", notional=Decimal("50")), config, DAY0)
+    allowed, reasons = acc.can_open(
+        _intent(asset="ETH", notional=Decimal("50"), is_dca=False, rule_kind="pullback"),
+        config,
+        DAY0,
+    )
     assert allowed is True
     assert reasons == []
 
@@ -1027,6 +1089,51 @@ def test_parity_with_guards_check_even_daily_pacing():
     # usdc=150 (cash=150), exposure=650 (1000-350) -- see `_parity_scenario`'s docstring for why
     # ETH (150) is left open rather than netted to ~0 in this BUY-only shared scenario.
     boundaries = {120, 130, 150, 350, 650, paced_boundary}
+    notionals = sorted(
+        {1} | {b - 1 for b in boundaries} | {b for b in boundaries} | {b + 1 for b in boundaries}
+    )
+
+    _assert_parity(repo, account, config, now_ts, notionals)
+
+
+def test_parity_with_guards_check_when_total_exposure_is_the_tightest_cap():
+    """#841: DCA is exempt from the total-exposure rail on BOTH sides. Here `max_exposure_usd`
+    leaves 50 of room (400 - 350) while cash leaves 150 and BTC's per-asset room is 200, so a
+    grid across 50 separates "exposure exempt" from "exposure binds" -- and the two sides must
+    agree at every point, which a one-sided exemption would break between 51 and 150."""
+    now_ts = JAN15
+    repo, account = _parity_scenario(now_ts)
+    config = _config(
+        max_per_order_usd=Decimal("1000"),
+        max_per_day_usd=Decimal("1000"),
+        max_exposure_usd=Decimal("400"),
+        max_per_asset_pct=Decimal("1"),
+        assumed_free_volume_usd=Decimal("2000"),
+    )
+    _attest(
+        repo,
+        free_volume_usd=config.subscription.assumed_free_volume_usd,
+        pacing=config.subscription.pacing,
+        now_ts=now_ts,
+    )
+    # The grid must actually straddle the exposure cap with the DCA buy allowed -- otherwise
+    # parity would hold by both sides vetoing, and prove nothing about the exemption.
+    ok, reasons = account.can_open(
+        OpenIntent(
+            asset="BTC",
+            qty=Decimal("1"),
+            entry=Decimal("100"),
+            stop=None,
+            notional=Decimal("100"),
+            is_dca=True,
+            rule_kind="dca",
+        ),
+        config,
+        now_ts,
+    )
+    assert (ok, reasons) == (True, [])
+
+    boundaries = (50, 150, 200)
     notionals = sorted(
         {1} | {b - 1 for b in boundaries} | {b for b in boundaries} | {b + 1 for b in boundaries}
     )

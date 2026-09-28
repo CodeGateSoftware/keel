@@ -990,9 +990,12 @@ fourth does not, which is most of why they drift apart.
 - **`paper.monthly_contribution_usd`** — a recurring top-up, applied once per UTC calendar month.
   It compounds, and the base is small: a contribution comparable to the seed doubles the account
   monthly, and every position size below grows with it.
-- **`caps.max_exposure_usd`** — has **two jobs at once**. It is the ceiling on total notional held
-  at any one moment (rail 4, and rail 6's concentration cap is a percentage of it), *and* it is the
-  **equity proxy that sizes orders** on the live path
+- **`caps.max_exposure_usd`** — has **two jobs at once**. It caps rule-trading entries' total
+  notional held at any one moment (rail 4; rail 6's concentration cap is a percentage of it).
+  DCA buys are exempt from rail 4 (#841), bounded instead by rail 14's monthly buy cap and by
+  rail 6's per-asset cap — but DCA holdings still count toward the total, so a growing DCA sleeve
+  can consume the room rule-trading entries have left under it (`docs/rails/rail-4-total-exposure.md`).
+  *And* it is the **equity proxy that sizes orders** on the live path
   (`keel/execution/executor.py::_build_intent`). So live `risk_pct` is a fraction of THIS number,
   not of real account equity — raising the cap raises the real dollars risked per trade. Set above
   actual equity it stops binding before available cash does, and the refusal comes later and less

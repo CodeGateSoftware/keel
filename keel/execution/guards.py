@@ -38,9 +38,14 @@ DCA exemptions (explicit): DCA is a "distinct order class" (§8/§12.1) designed
 through drawdowns on a fixed small budget/cadence, not a rule-trading signal. It is exempt from
 rail 11 (the DD breaker — stated explicitly in the plan) and, for the same functional reason,
 rail 8 (no-averaging-into-losers would otherwise block the exact buying-the-dip behavior DCA
-exists to do). DCA remains bound by every other rail, explicitly including the allowlist, the
-per-asset cap, and the kill-switch (§12.6) -- and, explicitly, rails 13/14 below: DCA orders are
-themselves the recurring "subscription" spend rail 14 exists to cap.
+exists to do), and from rail 16 (the consecutive-loss breaker, below). Since #841 (the operator's
+decision, 2026-09-27) it is also exempt from rail 4, the total-exposure cap: DCA is bounded by
+rail 14 -- the venue plan's attested monthly buy cap -- not by `max_exposure_usd`, because a fixed
+total-holdings cap halts a multi-rule accumulation sleeve within weeks whatever the plan. DCA
+remains bound by every other rail, explicitly including the allowlist, the per-asset cap
+(rail 6), and the kill-switch (§12.6) -- and, explicitly, rails 13/14 below: DCA orders are
+themselves the recurring "subscription" spend rail 14 exists to cap, and rail 14 is now the
+binding limit on them.
 
 Rails 13/14 (Issue #59, safety-critical, un-overridable like every rail above):
 
@@ -543,7 +548,14 @@ def check(
     # -- so it belongs with concurrent slots / pyramiding, not before them. Fixing the COMMENT
     # matters regardless: a comment that overstates what a safety rail enforces is worse than
     # no comment.
-    if is_buy:
+    #
+    # DCA exempt (#841, the operator's decision of 2026-09-27): DCA is bounded by rail 14 -- the
+    # venue plan's attested monthly buy cap -- not by `max_exposure_usd`. A fixed total-holdings
+    # cap stops a multi-rule accumulation sleeve within weeks whatever the plan is, which is the
+    # opposite of what DCA is for. The exemption is from THIS rail only: rail 6 (per-asset
+    # concentration) and rail 14 still bind DCA, and DCA holdings still count in
+    # `total_exposure`, so they still consume the headroom a rule-trading entry sees here.
+    if is_buy and not intent.is_dca:
         projected_exposure = total_exposure + intent.notional
         if projected_exposure > config.caps.max_exposure_usd:
             violations.append(
@@ -706,7 +718,8 @@ def check(
     #     with advice that sends the operator to attest the wrong venue. Fails closed:
     #     unattested, suspect, lapsed, or overdue all fall back to `unsubscribed_allowance_usd`
     #     (default 0). DCA is NOT exempt -- it is exactly the recurring spend this rail exists
-    #     to cap (Issue #59).
+    #     to cap (Issue #59) -- and since #841, with DCA exempt from rail 4, this is the rail
+    #     that bounds DCA's total spend.
     if is_buy:
         venue = current_venue() or DEFAULT_VENUE
         record = repo.get_broker_subscription(venue)

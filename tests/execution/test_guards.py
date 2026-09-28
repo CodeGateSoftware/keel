@@ -326,6 +326,106 @@ def test_rail4_total_exposure_cap_rejects_over_cap(repo):
     assert _keys(result) == {"total_exposure_cap"}
 
 
+# -- rail 4: DCA is exempt (#841) -- rail 14 bounds DCA, not max_exposure_usd ----------------------
+
+
+def _seed_open_exposure(repo: Repository, *, product_id: str, notional: Decimal) -> None:
+    """Open `notional` of `product_id`, filled well before this UTC month (so it counts toward
+    rails 4/6 but not toward rails 3/14's day or month spend)."""
+    _seed_filled_order(
+        repo,
+        product_id=product_id,
+        side=Side.BUY,
+        qty=notional / Decimal("100"),
+        price=Decimal("100"),
+        created_at=NOW_TS - 40 * 86_400,
+    )
+
+
+def _dca_intent(**overrides: Any) -> OrderIntent:
+    base: dict[str, Any] = dict(is_dca=True, rule_kind="dca", stop=None)
+    base.update(overrides)
+    return _intent(**base)
+
+
+def test_rail4_dca_buy_over_max_exposure_is_not_vetoed_by_total_exposure(repo):
+    """The operator's decision (#841): DCA is bounded by rail 14's attested monthly buy cap, not
+    by `max_exposure_usd`. 960 open + 45 = 1005 > 1000, and nothing else binds."""
+    _seed_open_exposure(repo, product_id="ETH-USD", notional=Decimal("960"))
+    config = _config(max_exposure_usd=Decimal("1000"), max_per_asset_pct=Decimal("0.6"))
+
+    result = check(_dca_intent(product_id="BTC-USD", notional=Decimal("45")), repo, config, NOW_TS)
+
+    assert result.violations == []
+    assert result.ok is True
+
+
+def test_rail4_the_same_buy_without_is_dca_is_still_vetoed_by_total_exposure(repo):
+    """The pairing to the test above: flip `is_dca` and nothing else, and rail 4 binds again."""
+    _seed_open_exposure(repo, product_id="ETH-USD", notional=Decimal("960"))
+    config = _config(max_exposure_usd=Decimal("1000"), max_per_asset_pct=Decimal("0.6"))
+
+    result = check(
+        _dca_intent(product_id="BTC-USD", notional=Decimal("45"), is_dca=False),
+        repo,
+        config,
+        NOW_TS,
+    )
+
+    assert result.ok is False
+    assert _keys(result) == {"total_exposure_cap"}
+
+
+def test_rail6_dca_buy_over_the_per_asset_cap_is_still_vetoed_by_concentration(repo):
+    """Rail 6 still binds DCA (#841) -- and ONLY rail 6 fires here, though the same buy also
+    crosses `max_exposure_usd` (960 + 45 = 1005 > 1000; BTC 1005 > 0.6 * 1000)."""
+    _seed_open_exposure(repo, product_id="BTC-USD", notional=Decimal("960"))
+    config = _config(max_exposure_usd=Decimal("1000"), max_per_asset_pct=Decimal("0.6"))
+
+    result = check(_dca_intent(product_id="BTC-USD", notional=Decimal("45")), repo, config, NOW_TS)
+
+    assert result.ok is False
+    assert _keys(result) == {"per_asset_concentration_cap"}
+
+
+def test_rail14_dca_buy_over_the_monthly_cap_is_still_vetoed_when_exposure_is_also_over(repo):
+    """Rail 14 is now the binding DCA limit (#841): it still fires, and rail 4 no longer fires
+    beside it. PAXG 960 open (a prior month) + BTC 600 = 1560 > 1000; 600 > the attested 500."""
+    _attest(repo, free_volume_usd=Decimal("500"))
+    _seed_open_exposure(repo, product_id="PAXG-USD", notional=Decimal("960"))
+    config = _config(
+        max_per_order_usd=Decimal("100000"),
+        max_per_day_usd=Decimal("100000"),
+        max_exposure_usd=Decimal("1000"),
+        max_per_asset_pct=Decimal("0.6"),  # BTC 600 <= 600: rail 6 stays out of the way
+    )
+
+    result = check(_dca_intent(product_id="BTC-USD", notional=Decimal("600")), repo, config, NOW_TS)
+
+    assert result.ok is False
+    assert _keys(result) == {"monthly_subscription_allowance"}
+
+
+@pytest.mark.parametrize("is_dca", [False, True])
+def test_rail4_never_gates_a_sell_whatever_the_order_class(repo, is_dca):
+    """A SELL reduces exposure; rail 4 has never read one, and the DCA exemption changes that
+    for neither class."""
+    _seed_open_exposure(repo, product_id="BTC-USD", notional=Decimal("2000"))
+    config = _config(max_exposure_usd=Decimal("1000"), max_per_asset_pct=Decimal("1"))
+    intent = _intent(
+        side=Side.SELL,
+        stop=None,
+        notional=Decimal("50"),
+        is_dca=is_dca,
+        rule_kind="target_harvest",
+    )
+
+    result = check(intent, repo, config, NOW_TS)
+
+    assert "total_exposure_cap" not in _keys(result)
+    assert result.ok is True
+
+
 # -- rail 5: correlation-adjusted sizing -----------------------------------------------------------
 
 
