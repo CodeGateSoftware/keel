@@ -47,7 +47,6 @@ from keel_core.telemetry import current_venue
 from keel_core.trade_scope import READ_ONLY, TRADING, TradeScopeState, VenueTradeScope
 
 from keel import attestations
-from keel.commands.positions_close import DECLARED_ORDER_TYPE
 from keel.data.feed_scope import reports_consolidated_volume
 from keel.data.freshness import Freshness
 from keel.execution import guards, sizing
@@ -1464,6 +1463,10 @@ def unbooked_exit_findings(
     is lost is the EVIDENCE, and that is a state a human resolves by deciding whether to
     backfill, not a fault that should stop a cycle.
     """
+    # Lazy, like this module's other `keel.execution` imports: `positions_close` pulls in the
+    # executor, and importing doctor must not.
+    from keel.commands.positions_close import DECLARED_ORDER_TYPE
+
     sold_at_by_product: dict[str, list[int]] = {}
     for order in orders:
         if order.get("side") != "SELL" or order.get("status") != "filled":
@@ -1555,8 +1558,10 @@ def ledger_drift_findings(
             WARN,
             f"{len(drifted)} product(s) where the ledger and the orders log disagree",
             detail + " -- a filled entry with no tranche (#799) or an unbooked sale",
-            "inspect the console's Positions view and `keel orders list`; record the missing "
-            "tranche or the out-of-band close by hand (#798 tracks a command for it)",
+            "inspect the console's Positions view and `keel orders list`: a filled entry with no "
+            "tranche needs its tranche recorded by hand (#799); a sale the orders log already "
+            "holds needs booking against its tranche by hand -- not `keel positions close`, "
+            "which would write a second SELL",
             products=tuple(product for product, _, _ in drifted),
         )
     ]
@@ -1633,8 +1638,8 @@ def venue_drift_findings(
             "; ".join(text for _, text in drifted)
             + " -- an out-of-band sale or transfer (#798), or a venue holding never observed; "
             "the rails still count what the ledger says",
-            "check the venue's holding; if it was sold or moved out of band, record the close "
-            "by hand (#798 tracks a command for it); if no holding is observed, let a live "
+            "check the venue's holding; if a tranche was sold on the venue by hand, record it "
+            "with `keel positions close <id> --price P`; if no holding is observed, let a live "
             "cycle record one",
             products=tuple(product for product, _ in drifted),
         )
@@ -1760,8 +1765,8 @@ def position_watch_findings(
                 f"{len(unmanaged)} open tranche(s) on a product with no {managed_status} rule",
                 _describe(unmanaged, levels=False)
                 + f" -- no {managed_status} rule evaluates these products, so no exit can fire",
-                "re-promote the owning rule, or close the tranche by hand "
-                "(`keel positions close <id>` once #798 ships)",
+                "re-promote the owning rule, or sell it on the venue and record that with "
+                "`keel positions close <id> --price P`",
                 products=_products(unmanaged),
             )
         )

@@ -68,7 +68,7 @@ SECOND_LEVEL_CALLERS = {
 
 #: Operations the browser and the MCP server must never name (S4). Grown by the PR that
 #: introduces each one.
-WEB_FORBIDDEN_NAMES: frozenset[str] = frozenset()
+WEB_FORBIDDEN_NAMES: frozenset[str] = frozenset({"close_declared_position"})  # P4
 
 
 def _module_of(path: str) -> str:

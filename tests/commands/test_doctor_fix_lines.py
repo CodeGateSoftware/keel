@@ -14,10 +14,16 @@ different gates.
 from __future__ import annotations
 
 import re
+from decimal import Decimal
 from pathlib import Path
 
 from keel.cli import cli
-from keel.commands.doctor import rail_state_findings
+from keel.commands.doctor import (
+    ledger_drift_findings,
+    position_watch_findings,
+    rail_state_findings,
+    venue_drift_findings,
+)
 
 _ROOT = Path(__file__).resolve().parents[2]
 _DOCTOR = _ROOT / "keel/commands/doctor.py"
@@ -29,18 +35,9 @@ _INVOCATION = re.compile(r'"keel ((?:[a-z][a-z-]*)(?: [a-z][a-z-]*)?)')
 
 #: The same shape, but for a `keel ...` invocation quoted with BACKTICKS inside a longer fix
 #: string rather than one that IS the whole quoted literal (`_INVOCATION` above only ever matches
-#: a string that opens with `"keel `). Most fix lines name their command this way, e.g. "...
-#: record a missing tranche, or declare an out-of-band close (`keel positions close <id>` once
-#: #798 ships)".
+#: a string that opens with `"keel `). Most fix lines name their command this way, e.g. "... if
+#: it was sold on the venue, record that with `keel positions close <id> --price P`".
 _BACKTICK_INVOCATION = re.compile(r"`keel ((?:[a-z][a-z-]*)(?: [a-z][a-z-]*)?)")
-
-#: `position.unmanaged`'s fix line names `keel positions close <id>` explicitly "once #798
-#: ships" -- the command does not exist yet, #798 tracks it, and this one line is allowed to
-#: name it anyway (#899 review: a forward reference is a suggestion for a WARN whose command
-#: really is coming, not a defect to fix here). Spelled as the exact text of that one line, not
-#: as the bare string "positions close": matching the substring would also allow any OTHER
-#: `positions close` reference elsewhere in the file, including a new one nobody meant to permit.
-_ALLOWED_UNSHIPPED_LINE = '"(`keel positions close <id>` once #798 ships)",'
 
 
 def _resolves(path: str) -> bool:
@@ -79,27 +76,13 @@ def test_every_backtick_invocation_in_a_fix_line_exists() -> None:
     sentence. #899's review found two such references (`ledger.drift`, `ledger.venue_drift`)
     naming `keel positions close <id>` before that command exists, which `_INVOCATION` never saw.
 
-    One reference is allowed to name it anyway: `position.unmanaged`'s, which says so explicitly
-    ("once #798 ships"). It is allowlisted by that ONE LINE'S exact text, not by the substring
-    "positions close" -- so a *different* new unresolvable reference, even one about the same
-    command, still fails this test.
+    Until #798 shipped, one reference was allowlisted by its exact text because it said "once
+    #798 ships". The command exists now (P4), every reference resolves, and the allowlist went:
+    nothing in this scan is exempt.
     """
-    text = _DOCTOR.read_text(encoding="utf-8")
-    lines = text.splitlines()
+    lines = _DOCTOR.read_text(encoding="utf-8").splitlines()
 
-    allowed_line_numbers = {i for i, line in enumerate(lines) if _ALLOWED_UNSHIPPED_LINE in line}
-    assert len(allowed_line_numbers) == 1, (
-        f"expected exactly one #798-pending line to allowlist, found {len(allowed_line_numbers)}: "
-        "has `position.unmanaged`'s fix line changed, or did the source pick up another copy of "
-        "it?"
-    )
-
-    found = [
-        match.group(1)
-        for lineno, line in enumerate(lines)
-        if lineno not in allowed_line_numbers
-        for match in _BACKTICK_INVOCATION.finditer(line)
-    ]
+    found = [match.group(1) for line in lines for match in _BACKTICK_INVOCATION.finditer(line)]
     assert found, "no backtick `keel ...` invocations found -- has the fix format changed?"
     assert "orders list" in found, (
         f"sanity check failed: a known invocation is missing from the scan: {found}"
@@ -138,3 +121,58 @@ def test_the_kill_switch_fix_names_the_command_that_clears_it() -> None:
     assert "autonomy" not in finding.fix, (
         "naming `autonomy` here re-conflates the two gates the design keeps apart"
     )
+
+
+def _fix_invocations(fix: str) -> list[str]:
+    return _BACKTICK_INVOCATION.findall(fix)
+
+
+def test_the_out_of_band_sale_findings_name_the_shipped_close_command() -> None:
+    """#798 shipped `keel positions close`, so the two findings whose cause can be a sale made on
+    the venue by hand name it -- rendered, not scanned, so the assertion is about the fix line an
+    operator actually reads. `ledger.venue_drift` is #798's own shape; `position.unmanaged` is
+    PAXG tranche 3's (#811), where closing the tranche by hand is one of the two ways out."""
+    [venue] = venue_drift_findings(
+        {"PAXG-USD": Decimal("0.0132")},
+        {"PAXG-USD": {"total": "0", "observed_at": 1_700_000_000}},
+    )
+    unmanaged = next(
+        f
+        for f in position_watch_findings(
+            [
+                {
+                    "id": 3,
+                    "product_id": "PAXG-USD",
+                    "rule_name": "turtle_breakout",
+                    "qty": Decimal("0.0132"),
+                    "initial_stop": None,
+                }
+            ],
+            [],
+            lambda p: True,
+            set(),
+        )
+        if f.name == "position.unmanaged"
+    )
+
+    for finding in (venue, unmanaged):
+        assert finding.status == "warn", finding.name
+        invocations = _fix_invocations(finding.fix)
+        assert "positions close" in invocations, (finding.name, finding.fix)
+        assert all(_resolves(path) for path in invocations), (finding.name, invocations)
+        assert "#798" not in finding.fix, "the command shipped; the pointer at its issue is stale"
+
+
+def test_ledger_drift_does_not_send_a_booked_sale_to_the_close_command() -> None:
+    """`ledger.drift` is the orders log against the ledger -- a disagreement between two keel
+    tables, which an out-of-band sale (invisible to BOTH) never causes. Its two shapes are a
+    filled BUY with no tranche (#799) and a SELL the orders log holds against a tranche still
+    open. `keel positions close` fixes neither: it would write a SECOND SELL for the latter. So
+    the fix names the reads that tell the two apart, and no longer points at #798."""
+    [finding] = ledger_drift_findings(
+        {"PAXG-USD": Decimal("0.0132")}, {"PAXG-USD": Decimal("0")}, {}
+    )
+    assert finding.status == "warn"
+    assert _fix_invocations(finding.fix) == ["orders list", "positions close"]
+    assert all(_resolves(path) for path in _fix_invocations(finding.fix))
+    assert "#798" not in finding.fix

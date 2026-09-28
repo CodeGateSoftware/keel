@@ -83,6 +83,8 @@ FORBIDDEN_SUBSTRINGS: tuple[str, ...] = (
     "order_create",
     "submit",
     "place",
+    # `keel positions close` (#798, P4): declaring an out-of-band sale shrinks measured exposure.
+    "close",
 )
 
 #: A lower->Upper boundary is where two words are glued without any separator a human would

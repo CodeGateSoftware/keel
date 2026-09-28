@@ -264,7 +264,7 @@ def test_the_gate_vocabulary_is_stated_and_bounded() -> None:
 def test_only_the_two_halt_releases_are_reachable_from_the_browser() -> None:
     """**Which actions the second gate covers, named, so widening it is an edit here.**
 
-    Seven of the nine remain CLI-only. The two that are not are the halt releases, and each
+    Eight of the ten remain CLI-only. The two that are not are the halt releases, and each
     appears twice in the inventory -- once as its CLI row, once as the `web` row mirroring it."""
     web = {cap.mirrors for cap in CAPABILITIES if cap.gate == BROWSER.name}
 

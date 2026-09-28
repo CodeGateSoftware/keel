@@ -1718,3 +1718,20 @@ def test_gather_findings_stays_read_only_with_venue_drift_to_report(
 
     assert conn.total_changes == before, "gather_findings wrote to the database"
     assert finding.products == ("BTC-USD",)
+
+
+def test_importing_doctor_does_not_import_the_executor() -> None:
+    """Doctor's `keel.execution` imports are lazy, inside the functions that need them: doctor is
+    shared with `keel mcp` and pinned read-only, and the order paths should not even be loaded by
+    asking it a question. Checked in a fresh interpreter, where nothing else has imported them."""
+    import subprocess
+    import sys
+
+    program = (
+        "import sys, keel.commands.doctor; "
+        "print('keel.execution.executor' in sys.modules, 'keel.agent' in sys.modules)"
+    )
+    out = subprocess.run(
+        [sys.executable, "-c", program], capture_output=True, text=True, check=True
+    ).stdout.split()
+    assert out == ["False", "False"]

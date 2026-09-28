@@ -7,16 +7,27 @@ places nothing. The CLI in front of it is gated by a typed `yes` at a terminal.
 from __future__ import annotations
 
 from decimal import Decimal
+from pathlib import Path
 from typing import Any
 
 import pytest
+from click.testing import CliRunner, Result
 
+from keel import cli as keel_cli
+from keel.commands import _common
 from keel.commands.doctor import unbooked_exit_findings
-from keel.commands.positions_close import PositionCloseRefused, close_declared_position
+from keel.commands.positions_close import (
+    DECLARED_CONFIRMATION,
+    DECLARED_ORDER_TYPE,
+    PositionCloseRefused,
+    close_declared_position,
+    close_gate_wording,
+)
 from keel.config import AutoTradeConfig, Config
 from keel.data.db import connect, migrate
 from keel.data.repository import Repository
 from keel.execution import executor, guards
+from tests.conftest import VALID_CONFIG_YAML
 from tests.execution.test_executor import NOW_TS
 from tests.execution.test_executor import _config as _base_config
 
@@ -314,3 +325,171 @@ def test_a_paper_profile_is_refused(repo: Repository) -> None:
         )
 
     assert _written(repo) == before
+
+
+# -- the gated CLI verb (Task 4.2) ---------------------------------------------------------------
+
+
+def _file_repo(db: Path) -> Repository:
+    conn = connect(str(db))
+    migrate(conn)
+    return Repository(conn)
+
+
+@pytest.fixture
+def live_config_path(write_config: Any) -> Path:
+    """`VALID_CONFIG_YAML` is a paper profile, and the verb refuses paper (R4 writes `live`)."""
+    text = VALID_CONFIG_YAML.replace("mode: paper", "mode: confirm")
+    assert text != VALID_CONFIG_YAML, "the fixture no longer says `mode: paper` -- update this"
+    return Path(write_config(text))
+
+
+@pytest.fixture
+def no_broker(monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    """S1: the command builds no broker at all. Every construction seam raises, and is counted,
+    so a test that never reached the command cannot pass this by vacuum."""
+    built: list[str] = []
+
+    def _refuse(*_a: Any, **_k: Any) -> Any:
+        built.append("broker")
+        raise AssertionError("keel positions close must not build a broker")
+
+    monkeypatch.setattr(_common, "_build_broker", _refuse)
+    monkeypatch.setattr(keel_cli, "_build_broker", _refuse)
+    return built
+
+
+def _seeded(tmp_path: Path) -> tuple[Path, int]:
+    db = tmp_path / "t.db"
+    return db, _tranche(_file_repo(db))
+
+
+def _invoke(db: Path, config: Path, pid: int, *extra: str, input: str | None = None) -> Result:
+    return CliRunner().invoke(
+        keel_cli.cli,
+        ["--db", str(db), "--config", str(config), "positions", "close", str(pid), *extra],
+        input=input,
+    )
+
+
+def _close_cli(db: Path, config: Path, pid: int, input: str | None = None) -> Result:
+    return _invoke(db, config, pid, "--price", "4400", "--fee", "0.52", input=input)
+
+
+def _declared(db: Path) -> list[dict[str, Any]]:
+    return [o for o in _file_repo(db).get_orders() if o["order_type"] == DECLARED_ORDER_TYPE]
+
+
+def test_off_a_tty_the_close_is_refused_and_nothing_is_written(
+    tmp_path: Path, live_config_path: Path, monkeypatch: pytest.MonkeyPatch, no_broker: list[str]
+) -> None:
+    monkeypatch.setattr(_common, "_is_interactive", lambda: False)
+    db, pid = _seeded(tmp_path)
+    before = _written(_file_repo(db))
+
+    result = _close_cli(db, live_config_path, pid)
+
+    assert result.exit_code != 0
+    action, _detail = close_gate_wording(_file_repo(db).get_open_positions()[0], Decimal("4400"))
+    assert (
+        f"Error: refusing to {action}: this needs confirmation from an interactive terminal."
+        in result.output.splitlines()
+    )
+    assert _written(_file_repo(db)) == before
+    assert no_broker == []
+
+
+def test_at_a_tty_a_typed_yes_records_it(
+    tmp_path: Path, live_config_path: Path, monkeypatch: pytest.MonkeyPatch, no_broker: list[str]
+) -> None:
+    monkeypatch.setattr(_common, "_is_interactive", lambda: True)
+    db, pid = _seeded(tmp_path)
+    [tranche] = _file_repo(db).get_open_positions()
+
+    result = _close_cli(db, live_config_path, pid, input="yes\n")
+
+    assert result.exit_code == 0, result.output
+    action, detail = close_gate_wording(tranche, Decimal("4400"))
+    lines = result.output.splitlines()
+    assert f"About to {action}." in lines
+    assert f"  {detail}" in lines
+    [sell] = _declared(db)
+    assert (sell["confirmation"], sell["qty"], sell["actual_fill"], sell["fee"]) == (
+        DECLARED_CONFIRMATION,
+        Decimal("0.0132"),
+        Decimal("4400"),
+        Decimal("0.52"),
+    )
+    assert f"recorded order {sell['id']}: tranche {pid} closed out-of-band" in lines
+    assert _file_repo(db).get_open_positions() == []
+    assert no_broker == []
+
+
+def test_the_fee_defaults_to_zero(
+    tmp_path: Path, live_config_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(_common, "_is_interactive", lambda: True)
+    db, pid = _seeded(tmp_path)
+
+    result = _invoke(db, live_config_path, pid, "--price", "4400", input="yes\n")
+
+    assert result.exit_code == 0, result.output
+    [sell] = _declared(db)
+    assert sell["fee"] == Decimal("0")
+
+
+def test_at_a_tty_anything_but_yes_writes_nothing(
+    tmp_path: Path, live_config_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(_common, "_is_interactive", lambda: True)
+    db, pid = _seeded(tmp_path)
+    before = _written(_file_repo(db))
+
+    result = _close_cli(db, live_config_path, pid, input="y\n")
+
+    assert result.exit_code != 0
+    assert "Error: aborted (confirmation not given)." in result.output.splitlines()
+    assert _written(_file_repo(db)) == before
+
+
+@pytest.mark.parametrize(
+    "args,refusal",
+    [
+        (("--price", "0"), "--price must be a positive number, got 0"),
+        (("--price", "4400", "--fee", "-1"), "--fee must be zero or a positive number, got -1"),
+    ],
+)
+def test_nonsense_is_refused_before_the_gate_asks(
+    tmp_path: Path,
+    live_config_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    args: tuple[str, ...],
+    refusal: str,
+) -> None:
+    """A refusal the service would make anyway is made BEFORE the typed gate, so the operator is
+    never asked to confirm a row that cannot be written."""
+    asked: list[bool] = []
+    monkeypatch.setattr(_common, "_is_interactive", lambda: asked.append(True) or True)
+    db, pid = _seeded(tmp_path)
+    before = _written(_file_repo(db))
+
+    result = _invoke(db, live_config_path, pid, *args, input="yes\n")
+
+    assert result.exit_code != 0
+    assert f"Error: {refusal}" in result.output.splitlines()
+    assert asked == []
+    assert _written(_file_repo(db)) == before
+
+
+def test_an_unknown_tranche_is_refused_before_the_gate_asks(
+    tmp_path: Path, live_config_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    asked: list[bool] = []
+    monkeypatch.setattr(_common, "_is_interactive", lambda: asked.append(True) or True)
+    db, _pid = _seeded(tmp_path)
+
+    result = _invoke(db, live_config_path, 999, "--price", "4400", input="yes\n")
+
+    assert result.exit_code != 0
+    assert asked == []
+    assert _declared(db) == []

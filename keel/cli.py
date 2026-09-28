@@ -62,11 +62,11 @@ in `tests/test_paper_equities_profile.py`).
 broker-touching commands (`fetch`, `agent`, `monitor`, `simulate`, `assets`) that share the
 `_build_broker` seam, and the remaining top-level commands. The broker-free command groups live
 in `keel/commands/*` and are registered here via `cli.add_command(...)`: `db`, `trials`,
-`withdrawals`, `autonomy`, `rules`, `research`, `subscription`, `versions`. The shared seams
-(`with_disclaimer`, the confirmation gate, `_open_repo`/`_load_cfg`/`_build_broker`) live in
-`keel.commands._common` and are re-imported here; `_is_interactive` is reached as
-`_common._is_interactive()` so a single patch point in `keel.commands._common` drives every gate
-wherever its command is defined.
+`withdrawals`, `autonomy`, `rules`, `positions`, `research`, `subscription`, `versions`. The
+shared seams (`with_disclaimer`, the confirmation gate, `_open_repo`/`_load_cfg`/
+`_build_broker`) live in `keel.commands._common` and are re-imported here; `_is_interactive` is
+reached as `_common._is_interactive()` so a single patch point in `keel.commands._common` drives
+every gate wherever its command is defined.
 
 **Thin by construction (issue #387 C1, the TUI PRD's O2).** Every command body here that used
 to carry logic now delegates to a service in `keel/commands/*`, so the CLI and the TUI are two
@@ -165,6 +165,7 @@ from keel.commands.monitor import run_monitor
 from keel.commands.open_console import open_cmd
 from keel.commands.orders import orders_cmd
 from keel.commands.pnl import build_pnl_report, render_pnl_report
+from keel.commands.positions_close import positions_group
 from keel.commands.posture import posture_group
 from keel.commands.purification import render_purification_report
 from keel.commands.research import research_group
@@ -1219,6 +1220,14 @@ cli.add_command(rules_group)
 # (the pure service) that proposes a multi-asset DCA schedule and, on approval at a terminal,
 # writes one `candidate` `dca` rule per asset through `rules.add_rule_row`.
 cli.add_command(dca_group)
+
+
+# -- positions ------------------------------------------------------------------------------
+
+# The `positions` group is defined in `keel.commands.positions_close` and holds one verb, `close`:
+# an operator-declared, out-of-band exit behind the typed gate (#798, plan R4/R30). It places no
+# order. The positions REPORT is the console's view, not a command here.
+cli.add_command(positions_group)
 
 
 # -- research (the front door over keel/research/*, issue #601) -----------------------------

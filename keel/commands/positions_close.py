@@ -42,9 +42,18 @@ a paper database would sit in front of rails that never saw its BUY. Refused, no
 
 from __future__ import annotations
 
-from decimal import Decimal
+import time
+from decimal import Decimal, InvalidOperation
 from typing import Any
 
+import click
+
+from keel.commands._common import (
+    _load_cfg,
+    _open_repo,
+    _require_interactive_confirmation,
+    with_disclaimer,
+)
 from keel.config import Config
 from keel.data.repository import Repository
 from keel.execution import executor, streak
@@ -157,3 +166,98 @@ def close_declared_position(
         for prefix in _OWNERSHIP_PREFIXES:
             repo.set_state(f"{prefix}{product_id}", None)
     return order_id
+
+
+# -- the gated CLI verb ------------------------------------------------------------------------
+
+
+def close_gate_wording(position: dict[str, Any], price: Decimal) -> tuple[str, str]:
+    """The typed gate's action and detail for closing `position` at `price` -- one home, so the
+    prompt and the tests that pin it cannot drift apart. The detail names the row (product, owning
+    kind, held qty, entry) the operator is vouching for, and says outright that nothing is sold:
+    the sale happened on the venue already, and this only tells keel so."""
+    action = f"record tranche {position['id']} as closed out-of-band"
+    detail = (
+        f"{position['product_id']} tranche {position['id']} ({position['rule_name']}, qty "
+        f"{position['qty']}, entry {position['entry_fill']}) is booked as SOLD at {price}. No "
+        "order is placed. Rails 4/5/6 stop counting it, which frees room for new entries."
+    )
+    return action, detail
+
+
+def positions_close_gate(
+    repo: Repository,
+    config: Config,
+    *,
+    position_id: int,
+    price: Decimal,
+    fee: Decimal,
+    now_ts: int,
+) -> int:
+    """`keel positions close`'s typed gate AND the close it releases -- the capability row's call
+    site. Refusals the service would make anyway come FIRST, so the operator is never asked to
+    confirm a row that cannot be written; then a typed `yes` at a terminal; then the write.
+
+    The gate and the effect share a function on purpose: `tests/web/test_server.py` derives the
+    operations `keel/web` may never reach from the calls inside each gated function, and this is
+    what puts `close_declared_position` in that derived set rather than only in S4's hand list."""
+    _check_amounts(price, fee)
+    position = declared_close_target(repo, config, position_id)
+    _require_interactive_confirmation(*close_gate_wording(position, price))
+    return close_declared_position(
+        repo, config, position_id=position_id, price=price, fee=fee, now_ts=now_ts
+    )
+
+
+def _decimal(_ctx: click.Context, _param: click.Parameter, value: str | None) -> Decimal | None:
+    if value is None:
+        return None
+    try:
+        return Decimal(value)
+    except InvalidOperation as exc:
+        raise click.BadParameter(f"not a number: {value!r}") from exc
+
+
+@click.group("positions")
+def positions_group() -> None:
+    """Held tranches. `close` records a sale you made on the venue yourself (#798)."""
+
+
+@positions_group.command("close")
+@click.argument("position_id", type=int)
+@click.option(
+    "--price",
+    required=True,
+    callback=_decimal,
+    help="The price the venue sold it at, per unit of base.",
+)
+@click.option(
+    "--fee",
+    default="0",
+    show_default=True,
+    callback=_decimal,
+    help="The fee the venue charged for that sale, in quote currency.",
+)
+@click.pass_context
+@with_disclaimer
+def positions_close(ctx: click.Context, position_id: int, price: Decimal, fee: Decimal) -> None:
+    """Record tranche POSITION_ID as sold out of band (dangerous: asks for confirmation).
+
+    For a sale made on the venue by hand. It places NO order: it writes the SELL keel never saw,
+    books the tranche's outcome, and closes it, so rails 4/5/6 stop counting inventory that is
+    gone. Take the tranche id from the console's Positions view or `keel doctor`.
+    """
+    repo = _open_repo(ctx)
+    config = _load_cfg(ctx)
+    try:
+        order_id = positions_close_gate(
+            repo,
+            config,
+            position_id=position_id,
+            price=price,
+            fee=fee,
+            now_ts=int(time.time()),
+        )
+    except PositionCloseRefused as exc:
+        raise click.ClickException(str(exc)) from exc
+    click.echo(f"recorded order {order_id}: tranche {position_id} closed out-of-band")
