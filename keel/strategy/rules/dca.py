@@ -8,9 +8,12 @@ perfectly-timed DCA", §12.1). This is a **distinct order class** from the risk-
 
 **Phase-3 note (spec §12.6, §14 rail 10) -- document only, not enforced here:** DCA is exempt
 from the rule-trading account-drawdown circuit breaker -- it keeps buying through drawdowns
-within its own small capped budget -- but it remains bounded by the halal allowlist, the
-per-asset concentration cap, and the kill-switch. Those bounds are enforced by
-`execution/guards.py` in Phase 3; this rule (like every Phase 2 rule) only emits *intents*.
+within its own small capped budget. It is also exempt from no-averaging-into-losers (rail 8),
+the consecutive-loss breaker (rail 16), the total-exposure cap (rail 4, #841) and, since #853,
+the per-asset concentration cap (rail 6). It remains bounded by the halal allowlist, the
+kill-switch and every other rail -- among them the per-order, per-day, correlated-size, cash and
+monthly-buy rails (2, 3, 5, 13, 14). `execution/guards.py`'s module docstring is the authoritative
+list; this rule (like every Phase 2 rule) only emits *intents*.
 """
 
 from __future__ import annotations
