@@ -1500,6 +1500,61 @@ def unbooked_exit_findings(
     ]
 
 
+def ledger_drift_findings(
+    ledger_by_product: dict[str, Decimal],
+    orders_by_product: dict[str, Decimal],
+    increments: dict[str, Decimal | None],
+) -> list[Finding]:
+    """The positions ledger against the orders log, per product (#799 proposal 3; plan R2).
+
+    #799's stranded PAXG fill logged only a `preview_failed` -- "a harmless pre-trade hiccup".
+    This is the check that would have named it: a filled BUY with no tranche makes the orders
+    log hold more than the ledger. Tolerance is one base increment, because a venue that takes
+    its fee in the base asset leaves exactly that kind of dust (#667). Unknown increment means
+    exact equality -- no tolerance may be invented.
+
+    A product absent from one side reads as ZERO there, not as "skip": a filled BUY whose
+    tranche was never written has no ledger key at all, and that absence IS the #799 shape.
+
+    Beside `ledger.unbooked_exit` rather than under a `sleeve.*` name (plan R2): it covers every
+    open tranche, DCA or not. WARN, not FAIL -- the deployment is trading; what is wrong is the
+    books, and which side is wrong is a human's call.
+    """
+    drifted: list[tuple[str, Decimal, Decimal]] = []
+    for product in sorted(set(ledger_by_product) | set(orders_by_product)):
+        ledger = ledger_by_product.get(product, Decimal("0"))
+        orders = orders_by_product.get(product, Decimal("0"))
+        tolerance = increments.get(product) or Decimal("0")
+        if abs(ledger - orders) > tolerance:
+            drifted.append((product, ledger, orders))
+    if not drifted:
+        return [
+            Finding(
+                "ledger.drift",
+                OK,
+                "the positions ledger matches the orders log",
+                "-",
+                "-",
+            )
+        ]
+    detail = "; ".join(
+        f"{product}: orders say {orders}, ledger says {ledger}"
+        for product, ledger, orders in drifted
+    )
+    return [
+        Finding(
+            "ledger.drift",
+            WARN,
+            f"{len(drifted)} product(s) where the ledger and the orders log disagree",
+            detail + " -- a filled entry with no tranche (#799) or an unbooked sale",
+            "inspect the console's Positions view and `keel orders list`; record a missing "
+            "tranche, or declare an out-of-band close (`keel positions close <id>` once #798 "
+            "ships)",
+            products=tuple(product for product, _, _ in drifted),
+        )
+    ]
+
+
 def position_watch_findings(
     open_positions: list[dict[str, Any]],
     all_rules: list[dict[str, Any]],
@@ -1775,6 +1830,47 @@ def _unlinked_pending_sells(repo: Any) -> dict[str, list[int]]:
     return out
 
 
+def _order_mode(config: Any) -> str:
+    """The `orders.mode` this profile's own fills carry -- the same derivation `agent.py` uses
+    for `rule_status`: a paper profile fills `mode="paper"`, every other mode fills live."""
+    return "paper" if config.auto_trade.mode == "paper" else "live"
+
+
+def _ledger_drift_inputs(
+    repo: Any, config: Any
+) -> tuple[dict[str, Decimal], dict[str, Decimal], dict[str, Decimal | None]]:
+    """`ledger_drift_findings`' three inputs, from repo reads only (plan Task 3.1).
+
+    Products: every open tranche's, plus every product with a filled order in this profile's
+    own mode -- the latter is `repo.held_products()` on a live profile, and it is what finds
+    #799's shape, a fill with NO tranche. The orders side reads the SAME mode as the fills
+    (`sleeve.orders_qty`), never `executor._held_position`, which is live-only by design and
+    would read zero behind every paper tranche (#881). The tolerance is the cached
+    `base_increment:` record `_base_increment_for` writes, coerced the way that function
+    coerces it; absent means `None`, exact equality. **Never the broker** -- doctor has none.
+    """
+    from keel.execution import executor as executor_mod
+    from keel.execution import sleeve
+
+    mode = _order_mode(config)
+    products = {str(p["product_id"]) for p in repo.get_open_positions()} | {
+        str(o["product_id"]) for o in repo.get_orders(mode=mode, status="filled")
+    }
+    ledger: dict[str, Decimal] = {}
+    orders: dict[str, Decimal] = {}
+    increments: dict[str, Decimal | None] = {}
+    for product in sorted(products):
+        ledger[product] = sleeve.ledger_qty(repo.get_open_positions(product))
+        orders[product] = sleeve.orders_qty(repo, product, mode)
+        record = repo.get_state(f"{executor_mod.BASE_INCREMENT_PREFIX}{product}")
+        increments[product] = (
+            executor_mod._coerce_increment(record.get("increment"))
+            if isinstance(record, dict)
+            else None
+        )
+    return ledger, orders, increments
+
+
 def gather_findings(repo: Any, config: Any, log_lines: Iterable[str], now_ts: int) -> list[Finding]:
     """Every doctor check, over an ALREADY-OPEN repo and an ALREADY-LOADED config.
 
@@ -1906,6 +2002,8 @@ def gather_findings(repo: Any, config: Any, log_lines: Iterable[str], now_ts: in
         managed_status="paper" if config.auto_trade.mode == "paper" else "live",
         pending_sells=_unlinked_pending_sells(repo),
     )
+    # #799 proposal 3 (plan R2): the ledger against the orders log, in this profile's own mode.
+    findings += ledger_drift_findings(*_ledger_drift_inputs(repo, config))
 
     from keel.data import freshness as freshness_mod
 

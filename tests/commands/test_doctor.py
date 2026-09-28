@@ -621,6 +621,7 @@ def test_gather_findings_covers_every_check_over_a_seeded_db(tmp_path, valid_con
         "ledger.unbooked_exit",
         "position.unmanaged",
         "position.unprotected",
+        "ledger.drift",
         "data.missing",
         "data.stale",
         "data.gaps",
@@ -1142,6 +1143,119 @@ def test_gather_findings_on_a_paper_profile_reports_neither(tmp_path, valid_conf
         "warn",
         "warn",
     ]
+
+
+# -- ledger drift: the positions ledger against the orders log (#799, plan R2) --------------------
+
+
+def _filled_order(repo, *, mode: str, product: str, side: str, qty: str) -> int:
+    return repo.insert_order(
+        dict(
+            mode=mode,
+            product_id=product,
+            side=side,
+            order_type="market",
+            qty=Decimal(qty),
+            limit_price=None,
+            status="filled",
+            fee=Decimal("0"),
+            expected_fill=Decimal("4673.23"),
+            actual_fill=Decimal("4673.23"),
+            raw_response=None,
+            created_at=NOW - 30 * DAY,
+            updated_at=NOW - 30 * DAY,
+        )
+    )
+
+
+def _open_tranche(repo, *, product: str, qty: str) -> int:
+    return repo.open_position(
+        product_id=product,
+        rule_name="dca",
+        opened_at=NOW - 30 * DAY,
+        qty=Decimal(qty),
+        entry_fill=Decimal("4673.23"),
+        entry_fee=Decimal("0"),
+    )
+
+
+def _named(findings, name: str):
+    (finding,) = [f for f in findings if f.name == name]
+    return finding
+
+
+def test_gather_findings_reports_the_799_stranded_fill_as_ledger_drift(
+    tmp_path, valid_config_path
+) -> None:
+    """#799's live state: order 4 filled 0.0132 PAXG and no tranche was ever written."""
+    repo = _seeded_repo(tmp_path / "keel.db")
+    _filled_order(repo, mode="live", product="PAXG-USD", side="BUY", qty="0.0132")
+    config = _live(load_config(valid_config_path))
+
+    drift = _named(gather_findings(repo, config, [], NOW), "ledger.drift")
+
+    assert drift.status == "warn"
+    assert drift.products == ("PAXG-USD",)
+
+
+def test_gather_findings_reads_the_cached_base_increment_as_the_tolerance(
+    tmp_path, valid_config_path
+) -> None:
+    """The tolerance comes from the `base_increment:` record `_base_increment_for` caches, and
+    ONLY from there -- doctor holds no broker. Dust within one increment is OK; the same dust
+    with no record is exact equality and WARNs, which proves the record reached the finding."""
+    from keel.execution.executor import BASE_INCREMENT_PREFIX
+
+    config = _live(load_config(valid_config_path))
+    statuses = {}
+    for label, record in (
+        ("cached", {"increment": "0.00001", "fetched_at": NOW, "quote_increment": "0.01"}),
+        ("absent", None),
+    ):
+        repo = _seeded_repo(tmp_path / f"{label}.db")
+        _filled_order(repo, mode="live", product="PAXG-USD", side="BUY", qty="0.0132")
+        _open_tranche(repo, product="PAXG-USD", qty="0.013195")
+        if record is not None:
+            repo.set_state(f"{BASE_INCREMENT_PREFIX}PAXG-USD", record)
+        statuses[label] = _named(gather_findings(repo, config, [], NOW), "ledger.drift").status
+    assert statuses == {"cached": "ok", "absent": "warn"}
+
+
+def test_gather_findings_on_a_paper_profile_compares_against_paper_fills(
+    tmp_path, valid_config_path
+) -> None:
+    """#881: on a paper profile every fill is `mode='paper'`. Comparing the ledger against the
+    live-only `_held_position` would read zero orders and WARN on every open paper tranche."""
+    repo = _seeded_repo(tmp_path / "keel.db")
+    _filled_order(repo, mode="paper", product="BTC-USD", side="BUY", qty="0.001")
+    _open_tranche(repo, product="BTC-USD", qty="0.001")
+    paper = _paper(load_config(valid_config_path))
+    live = _live(load_config(valid_config_path))
+
+    on_paper = _named(gather_findings(repo, paper, [], NOW), "ledger.drift")
+    on_live = _named(gather_findings(repo, live, [], NOW), "ledger.drift")
+
+    assert on_paper.status == "ok"
+    # the control: a live profile reads live fills, finds none behind the tranche, and warns --
+    # so the tranche did reach the comparison
+    assert (on_live.status, on_live.products) == ("warn", ("BTC-USD",))
+
+
+def test_gather_findings_stays_read_only_with_ledger_drift_to_report(
+    tmp_path, valid_config_path
+) -> None:
+    """The change-counter pin with rows on `ledger.drift`'s read path, so its reads run."""
+    repo = _seeded_repo(tmp_path / "keel.db")
+    _filled_order(repo, mode="live", product="PAXG-USD", side="BUY", qty="0.0132")
+    _open_tranche(repo, product="BTC-USD", qty="0.001")
+    conn = repo._conn  # noqa: SLF001 -- total_changes IS the read-only proof
+    config = _live(load_config(valid_config_path))
+    before = conn.total_changes
+
+    drift = _named(gather_findings(repo, config, [], NOW), "ledger.drift")
+
+    assert conn.total_changes == before, "gather_findings wrote to the database"
+    assert drift.products == ("BTC-USD", "PAXG-USD")
 
 
 # -- update backups: counted, never deleted (#681) ------------------------------------------------
