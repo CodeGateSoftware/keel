@@ -832,6 +832,19 @@ def _paper_enter(
         intent = executor._build_intent(
             signal, None, repo, config, now_ts, equity_override=paper_equity
         )
+    except executor.ActionNotExecutable as exc:
+        # #857: a `REDUCE` (or any action but ENTER/EXIT) has no paper path either -- refused
+        # before the rails and the paper trader, exactly as `executor.execute` refuses it.
+        log_event(
+            logger,
+            logging.WARNING,
+            "agent.paper_action_not_executable",
+            product=signal.product_id,
+            rule=signal.rule_name,
+            rule_id=signal.rule_id,
+            action=exc.action.value,
+        )
+        return _result(False, reason=f"paper: {exc}")
     except executor.DcaSizeInvalid as exc:
         log_event(
             logger,

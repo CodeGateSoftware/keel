@@ -204,12 +204,33 @@ def execute(
     not-placed `ExecutionResult` rather than allowed to propagate -- `None` already means "EXIT
     with nothing open" for this function's return, so a distinct exception is the signal that
     does not collide with that meaning (orchestrator ruling 2026-09-27).
+
+    Only `ENTER` and `EXIT` are executable here (`EXECUTABLE_ACTIONS`). Any other action --
+    `REDUCE` (#857) above all -- raises `ActionNotExecutable` out of `_build_intent` and is
+    caught the same way: not placed, before any broker call.
     """
     if now_ts is None:
         now_ts = int(time.time())
 
     try:
         intent = _build_intent(signal, broker, repo, config, now_ts)
+    except ActionNotExecutable as exc:
+        log_event(
+            logger,
+            logging.WARNING,
+            "executor.action_not_executable",
+            product=signal.product_id,
+            rule=signal.rule_name,
+            rule_id=signal.rule_id,
+            action=exc.action.value,
+        )
+        return ExecutionResult(
+            placed=False,
+            order_id=None,
+            vetoed_by=[],
+            preview=None,
+            reason=str(exc),
+        )
     except DcaSizeInvalid as exc:
         log_event(
             logger,
@@ -370,6 +391,31 @@ def _clear_resting_bracket(broker: Any, repo: Repository, product_id: str, now_t
 
 def _is_dca_setup(context: dict[str, Any]) -> bool:
     return bool(context.get("no_stop")) or context.get("order_class") == "dca"
+
+
+#: The actions `execute` (and `agent._paper_enter`, which sizes through the same
+#: `_build_intent`) has a path for. Everything else is refused before sizing.
+EXECUTABLE_ACTIONS: frozenset[Action] = frozenset({Action.ENTER, Action.EXIT})
+
+
+class ActionNotExecutable(ValueError):
+    """`_build_intent` was handed an action outside `EXECUTABLE_ACTIONS` (#857).
+
+    Until `Action.REDUCE` existed, `_build_intent` read every non-ENTER action as an EXIT and
+    sized a SELL of the WHOLE held position. A `REDUCE` taking that fall-through would turn a
+    partial sleeve sale into a full exit, through the rule ENTER/EXIT path, with no sells window
+    and no `sell_proposals` row -- the exact placement S1 forbids. A `REDUCE` is carried by a
+    `strategy.reduction.Reduction`, never by a `Signal`, and its one executor is
+    `executor.reduce` (plan P7), so reaching here with one is a programming error. It is refused
+    loudly rather than mapped to `None`, which means "an EXIT with nothing open".
+    """
+
+    def __init__(self, action: Action) -> None:
+        self.action = action
+        super().__init__(
+            f"{action.value} is not executable by execute(): only ENTER and EXIT are; "
+            "a sleeve sale is a Reduction, and executor.reduce is its only path"
+        )
 
 
 class DcaSizeInvalid(Exception):
@@ -818,7 +864,12 @@ def _build_intent(
     to fixed-fractional sizing on the ENTER/non-DCA path -- used by the paper-trading enter path
     (Task 6) to size off the paper account's real equity instead of the live exposure cap. `None`
     (the default) preserves the live-path behavior exactly.
+
+    Raises `ActionNotExecutable` for any action outside `EXECUTABLE_ACTIONS`, BEFORE anything is
+    read: the EXIT branch below is reached only by an actual `EXIT`, never by fall-through.
     """
+    if signal.action not in EXECUTABLE_ACTIONS:
+        raise ActionNotExecutable(signal.action)
     if signal.action == Action.ENTER:
         setup = signal.setup
         if setup is None:

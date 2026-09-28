@@ -1212,6 +1212,66 @@ def test_exit_signal_sells_the_held_position(repo):
     assert order["qty"] == Decimal("0.1")
 
 
+#: Every action `execute` has no path for. Derived from the enum rather than listed, so an action
+#: added later is refused here until someone gives it a path on purpose (#857: `REDUCE` is run by
+#: `executor.reduce`, P7, never by `execute`).
+_NOT_EXECUTABLE = sorted(set(Action) - {Action.ENTER, Action.EXIT}, key=lambda a: a.value)
+
+
+def test_the_not_executable_set_holds_reduce() -> None:
+    """The parametrisation below is not vacuous: it covers REDUCE, the action #857 added."""
+    assert Action.REDUCE in _NOT_EXECUTABLE
+
+
+@pytest.mark.parametrize("action", _NOT_EXECUTABLE, ids=lambda a: a.value)
+def test_execute_refuses_any_action_but_enter_and_exit_before_touching_the_broker(repo, action):
+    """#857: `_build_intent` used to treat every non-ENTER action as an EXIT, so a `REDUCE`
+    handed to `execute` would have sold the WHOLE held position -- a partial sleeve sale turned
+    into a full exit, through the rule ENTER/EXIT path, with no sells window in sight (S1).
+    It is refused before sizing: no balance read, no cancel, no preview, no order row."""
+    _seed_open_position(repo, "BTC-USD", Decimal("0.1"), Decimal("50000"))
+    rows_before = repo.get_orders()
+    broker = FakeBroker()
+    signal = Signal(
+        rule_name="reverse_dca",
+        product_id="BTC-USD",
+        action=action,
+        side=Side.SELL,
+        setup=None,
+        cts_score=0,
+        entry_technique="market",
+        ts=NOW_TS,
+    )
+
+    result = execute(signal, broker, repo, _config(), mode="autonomous", now_ts=NOW_TS)
+
+    assert (result.placed, result.order_id, result.vetoed_by) == (False, None, [])
+    assert broker.place_calls == []
+    assert broker.preview_calls == []
+    assert broker.cancel_calls == []
+    assert broker.get_balances_calls == 0
+    assert repo.get_orders() == rows_before
+
+
+@pytest.mark.parametrize("action", _NOT_EXECUTABLE, ids=lambda a: a.value)
+def test_build_intent_raises_for_an_action_it_has_no_path_for(repo, action):
+    """The one chokepoint both `execute` and `agent._paper_enter` size through."""
+    _seed_open_position(repo, "BTC-USD", Decimal("0.1"), Decimal("50000"))
+    signal = Signal(
+        rule_name="reverse_dca",
+        product_id="BTC-USD",
+        action=action,
+        side=Side.SELL,
+        setup=None,
+        cts_score=0,
+        entry_technique="market",
+        ts=NOW_TS,
+    )
+    with pytest.raises(executor.ActionNotExecutable) as raised:
+        executor._build_intent(signal, NoNetworkBroker(), repo, _config(), NOW_TS)
+    assert raised.value.action is action
+
+
 def test_exit_signal_with_no_open_position_is_not_placed(repo):
     broker = NoNetworkBroker()
     signal = Signal(
