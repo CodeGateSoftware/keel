@@ -568,6 +568,21 @@ def test_a_live_proposal_skips_no_rail(repo: Repository) -> None:
     assert _proposal(repo, _run(repo, SpyBroker()))["rails"]["skipped"] == []
 
 
+def test_no_broker_and_not_offline_says_the_venue_was_never_asked(repo: Repository) -> None:
+    """`live = not offline and broker is not None`: `broker=None` with `offline=False` runs every
+    rail (nothing is skipped, unlike the offline path) but has no broker to preview against, so
+    it records the fallback fee. Without a `fee_fallback_reason` the row would read exactly like
+    a venue preview that happened to fall back -- `preview_error` None, `skipped` empty -- when
+    in fact the venue was never asked at all."""
+    result = _run(repo, None)
+    row = _proposal(repo, result)
+    assert result.decision == "preview"
+    assert row["fee_source"] == sleeve.FALLBACK_FEE_SOURCE
+    assert row["rails"]["fee_fallback_reason"] == "no broker: the venue was not asked for a quote"
+    assert row["rails"]["preview_error"] is None
+    assert row["rails"]["skipped"] == []
+
+
 # --- sizing: never more than is held (P7 carried item c) ------------------------------------------
 
 

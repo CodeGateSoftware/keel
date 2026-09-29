@@ -3034,7 +3034,10 @@ def reduce(
     back, and says why in `rails.fee_fallback_reason`.
 
     `offline=True` (paper, R18) touches no broker: the offline rails run, their skipped list is
-    recorded, and the fee is the fallback.
+    recorded, and the fee is the fallback. `broker=None` with `offline=False` is a DIFFERENT
+    case -- every rail still runs (nothing is skipped) -- and is recorded with
+    `rails.fee_fallback_reason` set to say the venue was never asked, so the row cannot be read
+    as a preview that merely fell back on its own.
     """
     product_id = reduction.product_id
     live = not offline and broker is not None
@@ -3149,6 +3152,14 @@ def reduce(
                 rails["fee_fallback_reason"] = "venue preview carried no commission"
             else:
                 fee, source = preview.est_fee, sleeve.VENUE_FEE_SOURCE
+    elif not offline:
+        # `broker is None` with `offline=False`: `live` is False for lack of a broker, not
+        # because the caller asked to skip the venue (that is `offline=True`, which already
+        # skips every state rail and needs no further explanation). Every rail above still ran
+        # in full -- `rails["skipped"]` is empty, unlike the offline path -- so without this the
+        # row reads exactly like a preview that fell back on its own, when the venue was in fact
+        # never asked at all.
+        rails["fee_fallback_reason"] = "no broker: the venue was not asked for a quote"
 
     pid = _record(leg, "preview", fee, source, legs)
     log_event(
