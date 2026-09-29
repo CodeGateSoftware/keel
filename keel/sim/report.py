@@ -372,6 +372,9 @@ def _accumulate_asset(
         # bar per day makes this a no-op on a clean series; a duplicated daily bar would
         # otherwise buy twice.
         day = fill_bar.ts // 86_400
+        # A sale is decided once per completed bar's day (R14): a duplicated cadence bar is
+        # the same day asked twice, and must not sell twice.
+        sale_day = daily[i].ts // 86_400
         for rule, key in buyers:
             setup = rule.detect(view)
             if setup is None or day in decided[key]:
@@ -395,7 +398,7 @@ def _accumulate_asset(
                 )
             )
         holding = Holding(keyed[0][0].product_id, tuple(lots))
-        if not sellers or day in sale_days or holding.qty <= 0:
+        if not sellers or sale_day in sale_days or holding.qty <= 0:
             continue
         sale = decide_sleeve_sale(
             sellers,
@@ -409,7 +412,7 @@ def _accumulate_asset(
         )
         if sale is None:
             continue
-        sale_days.add(day)
+        sale_days.add(sale_day)
         if sale.refusal is not None:
             continue
         seller = key_of[id(sale.rule)]

@@ -13,6 +13,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 from decimal import Decimal
+from pathlib import Path
 
 import pytest
 
@@ -572,6 +573,7 @@ def _run_account(
     market: dict[str, dict[Granularity, list[Candle]]],
     *,
     fee: Decimal = Decimal("0.01"),
+    slippage: Decimal = _ZERO,
     config: Config | None = None,
     monthly_volume_cap: Decimal | None = None,
 ) -> portfolio_sim.SimResult:
@@ -584,7 +586,7 @@ def _run_account(
         end_ts=hourly[-1].ts,
         monthly_contribution=Decimal("100000"),
         fee_pct=fee,
-        slippage_pct=_ZERO,
+        slippage_pct=slippage,
         monthly_volume_cap=monthly_volume_cap,
     )
 
@@ -760,7 +762,7 @@ def test_the_accumulation_paragraph_on_distributions_appears_only_when_one_was_m
 
 
 def test_simulate_slices_the_accumulation_row_at_the_configured_per_order_cap(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     """`keel simulate` hands the edge pass the config's rail-2 cap, the one the account sim and
     `guards.check` read, so the two sim passes slice a distribution alike."""
@@ -792,8 +794,102 @@ def test_simulate_slices_the_accumulation_row_at_the_configured_per_order_cap(
         years=1,
         monthly_contribution=Decimal("500"),
         now_ts=NOW_TS,
+        out_path=tmp_path / "report.md",
         no_trial_record=True,
         skip_within_cap=True,
     )
 
     assert [call["max_per_order_usd"] for call in seen] == [Decimal("777")]
+
+
+# ---------------------------------------------------------------------------
+# (j) the shared decision: one sale per product per day, arbitration, fail-closed cadence
+# ---------------------------------------------------------------------------
+
+
+def test_a_duplicated_daily_bar_still_sells_once_that_day() -> None:
+    """R14 in the edge pass: the cadence bar of day 30 twice means day 30 is decided twice, and
+    only the first decision sells. (`min_hold_days=0`: the first decision fills on the
+    duplicate, still day 30, 29 days after the first lot.)"""
+    daily = [_candle(d, "100") for d in range(61)]
+    daily.insert(30, daily[30])
+    rows = accumulation_table(
+        [Dca("BTC-USD", cadence_days=7), _rev(min_hold_days=0)],
+        {"BTC": {Granularity.ONE_DAY: daily}},
+        fee_pct=_ZERO,
+        slippage_pct=_ZERO,
+    )
+
+    assert rows["reverse_dca:BTC"].distributions == 1
+
+
+class _ExitFirst(ReverseDca):
+    """A second sleeve-sell kind, named for the one spec §3.6 puts before `reverse_dca`."""
+
+    def __init__(self) -> None:
+        super().__init__("BTC-USD", target_usd=Decimal("20"), min_price_floor=Decimal("1"))
+        self.name = "sleeve_exit"
+
+
+def test_arbitration_follows_the_fixed_order_not_the_rule_order() -> None:
+    """Listed second, the `sleeve_exit`-named rule still wins the day (spec §3.6), and the
+    `reverse_dca` beside it sells nothing."""
+    rev, first = _rev(), _ExitFirst()
+    assert portfolio_sim.sleeve_sellers([Dca("BTC-USD"), rev, first]) == [first, rev]
+
+    rows = accumulation_table(
+        [Dca("BTC-USD", cadence_days=7), rev, first],
+        {"BTC": {Granularity.ONE_DAY: [_candle(d, "100") for d in range(61)]}},
+        fee_pct=_ZERO,
+        slippage_pct=_ZERO,
+    )
+
+    assert (rows["sleeve_exit:BTC"].units_sold, rows["reverse_dca:BTC"].distributions) == (
+        Decimal("0.2"),
+        0,
+    )
+
+
+class _BrokenDca(Dca):
+    def detect(self, candles_by_tf: dict[Granularity, list[Candle]]) -> Setup | None:
+        raise RuntimeError("boom")
+
+
+def test_a_dca_whose_detect_raises_counts_as_on_cadence() -> None:
+    """Fail toward refusing the sale, as `agent._dca_fires_today` does."""
+    view = {Granularity.ONE_DAY: [_candle(1, "100")]}
+    assert portfolio_sim.dca_on_cadence([Dca("BTC-USD", cadence_days=7)], view) is False
+    assert portfolio_sim.dca_on_cadence([_BrokenDca("BTC-USD")], view) is True
+
+
+def test_the_account_sim_sale_pays_slippage_and_the_fee() -> None:
+    slip = Decimal("0.002")
+    result = _run_account(
+        [Dca("BTC-USD", cadence_days=7), _rev()], _hourly_market({0: "100"}, 61), slippage=slip
+    )
+
+    [sale] = result.dca_sells
+    assert sale.fill_price == Decimal("100") * (1 - slip)
+    assert sale.gross_usd == sale.qty * sale.fill_price
+    assert sale.fee_usd == sale.gross_usd * Decimal("0.01")
+    assert sale.net_usd == sale.gross_usd - sale.fee_usd
+
+
+def test_a_sleeve_sold_down_to_nothing_keeps_its_row() -> None:
+    """A $1,000 target on a $250 holding sells all 2.5 units (the rule caps at the holding); the
+    lot is gone, but the asset's row stays, at qty 0, carrying the distribution."""
+    result = _run_account(
+        [Dca("BTC-USD", cadence_days=7), _rev(target_usd=Decimal("1000"))],
+        _hourly_market({0: "100"}, 33),
+        fee=_ZERO,
+    )
+
+    assert "BTC" not in result.dca_positions
+    row = portfolio_sim.dca_sleeve(result)["BTC"]
+    assert (row.qty, row.value_usd, row.distributions, row.units_sold) == (
+        _ZERO,
+        _ZERO,
+        1,
+        Decimal("2.5"),
+    )
+    assert row.cost_usd == _ZERO

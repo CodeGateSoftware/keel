@@ -335,8 +335,8 @@ def sleeve_sellers(rules: list[Rule]) -> list[Rule]:
 def dca_on_cadence(rules: list[Rule], candles_by_tf: dict[Granularity, list[Candle]]) -> bool:
     """The cadence half of `agent._dca_fires_today`: a `Dca` rule among `rules` is on cadence on
     this view. A `detect` that raises counts as firing -- refusing the sale is the direction that
-    costs nothing, as it is live. (The ledger half, "a buy already filled today", is the caller's:
-    the account sim reads its own buys, and the edge pass buys only on a cadence day.)"""
+    costs nothing, as it is live. (The ledger half, "a buy already filled today", adds nothing
+    in either sim pass: both buy only on a `Dca` cadence day, so this half already covers it.)"""
     for rule in rules:
         if not isinstance(rule, Dca):
             continue
@@ -706,7 +706,6 @@ def run(
                 t,
                 monthly_volume_cap,
                 decided=sleeve_decided,
-                buys=dca_buys,
                 sells=dca_sells,
                 last_sale=last_sale,
             )
@@ -997,7 +996,6 @@ def _process_reductions(
     monthly_volume_cap: Decimal | None = None,
     *,
     decided: set[tuple[str, int]],
-    buys: list[DcaBuy],
     sells: list[DcaSell],
     last_sale: dict[int, int],
 ) -> None:
@@ -1011,8 +1009,9 @@ def _process_reductions(
 
     **What it decides** -- `decide_sleeve_sale`, the pipeline shared with the edge pass: nothing
     held, nothing asked; the sleeve-sell rules in arbitration order; `sleeve.sleeve_refusal`
-    (same-day DCA from `dca_on_cadence` plus this asset's buys decided today, `min_hold_days`,
-    `cooldown_days` from `last_sale`); `sleeve.slice_qty` at `config.caps.max_per_order_usd` --
+    (same-day DCA from `dca_on_cadence` -- live's ledger half, a buy already filled today, adds
+    nothing here, because the sim buys only on a cadence day; `min_hold_days`; `cooldown_days`
+    from `last_sale`); `sleeve.slice_qty` at `config.caps.max_per_order_usd` --
     rail 2, from the same config the rails read. `decided` takes the day once a rule FIRES,
     whatever becomes of it (R14): a refused or unfillable distribution is lost, not carried to
     the next hour or day, as live.
@@ -1045,7 +1044,6 @@ def _process_reductions(
             ),
         ),
     )
-    bought_today = any(b.asset == asset and b.decision_ts // _SECONDS_PER_DAY == day for b in buys)
     fill_idx = idx + 1
     fill_bar = hourly[fill_idx] if fill_idx < len(hourly) else None
     sale = decide_sleeve_sale(
@@ -1053,7 +1051,7 @@ def _process_reductions(
         holding,
         candles_by_tf,
         SellCosts(account.fee_pct, account.slippage_pct, SIM_FEE_SOURCE),
-        dca_fires_today=bought_today or dca_on_cadence(asset_rules, candles_by_tf),
+        dca_fires_today=dca_on_cadence(asset_rules, candles_by_tf),
         last_sale_ts=lambda rule: last_sale.get(id(rule)),
         now_ts=now_ts if fill_bar is None else fill_bar.ts,
         max_per_order_usd=config.caps.max_per_order_usd,
