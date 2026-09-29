@@ -575,3 +575,40 @@ def test_no_module_reaches_the_executor_order_paths_under_another_name() -> None
         with open(path, encoding="utf-8") as fh:
             offenders += _executor_bypasses(ast.parse(fh.read()), module)
     assert offenders == []
+
+
+#: Everything a SELL path reaches once it stops previewing: the placement pipeline, the bracket
+#: cancel `execute`/`scale_out` run first, the cancel under it, the order-row writers, and the
+#: broker's own place and cancel. `executor.reduce` names NONE of them before P18 (R17, S1).
+_REDUCE_FORBIDDEN_REACHES = {
+    "_run_order",
+    "place_order",
+    "_clear_resting_bracket",
+    "_cancel_at_exchange",
+    "cancel_order",
+    "insert_order",
+    "update_order",
+    "place_bracket",
+    "execute",
+    "scale_out",
+}
+
+
+def test_reduce_reaches_no_placement_cancel_or_order_writer() -> None:
+    """P7 (R17): `reduce` exists, is scanned, and reaches none of `_REDUCE_FORBIDDEN_REACHES` by
+    any spelling the scan knows. The pinned sets above stay unchanged: `reduce` joining one is a
+    design change P18 owns, not something to absorb by editing a pin."""
+    with open(os.path.join(_ROOT, "keel", "execution", "executor.py"), encoding="utf-8") as fh:
+        tree = ast.parse(fh.read())
+    names = {f.name for f in ast.walk(tree) if isinstance(f, ast.FunctionDef)}
+    assert "reduce" in names, "the scan below would pass vacuously without the function"
+    reduce_ = ("keel.execution.executor", "reduce")
+    for name in sorted(_REDUCE_FORBIDDEN_REACHES):
+        assert reduce_ not in _calls_in(tree, "keel.execution.executor", {name}), name
+    assert reduce_ not in PLACEMENT_CALLERS | RUN_ORDER_CALLERS | SECOND_LEVEL_CALLERS
+
+
+def test_the_reduce_scan_is_false_capable() -> None:
+    """The same scan, over a `reduce` that cancels the bracket first, names it."""
+    tree = ast.parse("def reduce(r):\n    _clear_resting_bracket(b, repo, 'BTC-USD', 0)\n")
+    assert _calls_in(tree, "m", {"_clear_resting_bracket"}) == {("m", "reduce")}
