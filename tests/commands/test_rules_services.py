@@ -876,3 +876,39 @@ def test_the_cli_flag_reaches_the_gate(tmp_path, valid_config_path) -> None:
     promoted = CliRunner().invoke(cli, [*args, "--allow-concurrent-dca"])
     assert promoted.exit_code == 0, promoted.output
     assert _status(file_repo, rid) == "live"
+
+
+def test_too_few_daily_bars_to_reach_one_anchor_is_a_refusal(repo) -> None:
+    """Past `bias.DEFAULT_WARMUP` the walk starts; a cache shorter than that walks no bar, and a
+    check that walked no bar reads `clean` in the harness -- the gate must not take it as one."""
+    repo.upsert_candles("BTC-USD", Granularity.ONE_DAY, _WANDER[: bias.DEFAULT_WARMUP])
+    rid = _sleeve_rule(repo)
+    outcome, out, err = _promote(repo, rid)
+    assert outcome is None
+    assert _status(repo, rid) == "candidate"
+    assert any("over 0 daily bars" in line for line in out)
+    assert any("lookahead" in line for line in err)
+
+
+def test_the_adapter_hands_every_view_the_same_synthetic_holding() -> None:
+    """The holding must not be the thing that differs between a prefix view and the full one:
+    one lot of 1 unit at the FIRST close, fee-free, in every call the harness makes."""
+    from keel.strategy.reduction import Holding, Lot
+
+    seen: list[Holding] = []
+
+    class _Spy(ReverseDca):
+        def reduce_signal(self, holding, candles_by_tf, costs):
+            seen.append(holding)
+            return super().reduce_signal(holding, candles_by_tf, costs)
+
+    rule = _Spy("BTC-USD", target_usd=Decimal("10"), min_price_floor=Decimal("1"))
+    bias.lookahead_analysis(
+        rules_mod._reduction_as_detect(rule), {Granularity.ONE_DAY: _WANDER}, warmup=5
+    )
+    assert len(seen) > 100
+    first = _WANDER[0]
+    expected = Holding(
+        "BTC-USD", (Lot(0, "dca", first.ts, Decimal("1"), first.close, Decimal("0")),)
+    )
+    assert set(seen) == {expected}

@@ -324,32 +324,201 @@ def _load_pbo(ctx: click.Context, session: str | None, blocks: int) -> cscv_mod.
         raise  # unreachable: ctx.exit raises SystemExit
 
 
+def _parse_fee_rate(_ctx: click.Context, _param: click.Parameter, value: str | None) -> Any:
+    """`--fee-sensitivity-pct`: a FRACTION in [0, 1), like `config.fees.taker_pct` (0.012 is
+    1.2%). No default: the rate is the operator's to type (plan R29)."""
+    if value is None:
+        return None
+    try:
+        rate = Decimal(value)
+    except ArithmeticError as exc:
+        raise click.BadParameter(f"{value!r} is not a number") from exc
+    if not rate.is_finite() or not 0 <= rate < 1:
+        raise click.BadParameter(f"{value!r} must be a fraction in [0, 1), e.g. 0.012 for 1.2%")
+    return rate
+
+
+def _is_sleeve_sell_row(repo: Repository, rule_id: int) -> bool:
+    """Whether rule `rule_id`'s registered kind is a `sleeve_sell` class -- read off the CLASS, so
+    an unknown id or kind is simply `False` and the ordinary path's own refusal names it."""
+    row = next((r for r in repo.get_rules() if r["id"] == rule_id), None)
+    if row is None:
+        return False
+    cls = agent.RULE_REGISTRY.get(row["kind"])
+    return promotion_mod.promotion_class_of(cls) == promotion_mod.SLEEVE_SELL
+
+
 @rules_group.command("backtest")
 @click.argument("rule_id", type=int)
 @click.option(
     "--granularity", default=None, help="Override the candle granularity (default: the rule's own)."
 )
+@click.option(
+    "--fee-sensitivity-pct",
+    default=None,
+    callback=_parse_fee_rate,
+    help="A sleeve-sell rule only: also replay its proposals at this taker rate, a fraction "
+    "(0.012 = 1.2%), printed as a second fee line labelled operator-supplied. No default.",
+)
 @click.pass_context
 @with_disclaimer
-def rules_backtest(ctx: click.Context, rule_id: int, granularity: str | None) -> None:
+def rules_backtest(
+    ctx: click.Context,
+    rule_id: int,
+    granularity: str | None,
+    fee_sensitivity_pct: Decimal | None,
+) -> None:
     """Backtest a stored rule against its historical candles (read-only).
 
     The output states the fee rate the fills were priced at. That is not decoration: a profit
     factor is a statement about net edge, and at this strategy's cost-to-edge ratio the fee is
     the dominant term, not a rounding detail -- prior numbers printed without it turned out to
     be maker-priced against a taker fill model (#247).
+
+    A SLEEVE-SELL rule (`reverse_dca`) has no entries to backtest, so it gets its proposal
+    replay instead (spec §3.7): every proposal it would have made over the cached daily bars,
+    each with its realised P&L against a synthetic FIFO lot, and the terminal value with and
+    without the rule -- at `config.fees.taker_pct`, plus one line at `--fee-sensitivity-pct` when
+    the operator passes it. A mechanical description, not a pass mark.
     """
+    repo = _open_repo(ctx)
+    config = _optional_cfg(ctx)
+    echo_err = lambda message: click.echo(message, err=True)  # noqa: E731
     try:
+        if _is_sleeve_sell_row(repo, rule_id):
+            run_proposal_replay(
+                repo,
+                config,
+                rule_id,
+                granularity_opt=granularity,
+                fee_sensitivity_pct=fee_sensitivity_pct,
+                echo=click.echo,
+                echo_err=echo_err,
+            )
+            return
+        if fee_sensitivity_pct is not None:
+            raise click.BadParameter(
+                "applies only to a sleeve-sell rule's proposal replay; rule "
+                f"{rule_id} is backtested at config.fees.taker_pct",
+                param_hint="--fee-sensitivity-pct",
+            )
         run_rule_backtest(
-            _open_repo(ctx),
-            _optional_cfg(ctx),
+            repo,
+            config,
             rule_id,
             granularity_opt=granularity,
             echo=click.echo,
-            echo_err=lambda message: click.echo(message, err=True),
+            echo_err=echo_err,
         )
     except RulesRefused:
         ctx.exit(1)
+
+
+def run_proposal_replay(
+    repo: Repository,
+    config: Any | None,
+    rule_id: int,
+    *,
+    granularity_opt: str | None = None,
+    fee_sensitivity_pct: Decimal | None = None,
+    echo: Callable[[str], None] = _noop,
+    echo_err: Callable[[str], None] = _noop,
+) -> tuple[RulesOutcome, list[Any]]:
+    """THE `rules backtest` service for a `sleeve_sell` rule: its proposal replay (spec §3.7),
+    echoed through `sleeve_report.render_replay`. Read-only: nothing is written, nothing is
+    appended to the trials ledger, and no venue is asked.
+
+    **Fees (plan R29).** The headline line is at `config.fees.taker_pct`, labelled
+    `fallback:config.fees.taker_pct` (the label every sleeve fallback carries), or at
+    `backtest.TAKER_FEE_PCT` labelled as the library default when no config loads -- the two
+    agree by construction (`_backtest_fee`). A second line exists ONLY when the operator passes
+    `fee_sensitivity_pct`, labelled operator-supplied: the measured live rate is never a
+    constant in keel (spec §2.2, Q5).
+
+    **Everything else is the live pipeline's.** Slippage is the product's one liquidity-scaled
+    rate (`backtest_slippage`). The rail-2 cap is `config.caps.max_per_order_usd` (unsliced
+    without a config). The same-day-DCA exclusion replays the `dca` rules on the product at the
+    status this profile's cycle runs (`paper` on a paper profile, `live` otherwise -- R40's
+    reading), each through its own `detect`.
+
+    Refusals: an unknown id; a `--granularity` other than ONE_DAY (a sleeve-sell rule decides on
+    completed daily bars); no cached ONE_DAY candles, named as such.
+    """
+    from keel.commands import sleeve_report
+    from keel.execution import sleeve
+
+    row = _rule_row_or_refuse(repo, rule_id, echo_err)
+    rule = agent._build_rule(row)
+    kind = row["kind"]
+    if granularity_opt and Granularity(granularity_opt) != Granularity.ONE_DAY:
+        echo_err(
+            f"Error: rule {rule_id} ({kind}) is a sleeve-sell rule and decides on completed "
+            f"ONE_DAY bars; --granularity {granularity_opt} does not apply."
+        )
+        raise RulesRefused("sleeve-sell replay is daily")
+    product_id = rule.product_id
+    daily = repo.get_candles(product_id, Granularity.ONE_DAY)
+    if not daily:
+        echo_err(
+            f"Error: rule {rule_id} ({kind}): no cached ONE_DAY candles for {product_id} -- "
+            "nothing to replay. Its proposals are replayed over cached daily bars; fetch them "
+            "first."
+        )
+        raise RulesRefused(f"no daily candles for {product_id}")
+
+    if config is None:
+        fee_pct, fee_label = backtest_mod.TAKER_FEE_PCT, "library default: backtest.TAKER_FEE_PCT"
+        max_per_order: Decimal | None = None
+        dca_status = "live"
+    else:
+        fee_pct, fee_label = config.fees.taker_pct, sleeve.FALLBACK_FEE_SOURCE
+        max_per_order = config.caps.max_per_order_usd
+        dca_status = "paper" if config.auto_trade.mode == "paper" else "live"
+    slippage_pct, measured = backtest_slippage(repo, product_id)
+    dca_rows = [
+        r
+        for r in repo.get_rules(dca_status)
+        if r["kind"] == "dca" and (r["params"] or {}).get("product_id") == product_id
+    ]
+    dca_rules = [agent._build_rule(r) for r in dca_rows]
+    dca_note = (
+        f"{len(dca_rules)} dca rule(s) at status {dca_status} on {product_id} replayed "
+        f"(ids {', '.join(str(r['id']) for r in dca_rows)})"
+        if dca_rules
+        else f"no dca rule at status {dca_status} on {product_id}"
+    )
+
+    rates = [(fee_pct, fee_label)]
+    if fee_sensitivity_pct is not None:
+        rates.append((fee_sensitivity_pct, "operator-supplied sensitivity"))
+    replays = [
+        (
+            sleeve_report.proposal_replay(
+                rule,
+                daily,
+                fee_pct=rate,
+                slippage_pct=slippage_pct,
+                max_per_order_usd=max_per_order,
+                dca_rules=dca_rules,
+            ),
+            label,
+        )
+        for rate, label in rates
+    ]
+    sink, recorded = _line_sink(echo)
+    for line in sleeve_report.render_replay(
+        rule_id=rule_id,
+        kind=kind,
+        replays=replays,
+        slippage_measured=measured,
+        max_per_order_usd=max_per_order,
+        dca_note=dca_note,
+    ):
+        sink(line)
+    return (
+        RulesOutcome(lines=tuple(recorded), rule_id=rule_id, new_status=row["status"]),
+        [replay for replay, _label in replays],
+    )
 
 
 @dataclass(frozen=True)

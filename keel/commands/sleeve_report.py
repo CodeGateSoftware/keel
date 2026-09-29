@@ -41,6 +41,13 @@ that day, which no cycle ever makes; naming both is unambiguous.
 recorded prints `unrecorded` there -- a `$0.00` net would read as a break-even sale that nobody
 computed.
 
+**One proposal replay, per fee line** (`proposal_replay` / `render_replay`, for `keel rules
+backtest` on a sleeve-sell rule, spec §3.7): a head naming the bars and the synthetic holding, the
+`REPLAY_DISCLAIMER`, then per fee rate a `fee line: <pct> (<source>)` followed by one line per
+cadence bar the rule fired on -- `<YYYY-MM-DD> bar: sell ...` or `<YYYY-MM-DD> bar: vetoed (<cap>)`
+-- and one `terminal` line. It is a MECHANICAL replay of the rule's own proposals: a description
+with no threshold, never evidence for choosing parameters (the research freeze, 2026-09-27).
+
 **The fee source is always printed beside the fee.** A venue-previewed commission and the
 `config.fees.taker_pct` fallback are different kinds of number (the plan's Global Constraints:
 "every fallback records its source"), and a fee shown without its source reads as the venue's.
@@ -52,9 +59,15 @@ import json
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from decimal import Decimal
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from keel.commands.doctor import _money
+
+if TYPE_CHECKING:
+    from collections.abc import Sequence
+
+    from keel.strategy.rules.base import Rule
+    from keel.types import Candle
 
 _UNRECORDED = "unrecorded"
 
@@ -332,4 +345,257 @@ def render_distribution(rows: list[DistributionRow]) -> list[str]:
                 f"  a dca buy falls on the same day: the pipeline records it vetoed "
                 f"({SAME_DAY_DCA}), and it is not carried forward"
             )
+    return lines
+
+
+# -- keel rules backtest on a sleeve-sell rule: the proposal replay (P12, spec §3.7) -----------
+
+_ZERO = Decimal("0")
+
+#: Printed under every replay's head, verbatim: what the replay is, and what it is not.
+REPLAY_DISCLAIMER = (
+    "a mechanical replay of this rule's own proposals over the cached bars -- a description, "
+    "not a pass mark (spec §3.7), and not evidence for choosing parameters"
+)
+
+
+@dataclass(frozen=True)
+class ReplaySale:
+    """One proposal the replay would have recorded as a `preview`, and what selling it books.
+
+    `day` is the decided BAR's UTC day number (`ts // 86_400`); the proposal itself is made the
+    day after (R43). `qty` is the proposal's leg -- the first leg of rail 2's slicing, as a live
+    proposal row records it -- and `legs` is how many legs (days) the whole sale needs, `None`
+    when no cap was supplied to slice against. `gross_usd` is the notional less slippage,
+    `fee_usd` the notional at the line's fee rate, `cost_basis` the FIFO, fee-inclusive basis of
+    the units consumed (`Holding.fifo_cost`), and `realised_pnl = gross - fee - basis`:
+    `sleeve.record_proposal`'s definitions, so a replayed row reads like a recorded one."""
+
+    day: int
+    qty: Decimal
+    price: Decimal
+    gross_usd: Decimal
+    fee_usd: Decimal
+    cost_basis: Decimal
+    realised_pnl: Decimal
+    legs: int | None
+
+
+@dataclass(frozen=True)
+class ReplayVeto:
+    """A bar the rule fired on that the pipeline would have recorded `vetoed`, and why (the
+    `sleeve_refusal` cap, or `nothing_held`). Not carried forward, as live."""
+
+    day: int
+    reason: str
+
+
+@dataclass(frozen=True)
+class ProposalReplay:
+    """`proposal_replay`'s result for one fee rate. `terminal_with` marks the units left at the
+    last close and adds the cash the sales raised (gross less fee); `terminal_without` is the
+    same synthetic holding never sold, at the same close. Both are marks, not exits: neither
+    pays a fee to leave."""
+
+    product_id: str
+    fee_pct: Decimal
+    slippage_pct: Decimal
+    n_bars: int
+    start_price: Decimal | None
+    final_close: Decimal | None
+    rows: tuple[ReplaySale, ...]
+    vetoed: tuple[ReplayVeto, ...]
+    units_left: Decimal
+    cash_usd: Decimal
+
+    @property
+    def terminal_with(self) -> Decimal | None:
+        if self.final_close is None:
+            return None
+        return self.units_left * self.final_close + self.cash_usd
+
+    @property
+    def terminal_without(self) -> Decimal | None:
+        return None if self.final_close is None else self.final_close
+
+
+def proposal_replay(
+    rule: Rule,
+    daily: Sequence[Candle],
+    *,
+    fee_pct: Decimal,
+    slippage_pct: Decimal,
+    max_per_order_usd: Decimal | None = None,
+    dca_rules: Sequence[Rule] = (),
+) -> ProposalReplay:
+    """Walk `daily` bar by bar and replay what `rule`'s `reduce_signal` would have proposed,
+    through the live pipeline's own sleeve policy (spec §3.7). Pure and deterministic: no repo,
+    no config, no clock.
+
+    **The holding is synthetic, and says so:** one lot of 1 unit bought at the FIRST close, on
+    the first bar, fee-free -- a sleeve-sell rule needs something to sell, and the ledger's real
+    lots are not history. Each sale consumes it FIFO (`Holding.fifo_legs`), so a later bar sees
+    what the earlier sales left.
+
+    **Each bar is decided as a cycle would decide it:** `reduce_signal` over the prefix ending at
+    that bar (it reads completed daily bars only), at `SellCosts(fee_pct, slippage_pct)`. The
+    proposal is made the day after the bar (R43), so that is `now_ts` for the sleeve caps:
+    `sleeve.sleeve_refusal` -- the same-day-DCA exclusion, from each of `dca_rules`' own `detect`
+    over the same prefix (as `agent._dca_fires_today` asks it), `min_hold_days` on the lots the
+    sale would consume (R12), and the rule's `cooldown_days` from its last replayed sale (R15).
+    A refused bar is a `ReplayVeto` and is not carried forward. A bar that passes sells
+    `min(reduction.qty, held)`, sliced by `sleeve.slice_qty` when `max_per_order_usd` is given
+    (no venue increment: this asks no venue), and the replay books that first leg -- what a
+    proposal row records -- with the whole sale's leg count beside it.
+
+    **A fidelity check, not research.** The rule is replayed at ONE parameter set, the operator's;
+    nothing is searched, scored against a threshold, or appended to the trials ledger.
+    """
+    from keel.execution import sleeve
+    from keel.strategy.reduction import Holding, Lot, SellCosts
+    from keel.types import Granularity
+
+    costs = SellCosts(fee_pct, slippage_pct, sleeve.FALLBACK_FEE_SOURCE)
+    product_id = str(getattr(rule, "product_id", ""))
+    params = getattr(rule, "params", {}) or {}
+    if not daily:
+        return ProposalReplay(
+            product_id, fee_pct, slippage_pct, 0, None, None, (), (), Decimal("0"), Decimal("0")
+        )
+
+    first = daily[0]
+    holding = Holding(product_id, (Lot(0, "dca", first.ts, Decimal("1"), first.close, _ZERO),))
+    sales: list[ReplaySale] = []
+    vetoes: list[ReplayVeto] = []
+    cash = _ZERO
+    last_sale_ts: int | None = None
+    for i, bar in enumerate(daily):
+        prefix = {Granularity.ONE_DAY: list(daily[: i + 1])}
+        reduction = rule.reduce_signal(holding, prefix, costs)
+        if reduction is None:
+            continue
+        day = reduction.ts // _DAY
+        now_ts = bar.ts + _DAY
+        total = min(reduction.qty, holding.qty)
+        if total <= 0:
+            vetoes.append(ReplayVeto(day, "nothing_held"))
+            continue
+        refusal = sleeve.sleeve_refusal(
+            reduction=reduction,
+            holding=holding,
+            rule_kind=reduction.reason,
+            rule_params=params,
+            dca_fires_today=any(d.detect(prefix) is not None for d in dca_rules),
+            last_rule_proposal_ts=last_sale_ts,
+            now_ts=now_ts,
+        )
+        if refusal is not None:
+            vetoes.append(ReplayVeto(day, refusal))
+            continue
+        price = reduction.expected_price
+        legs: int | None = None
+        qty = total
+        if max_per_order_usd is not None:
+            qty, legs = sleeve.slice_qty(
+                total, price, max_per_order_usd=max_per_order_usd, base_increment=None
+            )
+            if legs == 0:
+                vetoes.append(ReplayVeto(day, "below_one_increment"))
+                continue
+        notional = qty * price
+        gross = notional * (Decimal("1") - slippage_pct)
+        fee = notional * fee_pct
+        basis = holding.fifo_cost(qty)
+        sales.append(ReplaySale(day, qty, price, gross, fee, basis, gross - fee - basis, legs))
+        cash += gross - fee
+        last_sale_ts = now_ts
+        holding = _after_sale(holding, qty)
+
+    return ProposalReplay(
+        product_id=product_id,
+        fee_pct=fee_pct,
+        slippage_pct=slippage_pct,
+        n_bars=len(daily),
+        start_price=first.close,
+        final_close=daily[-1].close,
+        rows=tuple(sales),
+        vetoed=tuple(vetoes),
+        units_left=holding.qty,
+        cash_usd=cash,
+    )
+
+
+def _after_sale(holding: Any, qty: Decimal) -> Any:
+    """`holding` less a FIFO sale of `qty`: each consumed lot keeps what it did not sell, its
+    sold units moved to `realized_qty` -- the ledger's own reading of a partial exit, so the
+    entry fee stays prorated by `Lot.entry_fee_share` exactly as on a real tranche."""
+    taken = {lot.position_id: take for lot, take in holding.fifo_legs(qty)}
+    lots = tuple(
+        replace(
+            lot,
+            qty=lot.qty - taken.get(lot.position_id, _ZERO),
+            realized_qty=lot.realized_qty + taken.get(lot.position_id, _ZERO),
+        )
+        for lot in holding.lots
+    )
+    return replace(holding, lots=tuple(lot for lot in lots if lot.qty > 0))
+
+
+def _pct(rate: Decimal) -> str:
+    return f"{rate * 100:.4f}%"
+
+
+def render_replay(
+    *,
+    rule_id: int,
+    kind: str,
+    replays: Sequence[tuple[ProposalReplay, str]],
+    slippage_measured: bool,
+    max_per_order_usd: Decimal | None,
+    dca_note: str,
+) -> list[str]:
+    """The replay's lines (the module docstring's format): one head, then per `(replay,
+    fee_label)` a `fee line:` and its bars and terminal. Every replay shares the bars and the
+    synthetic holding, so the head is printed once from the first."""
+    head = replays[0][0]
+    if head.n_bars == 0 or head.start_price is None:
+        return [f"rule {rule_id} ({kind}) {head.product_id}: no cached daily bars to replay."]
+    slippage = "measured" if slippage_measured else "floor, no daily volume to measure"
+    cap = (
+        "no config: legs not sliced"
+        if max_per_order_usd is None
+        else f"rail 2 cap {_usd(max_per_order_usd)} per leg (config.caps.max_per_order_usd)"
+    )
+    lines = [
+        f"rule {rule_id} ({kind}) {head.product_id}: proposal replay over {head.n_bars} cached "
+        "ONE_DAY bars",
+        REPLAY_DISCLAIMER,
+        f"  holding: a synthetic 1 unit bought at the first close {_plain(head.start_price)}, "
+        f"fee-free; slippage {_pct(head.slippage_pct)} per leg ({slippage}); {cap}",
+        f"  same-day dca: {dca_note}",
+    ]
+    for replay, fee_label in replays:
+        lines.append(f"fee line: {_pct(replay.fee_pct)} ({fee_label})")
+        events: list[tuple[int, str]] = [
+            (
+                sale.day,
+                f"  {_day(sale.day * _DAY)} bar: sell {_plain(sale.qty)} @ {_plain(sale.price)}"
+                f"  gross {_usd(sale.gross_usd)}  fee {_usd(sale.fee_usd)}"
+                f"  basis {_usd(sale.cost_basis)}  realised {_usd(sale.realised_pnl)}"
+                f"  legs {'unsliced' if sale.legs is None else sale.legs}",
+            )
+            for sale in replay.rows
+        ]
+        events += [
+            (veto.day, f"  {_day(veto.day * _DAY)} bar: vetoed ({veto.reason})")
+            for veto in replay.vetoed
+        ]
+        if not events:
+            lines.append("  the rule proposed nothing over these bars")
+        lines.extend(text for _day_no, text in sorted(events, key=lambda e: e[0]))
+        lines.append(
+            f"  terminal at the last close {_plain(replay.final_close)}: with the rule "
+            f"{_usd(replay.terminal_with)} ({_plain(replay.units_left)} units + "
+            f"{_usd(replay.cash_usd)} cash), without {_usd(replay.terminal_without)}"
+        )
     return lines

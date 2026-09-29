@@ -1396,3 +1396,51 @@ def test_rules_add_refuses_a_non_positive_target(tmp_path, valid_config_path):
     assert result.exit_code == 1 and "target_usd" in result.output
     assert "unknown rule kind" not in result.output
     assert _repo(tmp_path).get_rules() == []
+
+
+def test_the_printed_next_command_works_for_a_sleeve_sell_kind(tmp_path, valid_config_path):
+    """The hint `rules add --kind reverse_dca` prints is a command that RUNS: before P12 it
+    failed with "could not determine a granularity" (a sleeve-sell rule has none). It now
+    prints the rule's proposal replay (spec §3.7)."""
+    from keel.commands.sleeve_report import REPLAY_DISCLAIMER
+    from keel.types import Candle, Granularity
+
+    repo = _repo(tmp_path)
+    repo.upsert_candles(
+        "BTC-USD",
+        Granularity.ONE_DAY,
+        [
+            Candle(
+                ts=d * 86_400,
+                open=Decimal(100 + d),
+                high=Decimal(100 + d),
+                low=Decimal(100 + d),
+                close=Decimal(100 + d),
+                volume=Decimal("1000"),
+            )
+            for d in range(91)
+        ],
+    )
+    add = _add(
+        tmp_path,
+        valid_config_path,
+        "--kind",
+        "reverse_dca",
+        "--product",
+        "BTC-USD",
+        "--params",
+        '{"target_usd": "10", "min_price_floor": "1"}',
+    )
+    assert add.exit_code == 0, add.output
+    nexts = [line for line in add.output.splitlines() if line.startswith("next: keel ")]
+    assert len(nexts) == 1
+    argv = nexts[0].removeprefix("next: keel ").split()
+    assert argv[:2] == ["rules", "backtest"]
+
+    result = CliRunner().invoke(
+        cli, ["--db", str(tmp_path / "t.db"), "--config", str(valid_config_path), *argv]
+    )
+    assert result.exit_code == 0, result.output
+    lines = result.output.splitlines()
+    assert REPLAY_DISCLAIMER in lines
+    assert sum(1 for line in lines if line.startswith("fee line: ")) == 1

@@ -314,3 +314,267 @@ def test_a_closed_row_on_a_dca_day_says_nothing_of_a_veto() -> None:
         dca_collision=True,
     )
     assert len(render_distribution([row])) == 1
+
+
+# -- proposal replay (P12 Task 12.3, spec §3.7, R29) -------------------------------------------
+#
+# A FIDELITY check of the replay, not a verdict: synthetic candles and hand-computed figures. The
+# research freeze (2026-09-27) holds -- no sweep, nothing appended to the trials ledger.
+
+_FEE = D("0.012")
+_SLIP = D("0.0005")
+
+
+def _rising(days: int) -> list[Candle]:
+    """Close 100 + d on day d: every 30-day cadence bar clears the floor and the drawdown gate."""
+    return [_candle(d, str(100 + d)) for d in range(days)]
+
+
+def _reverse(**params: Any) -> Any:
+    from keel.strategy.rules.reverse_dca import ReverseDca
+
+    return ReverseDca("BTC-USD", **{"target_usd": D("10"), "min_price_floor": D("1"), **params})
+
+
+def test_the_replay_lists_every_reduction_and_is_deterministic() -> None:
+    from keel.commands.sleeve_report import proposal_replay
+
+    first = proposal_replay(_reverse(), _rising(91), fee_pct=_FEE, slippage_pct=_SLIP)
+    assert [r.day for r in first.rows] == [30, 60, 90]
+    assert first == proposal_replay(_reverse(), _rising(91), fee_pct=_FEE, slippage_pct=_SLIP)
+
+
+def test_the_first_cadence_bar_is_vetoed_by_min_hold_as_the_pipeline_would() -> None:
+    """Day 0 is a cadence bar too, but the synthetic lot was bought on day 0 and the proposal
+    for bar 0 is made on day 1: one day held < 30 (`sleeve_refusal`, R12)."""
+    from keel.commands.sleeve_report import proposal_replay
+    from keel.execution.sleeve import MIN_HOLD
+
+    replay = proposal_replay(_reverse(), _rising(91), fee_pct=_FEE, slippage_pct=_SLIP)
+    assert [(v.day, v.reason) for v in replay.vetoed] == [(0, MIN_HOLD)]
+
+
+def test_each_sale_is_hand_computed_against_the_fifo_lot() -> None:
+    """Bar 30, close 130: gross from net is 10 / (1 - 0.012 - 0.0005), qty = gross / 130. The
+    realised P&L is the leg's notional less slippage, less the fee on the notional, less the
+    basis of the units consumed from the one lot bought at 100."""
+    from keel.commands.sleeve_report import proposal_replay
+
+    replay = proposal_replay(_reverse(), _rising(91), fee_pct=_FEE, slippage_pct=_SLIP)
+    row = replay.rows[0]
+    qty = D("10") / (D("1") - _FEE - _SLIP) / D("130")
+    notional = qty * D("130")
+    assert (row.qty, row.price) == (qty, D("130"))
+    assert row.gross_usd == notional * (D("1") - _SLIP)
+    assert row.fee_usd == notional * _FEE
+    assert row.cost_basis == qty * D("100")
+    assert row.realised_pnl == row.gross_usd - row.fee_usd - row.cost_basis
+    assert row.legs is None  # no cap supplied: legs are not claimed
+
+
+def test_the_terminal_value_is_with_and_without_the_rule() -> None:
+    from keel.commands.sleeve_report import proposal_replay
+
+    replay = proposal_replay(_reverse(), _rising(91), fee_pct=_FEE, slippage_pct=_SLIP)
+    sold = sum((r.qty for r in replay.rows), D("0"))
+    cash = sum((r.gross_usd - r.fee_usd for r in replay.rows), D("0"))
+    assert replay.final_close == D("190")
+    assert replay.units_left == D("1") - sold
+    assert replay.cash_usd == cash
+    assert replay.terminal_with == (D("1") - sold) * D("190") + cash
+    assert replay.terminal_without == D("190")
+
+
+def test_a_cap_slices_a_sale_into_legs_and_the_proposal_sells_the_first() -> None:
+    """The live pipeline's rail-2 slicing (`sleeve.slice_qty`): a $10 target under a $4 cap
+    needs 3 legs, and a proposal row carries its FIRST leg -- so does the replay."""
+    from keel.commands.sleeve_report import proposal_replay
+    from keel.execution import sleeve
+
+    replay = proposal_replay(
+        _reverse(), _rising(91), fee_pct=_FEE, slippage_pct=_SLIP, max_per_order_usd=D("4")
+    )
+    row = replay.rows[0]
+    whole = D("10") / (D("1") - _FEE - _SLIP) / D("130")
+    leg, legs = sleeve.slice_qty(whole, D("130"), max_per_order_usd=D("4"), base_increment=None)
+    assert legs == 3
+    assert (row.qty, row.legs) == (leg, 3)
+
+
+def test_a_same_day_dca_vetoes_the_sale_and_it_is_not_carried() -> None:
+    """Review Focus 1: with a 30-day dca on the product every distribution bar is a buy bar,
+    so every one is vetoed `same_day_dca`, and none is carried to the next day."""
+    from keel.commands.sleeve_report import proposal_replay
+    from keel.execution.sleeve import SAME_DAY_DCA
+    from keel.strategy.rules.dca import Dca
+
+    dca = Dca("BTC-USD", cadence_days=30)
+    replay = proposal_replay(
+        _reverse(min_hold_days=0), _rising(91), fee_pct=_FEE, slippage_pct=_SLIP, dca_rules=[dca]
+    )
+    assert replay.rows == ()
+    assert [(v.day, v.reason) for v in replay.vetoed] == [
+        (0, SAME_DAY_DCA),
+        (30, SAME_DAY_DCA),
+        (60, SAME_DAY_DCA),
+        (90, SAME_DAY_DCA),
+    ]
+
+
+def test_the_replay_holding_shrinks_fifo_and_floor_qty_stops_it() -> None:
+    """A target larger than what floor_qty leaves: the first sale takes the holding down to the
+    floor, and every later bar proposes nothing (the rule's own floor_qty gate)."""
+    from keel.commands.sleeve_report import proposal_replay
+
+    rule = _reverse(target_usd=D("1000"), floor_qty=D("0.5"))
+    replay = proposal_replay(rule, _rising(91), fee_pct=_FEE, slippage_pct=_SLIP)
+    assert [r.day for r in replay.rows] == [30]
+    assert replay.rows[0].qty == D("0.5")
+    assert replay.units_left == D("0.5")
+
+
+def test_no_daily_candles_replays_nothing() -> None:
+    from keel.commands.sleeve_report import proposal_replay
+
+    replay = proposal_replay(_reverse(), [], fee_pct=_FEE, slippage_pct=_SLIP)
+    assert (replay.rows, replay.vetoed, replay.n_bars) == ((), (), 0)
+
+
+def _file_repo(db) -> Repository:
+    conn = connect(str(db))
+    migrate(conn)
+    return Repository(conn)
+
+
+def _backtest(tmp_path, valid_config_path, rid, *extra):
+    from click.testing import CliRunner
+
+    from keel.cli import cli
+
+    return CliRunner().invoke(
+        cli,
+        [
+            "--db",
+            str(tmp_path / "t.db"),
+            "--config",
+            str(valid_config_path),
+            "rules",
+            "backtest",
+            str(rid),
+            *extra,
+        ],
+    )
+
+
+def _fee_lines(output: str) -> list[str]:
+    return [line for line in output.splitlines() if line.startswith("fee line:")]
+
+
+def test_the_sensitivity_row_exists_only_when_the_operator_supplies_a_rate(
+    tmp_path, valid_config_path
+) -> None:
+    repo = _file_repo(tmp_path / "t.db")
+    repo.upsert_candles("BTC-USD", Granularity.ONE_DAY, _rising(91))
+    rid = repo.insert_rule(
+        "reverse_dca",
+        {"product_id": "BTC-USD", "target_usd": "10", "min_price_floor": "1"},
+        status="candidate",
+    )
+
+    plain = _backtest(tmp_path, valid_config_path, rid)
+    both = _backtest(tmp_path, valid_config_path, rid, "--fee-sensitivity-pct", "0.009")
+
+    assert plain.exit_code == 0, plain.output
+    assert both.exit_code == 0, both.output
+    assert _fee_lines(plain.output) == ["fee line: 1.2000% (fallback:config.fees.taker_pct)"]
+    assert _fee_lines(both.output) == [
+        "fee line: 1.2000% (fallback:config.fees.taker_pct)",
+        "fee line: 0.9000% (operator-supplied sensitivity)",
+    ]
+
+
+def test_the_replay_says_it_is_a_description_not_evidence(tmp_path, valid_config_path) -> None:
+    """The research freeze: the output states plainly what the replay is and is not."""
+    repo = _file_repo(tmp_path / "t.db")
+    repo.upsert_candles("BTC-USD", Granularity.ONE_DAY, _rising(91))
+    rid = repo.insert_rule(
+        "reverse_dca",
+        {"product_id": "BTC-USD", "target_usd": "10", "min_price_floor": "1"},
+        status="candidate",
+    )
+    out = _backtest(tmp_path, valid_config_path, rid).output
+    assert sleeve_report.REPLAY_DISCLAIMER in out.splitlines()
+    sales = [line for line in out.splitlines() if " bar: sell " in line]
+    vetoes = [line for line in out.splitlines() if " bar: vetoed " in line]
+    assert (len(sales), len(vetoes)) == (3, 1)
+    assert sum(1 for line in out.splitlines() if line.startswith("  terminal ")) == 1
+
+
+def test_the_sensitivity_flag_is_refused_on_a_rule_with_no_replay(
+    tmp_path, valid_config_path
+) -> None:
+    repo = _file_repo(tmp_path / "t.db")
+    repo.upsert_candles("BTC-USD", Granularity.ONE_DAY, _rising(91))
+    rid = repo.insert_rule("dca", {"product_id": "BTC-USD", "cadence_days": 7}, status="candidate")
+    result = _backtest(tmp_path, valid_config_path, rid, "--fee-sensitivity-pct", "0.01")
+    assert result.exit_code == 2
+    assert "No such option" not in result.output
+    assert "only to a sleeve-sell rule's proposal replay" in result.output
+
+
+@pytest.mark.parametrize("rate", ["-0.001", "1", "abc"])
+def test_a_rate_outside_zero_to_one_is_a_usage_error(tmp_path, valid_config_path, rate) -> None:
+    repo = _file_repo(tmp_path / "t.db")
+    rid = repo.insert_rule(
+        "reverse_dca",
+        {"product_id": "BTC-USD", "target_usd": "10", "min_price_floor": "1"},
+        status="candidate",
+    )
+    result = _backtest(tmp_path, valid_config_path, rid, "--fee-sensitivity-pct", rate)
+    assert result.exit_code == 2
+    assert "No such option" not in result.output
+
+
+def test_no_cached_daily_bars_is_a_named_refusal(tmp_path, valid_config_path) -> None:
+    repo = _file_repo(tmp_path / "t.db")
+    rid = repo.insert_rule(
+        "reverse_dca",
+        {"product_id": "BTC-USD", "target_usd": "10", "min_price_floor": "1"},
+        status="candidate",
+    )
+    result = _backtest(tmp_path, valid_config_path, rid)
+    assert result.exit_code == 1
+    assert "no cached ONE_DAY candles for BTC-USD" in result.output
+    assert "granularity" not in result.output
+
+
+def test_no_live_fee_rate_is_hardcoded_anywhere_in_keel() -> None:
+    """Spec §2.2 / Q5, plan R29: the tier can change, and the preview is the fact. The 0.9% row
+    exists only when the operator types --fee-sensitivity-pct."""
+    import re
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[2] / "keel"
+    files = list(root.rglob("*.py"))
+    assert len(files) > 100  # the scan reaches the package, not an empty glob
+    hits = [str(p) for p in files if re.search(r"\b0\.009\b", p.read_text())]
+    assert hits == []
+
+
+def test_a_cooldown_param_is_enforced_from_the_last_replayed_sale() -> None:
+    """R15 as the pipeline applies it (`sleeve_refusal` reads `cooldown_days` off the rule's
+    params): with a 45-day cooldown a 30-day cadence sells on bar 30, is refused on bar 60 (30
+    days after the bar-30 proposal), and sells again on bar 90 (60 days after it). A vetoed bar
+    does not re-arm the cooldown (#915)."""
+    from keel.commands.sleeve_report import proposal_replay
+    from keel.execution.sleeve import COOLDOWN, MIN_HOLD
+
+    rule = _reverse()
+    rule.params["cooldown_days"] = 45
+    replay = proposal_replay(rule, _rising(121), fee_pct=_FEE, slippage_pct=_SLIP)
+    assert [r.day for r in replay.rows] == [30, 90]
+    assert [(v.day, v.reason) for v in replay.vetoed] == [
+        (0, MIN_HOLD),
+        (60, COOLDOWN),
+        (120, COOLDOWN),
+    ]
