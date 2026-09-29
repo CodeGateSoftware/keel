@@ -1402,6 +1402,24 @@ def _dump_existing_tables(conn: sqlite3.Connection) -> dict[str, list[tuple[obje
     }
 
 
+_V22_ADDED_OBJECTS = {("table", "sell_proposals"), ("index", "idx_sell_proposals_product_ts")}
+
+
+def _dump_schema(conn: sqlite3.Connection) -> dict[tuple[str, str], tuple[object, ...]]:
+    """The DDL of every pre-existing `sqlite_master` object -- everything except the internal
+    `sqlite_%` bookkeeping entries and the v22 `sell_proposals` table/index -- keyed by
+    `(type, name)`. `_dump_existing_tables` above only diffs ROWS, so a column or index change on
+    an EXISTING table (e.g. an `ALTER TABLE rules ADD COLUMN ...` slipped into
+    `_migrate_v22_sell_proposals`) would pass unseen; this catches that."""
+    return {
+        (row["type"], row["name"]): tuple(row)
+        for row in conn.execute(
+            "SELECT type, name, tbl_name, sql FROM sqlite_master WHERE name NOT LIKE 'sqlite_%'"
+        )
+        if row["name"] not in {"sell_proposals", "idx_sell_proposals_product_ts"}
+    }
+
+
 def test_the_deploy_migrate_takes_a_populated_v21_file_to_v22_touching_no_row(tmp_path) -> None:
     """The live deployment reaches v22 by `keel --db <db> migrate`, on a FILE (WAL), holding
     orders, tranches and an audit chain. v22 is additive: the new table arrives empty, every
@@ -1442,6 +1460,11 @@ def test_the_deploy_migrate_takes_a_populated_v21_file_to_v22_touching_no_row(tm
     repo.append_journal_entry(ts=1_780_000_100, chart_note="pre-v22 note")
     before = _dump_existing_tables(conn)
     events_before = len(audit.read_events(conn))
+    schema_before = _dump_schema(conn)
+    objects_before = {
+        (r["type"], r["name"])
+        for r in conn.execute("SELECT type, name FROM sqlite_master WHERE name NOT LIKE 'sqlite_%'")
+    }
     assert "sell_proposals" not in {
         r["name"] for r in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
     }
@@ -1460,3 +1483,13 @@ def test_the_deploy_migrate_takes_a_populated_v21_file_to_v22_touching_no_row(tm
     assert len(before["journal"]) == 1 and len(before["audit_events"]) == events_before == 3
     state = audit.chain_state(after_conn)
     assert state.errors == () and state.event_count == events_before
+    # A column or index change on an EXISTING table (not just a changed row) must also show up.
+    schema_after = _dump_schema(after_conn)
+    assert schema_after == schema_before
+    objects_after = {
+        (r["type"], r["name"])
+        for r in after_conn.execute(
+            "SELECT type, name FROM sqlite_master WHERE name NOT LIKE 'sqlite_%'"
+        )
+    }
+    assert objects_after - objects_before == _V22_ADDED_OBJECTS

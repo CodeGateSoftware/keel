@@ -76,6 +76,16 @@ def test_an_unrecorded_figure_reads_as_unrecorded_never_as_zero() -> None:
     assert not any(f.startswith("net $") for f in fields)
 
 
+def test_vwae_and_cost_basis_print_unrecorded_when_null() -> None:
+    row = _stored(vwae=None, cost_basis=None)
+    lines = sleeve_report.render_proposal(row)
+    detail = dict(line.strip().split(": ", 1) for line in lines[1:])
+    assert detail["vwae"] == "unrecorded"
+    assert detail["cost basis"] == "unrecorded"
+    assert "  vwae: unrecorded" in lines
+    assert "  cost basis: unrecorded" in lines
+
+
 def test_render_proposal_leads_with_the_line_then_the_detail() -> None:
     row = _stored(
         fee_source="fallback:config.fees.taker_pct",
