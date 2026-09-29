@@ -442,7 +442,9 @@ def run_proposal_replay(
     reading), each through its own `detect`.
 
     Refusals: an unknown id; a `--granularity` other than ONE_DAY (a sleeve-sell rule decides on
-    completed daily bars); no cached ONE_DAY candles, named as such.
+    completed daily bars); no cached ONE_DAY candles, named as such; a headline or
+    `--fee-sensitivity-pct` rate that leaves `fee + slippage >= 1` (`SellCosts.__post_init__`
+    would otherwise raise `ValueError` uncaught -- sizing gross from net is undefined there).
     """
     from keel.commands import sleeve_report
     from keel.execution import sleeve
@@ -491,6 +493,13 @@ def run_proposal_replay(
     rates = [(fee_pct, fee_label)]
     if fee_sensitivity_pct is not None:
         rates.append((fee_sensitivity_pct, "operator-supplied sensitivity"))
+    for rate, label in rates:
+        if rate + slippage_pct >= 1:
+            echo_err(
+                f"Error: rule {rule_id} ({kind}): {label} fee {rate} + slippage {slippage_pct} "
+                ">= 1 -- sizing gross from net (spec §6) is undefined there. Nothing was replayed."
+            )
+            raise RulesRefused(f"rule {rule_id}: fee {rate} + slippage {slippage_pct} >= 1")
     replays = [
         (
             sleeve_report.proposal_replay(
@@ -1289,6 +1298,98 @@ def _reduction_as_detect(rule: Rule) -> Callable[[dict[Granularity, list[Candle]
     return _detect
 
 
+def _sleeve_lookahead(
+    rule: Rule, daily: list[Candle], rule_id: str
+) -> tuple[bias_mod.LookaheadReport, int]:
+    """The sleeve-sell lookahead check (issue #929, plan R44): truncation-diff `reduce_signal`
+    at every day the rule could have been PROMOTED on, not just at the cached series' own end.
+
+    **Why the single full-series run is vacuous most days.** `bias_mod.lookahead_analysis` run
+    ONCE over the whole cached series compares Axis A only at the full run's own claimed anchor
+    (`Setup.ts`); a rule that never fires on that one run has nothing to diff and reads `clean`
+    honestly, but for `reverse_dca` the full run fires only when the LAST cached bar happens to
+    land on the rule's cadence day -- about one day in `cadence_days`. Every other day, the old
+    check walked ONE_DAY anchors (so `n_bars_checked > 0`) and compared NOTHING, and
+    `verdict == "clean" and n_bars_checked > 0` read that as a pass.
+
+    **The fix: one harness call per TRUNCATION.** For every sampled end index `e` from
+    `bias_mod.DEFAULT_WARMUP` to `len(daily) - 1` (a day past warmup the rule could have been
+    judged on), the ONE harness runs again on `daily[: e + 1]` alone -- a `sample_step` past
+    that truncation's own length collapses `lookahead_analysis`'s own walk to just its warmup
+    bar, its final bar and its full run's claimed anchor, exactly as a single run over that
+    truncated history would. Each truncation whose full run FIRES is one real comparison
+    (`n_compared`); a truncation whose full run does not fire has nothing to diff there, same as
+    the module's own honesty about a rule that never fires.
+
+    Divergences across every truncation are deduplicated on `(bar_ts, field, prefix_value,
+    full_value)` -- the same bar firing at more than one truncation must not double-count -- with
+    the first five kept for `render_lines` and the true total counted. `n_bars_checked` on the
+    aggregate report is truncations WALKED, not anchors compared; `n_compared` (returned beside
+    the report, and the caller's to refuse on) is truncations whose full run had a decision at
+    all. A rule that fires nowhere over the cached history has `n_compared == 0`: an UN-RUN
+    check, which the caller refuses same as no cached bars at all.
+    """
+    detect = _reduction_as_detect(rule)
+    n = len(daily)
+    stride = max(1, -(-n // 200))
+    last_index = n - 1
+    ends = set(range(bias_mod.DEFAULT_WARMUP, n, stride))
+    if last_index >= bias_mod.DEFAULT_WARMUP:
+        ends.add(last_index)
+    ordered_ends = sorted(ends)
+
+    # A sample_step past the FULL series' own length: inside each per-truncation call, the only
+    # indices ever walked are that truncation's warmup bar, its own final bar, and (if within
+    # range) its full run's claimed anchor -- see `lookahead_analysis`'s own indices logic.
+    walk_stride = n + 1
+    max_divergences = 5
+
+    kept: list[bias_mod.LookaheadDivergence] = []
+    seen: set[tuple[int, str, str, str]] = set()
+    n_divergences = 0
+    n_compared = 0
+
+    for e in ordered_ends:
+        candles_by_tf = {Granularity.ONE_DAY: daily[: e + 1]}
+        if detect(candles_by_tf) is not None:
+            n_compared += 1
+        sub = bias_mod.lookahead_analysis(
+            detect,
+            candles_by_tf,
+            rule_id=rule_id,
+            sample_step=walk_stride,
+            warmup=bias_mod.DEFAULT_WARMUP,
+            max_divergences=max_divergences,
+        )
+        for divergence in sub.divergences:
+            key = (
+                divergence.bar_ts,
+                divergence.field,
+                divergence.prefix_value,
+                divergence.full_value,
+            )
+            if key in seen:
+                continue
+            seen.add(key)
+            n_divergences += 1
+            if len(kept) < max_divergences:
+                kept.append(divergence)
+
+    report = bias_mod.LookaheadReport(
+        rule_id=rule_id,
+        n_bars_checked=len(ordered_ends),
+        divergences=tuple(kept),
+        n_divergences=n_divergences,
+        sample_step=stride,
+        anchor_granularity=Granularity.ONE_DAY.value,
+        notes=(
+            bias_mod.HIGHER_TF_NOT_RUN_NOTE,
+            f"{n_compared} of {len(ordered_ends)} truncation(s) had a decision to compare",
+        ),
+    )
+    return report, n_compared
+
+
 def _reviewed_paper_proposals(repo: Repository, rule_id: int) -> int:
     """How many of rule `rule_id`'s proposals made IN PAPER the operator has marked reviewed
     (`keel dca proposals review <id>`) -- spec §3.7's paper->live evidence. A proposal the rule
@@ -1323,24 +1424,36 @@ def _promote_sleeve_sell(
     echo_err: Callable[[str], None],
 ) -> RulesOutcome:
     """`attempt_promotion`'s route for a `sleeve_sell` rule: the lookahead check on
-    `reduce_signal` through `_reduction_as_detect`, then `promotion.sleeve_sell_gate`, then the
-    one-step transition -- or a `RulesRefused` naming every failing condition, with nothing
-    written.
+    `reduce_signal` through `_reduction_as_detect` and `_sleeve_lookahead`, then
+    `promotion.sleeve_sell_gate`, then the one-step transition -- or a `RulesRefused` naming
+    every failing condition, with nothing written.
 
-    **The lookahead runs over the product's cached ONE_DAY bars** (a sleeve-sell rule decides on
-    completed daily bars, `completed_days`), past `bias.DEFAULT_WARMUP` rather than the rule's
-    `lookback_days`: `reduce_signal` has no indicator warmup region -- its gates are a trailing
-    max and comparisons on the bar itself -- so its early decisions are real decisions, and a
-    200-bar skip would leave most caches with nothing to walk. **A check that walked no bar is
-    not a pass** (#440's fail-closed rule): no cached daily bars, or too few to reach one anchor,
-    refuses.
+    **The lookahead truncates at every sampled end of the product's cached ONE_DAY bars**
+    (`_sleeve_lookahead`, issue #929/plan R44), past `bias.DEFAULT_WARMUP` rather than the
+    rule's `lookback_days`: `reduce_signal` has no indicator warmup region -- its gates are a
+    trailing max and comparisons on the bar itself -- so its early decisions are real decisions,
+    and a 200-bar skip would leave most caches with nothing to walk. Truncating (rather than one
+    run over the whole series) asks the gate's actual question at every day the rule could have
+    been promoted on, so Axis A gets a comparison wherever the rule fires, not only at the one
+    anchor the untruncated series happens to end on. **A check that compared nothing is not a
+    pass** (#440's fail-closed rule, sharpened by #929): no cached daily bars, too few to reach
+    one anchor, or a rule that never fired at any sampled truncation (`n_compared == 0`) all
+    refuse, each named.
 
     **Concurrency (Q2) is read for `reverse_dca` only**: it is the kind whose monthly sale beside
-    a weekly buy the spec names (§6 failure mode a).
+    a weekly buy the spec names (§6 failure mode a). **`--allow-concurrent-dca` is a paper ->
+    live condition only** (Q2); passed at any other step it has no effect, and this prints one
+    line saying so rather than silently accepting a flag that does nothing.
     """
     rule_id = int(row["id"])
     kind = row["kind"]
     product_id = rule.product_id
+    if allow_concurrent_dca and row["status"] != "paper":
+        sink(
+            f"rule {rule_id} ({kind}): --allow-concurrent-dca has no effect at "
+            f"{row['status']!r} -> {promotion_mod.next_status(row['status'])!r} -- it applies "
+            "only to the paper -> live step (spec Q2)"
+        )
     daily = repo.get_candles(product_id, Granularity.ONE_DAY)
     if not daily:
         echo_err(
@@ -1350,13 +1463,7 @@ def _promote_sleeve_sell(
         )
         raise RulesRefused(f"rule {rule_id}: no daily candles for the lookahead check")
     try:
-        report = bias_mod.lookahead_analysis(
-            _reduction_as_detect(rule),
-            {Granularity.ONE_DAY: daily},
-            rule_id=str(rule_id),
-            sample_step=max(1, -(-len(daily) // 200)),
-            warmup=bias_mod.DEFAULT_WARMUP,
-        )
+        report, n_compared = _sleeve_lookahead(rule, daily, str(rule_id))
     except Exception as exc:
         echo_err(
             f"Error: rule {rule_id} ({kind}): lookahead analysis could not run: {exc!r}. An "
@@ -1370,9 +1477,15 @@ def _promote_sleeve_sell(
         )
         for line in bias_mod.render_lines(report):
             echo_err(f"  {line}")
+    elif n_compared == 0:
+        echo_err(
+            f"Error: rule {rule_id} ({kind}): reduce_signal never fired over the {len(daily)} "
+            "cached daily bars, so the lookahead check compared nothing -- an un-run check is "
+            "not a pass."
+        )
     for note in report.notes:
         sink(f"warning: rule {rule_id} ({kind}): {note}")
-    lookahead_clean = report.verdict == "clean" and report.n_bars_checked > 0
+    lookahead_clean = report.n_divergences == 0 and n_compared > 0
 
     reviewed = _reviewed_paper_proposals(repo, rule_id)
     concurrent = kind == "reverse_dca" and _live_dca_on(repo, product_id)
@@ -1393,7 +1506,7 @@ def _promote_sleeve_sell(
     )
     sink(
         f"rule {rule_id} ({kind}): sleeve_sell gate -- lookahead {report.verdict} over "
-        f"{report.n_bars_checked} daily bars; days in paper {in_paper} "
+        f"{report.n_bars_checked} daily bars ({n_compared} compared); days in paper {in_paper} "
         f"(need {promotion_mod.SLEEVE_SELL_MIN_PAPER_DAYS}); reviewed paper proposals {reviewed}; "
         f"live dca on {product_id}: {'yes' if concurrent else 'no'}"
     )

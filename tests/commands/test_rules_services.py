@@ -912,3 +912,88 @@ def test_the_adapter_hands_every_view_the_same_synthetic_holding() -> None:
         "BTC-USD", (Lot(0, "dca", first.ts, Decimal("1"), first.close, Decimal("0")),)
     )
     assert set(seen) == {expected}
+
+
+# -- issue #929: the sleeve-sell lookahead gate truncates at every sampled end -------------------
+#
+# The OLD check ran the ONE harness once over the whole cached series: Axis A only compares at
+# the full run's own claimed anchor, so for `reverse_dca` that anchor exists only when the LAST
+# cached bar happens to be a cadence day (~1 in `cadence_days`). Any other day, the full run
+# claims nothing, nothing is compared, and `n_bars_checked > 0` (ONE_DAY walked some anchors
+# regardless) read a vacuous "clean". `_sleeve_lookahead` instead re-runs the harness on every
+# sampled TRUNCATION `daily[: e + 1]`, so a comparison happens at every day the rule actually
+# fired on, and `n_compared` says how many of those truncations had one.
+
+
+def test_a_peeking_rule_is_refused_even_when_the_cache_ends_off_its_firing_day(
+    repo, monkeypatch
+) -> None:
+    """Issue #929's repro: over 120 bars (whose LAST bar, day 119, is not a day the peeking rule
+    fires on -- day 119's close 101 is not above day 118's 107, see `_WANDER`'s own docstring),
+    the OLD full-run-only check compared nothing there and read a vacuous 'clean'. This must
+    fail against the unpatched code (the old vacuous promotion) before the fix, and pass after."""
+    repo.upsert_candles("BTC-USD", Granularity.ONE_DAY, _WANDER[:120])
+    monkeypatch.setitem(agent.RULE_REGISTRY, "reverse_dca", _PeekingReduce)
+    rid = _sleeve_rule(repo)
+    outcome, _out, err = _promote(repo, rid)
+    assert outcome is None
+    assert _status(repo, rid) == "candidate"
+    assert any("lookahead" in line for line in err)
+
+
+def test_reverse_dca_over_a_non_cadence_ending_cache_still_compares_and_promotes(repo) -> None:
+    """The shipped (non-peeking) `ReverseDca`, same 120-bar cache whose last bar is off cadence:
+    truncating at every sampled end still finds the two cadence bars actually walked in range
+    (days 60 and 90 -- the only multiples of 30 in the walked window 50..119), so the gate has a
+    real comparison, and promotes on it."""
+    repo.upsert_candles("BTC-USD", Granularity.ONE_DAY, _WANDER[:120])
+    rid = _sleeve_rule(repo)
+    outcome, out, err = _promote(repo, rid)
+    assert outcome is not None and outcome.new_status == "paper"
+    assert _status(repo, rid) == "paper"
+    assert err == []
+    [line] = [line for line in out if "sleeve_sell gate" in line]
+    assert "lookahead clean over 70 daily bars (2 compared)" in line
+
+
+def test_a_rule_that_never_fires_over_the_cache_compares_nothing_and_is_refused(repo) -> None:
+    """A `min_price_floor` above every cached close: `reduce_signal` never fires at any
+    truncation, so nothing is ever compared -- an UN-RUN check, refused by name, not a vacuous
+    clean pass."""
+    repo.upsert_candles("BTC-USD", Granularity.ONE_DAY, _WANDER)
+    rid = _sleeve_rule(repo, min_price_floor="99999")
+    outcome, _out, err = _promote(repo, rid)
+    assert outcome is None
+    assert _status(repo, rid) == "candidate"
+    assert any(
+        "never fired" in line and "compared nothing" in line and "121" in line for line in err
+    )
+
+
+# -- issue #931: the fail-closed branch when the lookahead harness itself raises ------------------
+
+
+def test_a_raising_lookahead_harness_is_a_refusal_not_a_crash(btc_book, monkeypatch) -> None:
+    def _boom(*_a: Any, **_k: Any) -> Any:
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(rules_mod.bias_mod, "lookahead_analysis", _boom)
+    rid = _sleeve_rule(btc_book)
+    outcome, _out, err = _promote(btc_book, rid)
+    assert outcome is None
+    assert _status(btc_book, rid) == "candidate"
+    assert any("lookahead analysis could not run" in line for line in err)
+
+
+# -- review finding 4c: --allow-concurrent-dca at a step it cannot affect ------------------------
+
+
+def test_allow_concurrent_dca_at_candidate_has_no_effect_and_says_so(btc_book) -> None:
+    """Q2 gates only the paper -> live step; passed at candidate -> paper it does nothing, and
+    the gate says so rather than silently accepting it."""
+    rid = _sleeve_rule(btc_book)
+    outcome, out, _err = _promote(btc_book, rid, allow_concurrent_dca=True)
+    assert outcome is not None and outcome.new_status == "paper"
+    assert _status(btc_book, rid) == "paper"
+    notice = [line for line in out if "--allow-concurrent-dca" in line and "no effect" in line]
+    assert len(notice) == 1
