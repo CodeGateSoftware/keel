@@ -87,6 +87,50 @@ _ORDER_MONEY_FIELDS = (
 
 _SIGNAL_COLUMNS = ("rule_id", "product_id", "ts", "indicators", "cts_score", "fired")
 
+#: `sell_proposals` (#857, spec §3.8), every column but `id`, in DDL order.
+_SELL_PROPOSAL_COLUMNS = (
+    "ts",
+    "product_id",
+    "rule_id",
+    "rule_kind",
+    "rule_status",
+    "qty",
+    "expected_price",
+    "vwae",
+    "cost_basis",
+    "expected_gross",
+    "expected_fee",
+    "fee_source",
+    "expected_net_pnl",
+    "legs",
+    "trigger",
+    "rails",
+    "decision",
+    "superseded_by",
+    "order_id",
+    "reviewed_ts",
+)
+_SELL_PROPOSAL_MONEY_FIELDS = (
+    "qty",
+    "expected_price",
+    "vwae",
+    "cost_basis",
+    "expected_gross",
+    "expected_fee",
+    "expected_net_pnl",
+)
+_SELL_PROPOSAL_JSON_FIELDS = ("trigger", "rails")
+
+#: What a proposal came to -- a CLOSED vocabulary, checked on every write, like `EVENT_STORES`.
+#: Spec §3.8's five (`preview`, `superseded`, `vetoed`, `declined`, `placed`), plus `failed`
+#: (plan R34: the operator said yes and the cancel or the venue then refused -- a different
+#: statement from `declined`, which is the operator's own no). A decision that arrives via a
+#: typo is a proposal no reader recognises: `keel dca proposals list` would print it, and R14's
+#: one-per-day read and R15's cooldown read would count it, without anything knowing what it is.
+SELL_PROPOSAL_DECISIONS = frozenset(
+    {"preview", "superseded", "vetoed", "declined", "placed", "failed"}
+)
+
 
 def _dec_to_text(value: Any) -> str | None:
     """Convert a `Decimal` (or decimal-like value) to its exact TEXT storage form."""
@@ -1433,6 +1477,161 @@ class Repository:
             raw = d.get(accumulator)
             d[accumulator] = Decimal("0") if raw is None else _text_to_dec(raw)
         return d
+
+    # -- sell proposals (the sleeve's sell-side audit trail; #857, spec §3.8) ---------------
+    #
+    # One row per `Reduction` a sleeve-sell rule proposed, executed or not. The row is an AUDIT
+    # RECORD, so both writers chain an event in the same transaction as the row, the way
+    # `insert_order`/`update_order` do: a proposal cannot be deleted or rewritten quietly.
+    # `sell_proposal_recorded` / `sell_proposal_updated` follow the chain's `<store>_<verb>`
+    # vocabulary; the spec's `sleeve.proposal`/`sleeve.placed` names are the NOTIFICATION events
+    # (`keel/notifications.py`), a different surface.
+    #
+    # Neither writer may be named by `keel/web` or `keel/mcp` (S4, pinned by
+    # `tests/execution/test_sell_side_invariants.py`): the confirm path places FROM a proposal row.
+
+    @staticmethod
+    def _check_sell_proposal_decision(decision: Any) -> None:
+        if decision not in SELL_PROPOSAL_DECISIONS:
+            raise ValueError(f"decision: {decision!r} not in {sorted(SELL_PROPOSAL_DECISIONS)}")
+
+    @staticmethod
+    def _encode_sell_proposal_fields(values: dict[str, Any]) -> None:
+        """Money to its exact TEXT, `trigger`/`rails` to canonical JSON -- in place, and only for
+        the keys present, so the insert and the partial update share one encoding."""
+        for field in _SELL_PROPOSAL_MONEY_FIELDS:
+            if field in values:
+                values[field] = _dec_to_text(values[field])
+        for field in _SELL_PROPOSAL_JSON_FIELDS:
+            if field in values and values[field] is not None:
+                values[field] = json.dumps(values[field], default=str, sort_keys=True)
+
+    def insert_sell_proposal(self, row: dict[str, Any]) -> int:
+        """Record one proposal and chain a `sell_proposal_recorded` event; return its `id`.
+
+        `row` carries the table's columns (`id` excepted). Money may be `Decimal` or
+        decimal-like and is stored as its exact text; `trigger` and `rails` are JSON objects.
+        `legs` defaults to 1 -- a sale that fits one order -- and every other absent key is NULL,
+        which the NOT NULL columns refuse. `decision` must be in `SELL_PROPOSAL_DECISIONS`,
+        checked BEFORE the transaction opens, so a refused row leaves neither row nor event.
+        """
+        values: dict[str, Any] = {col: row.get(col) for col in _SELL_PROPOSAL_COLUMNS}
+        self._check_sell_proposal_decision(values["decision"])
+        if values["legs"] is None:
+            values["legs"] = 1
+        self._encode_sell_proposal_fields(values)
+        columns_sql = ", ".join(_SELL_PROPOSAL_COLUMNS)
+        placeholders_sql = ", ".join(f":{c}" for c in _SELL_PROPOSAL_COLUMNS)
+        with write_transaction(self._conn):
+            cursor = self._conn.execute(
+                f"INSERT INTO sell_proposals ({columns_sql}) VALUES ({placeholders_sql})", values
+            )
+            assert cursor.lastrowid is not None
+            proposal_id = cursor.lastrowid
+            append_event(
+                self._conn,
+                ts=_event_ts(values["ts"]),
+                event_type="sell_proposal_recorded",
+                entity_id=str(proposal_id),
+                # The row AS STORED, id included -- `insert_order`'s reasoning: a reader can
+                # reproduce the hash from the row without knowing which columns were populated.
+                payload={"id": proposal_id, **values},
+            )
+        return proposal_id
+
+    def update_sell_proposal(self, proposal_id: int, **fields: Any) -> None:
+        """Partially update proposal `proposal_id` and chain a `sell_proposal_updated` event.
+
+        The event carries WHAT CHANGED, not the row (`update_order`'s rule), and an empty update
+        is a no-op that appends nothing. The keys are spliced into the SET clause, so each must
+        be one of the table's columns, and `id` -- the proposal's identity, which the chain
+        files every event under -- is not one a caller may rewrite. The event's timestamp is the
+        moment of the update: the table has no `updated_at`, and the statement is "this changed
+        now". An id with no row raises `LookupError` and chains nothing.
+        """
+        if not fields:
+            return
+        unknown = sorted(set(fields) - set(_SELL_PROPOSAL_COLUMNS))
+        if unknown:
+            raise ValueError(f"sell_proposals has no updatable column(s) {unknown}")
+        if "decision" in fields:
+            self._check_sell_proposal_decision(fields["decision"])
+        values = dict(fields)
+        self._encode_sell_proposal_fields(values)
+        set_sql = ", ".join(f"{k} = :{k}" for k in values)
+        with write_transaction(self._conn):
+            cursor = self._conn.execute(
+                f"UPDATE sell_proposals SET {set_sql} WHERE id = :proposal_id",
+                {**values, "proposal_id": proposal_id},
+            )
+            if cursor.rowcount == 0:
+                # Raised INSIDE the transaction, so it rolls back: an `updated` event about a row
+                # that does not exist would be a chained statement the table contradicts.
+                raise LookupError(f"no sell proposal with id {proposal_id}")
+            append_event(
+                self._conn,
+                ts=_event_ts(None),
+                event_type="sell_proposal_updated",
+                entity_id=str(proposal_id),
+                payload=values,
+            )
+
+    def get_sell_proposal(self, proposal_id: int) -> dict[str, Any] | None:
+        """One proposal, decoded, or `None` -- including on a database that predates v22, where
+        no proposal can exist (the `table_present` idiom, #751)."""
+        if not self.table_present("sell_proposals"):
+            return None
+        row = self._conn.execute(
+            "SELECT * FROM sell_proposals WHERE id = ?", (proposal_id,)
+        ).fetchone()
+        return None if row is None else self._sell_proposal_row_to_dict(row)
+
+    def get_sell_proposals(
+        self,
+        *,
+        product_id: str | None = None,
+        rule_id: int | None = None,
+        since_ts: int | None = None,
+        limit: int | None = None,
+    ) -> list[dict[str, Any]]:
+        """Proposals, NEWEST FIRST (`ts`, then `id` for a same-second tie), decoded.
+
+        Newest first because every reader asks about the recent end: the proposals log, R14's
+        "already proposed today", R15's "last proposal for this rule". `since_ts` is inclusive.
+        A database that predates v22 reads as `[]` -- no proposal has been made there -- rather
+        than raising (`table_present`, #751): `keel mcp` and the web server read without
+        migrating.
+        """
+        if not self.table_present("sell_proposals"):
+            return []
+        clauses: list[str] = []
+        params: list[Any] = []
+        if product_id is not None:
+            clauses.append("product_id = ?")
+            params.append(product_id)
+        if rule_id is not None:
+            clauses.append("rule_id = ?")
+            params.append(rule_id)
+        if since_ts is not None:
+            clauses.append("ts >= ?")
+            params.append(since_ts)
+        where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
+        query = f"SELECT * FROM sell_proposals{where} ORDER BY ts DESC, id DESC"
+        if limit is not None:
+            query += " LIMIT ?"
+            params.append(limit)
+        rows = self._conn.execute(query, params).fetchall()
+        return [self._sell_proposal_row_to_dict(row) for row in rows]
+
+    @staticmethod
+    def _sell_proposal_row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
+        proposal = dict(row)
+        for field in _SELL_PROPOSAL_MONEY_FIELDS:
+            proposal[field] = _text_to_dec(proposal[field])
+        for field in _SELL_PROPOSAL_JSON_FIELDS:
+            raw = proposal[field]
+            proposal[field] = None if raw is None else json.loads(raw)
+        return proposal
 
     # -- profile (the user's own settings) ------------------------------------
 

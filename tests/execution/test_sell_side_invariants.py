@@ -68,7 +68,13 @@ SECOND_LEVEL_CALLERS = {
 
 #: Operations the browser and the MCP server must never name (S4). Grown by the PR that
 #: introduces each one.
-WEB_FORBIDDEN_NAMES: frozenset[str] = frozenset({"close_declared_position"})  # P4
+WEB_FORBIDDEN_NAMES: frozenset[str] = frozenset(
+    {
+        "close_declared_position",  # P4
+        "insert_sell_proposal",  # P6
+        "update_sell_proposal",  # P6
+    }
+)
 
 
 def _module_of(path: str) -> str:
@@ -370,31 +376,53 @@ def test_the_attr_scan_does_not_confuse_executor_execute_with_conn_execute() -> 
     assert _calls_via_attr(tree, "m", "executor", {"execute"}) == {("m", "honest")}
 
 
+def _web_offenders(tree: ast.AST, module: str) -> list[str]:
+    """Every sell-side operation `tree` names: a `WEB_FORBIDDEN_NAMES` name as an attribute or a
+    bare name, or `executor.reduce` specifically (a bare `reduce` is `functools.reduce`)."""
+    offenders: list[str] = []
+    for node in ast.walk(tree):
+        name = (
+            node.attr
+            if isinstance(node, ast.Attribute)
+            else node.id
+            if isinstance(node, ast.Name)
+            else None
+        )
+        if name in WEB_FORBIDDEN_NAMES:
+            offenders.append(f"{module}: {name}")
+        if (
+            isinstance(node, ast.Attribute)
+            and node.attr == "reduce"
+            and isinstance(node.value, ast.Name)
+            and node.value.id == "executor"
+        ):
+            offenders.append(f"{module}: executor.reduce")
+    return offenders
+
+
 def test_the_browser_and_mcp_name_no_sell_side_operation() -> None:
     offenders: list[str] = []
     for root in ("keel/web", "keel/mcp"):
         for path in sorted(glob.glob(os.path.join(_ROOT, root, "**", "*.py"), recursive=True)):
             with open(path, encoding="utf-8") as fh:
-                tree = ast.parse(fh.read())
-            for node in ast.walk(tree):
-                name = (
-                    node.attr
-                    if isinstance(node, ast.Attribute)
-                    else node.id
-                    if isinstance(node, ast.Name)
-                    else None
-                )
-                if name in WEB_FORBIDDEN_NAMES:
-                    offenders.append(f"{_module_of(path)}: {name}")
-                # `executor.reduce` specifically -- a bare `reduce` is `functools.reduce`.
-                if (
-                    isinstance(node, ast.Attribute)
-                    and node.attr == "reduce"
-                    and isinstance(node.value, ast.Name)
-                    and node.value.id == "executor"
-                ):
-                    offenders.append(f"{_module_of(path)}: executor.reduce")
+                offenders += _web_offenders(ast.parse(fh.read()), _module_of(path))
     assert offenders == []
+
+
+def test_the_web_scan_catches_the_sell_proposal_writers() -> None:
+    """P6: a proposal row is the input P18's confirm path places from, so writing one from the
+    browser would be a capability increase (S4). Both writers, by attribute and by bare name."""
+    tree = ast.parse(
+        "def sneaky(repo):\n"
+        "    repo.insert_sell_proposal({})\n"
+        "    update_sell_proposal(1, decision='placed')\n"
+        "def honest(repo):\n"
+        "    repo.get_sell_proposals()\n"
+    )
+    assert _web_offenders(tree, "m") == [
+        "m: insert_sell_proposal",
+        "m: update_sell_proposal",
+    ]
 
 
 def test_the_import_scan_catches_a_direct_import_and_an_alias() -> None:
