@@ -45,7 +45,8 @@ from keel.config import (
 from keel.data.db import connect, migrate
 from keel.data.repository import Repository
 from keel.execution import executor
-from keel.strategy.rules.base import Action, Rule, Setup, Signal
+from keel.strategy.reduction import Reduction
+from keel.strategy.rules.base import Action, Rule, Setup, Signal, completed_days
 from keel.strategy.rules.dca import Dca
 from keel.strategy.rules.pullback_continuation import PullbackContinuation
 from keel.strategy.rules.turtle_breakout import TurtleBreakout
@@ -5326,3 +5327,203 @@ def test_900_held_position_counts_the_venue_filled_size(repo, held_position) -> 
     qty, _ = held_position(repo, "BTC-USD")
 
     assert qty == Decimal("0.00077099")
+
+
+# -- P8 (#857): sleeve-sell rules in the cycle ----------------------------------------------------
+#
+# A sleeve-sell rule (`promotion_class = "sleeve_sell"`) is loaded apart from the entry/exit rules
+# (plan R31) and asked for a `Reduction` by `agent._handle_reductions`, which runs AFTER the
+# cycle's exits and entries -- the DCA buy included -- and only ever PROPOSES (`executor.reduce`
+# is preview-only in this build, S1).
+
+DAY = 86_400
+
+
+class _AlwaysReduceRule(Rule):
+    """Test double: proposes selling 10% of whatever is held, every cycle."""
+
+    name = "fake_reduce"
+    promotion_class = "sleeve_sell"
+    accumulates = True
+
+    def __init__(self, product_id: str, name: str = "fake_reduce") -> None:
+        self.name, self.product_id = name, product_id
+        self.params: dict = {"product_id": product_id}
+
+    def detect(self, candles_by_tf):
+        return None
+
+    def exit_signal(self, held, candles_by_tf):
+        return False
+
+    def describe(self):
+        return {"name": self.name, "params": self.params}
+
+    def reduce_signal(self, holding, candles_by_tf, costs):
+        days = completed_days(candles_by_tf) or next(iter(candles_by_tf.values()), [])
+        if holding.qty <= 0 or not days:
+            return None
+        return Reduction(
+            self.product_id, holding.qty / 10, self.name, {}, days[-1].close, days[-1].ts
+        )
+
+
+class _ExitingReduceRule(_AlwaysReduceRule):
+    """A sleeve rule whose `exit_signal` would fire -- it must never be asked (R31)."""
+
+    def __init__(self, product_id: str) -> None:
+        super().__init__(product_id, name="fake_reduce_exit")
+
+    def exit_signal(self, held, candles_by_tf):
+        return True
+
+
+def _seed_rules(repo, monkeypatch, *rules_and_status):
+    """Seed rows, register each double's CLASS under its kind (the cycle reads the class to tell a
+    sleeve rule from an entry rule before building it), and make `_build_rule` hand back the
+    matching instance BY KIND, with the row's id threaded on as the real builder does."""
+    by_kind = {}
+    for rule, status in rules_and_status:
+        repo.insert_rule(rule.name, {"product_id": rule.product_id}, status=status)
+        by_kind[rule.name] = rule
+        if rule.name not in agent.RULE_REGISTRY:
+            monkeypatch.setitem(agent.RULE_REGISTRY, rule.name, type(rule))
+
+    def _build(row):
+        rule = by_kind[row["kind"]]
+        rule.rule_id = row.get("id")
+        return rule
+
+    monkeypatch.setattr(agent, "_build_rule", _build)
+
+
+class _HoldingBroker(FakeBroker):
+    """`FakeBroker`, plus the base currencies it holds -- `executor.reduce` clamps every SELL to
+    the venue's `Balance.total` of the base leg."""
+
+    def __init__(self, *args: Any, base: dict[str, Decimal] | None = None, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self.base = dict(base or {"BTC": Decimal("1000")})
+        self.balance_reads = 0
+
+    def get_balances(self) -> list[Balance]:
+        self.balance_reads += 1
+        return [
+            *super().get_balances(),
+            *(Balance(currency=c, available=q, total=q) for c, q in self.base.items()),
+        ]
+
+
+def _lagging_config() -> Config:
+    """A polling interval long enough that a product one daily bar BEHIND is still fresh (not
+    skipped as stale) and so reaches the entry-bar readiness gate -- the case R31 is about."""
+    return _config(auto_trade=AutoTradeConfig(mode="confirm", interval_sec=100_000))
+
+
+def test_a_sleeve_rule_is_not_an_entry_rule_and_cannot_withhold_the_dca_buy(repo, monkeypatch):
+    """R31: a sleeve rule in the entry pre-pass would withhold EVERY entry of the cycle on its own
+    product's lagging bar; it must not be in that pass at all. ETH is fresh but one daily bar
+    behind; BTC is ready and its DCA is due."""
+    _seed_rules(
+        repo,
+        monkeypatch,
+        (Dca(product_id=PRODUCT, cadence_days=1), "live"),
+        (_AlwaysReduceRule("ETH-USD"), "live"),
+    )
+    # ETH's one stored bar is day 0; the venue has nothing newer, so ETH stays a bar behind.
+    _seed_history(repo, [_candle(0, "100")], product="ETH-USD")
+    broker = _HoldingBroker(
+        series={(PRODUCT, Granularity.ONE_DAY): [_candle(0, "100"), _candle(DAY, "100")]}
+    )
+
+    result = run_once(broker, repo, _lagging_config(), now_ts=2 * DAY + 3_600)
+
+    assert "ETH-USD" not in result.stale_products, "fixture: ETH must reach the readiness gate"
+    assert result.blocked_entries == []
+    assert [r.placed for r in result.enter_results] == [True]
+    assert [c["side"] for c in broker.place_calls] == [Side.BUY]
+    assert "ETH-USD" in result.products, "the sleeve rule's product is still polled"
+
+
+def test_a_paper_status_sleeve_rule_joins_a_live_cycles_poll_set(repo, monkeypatch):
+    """R16: a live cycle also evaluates `paper`-status sleeve rules, so their product is polled."""
+    _seed_rules(repo, monkeypatch, (_AlwaysReduceRule("ETH-USD"), "paper"))
+    broker = _HoldingBroker(series={("ETH-USD", Granularity.ONE_DAY): [_candle(0, "100")]})
+
+    result = run_once(broker, repo, _config(), now_ts=90_000)
+
+    assert result.products == ["ETH-USD"]
+    assert [call[0] for call in broker.get_candles_calls] == ["ETH-USD"]
+
+
+def test_sleeve_rules_are_loaded_by_class_at_both_statuses_in_a_live_cycle(repo, monkeypatch):
+    """`_sleeve_rules`: every sleeve-class row at `paper` and `live` in a live cycle, each with
+    its status; an entry rule at either status is not a sleeve rule."""
+    live, paper = _AlwaysReduceRule(PRODUCT), _AlwaysReduceRule("ETH-USD", name="fake_reduce_2")
+    _seed_rules(
+        repo,
+        monkeypatch,
+        (live, "live"),
+        (paper, "paper"),
+        (_AlwaysEnterRule(PRODUCT), "live"),
+        (_AlwaysExitRule(PRODUCT), "paper"),
+    )
+
+    loaded = agent._sleeve_rules(repo, _config())
+
+    assert sorted((rule.name, status) for rule, status in loaded) == [
+        ("fake_reduce", "live"),
+        ("fake_reduce_2", "paper"),
+    ]
+
+
+def test_a_paper_cycle_loads_only_paper_status_sleeve_rules(repo, monkeypatch):
+    """A paper cycle proves `paper` rules forward; a `live` sleeve rule is the live cycle's."""
+    _seed_rules(
+        repo,
+        monkeypatch,
+        (_AlwaysReduceRule(PRODUCT), "live"),
+        (_AlwaysReduceRule("ETH-USD", name="fake_reduce_2"), "paper"),
+    )
+
+    loaded = agent._sleeve_rules(repo, _paper_config())
+
+    assert [(rule.name, status) for rule, status in loaded] == [("fake_reduce_2", "paper")]
+
+
+def test_a_sleeve_row_that_cannot_be_built_costs_neither_the_cycle_nor_the_dca_buy(
+    repo, monkeypatch
+):
+    """A sleeve row whose params do not build (a bad `reverse_dca` row, say) is logged and
+    skipped. It must not raise out of `run_once` and take the DCA buy with it."""
+    _seed_rules(repo, monkeypatch, (Dca(product_id=PRODUCT, cadence_days=1), "live"))
+    monkeypatch.setitem(agent.RULE_REGISTRY, "fake_reduce", _AlwaysReduceRule)
+    repo.insert_rule("fake_reduce", {"product_id": PRODUCT}, status="live")
+    built = agent._build_rule
+
+    def _build(row):
+        if row["kind"] == "fake_reduce":
+            raise ValueError("reverse_dca: target_usd is required")
+        return built(row)
+
+    monkeypatch.setattr(agent, "_build_rule", _build)
+    broker = _HoldingBroker(series={(PRODUCT, Granularity.ONE_DAY): [_candle(0, "100")]})
+
+    result = run_once(broker, repo, _config(), now_ts=90_000)
+
+    assert [r.placed for r in result.enter_results] == [True]
+
+
+def test_a_sleeve_rule_does_not_own_a_positions_exit(repo, monkeypatch):
+    """Review Focus 5 at the cycle: a sleeve rule can only PROPOSE, so even when it is on record as
+    the product's `position_rule` and its `exit_signal` says yes, no EXIT is placed."""
+    rule = _ExitingReduceRule(PRODUCT)
+    _seed_rules(repo, monkeypatch, (rule, "live"))
+    _seed_open_position(repo, PRODUCT, Decimal("1"), Decimal("80"), ts=0, rule_name=rule.name)
+    repo.set_state(f"position_rule:{PRODUCT}", {"rule_name": rule.name, "opened_at": 0})
+    broker = _HoldingBroker(series={(PRODUCT, Granularity.ONE_DAY): [_candle(0, "100")]})
+
+    result = run_once(broker, repo, _config(), now_ts=90_000)
+
+    assert result.exit_results == []
+    assert [c for c in broker.place_calls if c["side"] is Side.SELL] == []

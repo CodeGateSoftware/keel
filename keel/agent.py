@@ -86,7 +86,7 @@ from keel.execution import equity as equity_mod
 from keel.execution import executor, guards, reconcile, streak
 from keel.execution.executor import ExecutionResult, _fetch_quote_balance_pair
 from keel.execution.guards import FEED_STALENESS_CYCLES
-from keel.strategy import engine
+from keel.strategy import engine, promotion
 from keel.strategy.exit_policy import EXIT_POLICY_OFF, next_stop, policy_for, trailing_atr
 from keel.strategy.paper import PaperTrader
 from keel.strategy.rules.base import Action, Rule, Setup, Signal
@@ -235,6 +235,57 @@ def _build_rule(row: dict[str, Any]) -> Rule:
     # still builds a rule, just with `rule_id` left at its `None` default.
     rule.rule_id = row.get("id")
     return rule
+
+
+def _is_sleeve_kind(kind: str) -> bool:
+    """Whether rule kind `kind` is a sleeve-sell kind, read off its registered CLASS -- so a row
+    is sorted into the entry path or the sleeve path BEFORE it is built. An unregistered kind is
+    not a sleeve kind: it stays on the entry path, where `_build_rule` refuses it exactly as it
+    always has."""
+    return promotion.promotion_class_of(RULE_REGISTRY.get(kind)) == promotion.SLEEVE_SELL
+
+
+def _sleeve_rules(repo: Repository, config: Config) -> list[tuple[Rule, str]]:
+    """Every sleeve-sell rule this cycle asks for a `Reduction`, as `(rule, status)` pairs
+    (#857, plan R16, R31).
+
+    **Loaded apart from the entry/exit rules (R31).** `run_once`'s entry pre-pass withholds EVERY
+    entry of the cycle when any rule's bar is not ready; a sell rule on a product with a lagging
+    feed would withhold the BTC DCA buy. A sleeve rule neither enters nor exits, so it is in
+    neither pass, and it never owns a position's exit (`_handle_exits` never sees it).
+
+    **Both statuses in a live cycle (R16).** A live-mode cycle evaluates `paper` AND `live`
+    sleeve rules: for a rule that can only propose, `paper` honestly means "proposals against the
+    real book, never placed", and the status rides onto each proposal (`rule_status`). A paper
+    cycle loads `paper` only.
+
+    **A row that does not build costs that row, never the cycle.** The entry path lets
+    `_build_rule` raise; a sleeve row runs after the DCA buy has been decided, but it is loaded
+    before it, so a bad `reverse_dca` row (a missing required param) is logged and skipped here
+    rather than taking the whole cycle -- and the buy -- down with it.
+    """
+    statuses = ("paper",) if config.auto_trade.mode == "paper" else ("paper", "live")
+    loaded: list[tuple[Rule, str]] = []
+    for status in statuses:
+        for row in repo.get_rules(status):
+            if not _is_sleeve_kind(row["kind"]):
+                continue
+            try:
+                rule = _build_rule(row)
+            except Exception:  # noqa: BLE001 -- one bad sleeve row must not cost the cycle
+                log_exception(
+                    logger,
+                    "agent.sleeve_rule_build_failed",
+                    rule_id=row.get("id"),
+                    kind=row["kind"],
+                )
+                continue
+            if promotion.promotion_class_of(rule) != promotion.SLEEVE_SELL:
+                continue
+            if not getattr(rule, "product_id", None):
+                continue
+            loaded.append((rule, status))
+    return loaded
 
 
 # -- freshness -----------------------------------------------------------------------------
@@ -1732,8 +1783,24 @@ def run_once(
         # would rehearse what is already trading and never advance a candidate, which is the
         # opposite of what the proving gate is for.
         rule_status = "paper" if config.auto_trade.mode == "paper" else "live"
-        rules = [_build_rule(row) for row in repo.get_rules(rule_status)]
-        products = sorted({p for p in (getattr(r, "product_id", None) for r in rules) if p})
+        # Sleeve-sell rules are NOT entry/exit rules (plan R31): sorted out by kind before any
+        # row is built, and loaded on their own by `_sleeve_rules` (which also reads `paper`
+        # rows in a live cycle, R16). Their products join the poll set, so the reduction step
+        # at the end of the cycle has candles to decide on.
+        rules = [
+            rule
+            for rule in (
+                _build_rule(row)
+                for row in repo.get_rules(rule_status)
+                if not _is_sleeve_kind(row["kind"])
+            )
+            if promotion.promotion_class_of(rule) != promotion.SLEEVE_SELL
+        ]
+        sleeve_rules = _sleeve_rules(repo, config)
+        products = sorted(
+            {p for p in (getattr(r, "product_id", None) for r in rules) if p}
+            | {str(getattr(r, "product_id")) for r, _status in sleeve_rules}
+        )
         granularities = list(config.market_data.granularities)
 
         polled = market_feed.poll_once(broker, repo, products, granularities, now_ts=now_ts)
