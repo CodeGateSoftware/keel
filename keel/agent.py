@@ -1238,8 +1238,10 @@ def _handle_reductions(
     7. `executor.reduce`, with `offline=True` and no broker on a paper cycle (R18).
     8. **A repeated refusal is recorded, not re-announced** (`_flag_repeat`, P9): the winner's
        result carries `repeats_previous` when its row is the same refusal as the product's
-       previous proposal, and `sleeve.proposal` skips it -- a 30-day cooldown is one alert at
-       its first veto, not 29.
+       previous proposal MADE ON THE IMMEDIATELY PRECEDING UTC DAY (#919 -- a cadence rule like
+       `reverse_dca` writes a row only on its own cadence days, so an unbounded "previous" would
+       read a month-old identical veto as a repeat and silence the lost month), and
+       `sleeve.proposal` skips it -- a 30-day cooldown is one alert at its first veto, not 29.
 
     The caller wraps this per product: a database error here costs this product's proposal,
     never the cycle and never another product.

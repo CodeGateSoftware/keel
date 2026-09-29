@@ -123,9 +123,10 @@ DEFAULT_CLASS = "default"
 TREND_FOLLOW = "trend_follow"
 #: A rule that only ever proposes selling part of a held sleeve (`Rule.reduce_signal`, #857).
 #: It has no entries and so no R, and it must never be judged by a trade floor: it is
-#: deliberately NOT in `_CLASS_FLOORS`, and `attempt_promotion` will route it to its own gate
-#: (`sleeve_sell_gate`, plan P12) before `floor_for_class` is reached. Until P12 no rule declares
-#: it.
+#: deliberately NOT in `_CLASS_FLOORS`. `reverse_dca` (P9) declares it, and until P12 routes a
+#: sleeve-sell rule to its own gate (`sleeve_sell_gate`), `floor_for_class` falls back to the
+#: default floor for it like any other undeclared class, so `rules promote` on one is refused at
+#: 0 trades (no entries, no backtest trades) -- it fails closed, not silently through.
 SLEEVE_SELL = "sleeve_sell"
 
 _CLASS_FLOORS: dict[str, PromotionConfig] = {

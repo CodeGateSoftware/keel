@@ -6077,6 +6077,63 @@ def test_a_repeated_cooldown_veto_is_recorded_daily_and_notified_once(repo, monk
     assert flags == [False, False, *([True] * 28), False]
 
 
+class _CadenceCooldownReduceRule(_CooldownReduceRule):
+    """`_CooldownReduceRule`, gated to fire only on cadence days -- `reverse_dca`'s real shape
+    (#919): a proposal row is written only every `cadence_days`, never in between."""
+
+    def __init__(self, product_id: str, cadence_days: int = 30, cooldown_days: int = 200) -> None:
+        super().__init__(product_id, cooldown_days=cooldown_days)
+        self.cadence_days = cadence_days
+
+    def reduce_signal(self, holding, candles_by_tf, costs):
+        days = completed_days(candles_by_tf) or next(iter(candles_by_tf.values()), [])
+        if not days or days[-1].ts // DAY % self.cadence_days != 0:
+            return None
+        return super().reduce_signal(holding, candles_by_tf, costs)
+
+
+def test_a_cadence_rules_veto_a_month_apart_is_not_a_repeat(repo, monkeypatch):
+    """#919: `reverse_dca` writes a proposal row only on its cadence days, so consecutive ROWS
+    can be a month apart. Day 30 previews (the tranche clears `min_hold_days` and arms the
+    cooldown); day 60 and day 90 -- both vetoed, cooldown, exactly 30 days apart -- must each
+    still notify: the earlier row is not the immediately preceding UTC day, so the second veto
+    is not read as a repeat of the first."""
+    from keel.notifications import events_from_state
+
+    _seed_rules(repo, monkeypatch, (_CadenceCooldownReduceRule(PRODUCT), "live"))
+    _held_since_day_0(repo)
+    broker = _HoldingBroker()
+    series = [_candle(30 * DAY, "100")]
+    _seed_history(repo, series)
+
+    first = run_once(broker, repo, _config(), now_ts=30 * DAY + 3_600)
+    assert [r.decision for r in first.reduce_results] == ["preview"]
+
+    flags: list[bool] = []
+    notified: list[str] = []
+    for day in (60, 90):
+        series.append(_candle(day * DAY, "100"))
+        _seed_history(repo, series)
+        result = run_once(broker, repo, _config(), now_ts=day * DAY + 3_600)
+        [reduced] = result.reduce_results
+        flags.append(reduced.repeats_previous)
+        events = events_from_state(
+            attestation_findings=(),
+            rail_findings=(),
+            month_to_date_spend=None,
+            allowance=None,
+            unplaced_setups=(),
+            stale_products=(),
+            held_products=(),
+            sleeve_proposals=result.reduce_results,
+        )
+        notified += [e.fields["decision"] for e in events if e.key == "sleeve.proposal"]
+
+    assert [r["decision"] for r in repo.get_sell_proposals()] == ["vetoed", "vetoed", "preview"]
+    assert flags == [False, False]
+    assert notified == ["vetoed", "vetoed"]
+
+
 def test_a_repeat_check_that_raises_costs_neither_the_proposal_nor_its_alert(repo, monkeypatch):
     """The row is written before the check runs, and only the notification reads the flag: a
     check that raises is logged and the result goes out unflagged (a possible duplicate alert,

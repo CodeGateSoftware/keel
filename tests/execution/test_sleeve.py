@@ -621,6 +621,25 @@ def test_the_same_refusal_the_next_day_is_a_repeat() -> None:
     ]
 
 
+def test_a_veto_thirty_days_later_is_not_a_repeat() -> None:
+    """`reverse_dca` writes a proposal row only on its cadence days (#919): a monthly cooldown
+    vetoed on day 60 and again, identically, on day 90 must still notify -- the two rows are not
+    on consecutive UTC days, so the second is news, not a repeat of a month-old alert."""
+    repo = _repo()
+    _veto(repo, 60 * DAY, sleeve_reason=sleeve.COOLDOWN)
+    later = _veto(repo, 90 * DAY, sleeve_reason=sleeve.COOLDOWN)
+    assert sleeve.repeats_previous_refusal(repo, "BTC-USD", later) is False
+
+
+def test_a_gap_of_two_days_is_not_a_repeat() -> None:
+    """ "Previous" means the immediately preceding UTC day, not merely the newest earlier row:
+    a two-day gap is still a silenced month unless it notifies."""
+    repo = _repo()
+    _veto(repo, 1 * DAY, sleeve_reason=sleeve.COOLDOWN)
+    gapped = _veto(repo, 3 * DAY, sleeve_reason=sleeve.COOLDOWN)
+    assert sleeve.repeats_previous_refusal(repo, "BTC-USD", gapped) is False
+
+
 def test_a_changed_refusal_reason_is_a_transition_not_a_repeat() -> None:
     repo = _repo()
     _veto(repo, 1 * DAY, sleeve_reason=sleeve.MIN_HOLD)

@@ -320,8 +320,9 @@ def _refusal_reason(proposal: Mapping[str, Any]) -> tuple[Any, ...]:
 
 def repeats_previous_refusal(repo: Repository, product_id: str, proposal_id: int | None) -> bool:
     """Whether proposal `proposal_id` is a REFUSAL that repeats its product's previous proposal:
-    both `vetoed`, by the same kind, for the same reason (`_refusal_reason`). The P9 ruling on
-    P8's `sleeve.proposal`: a 30-day cooldown vetoing daily sent 29 alerts in a row.
+    both `vetoed`, on the IMMEDIATELY PRECEDING UTC day, by the same kind, for the same reason
+    (`_refusal_reason`). The P9 ruling on P8's `sleeve.proposal`: a 30-day cooldown vetoing daily
+    sent 29 alerts in a row.
 
     The row is still recorded every day -- it is the audit trail, and R14/R15 read it -- and
     this answers only whether it is NEWS. "Previous" is the product's newest non-`superseded`
@@ -329,6 +330,15 @@ def repeats_previous_refusal(repo: Repository, product_id: str, proposal_id: int
     so the first veto after a preview, a change of reason, and the preview after a run of vetoes
     are all transitions and all notify. A `preview` is never a repeat: each is a distinct sale
     the operator acts on by its own id.
+
+    **The day bound is load-bearing, not cosmetic (#919).** `reverse_dca` writes a proposal row
+    only on its own cadence days, so an identical monthly veto on day 60 and day 90 are each the
+    product's newest-and-only earlier row at the time -- with no bound on "previous" the second
+    would read as a repeat of an alert sent a MONTH ago, silencing exactly the lost month spec
+    §6's failure mode (d) requires an alert to explain. Bounding "previous" to the immediately
+    preceding UTC day (`current.ts // 86400 - previous.ts // 86400 == 1`) means a repeat can only
+    ever suppress an alert that fired YESTERDAY, so a cadence rule's every cadence-day veto still
+    notifies, while a daily-firing rule's 29 identical alerts still collapse to one.
 
     **No state beyond the proposals table.** The notification layer still writes exactly one key
     (R19): the table this reads is the one `executor.reduce` and `_handle_reductions` already
@@ -348,6 +358,7 @@ def repeats_previous_refusal(repo: Repository, product_id: str, proposal_id: int
     return (
         current["decision"] == "vetoed"
         and previous["decision"] == "vetoed"
+        and int(current["ts"]) // _DAY - int(previous["ts"]) // _DAY == 1
         and _refusal_reason(current) == _refusal_reason(previous)
     )
 
