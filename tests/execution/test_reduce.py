@@ -745,7 +745,12 @@ def test_the_sim_and_guards_agree_on_an_oversized_distribution(repo: Repository)
     """Spec §6: a parity test. The account sim sells a $100 distribution under a $50 per-order
     cap; the leg it FILLED -- sliced by the one slicer live uses (`sleeve.slice_qty`), from the
     one config both read -- passes rail 2 in `guards.check`, and one increment more is vetoed
-    by it. So the sim never books a leg the live rails would refuse."""
+    by it. So the sim never books a leg the live rails would refuse.
+
+    `min_hold_days=0`: `sleeve.sleeve_refusal`'s `min_hold_days` walk is checked against the
+    PRE-slice $100 reduction (#924's per-buy FIFO holding), which reaches a lot younger than the
+    default 30 days before rail 2 ever slices it to the $50 leg this test is about; zeroing
+    `min_hold_days` isolates rail 2's own slicing from that separate gate."""
     from keel.config import SubscriptionConfig
     from keel.sim import portfolio_sim
     from keel.strategy.rules.dca import Dca
@@ -761,7 +766,7 @@ def test_the_sim_and_guards_agree_on_an_oversized_distribution(repo: Repository)
     result = portfolio_sim.run(
         [
             Dca("BTC-USD", cadence_days=7, budget_usd=cap),
-            ReverseDca("BTC-USD", target_usd=D("100"), min_price_floor=D("1")),
+            ReverseDca("BTC-USD", target_usd=D("100"), min_price_floor=D("1"), min_hold_days=0),
         ],
         market,
         config,

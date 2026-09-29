@@ -548,6 +548,28 @@ def test_a_sale_pays_slippage_and_the_fee() -> None:
     assert out.distributed_usd == gross_notional - out.sell_fees
 
 
+def test_lots_keep_distinct_ids_once_a_sale_fully_consumes_one() -> None:
+    """#923: `Lot(position_id=len(lots), ...)` reuses an id once a sale drops a fully consumed
+    lot from `lots`, so a later buy's id collides with a still-held lot's -- `consumed[...]`
+    (keyed by `position_id`) then takes units meant for both. On a flat, zero-fee market every
+    buy and every sale trade at the same price, so units bought must equal units still held plus
+    units sold exactly, and nothing is created or destroyed (realised P&L must be exactly zero).
+    400 days is long enough that several lots are fully consumed and dropped."""
+    daily = [_candle(d, "100") for d in range(400)]
+    dca = Dca("BTC-USD", cadence_days=7, budget_usd=Decimal("50"))
+    rev = _rev(target_usd=Decimal("50"))
+
+    rows = accumulation_table(
+        [dca, rev], {"BTC": {Granularity.ONE_DAY: daily}}, fee_pct=_ZERO, slippage_pct=_ZERO
+    )
+
+    kept, out = rows["dca:BTC"], rows["reverse_dca:BTC"]
+    assert out.distributions > 1, "fixture: several sales, so a lot is fully consumed"
+    bought = kept.buys * Decimal("0.5")
+    assert kept.qty + out.units_sold == bought
+    assert out.realised_pnl == _ZERO
+
+
 # ---------------------------------------------------------------------------
 # (h) the reverse path through the ACCOUNT sim (#857, P11): average cost, one averaged lot
 # ---------------------------------------------------------------------------
@@ -639,6 +661,27 @@ def test_the_account_sim_books_the_sale_at_average_cost_not_fifo() -> None:
     assert fifo.realised_pnl.quantize(_CENT) == Decimal("4.90")
 
 
+def test_the_account_sim_refuses_a_sale_that_reaches_a_lot_younger_than_min_hold_days() -> None:
+    """#924: the account sim's refusal check used to build its `Holding` from ONE lot, opened at
+    the averaged lot's FIRST buy (day 1) -- so `min_hold_days` only ever saw that oldest buy.
+    Five weekly $50 buys (days 1, 8, 15, 22, 29) hold 2.5 units by day 29; an $80 net target on
+    day 30 needs ~0.808 units, which FIFO reaches into the day-8 lot (23 days old at the day-31
+    fill, under the default 30-day `min_hold_days`) -- live's `sleeve.sleeve_refusal` walks every
+    FIFO lot the sale would consume and refuses it. The account sim must refuse it too, and agree
+    with the edge pass, which was already FIFO-correct."""
+    market = _hourly_market({0: "100"}, 40)
+    rules: list[Rule] = [Dca("BTC-USD", cadence_days=7), _rev(target_usd=Decimal("80"))]
+
+    result = _run_account(rules, market)
+
+    fifo = accumulation_table(
+        rules, {"BTC": {Granularity.ONE_DAY: market["BTC"][Granularity.ONE_DAY]}},
+        fee_pct=Decimal("0.01"), slippage_pct=_ZERO,
+    )["reverse_dca:BTC"]  # fmt: skip
+    assert fifo.distributions == 0, "fixture: the edge pass, FIFO, refuses the whole sale"
+    assert result.dca_sells == []
+
+
 def test_the_account_sim_skips_a_distribution_on_a_dca_day_as_live() -> None:
     result = _run_account([Dca("BTC-USD", cadence_days=7), _rev()], _hourly_market({0: "100"}, 212))
 
@@ -647,10 +690,16 @@ def test_the_account_sim_skips_a_distribution_on_a_dca_day_as_live() -> None:
 
 def test_the_account_sim_slices_to_the_configured_per_order_cap() -> None:
     """Rail 2, from the sim's own config: a $50 cap (which the $50 DCA buys still clear) sells
-    one $50 leg of the ~$80 distribution -- 0.5 units at 100 -- and carries nothing over."""
+    one $50 leg of the ~$80 distribution -- 0.5 units at 100 -- and carries nothing over.
+
+    `min_hold_days=0`: `sleeve.sleeve_refusal`'s `min_hold_days` walk is checked against the
+    PRE-slice reduction (0.8 units, #924's per-buy FIFO holding), which reaches into the day-8
+    lot (23 days old at the day-31 fill) before rail 2 ever slices it down to the $50 leg this
+    test is about; zeroing `min_hold_days` isolates rail 2's own slicing from that separate gate
+    (covered on its own by `test_min_hold_days_refuses_a_sale_that_would_consume_a_young_lot`)."""
     config = _config(max_per_order_usd=Decimal("50"))
     result = _run_account(
-        [Dca("BTC-USD", cadence_days=7), _rev(target_usd=Decimal("80"))],
+        [Dca("BTC-USD", cadence_days=7), _rev(target_usd=Decimal("80"), min_hold_days=0)],
         _hourly_market({0: "100"}, 61),
         fee=_ZERO,
         config=config,
@@ -757,8 +806,64 @@ def test_the_accumulation_paragraph_on_distributions_appears_only_when_one_was_m
     quiet_table = report._render_holdings_table("Rule", {"dca:BTC": held})
     assert quiet == [*quiet[:4], *quiet_table] and len(quiet) == 4 + len(quiet_table)
     loud_table = report._render_holdings_table("Rule", {"dca:BTC": held, "reverse_dca:BTC": sold})
-    assert loud[:3] == quiet[:3] and loud[3] == "" and loud[5] == ""
+    assert loud[0] == quiet[0] and loud[1] == quiet[1] and loud[3] == "" and loud[5] == ""
     assert loud[6:] == loud_table and loud[4] not in quiet
+
+
+def test_the_accumulation_intro_stops_claiming_never_sell_once_something_did() -> None:
+    """#925: the intro sentence claimed every accumulating row never sells, which is false once
+    a `reverse_dca` row (also `accumulates`) has distributed. Byte-identical when nothing was."""
+    held = portfolio_sim.DcaSleeve.marked(1, Decimal("1"), Decimal("100"), Decimal("120"))
+    sold = portfolio_sim.DcaSleeve.marked(
+        0, _ZERO, _ZERO, Decimal("120"), distributions=1, units_sold=Decimal("0.1")
+    )
+
+    quiet = report._render_accumulation_section({"dca:BTC": held})
+    loud = report._render_accumulation_section({"dca:BTC": held, "reverse_dca:BTC": sold})
+
+    assert quiet[2] == (
+        "Accumulating rules buy on a cadence and never sell, so they have no win rate, "
+        "expectancy or R-multiples. Each row is its buys over the daily series (decided on "
+        "completed days, once per day, filled at the next open), their cost including fees, and "
+        f"the holding marked at the last close. Not in `{report.POOLED_KEY}`, not in G2."
+    )
+    assert loud[2] == (
+        "Accumulating rules buy on a cadence; a sleeve-sell rule among them also sells (below), "
+        "so they have no win rate, expectancy or R-multiples. Each row is its buys over the "
+        "daily series (decided on completed days, once per day, filled at the next open), their "
+        f"cost including fees, and the holding marked at the last close. Not in "
+        f"`{report.POOLED_KEY}`, not in G2."
+    )
+    assert "never sell" not in loud[2]
+
+
+def test_the_sleeve_caption_stops_claiming_never_sold_once_something_did() -> None:
+    """#925: `_render_account_section`'s DCA-sleeve caption claimed the sleeve never sold,
+    unconditionally. Byte-identical when nothing was distributed."""
+    held = {"BTC": portfolio_sim.DcaSleeve.marked(1, Decimal("1"), Decimal("100"), Decimal("120"))}
+    sold = {
+        "BTC": portfolio_sim.DcaSleeve.marked(
+            0, _ZERO, _ZERO, Decimal("120"), distributions=1, units_sold=Decimal("0.1")
+        )
+    }
+
+    quiet = report._render_account_section({"dca_sleeve": held})
+    loud = report._render_account_section({"dca_sleeve": sold})
+
+    caption_idx = quiet.index("### DCA sleeve (accumulation, marked to market)") + 2
+    assert quiet[caption_idx] == (
+        "Bought on the DCA cadence and never sold: unrealized, marked at each asset's "
+        "last close. Cost basis includes entry fees. Included in the ending value above, "
+        "not in the trade count or the realized P&L."
+    )
+    loud_idx = loud.index("### DCA sleeve (accumulation, marked to market)") + 2
+    assert loud[loud_idx] == (
+        "Bought on the DCA cadence; a sleeve-sell rule also sold from it (the distribution "
+        "columns below), so what remains is unrealized, marked at each asset's last close. "
+        "Cost basis includes entry fees. Included in the ending value above, not in the trade "
+        "count or the realized P&L."
+    )
+    assert "never sold" not in loud[loud_idx]
 
 
 def test_simulate_slices_the_accumulation_row_at_the_configured_per_order_cap(
@@ -877,9 +982,13 @@ def test_the_account_sim_sale_pays_slippage_and_the_fee() -> None:
 
 def test_a_sleeve_sold_down_to_nothing_keeps_its_row() -> None:
     """A $1,000 target on a $250 holding sells all 2.5 units (the rule caps at the holding); the
-    lot is gone, but the asset's row stays, at qty 0, carrying the distribution."""
+    lot is gone, but the asset's row stays, at qty 0, carrying the distribution.
+
+    `min_hold_days=0`: selling every unit necessarily reaches the day-29 lot, 2 days old at the
+    day-31 fill (#924's per-buy FIFO holding) -- zeroing `min_hold_days` isolates the "sold to
+    nothing" behaviour this test is about from that separate gate."""
     result = _run_account(
-        [Dca("BTC-USD", cadence_days=7), _rev(target_usd=Decimal("1000"))],
+        [Dca("BTC-USD", cadence_days=7), _rev(target_usd=Decimal("1000"), min_hold_days=0)],
         _hourly_market({0: "100"}, 33),
         fee=_ZERO,
     )
@@ -893,3 +1002,64 @@ def test_a_sleeve_sold_down_to_nothing_keeps_its_row() -> None:
         Decimal("2.5"),
     )
     assert row.cost_usd == _ZERO
+
+
+# ---------------------------------------------------------------------------
+# (k) the cooldown's own bookkeeping (`last_sale[...] = ...`, R15) -- both sim passes
+# ---------------------------------------------------------------------------
+
+
+class _Cooldown(ReverseDca):
+    """A `reverse_dca` whose `params` carries a `cooldown_days` (R15): the constructor exposes
+    no such keyword (the sell pipeline reads it straight off `params`, never off the rule), so a
+    stub sets it there directly."""
+
+    def __init__(self, cooldown_days: int, **kw: object) -> None:
+        super().__init__("BTC-USD", **kw)
+        self.params = {**self.params, "cooldown_days": cooldown_days}
+
+
+def _cooldown_rev(cooldown_days: int = 20) -> _Cooldown:
+    """Cadence 10, short enough to fire twice inside a 20-day cooldown; `min_hold_days=0`
+    isolates the cooldown gate from R12's own."""
+    return _Cooldown(
+        cooldown_days,
+        target_usd=Decimal("10"),
+        min_price_floor=Decimal("1"),
+        cadence_days=10,
+        min_hold_days=0,
+    )
+
+
+def test_cooldown_refuses_the_repeat_sale_and_allows_it_once_elapsed_in_the_edge_pass() -> None:
+    """#857's cooldown (R15), and the missing coverage of `_accumulate_asset`'s own bookkeeping:
+    cadence day 0 is also a DCA day (refused SAME_DAY_DCA, not cooldown, and never recorded);
+    cadence day 10 (decided/filled day 11) sells and records `last_sale`; cadence day 20
+    (decided/filled day 21) is only 10 days after day 11's sale, under the 20-day cooldown, and
+    is refused; cadence day 30 (decided/filled day 31) is exactly 20 days after day 11's sale,
+    the cooldown elapsed, and sells again. Two distributions, not three -- proving the test would
+    fail (three) if `last_sale[seller] = fill_bar.ts` were removed, since `last_rule_proposal_ts`
+    would then always read `None` and day 20 would sell too."""
+    daily = [_candle(d, "100") for d in range(40)]
+    dca = Dca("BTC-USD", cadence_days=7, budget_usd=Decimal("50"))
+    rev = _cooldown_rev()
+
+    rows = accumulation_table(
+        [dca, rev], {"BTC": {Granularity.ONE_DAY: daily}}, fee_pct=_ZERO, slippage_pct=_ZERO
+    )
+
+    assert rows["reverse_dca:BTC"].distributions == 2
+
+
+def test_cooldown_refuses_the_repeat_sale_and_allows_it_once_elapsed_in_the_account_sim() -> None:
+    """The same fixture through the account sim (`_process_reductions`'s own `last_sale`).
+    Proves the test would fail (three fills, at days 11, 21 and 31) if
+    `last_sale[id(sale.rule)] = fill_bar.ts` were removed there."""
+    market = _hourly_market({0: "100"}, 40)
+    result = _run_account(
+        [Dca("BTC-USD", cadence_days=7, budget_usd=Decimal("50")), _cooldown_rev()],
+        market,
+        fee=_ZERO,
+    )
+
+    assert [s.decision_ts // _DAY for s in result.dca_sells] == [11, 31]

@@ -354,11 +354,18 @@ def _accumulate_asset(
     max_per_order_usd: Decimal,
 ) -> dict[str, DcaSleeve]:
     """`accumulation_table` for ONE asset's accumulating rules over its daily series: one FIFO
-    pool of `Lot`s, each buying rule's remaining lots, and each selling rule's sales."""
+    pool of `Lot`s, each buying rule's remaining lots, and each selling rule's sales.
+
+    **`position_id` is a monotonic counter, not `len(lots)` (#923).** A sale that fully consumes
+    a lot drops it from `lots`, shrinking the list, so an id derived from the list's length can
+    collide with a still-held lot's once one is dropped -- `consumed[lot.position_id]` (keyed by
+    that id) then takes units meant for both. The counter only ever grows, so no two lots this
+    asset's pool ever holds at once share an id."""
     sellers = sleeve_sellers([rule for rule, _ in keyed])
     buyers = [(rule, key) for rule, key in keyed if rule.promotion_class != SLEEVE_SELL]
     key_of = {id(rule): key for rule, key in keyed}
     lots: list[Lot] = []
+    next_lot_id = 0
     buys = {key: 0 for _, key in buyers}
     cost = {key: Decimal("0") for _, key in buyers}
     decided: dict[str, set[int]] = {key: set() for _, key in buyers}
@@ -389,7 +396,7 @@ def _accumulate_asset(
             cost[key] += fill * buy_qty * (Decimal(1) + fee_pct)
             lots.append(
                 Lot(
-                    position_id=len(lots),
+                    position_id=next_lot_id,
                     rule_name=key,
                     opened_at=fill_bar.ts,
                     qty=buy_qty,
@@ -397,6 +404,7 @@ def _accumulate_asset(
                     entry_fee=fill * buy_qty * fee_pct,
                 )
             )
+            next_lot_id += 1
         holding = Holding(keyed[0][0].product_id, tuple(lots))
         if not sellers or sale_day in sale_days or holding.qty <= 0:
             continue
@@ -1037,15 +1045,25 @@ def _render_holdings_table(first_column: str, rows: dict[str, DcaSleeve]) -> lis
 
 
 def _render_accumulation_section(accumulation: dict[str, DcaSleeve]) -> list[str]:
-    """Accumulating rules' edge pass (#821), kept apart from the round-trip edge table."""
+    """Accumulating rules' edge pass (#821), kept apart from the round-trip edge table.
+
+    **The intro sentence is conditional on `distributed` (#925).** `rule.accumulates` is true of
+    `reverse_dca` too, so "never sell" is false of the whole section once one of its rows has --
+    the claim is dropped rather than left to contradict the sell columns rendered below it. With
+    nothing distributed the text is byte-identical to before the reverse path existed."""
     distributed = any(row.distributions for row in accumulation.values())
+    lede = (
+        "Accumulating rules buy on a cadence; a sleeve-sell rule among them also sells (below), so"
+        if distributed
+        else "Accumulating rules buy on a cadence and never sell, so"
+    )
     return [
         "## DCA accumulation (not round trips)",
         "",
-        "Accumulating rules buy on a cadence and never sell, so they have no win rate, "
-        "expectancy or R-multiples. Each row is its buys over the daily series (decided on "
-        "completed days, once per day, filled at the next open), their cost including fees, and "
-        f"the holding marked at the last close. Not in `{POOLED_KEY}`, not in G2.",
+        f"{lede} they have no win rate, expectancy or R-multiples. Each row is its buys over "
+        "the daily series (decided on completed days, once per day, filled at the next open), "
+        f"their cost including fees, and the holding marked at the last close. Not in "
+        f"`{POOLED_KEY}`, not in G2.",
         *(
             [
                 "",
@@ -1087,14 +1105,24 @@ def _render_account_section(account_metrics: dict, slippage_rows=None) -> list[s
         lines.extend(f"- {asset}: {pnl}" for asset, pnl in sorted(per_asset.items()))
     sleeve = account_metrics.get("dca_sleeve")
     if sleeve:
+        # The caption is conditional on `distributed` (#925): "never sold" is false of the
+        # sleeve once a distribution has shrunk it. Byte-identical to before the reverse path
+        # existed when nothing was.
+        distributed = any(row.distributions for row in sleeve.values())
+        caption = (
+            "Bought on the DCA cadence; a sleeve-sell rule also sold from it (the distribution "
+            "columns below), so what remains is"
+            if distributed
+            else "Bought on the DCA cadence and never sold:"
+        )
         lines.extend(
             [
                 "",
                 "### DCA sleeve (accumulation, marked to market)",
                 "",
-                "Bought on the DCA cadence and never sold: unrealized, marked at each asset's "
-                "last close. Cost basis includes entry fees. Included in the ending value above, "
-                "not in the trade count or the realized P&L.",
+                f"{caption} unrealized, marked at each asset's last close. Cost basis includes "
+                "entry fees. Included in the ending value above, not in the trade count or the "
+                "realized P&L.",
                 "",
                 *_render_holdings_table("Asset", sleeve),
             ]

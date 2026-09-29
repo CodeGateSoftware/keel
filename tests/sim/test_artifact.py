@@ -257,3 +257,50 @@ def test_render_html_shows_the_dca_sleeve_as_its_own_table_beside_realized_pnl()
 def test_render_html_omits_the_sleeve_table_when_there_is_no_sleeve():
     html = render_html(_sim(), _benchmark(), _verdict(), _gaps(), _account_metrics())
     assert "DCA sleeve" not in html
+
+
+def test_render_html_adds_the_sell_columns_and_drops_the_never_sold_caption_once_distributed():
+    """#925: `_render_dca_sleeve` had 7 fixed headers and an unconditional "never sold" caption,
+    so a sleeve that HAD distributed still rendered as though it had not. The five sell columns
+    (mirroring `report._render_holdings_table`) and an honest caption appear only once something
+    was; with nothing distributed the table is byte-identical to before the reverse path."""
+    metrics = _account_metrics()
+    metrics["dca_sleeve"] = {
+        "BTC": DcaSleeve.marked(
+            3,
+            Decimal("1.5"),
+            Decimal("150"),
+            Decimal("120"),
+            distributions=2,
+            units_sold=Decimal("0.5"),
+            distributed_usd=Decimal("55"),
+            realised_pnl=Decimal("5"),
+            sell_fees=Decimal("0.5"),
+        ),
+    }
+
+    html = render_html(_sim(), _benchmark(), _verdict(), _gaps(), metrics)
+
+    assert "never sold" not in html
+    section = html.split("<h2>DCA sleeve (accumulation, marked to market)</h2>", 1)[1]
+    table = section.split("</table>", 1)[0]
+    header = [cell.split("</th>")[0] for cell in table.split("<th>")[1:]]
+    assert header == [
+        "Asset",
+        "Buys",
+        "Qty",
+        "Cost basis",
+        "Last close",
+        "Value",
+        "Unrealized P&amp;L",
+        "Distributions",
+        "Units sold",
+        "Distributed (net)",
+        "Sell fees",
+        "Realised P&amp;L",
+    ]
+    body_rows = table.split("<tbody>", 1)[1].split("<tr>")[1:]
+    cells = [[c.split("</td>")[0] for c in row.split("<td>")[1:]] for row in body_rows]
+    assert cells == [
+        ["BTC", "3", "1.5", "150", "120", "180.0", "30.0", "2", "0.5", "55", "0.5", "5"]
+    ]

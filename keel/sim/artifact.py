@@ -395,31 +395,59 @@ def _render_gaps_table(gaps: list[GapItem]) -> str:
 
 def _render_dca_sleeve(sleeve: dict) -> str:
     """The never-closed DCA sleeve (#821), one row per asset, marked to market. Empty string when
-    there is no sleeve, so a run without DCA renders exactly what it did before."""
+    there is no sleeve, so a run without DCA renders exactly what it did before.
+
+    **The five sell columns and the caption are conditional on `distributed` (#925), mirroring
+    `report._render_holdings_table`.** "Never sold" is false of a sleeve one of whose rows has,
+    so the caption drops that claim and the table gains `Distributions`, `Units sold`,
+    `Distributed (net)`, `Sell fees` and `Realised P&L` once anything was; with nothing
+    distributed the table is byte-identical to before the reverse path existed."""
     if not sleeve:
         return ""
+    distributed = any(row.distributions for row in sleeve.values())
     headers = ["Asset", "Buys", "Qty", "Cost basis", "Last close", "Value", "Unrealized P&L"]
+    if distributed:
+        headers += ["Distributions", "Units sold", "Distributed (net)", "Sell fees", "Realised P&L"]
     head = "".join(f"<th>{_esc(h)}</th>" for h in headers)
     rows = "".join(
         "<tr>"
         + "".join(
             f"<td>{_esc(str(v))}</td>"
             for v in (
-                asset,
-                row.buys,
-                row.qty,
-                row.cost_usd,
-                row.last_close,
-                row.value_usd,
-                row.unrealized_pnl,
+                (
+                    asset,
+                    row.buys,
+                    row.qty,
+                    row.cost_usd,
+                    row.last_close,
+                    row.value_usd,
+                    row.unrealized_pnl,
+                )
+                + (
+                    (
+                        row.distributions,
+                        row.units_sold,
+                        row.distributed_usd,
+                        row.sell_fees,
+                        row.realised_pnl,
+                    )
+                    if distributed
+                    else ()
+                )
             )
         )
         + "</tr>"
         for asset, row in sleeve.items()
     )
+    caption = (
+        "Bought on the DCA cadence; a sleeve-sell rule also sold from it (the distribution "
+        "columns below), so what remains is"
+        if distributed
+        else "Bought on the DCA cadence and never sold:"
+    )
     return (
         "<h2>DCA sleeve (accumulation, marked to market)</h2>\n"
-        "<p>Bought on the DCA cadence and never sold: unrealized, marked at each asset's last "
+        f"<p>{caption} unrealized, marked at each asset's last "
         "close; cost includes entry fees. In the ending value, not in the realized P&amp;L "
         "above.</p>\n"
         f"<table><thead><tr>{head}</tr></thead><tbody>{rows}</tbody></table>\n"
