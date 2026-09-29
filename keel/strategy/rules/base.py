@@ -21,6 +21,7 @@ from decimal import ROUND_FLOOR, Decimal
 from enum import Enum
 from typing import Any, ClassVar, Literal
 
+from keel.strategy.reduction import Holding, Reduction, SellCosts
 from keel.types import Candle, Granularity, Side
 
 _DAY_SECONDS = 24 * 60 * 60
@@ -64,6 +65,12 @@ class Action(str, Enum):
     ENTER = "ENTER"
     EXIT = "EXIT"
     NONE = "NONE"
+    #: A sleeve-sell rule's decision to sell PART of a holding (spec §3.2, #857). It is carried by
+    #: a `reduction.Reduction` from `Rule.reduce_signal`, never built into a `Signal` and never
+    #: persisted in `signals`: its audit row is `sell_proposals` (P6), and its one executor is
+    #: `executor.reduce` (P7). `executor.execute` and the paper path refuse it before any broker
+    #: call (`executor.ActionNotExecutable`), so no existing placement path can run it.
+    REDUCE = "REDUCE"
 
 
 @dataclass(frozen=True)
@@ -401,6 +408,23 @@ class Rule(ABC):
     def describe(self) -> dict:
         """Name + params, for persistence in the `rules` table."""
         raise NotImplementedError
+
+    def reduce_signal(
+        self,
+        holding: Holding,
+        candles_by_tf: dict[Granularity, list[Candle]],
+        costs: SellCosts,
+    ) -> Reduction | None:
+        """Pure. A sleeve-sell rule's proposal to sell part of `holding`, or `None` (spec §3.2).
+
+        Default `None`: an ENTRY rule proposes no reduction, so adding this hook changes nothing
+        for the rules that exist. A sell-side kind overrides it; `agent._handle_reductions` (P8)
+        is its only caller. `costs` is what the caller resolved (the fallback rate and
+        per-product slippage, plan R6) -- a rule is built from params and cannot read config.
+        The venue's previewed fee, when there is one, is recorded by `executor.reduce`, not
+        decided here.
+        """
+        return None
 
     def param_space(self) -> tuple[ParamSpec, ...]:
         """The dimensions of this rule's parameter space a sweep may legitimately explore

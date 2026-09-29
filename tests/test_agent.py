@@ -3271,6 +3271,70 @@ def test_paper_dca_fill_is_sized_from_the_rules_amount_not_the_config_budget(rep
     assert orders[0]["qty"] * price == Decimal("15")
 
 
+def test_paper_enter_refuses_a_reduce_before_the_rails_or_the_paper_fill(repo, monkeypatch):
+    """#857: `Action.REDUCE` has no path through `_paper_enter`. Before the refusal existed,
+    `_build_intent` read any non-ENTER action as an EXIT: it sized a SELL of the whole LIVE
+    holding, ran the rails on it and handed the REDUCE to the paper trader. It is refused at
+    sizing now, so neither the rails nor the trader is reached and no paper row is written.
+
+    The live BUY below is what makes the old path reach the rails at all (with nothing held,
+    `_build_intent` returned `None` and the test would pass by vacuum); the spies count it."""
+    from keel.execution import guards
+    from keel.strategy.paper import PaperTrader
+
+    trader = PaperTrader(repo)
+    trader.seed_cash(Decimal("30000"), now_ts=1_000)
+    repo.set_state("last_feed_ts", 90_000)
+    repo.insert_order(
+        dict(
+            mode="live",
+            product_id=PRODUCT,
+            side=Side.BUY.value,
+            order_type="market",
+            qty=Decimal("2"),
+            limit_price=Decimal("30"),
+            status="filled",
+            fee=Decimal("0"),
+            expected_fill=Decimal("30"),
+            actual_fill=Decimal("30"),
+            created_at=1_000,
+            updated_at=1_000,
+        )
+    )
+    paper_rows_before = repo.get_orders(mode="paper")
+    calls: dict[str, int] = {"guards": 0, "trader": 0}
+    real_check, real_on_signal = guards.check, trader.on_signal
+
+    def _count_check(*args: Any, **kwargs: Any) -> Any:
+        calls["guards"] += 1
+        return real_check(*args, **kwargs)
+
+    def _count_on_signal(*args: Any, **kwargs: Any) -> Any:
+        calls["trader"] += 1
+        return real_on_signal(*args, **kwargs)
+
+    monkeypatch.setattr(guards, "check", _count_check)
+    monkeypatch.setattr(trader, "on_signal", _count_on_signal)
+    signal = Signal(
+        rule_name="reverse_dca",
+        product_id=PRODUCT,
+        action=Action.REDUCE,
+        side=Side.SELL,
+        setup=None,
+        cts_score=0,
+        entry_technique="market",
+        ts=90_000,
+    )
+
+    result = agent._paper_enter(
+        trader, signal, repo, _paper_config(), now_ts=90_000, paper_equity=Decimal("30000")
+    )
+
+    assert (result.placed, result.order_id, result.vetoed_by) == (False, None, [])
+    assert calls == {"guards": 0, "trader": 0}
+    assert repo.get_orders(mode="paper") == paper_rows_before
+
+
 @pytest.mark.parametrize(
     "size_usd",
     [Decimal("0"), Decimal("-15"), Decimal("Infinity"), Decimal("NaN"), "15", True],

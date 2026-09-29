@@ -19,12 +19,13 @@ from decimal import Decimal
 from typing import Any
 
 from keel.data.repository import Repository
+from keel.strategy.reduction import Holding
 from keel.types import Side
 
 
 def ledger_qty(positions: Iterable[dict[str, Any]]) -> Decimal:
-    """Sum of `qty` over the given OPEN tranches -- what is still held. `Holding.qty` (P5) is
-    defined as exactly this, and a test pins the two equal.
+    """Sum of `qty` over the given OPEN tranches -- what is still held. `Holding.qty` is
+    defined as exactly this, and a test pins the two equal (`holding_of`).
 
     `qty` on an open tranche is what REMAINS after any scale-out (the sold part moves to
     `realized_qty`), so the sum is the held quantity, not the quantity ever bought."""
@@ -62,3 +63,26 @@ def orders_qty(repo: Repository, product_id: str, mode: str) -> Decimal:
             sell_qty += qty
     net = buy_qty - sell_qty
     return net if net > 0 else Decimal("0")
+
+
+def holding_of(repo: Repository, product_id: str, mark: Decimal | None = None) -> Holding:
+    """The `Holding` a sleeve sale is proposed from: every OPEN `positions` tranche of
+    `product_id`, oldest first (spec §3.3).
+
+    **No `rule_name` filter (plan R8).** A sleeve-sell rule governs the product's holding, not
+    its latest entrant, so a mixed-ownership product (PAXG: turtle tranche 3 is the oldest row)
+    has one `Holding`, and a FIFO sale reaches the turtle tranche first. That leg is booked
+    honestly, as a rule outcome, by `streak.book_exit(is_dca=None)` (R9, spec Q10).
+
+    **Order is `get_open_positions`' FIFO contract**, kept as is by `Holding.from_rows`, so the
+    tranches a preview names are the ones `book_exit` will consume. Its `qty` is `ledger_qty` over
+    the same rows -- the quantity `ledger.drift` compares -- never `orders`.
+
+    **It can overstate the venue by about a fee (#900).** Since #905 a tranche is booked at the
+    venue-filled size, but the live tranches booked before it still carry the ORDERED size until a
+    backfill runs, so for those `qty` exceeds the base the venue delivered by roughly the fee. This
+    does not clamp to the venue (it holds no broker, like the rest of this module): the executor
+    clamps every SELL to the venue's holding (`_clamped_sell_qty`), and `ledger.venue_drift`
+    reports the gap before a sale is proposed.
+    """
+    return Holding.from_rows(product_id, repo.get_open_positions(product_id), mark)

@@ -121,6 +121,12 @@ class PromotionConfig:
 # a trend-follower; a small sample is not a property of anything, it is just less evidence.
 DEFAULT_CLASS = "default"
 TREND_FOLLOW = "trend_follow"
+#: A rule that only ever proposes selling part of a held sleeve (`Rule.reduce_signal`, #857).
+#: It has no entries and so no R, and it must never be judged by a trade floor: it is
+#: deliberately NOT in `_CLASS_FLOORS`, and `attempt_promotion` will route it to its own gate
+#: (`sleeve_sell_gate`, plan P12) before `floor_for_class` is reached. Until P12 no rule declares
+#: it.
+SLEEVE_SELL = "sleeve_sell"
 
 _CLASS_FLOORS: dict[str, PromotionConfig] = {
     TREND_FOLLOW: PromotionConfig(
@@ -130,6 +136,13 @@ _CLASS_FLOORS: dict[str, PromotionConfig] = {
         min_win_rate=0.30,
     ),
 }
+
+
+#: Every `promotion_class` value a rule may declare (plan R10). The conformance test reads this
+#: rather than `{DEFAULT_CLASS} | set(_CLASS_FLOORS)`, because a class with its own gate
+#: (`SLEEVE_SELL`) is recognised without having a floor -- and must not silently fall back to the
+#: default one, which is what that test exists to prevent.
+RECOGNISED_CLASSES: frozenset[str] = frozenset({DEFAULT_CLASS, TREND_FOLLOW, SLEEVE_SELL})
 
 
 def floor_for_class(class_name: str, default: PromotionConfig | None = None) -> PromotionConfig:
