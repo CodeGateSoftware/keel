@@ -1165,3 +1165,106 @@ def test_sleeve_sell_is_recognised_and_is_never_a_backtest_floor() -> None:
         {promotion.DEFAULT_CLASS, promotion.TREND_FOLLOW, promotion.SLEEVE_SELL}
     )
     assert promotion.SLEEVE_SELL not in promotion._CLASS_FLOORS
+
+
+# -- the sleeve_sell gate (P12 Task 12.1, spec §3.7, Q2, Q6) ------------------------------------
+
+DAY = 86_400
+_GATE = dict(lookahead_clean=True, concurrent_live_dca=False, allow_concurrent_dca=False)
+
+
+def test_candidate_to_paper_needs_only_a_clean_lookahead() -> None:
+    from keel.strategy import promotion
+
+    ok, why = promotion.sleeve_sell_gate(
+        status="candidate", promoted_at=None, reviewed_proposals=0, now_ts=0, **_GATE
+    )
+    assert (ok, why) == (True, [])
+    ok, why = promotion.sleeve_sell_gate(
+        status="candidate",
+        promoted_at=None,
+        reviewed_proposals=0,
+        now_ts=0,
+        **{**_GATE, "lookahead_clean": False},
+    )
+    assert not ok and len(why) == 1 and "lookahead" in why[0]
+
+
+def test_candidate_to_paper_ignores_the_paper_only_conditions() -> None:
+    """A concurrent live dca and zero reviewed proposals are paper->live conditions (Q2, Q6): a
+    candidate is not refused on either, because going to paper places nothing and is how the
+    reviewed proposal the next step needs is ever produced."""
+    from keel.strategy import promotion
+
+    ok, why = promotion.sleeve_sell_gate(
+        status="candidate",
+        promoted_at=None,
+        reviewed_proposals=0,
+        now_ts=0,
+        **{**_GATE, "concurrent_live_dca": True},
+    )
+    assert (ok, why) == (True, [])
+
+
+def test_paper_to_live_needs_sixty_days_and_one_reviewed_proposal() -> None:
+    from keel.strategy import promotion
+
+    assert promotion.SLEEVE_SELL_MIN_PAPER_DAYS == 60
+    base = dict(status="paper", promoted_at=0, **_GATE)
+    short = promotion.sleeve_sell_gate(reviewed_proposals=1, now_ts=60 * DAY - 1, **base)
+    assert short[0] is False and len(short[1]) == 1 and "60" in short[1][0]
+    unreviewed = promotion.sleeve_sell_gate(reviewed_proposals=0, now_ts=60 * DAY, **base)
+    assert unreviewed[0] is False and len(unreviewed[1]) == 1
+    assert "keel dca proposals review" in unreviewed[1][0]
+    assert promotion.sleeve_sell_gate(reviewed_proposals=1, now_ts=60 * DAY, **base) == (True, [])
+
+
+def test_paper_to_live_lists_every_failing_condition_at_once() -> None:
+    from keel.strategy import promotion
+
+    ok, why = promotion.sleeve_sell_gate(
+        status="paper",
+        promoted_at=0,
+        reviewed_proposals=0,
+        now_ts=DAY,
+        lookahead_clean=False,
+        concurrent_live_dca=True,
+        allow_concurrent_dca=False,
+    )
+    assert not ok and len(why) == 4
+
+
+def test_paper_with_no_promotion_timestamp_is_refused_not_counted_as_zero() -> None:
+    """`promoted_at` NULL is "not recorded": the paper days cannot be counted, so the gate
+    refuses rather than reading it as the epoch (which would pass any day count)."""
+    from keel.strategy import promotion
+
+    ok, why = promotion.sleeve_sell_gate(
+        status="paper", promoted_at=None, reviewed_proposals=1, now_ts=10_000 * DAY, **_GATE
+    )
+    assert not ok and len(why) == 1 and "promoted_at" in why[0]
+
+
+def test_a_live_dca_on_the_product_refuses_unless_the_operator_types_the_flag() -> None:
+    from keel.strategy import promotion
+
+    base = dict(
+        status="paper", promoted_at=0, reviewed_proposals=1, now_ts=60 * DAY, lookahead_clean=True
+    )
+    ok, why = promotion.sleeve_sell_gate(
+        concurrent_live_dca=True, allow_concurrent_dca=False, **base
+    )
+    assert not ok and len(why) == 1 and "--allow-concurrent-dca" in why[0]
+    assert promotion.sleeve_sell_gate(
+        concurrent_live_dca=True, allow_concurrent_dca=True, **base
+    ) == (True, [])
+
+
+@pytest.mark.parametrize("status", ["live", "disabled", "bogus"])
+def test_a_status_with_no_next_step_is_refused(status: str) -> None:
+    from keel.strategy import promotion
+
+    ok, why = promotion.sleeve_sell_gate(
+        status=status, promoted_at=0, reviewed_proposals=1, now_ts=100 * DAY, **_GATE
+    )
+    assert not ok and len(why) == 1 and status in why[0]
