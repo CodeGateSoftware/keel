@@ -575,3 +575,121 @@ def test_unverified_fill_orders_lets_a_sized_order_own_its_lot() -> None:
     )
     assert sized != unsized
     assert sleeve.unverified_fill_orders(repo, "BTC-USD") == []
+
+
+# -- repeated refusals notify once (P9 carried item: a veto repeated daily is one alert) ---------
+
+
+def _veto(
+    repo: Repository,
+    ts: int,
+    *,
+    sleeve_reason=None,
+    violations=(),
+    kind="reverse_dca",
+    product="BTC-USD",
+    decision="vetoed",
+) -> int:
+    rails: dict[str, Any] = {"violations": list(violations)}
+    if sleeve_reason is not None:
+        rails["sleeve"] = sleeve_reason
+    return sleeve.record_proposal(
+        repo,
+        **_proposal_kw(
+            now_ts=ts,
+            decision=decision,
+            rails=rails,
+            reduction=Reduction(product, D("0.001"), kind, {}, D("110000"), ts),
+        ),
+    )
+
+
+def test_the_first_refusal_is_not_a_repeat() -> None:
+    repo = _repo()
+    first = _veto(repo, 1 * DAY, sleeve_reason=sleeve.COOLDOWN)
+    assert sleeve.repeats_previous_refusal(repo, "BTC-USD", first) is False
+
+
+def test_the_same_refusal_the_next_day_is_a_repeat() -> None:
+    repo = _repo()
+    _veto(repo, 1 * DAY, sleeve_reason=sleeve.COOLDOWN)
+    second = _veto(repo, 2 * DAY, sleeve_reason=sleeve.COOLDOWN)
+    third = _veto(repo, 3 * DAY, sleeve_reason=sleeve.COOLDOWN)
+    assert [sleeve.repeats_previous_refusal(repo, "BTC-USD", p) for p in (second, third)] == [
+        True,
+        True,
+    ]
+
+
+def test_a_changed_refusal_reason_is_a_transition_not_a_repeat() -> None:
+    repo = _repo()
+    _veto(repo, 1 * DAY, sleeve_reason=sleeve.MIN_HOLD)
+    changed = _veto(repo, 2 * DAY, sleeve_reason=sleeve.COOLDOWN)
+    rails = _veto(repo, 3 * DAY, violations=["stale_data: feed is stale (9s; threshold 5s)"])
+    assert sleeve.repeats_previous_refusal(repo, "BTC-USD", changed) is False
+    assert sleeve.repeats_previous_refusal(repo, "BTC-USD", rails) is False
+
+
+def test_the_same_rail_with_a_different_detail_is_still_a_repeat() -> None:
+    """A rail's violation text carries live numbers (a feed's age); the REASON is the rail's
+    name, the part before the colon, so a stale feed two days running is one alert."""
+    repo = _repo()
+    _veto(repo, 1 * DAY, violations=["stale_data: feed is stale (9s; threshold 5s)"])
+    again = _veto(repo, 2 * DAY, violations=["stale_data: feed is stale (70s; threshold 5s)"])
+    more = _veto(
+        repo,
+        3 * DAY,
+        violations=["stale_data: feed is stale (80s)", "kill_switch: engaged"],
+    )
+    assert sleeve.repeats_previous_refusal(repo, "BTC-USD", again) is True
+    assert sleeve.repeats_previous_refusal(repo, "BTC-USD", more) is False
+
+
+def test_a_refusal_after_a_preview_is_a_transition() -> None:
+    repo = _repo()
+    _veto(repo, 1 * DAY, sleeve_reason=sleeve.COOLDOWN)
+    _veto(repo, 2 * DAY, decision="preview")
+    after = _veto(repo, 3 * DAY, sleeve_reason=sleeve.COOLDOWN)
+    assert sleeve.repeats_previous_refusal(repo, "BTC-USD", after) is False
+
+
+def test_a_preview_is_never_a_repeat_even_after_a_preview() -> None:
+    """Each preview is a distinct sale the operator may act on, by its own id: only a
+    REFUSAL repeating is noise."""
+    repo = _repo()
+    _veto(repo, 1 * DAY, decision="preview")
+    again = _veto(repo, 31 * DAY, decision="preview")
+    assert sleeve.repeats_previous_refusal(repo, "BTC-USD", again) is False
+
+
+def test_the_previous_proposal_is_this_products_and_never_a_superseded_one() -> None:
+    repo = _repo()
+    _veto(repo, 1 * DAY, sleeve_reason=sleeve.COOLDOWN)
+    _veto(repo, 2 * DAY, sleeve_reason=sleeve.MIN_HOLD, product="PAXG-USD")
+    _veto(repo, 2 * DAY, sleeve_reason=sleeve.MIN_HOLD, decision="superseded")
+    second = _veto(repo, 2 * DAY, sleeve_reason=sleeve.COOLDOWN)
+    assert sleeve.repeats_previous_refusal(repo, "BTC-USD", second) is True
+
+
+def test_another_kind_refused_for_the_same_reason_is_not_a_repeat() -> None:
+    """A different rule refused is news, even for the same reason: prefer the duplicate."""
+    repo = _repo()
+    _veto(repo, 1 * DAY, sleeve_reason=sleeve.MIN_HOLD, kind="reverse_dca")
+    other = _veto(repo, 2 * DAY, sleeve_reason=sleeve.MIN_HOLD, kind="profit_take")
+    assert sleeve.repeats_previous_refusal(repo, "BTC-USD", other) is False
+
+
+def test_an_unknown_proposal_id_is_not_a_repeat() -> None:
+    """Fails OPEN: an id the product does not have reads as news, never as silence."""
+    repo = _repo()
+    _veto(repo, 1 * DAY, sleeve_reason=sleeve.COOLDOWN)
+    assert sleeve.repeats_previous_refusal(repo, "BTC-USD", 999) is False
+
+
+def test_a_preview_is_not_a_repeat_even_of_a_veto_with_no_recorded_reason() -> None:
+    """The decision itself is part of what changed: a preview after a veto whose row names no
+    cap and no rail (so the two reasons compare equal) is still a transition."""
+    repo = _repo()
+    _veto(repo, 1 * DAY)
+    preview = _veto(repo, 2 * DAY, decision="preview")
+    assert sleeve.repeats_previous_refusal(repo, "BTC-USD", preview) is False

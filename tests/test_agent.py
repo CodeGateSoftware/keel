@@ -6037,6 +6037,70 @@ def test_a_vetoed_cooldown_row_does_not_re_arm_the_cooldown_forever(repo, monkey
     assert [r.decision for r in last.reduce_results] == ["preview"]
 
 
+def test_a_repeated_cooldown_veto_is_recorded_daily_and_notified_once(repo, monkeypatch):
+    """P9's carried item. P8 notified `sleeve.proposal` for every vetoed row, so a 30-day
+    cooldown sent 29 alerts in a row. The row is still recorded every day (it is the audit
+    trail, and R14/R15 read it), but only a CHANGE in the product's decision or refusal reason
+    notifies: day 41's preview, day 42's first veto, and day 71's preview -- three events over
+    31 cycles, derived through the real `events_from_state` from each cycle's result."""
+    from keel.notifications import events_from_state
+
+    _seed_rules(repo, monkeypatch, (_CooldownReduceRule(PRODUCT), "live"))
+    _held_since_day_0(repo)
+    broker = _HoldingBroker()
+    series = [_candle(d * DAY, "100") for d in range(41)]
+    _seed_history(repo, series)
+
+    notified: list[tuple[int, str]] = []
+    flags: list[bool] = []
+    for day in range(41, 72):
+        if day > 41:
+            series.append(_candle((day - 1) * DAY, "100"))
+            _seed_history(repo, series)
+        result = run_once(broker, repo, _config(), now_ts=day * DAY + 3_600)
+        [reduced] = result.reduce_results
+        flags.append(reduced.repeats_previous)
+        events = events_from_state(
+            attestation_findings=(),
+            rail_findings=(),
+            month_to_date_spend=None,
+            allowance=None,
+            unplaced_setups=(),
+            stale_products=(),
+            held_products=(),
+            sleeve_proposals=result.reduce_results,
+        )
+        notified += [(day, e.fields["decision"]) for e in events if e.key == "sleeve.proposal"]
+
+    assert len(repo.get_sell_proposals()) == 31, "every day's row is still recorded"
+    assert notified == [(41, "preview"), (42, "vetoed"), (71, "preview")]
+    assert flags == [False, False, *([True] * 28), False]
+
+
+def test_a_repeat_check_that_raises_costs_neither_the_proposal_nor_its_alert(repo, monkeypatch):
+    """The row is written before the check runs, and only the notification reads the flag: a
+    check that raises is logged and the result goes out unflagged (a possible duplicate alert,
+    never a lost or silenced proposal)."""
+    _seed_rules(repo, monkeypatch, (_AlwaysReduceRule(PRODUCT), "live"))
+    _held_since_day_0(repo)
+    now = _history(repo, 41)
+    calls: list[int | None] = []
+
+    def _raises(repo_, product_id, proposal_id):
+        calls.append(proposal_id)
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(sleeve, "repeats_previous_refusal", _raises)
+
+    result = run_once(_HoldingBroker(), repo, _config(), now_ts=now)
+
+    [row] = repo.get_sell_proposals()
+    assert calls == [row["id"]], "the check must actually have been reached"
+    assert [(r.proposal_id, r.decision, r.repeats_previous) for r in result.reduce_results] == [
+        (row["id"], "preview", False)
+    ]
+
+
 def test_a_young_tranche_is_refused_by_min_hold_days(repo, monkeypatch):
     """#916: no cycle test used to reach `_handle_reductions`' `min_hold_days` refusal -- the
     FIFO tranche the sale would consume is only 10 days old, younger than the default 30, so the

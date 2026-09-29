@@ -132,7 +132,9 @@ def events_from_state(
 
     `sleeve_proposals` is the cycle's `LoopResult.reduce_results` (#857, plan R19): one
     `sleeve.proposal` per proposal the operator should look at -- `preview` or `vetoed` -- and
-    none for arbitration's `superseded` losers, whose winner is already reported. Each names its
+    none for arbitration's `superseded` losers, whose winner is already reported, and none for a
+    refusal that REPEATS the product's previous one (`ReduceResult.repeats_previous`, P9): a
+    cooldown vetoing daily is one alert at its first veto, not one per day. Each names its
     proposal id and the command that shows it, and the WHOLE sale (`total_qty`, over `legs`):
     the row's own `qty` is only rail 2's first leg.
     """
@@ -238,6 +240,9 @@ def events_from_state(
 
     for proposal in sleeve_proposals:
         if proposal.decision not in _NOTIFYING_PROPOSAL_DECISIONS:
+            continue
+        if proposal.repeats_previous:
+            # Recorded, not news: the same refusal as the product's previous proposal (P9).
             continue
         total = None if proposal.total_qty is None else str(proposal.total_qty)
         legs = f"{proposal.legs} leg{'' if proposal.legs == 1 else 's'}"

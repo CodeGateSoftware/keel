@@ -1236,6 +1236,10 @@ def _handle_reductions(
        refusal is recorded `vetoed` with `rails.sleeve`, so a skipped distribution says why and
        is not carried forward (Review Focus 1).
     7. `executor.reduce`, with `offline=True` and no broker on a paper cycle (R18).
+    8. **A repeated refusal is recorded, not re-announced** (`_flag_repeat`, P9): the winner's
+       result carries `repeats_previous` when its row is the same refusal as the product's
+       previous proposal, and `sleeve.proposal` skips it -- a 30-day cooldown is one alert at
+       its first veto, not 29.
 
     The caller wraps this per product: a database error here costs this product's proposal,
     never the cycle and never another product.
@@ -1350,32 +1354,55 @@ def _handle_reductions(
         )
         return [
             *results,
-            ReduceResult(
-                product_id,
-                winner.name,
-                pid,
-                "vetoed",
-                [],
-                0,
-                refusal,
-                total_qty=min(winning.qty, holding.qty),
+            _flag_repeat(
+                repo,
+                ReduceResult(
+                    product_id,
+                    winner.name,
+                    pid,
+                    "vetoed",
+                    [],
+                    0,
+                    refusal,
+                    total_qty=min(winning.qty, holding.qty),
+                ),
             ),
         ]
     return [
         *results,
-        executor.reduce(
-            winning,
-            broker=None if offline else broker,
-            repo=repo,
-            config=config,
-            holding=holding,
-            costs=costs,
-            rule_id=winner.rule_id,
-            rule_status=winner_status,
-            now_ts=now_ts,
-            offline=offline,
+        _flag_repeat(
+            repo,
+            executor.reduce(
+                winning,
+                broker=None if offline else broker,
+                repo=repo,
+                config=config,
+                holding=holding,
+                costs=costs,
+                rule_id=winner.rule_id,
+                rule_status=winner_status,
+                now_ts=now_ts,
+                offline=offline,
+            ),
         ),
     ]
+
+
+def _flag_repeat(repo: Repository, result: ReduceResult) -> ReduceResult:
+    """`result`, with `repeats_previous` set when its row repeats the product's previous refusal
+    (`sleeve.repeats_previous_refusal`; the P9 ruling on P8's daily `sleeve.proposal`).
+
+    Only the notification reads the flag, and the row is already written by now, so a failure
+    here must cost neither: it is logged and the result goes out UNFLAGGED -- a possible
+    duplicate alert, never a lost proposal or a silenced one (the same fail-open direction as
+    `notifications.reported_windows`).
+    """
+    try:
+        repeats = sleeve.repeats_previous_refusal(repo, result.product_id, result.proposal_id)
+    except Exception:  # noqa: BLE001 -- see the docstring: fail toward the alert
+        log_exception(logger, "agent.repeat_check_failed", product=result.product_id)
+        return result
+    return replace(result, repeats_previous=repeats) if repeats else result
 
 
 def _manage_stops(
