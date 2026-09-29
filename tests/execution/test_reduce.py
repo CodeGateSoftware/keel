@@ -169,6 +169,7 @@ def test_preview_quotes_at_the_venue_records_and_places_nothing(repo: Repository
         vetoed_by=[],
         legs=1,
         reason="preview only: nothing placed",
+        total_qty=D("0.001"),
     )
     assert broker.calls.count("preview_order") == 1
     assert "place_order" not in broker.calls and "cancel_order" not in broker.calls
@@ -672,3 +673,50 @@ def test_a_leg_below_one_increment_records_the_capped_sale_not_the_uncapped_ask(
     assert row["rails"]["sleeve"] == "below_one_increment"
     assert row["qty"] == D("0.002")
     assert row["expected_fee"] == D("0.002") * D("110000") * D("0.012")
+
+
+# -- the sale's total (P8, carried over from P7's held question) --------------------------------
+
+
+def _sliced_config() -> Any:
+    return _config(
+        caps=Caps(
+            max_exposure_usd=D("1000000"),
+            max_per_asset_pct=D("1"),
+            max_per_order_usd=D("50"),
+            max_per_day_usd=D("300000"),
+        )
+    )
+
+
+def test_a_sliced_sale_records_its_total_not_only_the_first_leg(repo: Repository) -> None:
+    """Rail 2 slices $165 into 4 legs, and the row's `qty` is the FIRST leg. Without the total
+    the proposal says "sell 0.00045, 4 legs" and nothing says the sale is 0.0015: the total is
+    on the result and in the row's `rails.total_qty`."""
+    result = _run(repo, SpyBroker(), config=_sliced_config(), qty="0.0015")
+
+    row = _proposal(repo, result)
+    assert result.legs == 4 and row["qty"] < D("0.0015"), "fixture: the sale must be sliced"
+    assert result.total_qty == D("0.0015")
+    assert D(row["rails"]["total_qty"]) == D("0.0015")
+
+
+def test_the_recorded_total_is_the_capped_and_clamped_sale(repo: Repository) -> None:
+    """The total is what would actually be sold -- capped at the ledger, clamped to the venue --
+    never the rule's ask."""
+    broker = SpyBroker(balances={"USD": D("1"), "BTC": D("0.00198")})
+
+    result = _run(repo, broker, qty="0.005")
+
+    assert result.total_qty == D("0.00198")
+    assert D(_proposal(repo, result)["rails"]["total_qty"]) == D("0.00198")
+
+
+def test_a_rails_veto_still_records_the_total(repo: Repository) -> None:
+    _kill(repo)
+
+    result = _run(repo, SpyBroker(), config=_sliced_config(), qty="0.0015")
+
+    assert result.decision == "vetoed" and result.legs == 4
+    assert result.total_qty == D("0.0015")
+    assert D(_proposal(repo, result)["rails"]["total_qty"]) == D("0.0015")

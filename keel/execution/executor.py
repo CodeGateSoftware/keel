@@ -2983,6 +2983,11 @@ class ReduceResult:
     rails' violations, empty for a sleeve-level refusal such as `below_one_increment`, whose
     reason is on the row's `rails.sleeve`; `legs` is how many per-order legs (one per cycle)
     the sale needs under rail 2 (R11), `0` when no leg can be expressed.
+
+    `total_qty` is the WHOLE sale -- capped at the ledger's holding and clamped to the venue's
+    -- of which the row's `qty` is only the first leg (also recorded as the row's
+    `rails.total_qty`). Without it a sliced proposal reads "sell one leg, N legs" and nowhere says
+    how much the sale is. `None` when no sale was sized at all (`nothing_held`, `superseded`).
     """
 
     product_id: str
@@ -2992,6 +2997,7 @@ class ReduceResult:
     vetoed_by: list[str]
     legs: int
     reason: str
+    total_qty: Decimal | None = None
 
 
 def reduce(
@@ -3076,7 +3082,16 @@ def reduce(
         rails["sleeve"] = why
         fee = priced.qty * priced.expected_price * costs.fee_pct
         pid = _record(priced, "vetoed", fee, costs.fee_source, 0)
-        return ReduceResult(product_id, reduction.reason, pid, "vetoed", [], 0, reason)
+        return ReduceResult(
+            product_id,
+            reduction.reason,
+            pid,
+            "vetoed",
+            [],
+            0,
+            reason,
+            None if sale is None else sale.qty,
+        )
 
     total = min(reduction.qty, holding.qty)
     if total <= 0:
@@ -3087,6 +3102,9 @@ def reduce(
     if live:
         increment = _base_increment_for(broker, repo, product_id, now_ts)
         total, held = _clamped_sell_qty(broker, repo, product_id, total, now_ts)
+    # The whole sale, of which the row's `qty` is one leg (see `ReduceResult.total_qty`). Text,
+    # like every other figure in this JSON column's siblings: exact, never a float.
+    rails["total_qty"] = str(total)
     leg_qty, legs = sleeve.slice_qty(
         total,
         reduction.expected_price,
@@ -3128,6 +3146,7 @@ def reduce(
             list(verdict.violations),
             legs,
             "vetoed by guards",
+            total,
         )
 
     fee, source = fallback_fee, costs.fee_source
@@ -3174,7 +3193,14 @@ def reduce(
         fee_source=source,
     )
     return ReduceResult(
-        product_id, reduction.reason, pid, "preview", [], legs, "preview only: nothing placed"
+        product_id,
+        reduction.reason,
+        pid,
+        "preview",
+        [],
+        legs,
+        "preview only: nothing placed",
+        total,
     )
 
 
