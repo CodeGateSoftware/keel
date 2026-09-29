@@ -3062,10 +3062,17 @@ def reduce(
             now_ts=now_ts,
         )
 
-    def _sleeve_veto(why: str, reason: str) -> ReduceResult:
+    def _sleeve_veto(why: str, reason: str, sale: Reduction | None = None) -> ReduceResult:
+        # `sale` is the CAPPED reduction (post holding-cap, post venue-clamp) when one exists --
+        # `below_one_increment` is reached only after `total` is computed, so the row must record
+        # what was actually being sold, not the rule's uncapped ask (#911). `nothing_held` is
+        # reached BEFORE any cap is meaningful (`total <= 0`), and a `Reduction` of qty <= 0
+        # cannot even be built, so it falls back to the original `reduction` -- its net is NULL
+        # regardless, since there is no lot for `record_proposal` to consume.
+        priced = reduction if sale is None else sale
         rails["sleeve"] = why
-        fee = reduction.qty * reduction.expected_price * costs.fee_pct
-        pid = _record(reduction, "vetoed", fee, costs.fee_source, 0)
+        fee = priced.qty * priced.expected_price * costs.fee_pct
+        pid = _record(priced, "vetoed", fee, costs.fee_source, 0)
         return ReduceResult(product_id, reduction.reason, pid, "vetoed", [], 0, reason)
 
     total = min(reduction.qty, holding.qty)
@@ -3085,7 +3092,9 @@ def reduce(
     )
     if legs == 0:
         return _sleeve_veto(
-            "below_one_increment", "one leg cannot be expressed in the venue's increment"
+            "below_one_increment",
+            "one leg cannot be expressed in the venue's increment",
+            replace(reduction, qty=total),
         )
 
     leg = replace(reduction, qty=leg_qty)

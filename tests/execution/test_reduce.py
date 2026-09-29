@@ -621,6 +621,10 @@ def test_nothing_held_is_recorded_vetoed_and_the_venue_is_never_asked(
     row = _proposal(repo, result)
     assert (result.decision, result.legs, row["rails"]["sleeve"]) == ("vetoed", 0, "nothing_held")
     assert broker.calls == []
+    # A `Reduction` refuses qty <= 0, so `nothing_held` cannot record the (nonexistent) capped
+    # sale; it records the reduction's own qty instead. Its net is NULL regardless -- there is no
+    # lot to consume -- which is what this pins, not the qty column.
+    assert row["expected_net_pnl"] is None
 
 
 def test_a_leg_below_one_increment_is_recorded_vetoed_and_never_quoted(
@@ -632,3 +636,19 @@ def test_a_leg_below_one_increment_is_recorded_vetoed_and_never_quoted(
     assert (result.decision, result.legs) == ("vetoed", 0)
     assert (row["legs"], row["rails"]["sleeve"]) == (0, "below_one_increment")
     assert "preview_order" not in broker.calls
+
+
+def test_a_leg_below_one_increment_records_the_capped_sale_not_the_uncapped_ask(
+    repo: Repository,
+) -> None:
+    """#911: a `Reduction` larger than the holding must not record qty/fee/net for units not
+    held. Ledger holds 0.002 BTC; the reduction asks for 0.005; the increment (0.01) makes even
+    the held 0.002 inexpressible. The row must show 0.002, priced on 0.002 -- not the uncapped
+    0.005 the rule asked for."""
+    broker = SpyBroker(increment=D("0.01"))
+    result = _run(repo, broker, qty="0.005")
+    row = _proposal(repo, result)
+    assert (result.decision, result.legs) == ("vetoed", 0)
+    assert row["rails"]["sleeve"] == "below_one_increment"
+    assert row["qty"] == D("0.002")
+    assert row["expected_fee"] == D("0.002") * D("110000") * D("0.012")
