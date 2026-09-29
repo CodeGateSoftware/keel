@@ -830,10 +830,12 @@ def sleeve_sell_gate(
       not promoted on silence". A NULL `promoted_at` is "not recorded", never the epoch, so the
       days cannot be counted and the step is refused. Q6's default is that 60 days and one
       reviewed proposal are enough FOR `preview` execution, which is all this build has.
-    - **Q2:** a `live` `dca` on the same product refuses `paper -> live` unless the operator
-      typed `--allow-concurrent-dca` -- buying weekly and distributing monthly is a legal round
-      trip at two fees, and the operator says so on the record. The caller decides what counts
-      as concurrent (a `reverse_dca` beside a `live` `dca`, spec §6 failure mode a).
+    - **Q2:** a `dca` on the same product refuses `paper -> live` unless the operator typed
+      `--allow-concurrent-dca` -- buying weekly and distributing monthly is a legal round trip at
+      two fees, and the operator says so on the record. The caller decides what counts as
+      concurrent (`concurrent_live_dca`, named for the spec's live case): a `reverse_dca` beside
+      a `dca` the profile's cycle runs -- `live` on a live profile, `paper` on a paper one (plan
+      R40; spec §6 failure mode a).
 
     **`live` means preview in this build (S2).** Every sleeve-sell kind declares `execution:
     Literal["preview"]`, so a rule this gate promotes to `live` still only records proposals;
@@ -874,7 +876,8 @@ def sleeve_sell_gate(
             )
         if concurrent_live_dca and not allow_concurrent_dca:
             reasons.append(
-                "a live dca rule buys this product: distributing beside it is a round trip at two "
-                "fees -- pass --allow-concurrent-dca to promote anyway (spec Q2)"
+                "a dca rule this profile's cycle runs buys this product: distributing beside it "
+                "is a round trip at two fees -- pass --allow-concurrent-dca to promote anyway "
+                "(spec Q2)"
             )
     return (not reasons, reasons)

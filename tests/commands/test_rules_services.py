@@ -668,12 +668,12 @@ def _status(repo: Repository, rule_id: int) -> str:
     return {r["id"]: r["status"] for r in repo.get_rules()}[rule_id]
 
 
-def _promote(repo: Repository, rule_id: int, **kwargs: Any):
+def _promote(repo: Repository, rule_id: int, *, mode: str = "paper", **kwargs: Any):
     out, err = _collect()
     try:
         outcome = attempt_promotion(
             repo,
-            _config(),
+            _config(auto_trade=AutoTradeConfig(mode=mode, interval_sec=900)),
             rule_id,
             now_ts=_SLEEVE_NOW,
             echo=out.append,
@@ -794,34 +794,53 @@ def test_only_this_rules_own_reviewed_paper_proposals_count(btc_book) -> None:
     assert outcome is not None and outcome.new_status == "live"
 
 
-def test_paper_to_live_refused_beside_a_live_dca_without_the_flag(btc_book) -> None:
+@pytest.mark.parametrize(("mode", "dca_status"), [("paper", "paper"), ("live", "live")])
+def test_paper_to_live_refused_beside_the_cycles_dca_without_the_flag(
+    btc_book, mode, dca_status
+) -> None:
+    """R40: the concurrent dca is the one this profile's cycle actually RUNS -- `paper` rules
+    on a paper profile, `live` ones on a live profile (`agent._dca_fires_today`'s reading)."""
     rid = _paper_reverse(btc_book, days_in_paper=61)
     _review(btc_book, rid)
     btc_book.insert_rule(
-        "dca", {"product_id": "BTC-USD", "cadence_days": 7, "budget_usd": "40"}, status="live"
+        "dca", {"product_id": "BTC-USD", "cadence_days": 7, "budget_usd": "40"}, status=dca_status
     )
-    outcome, _out, err = _promote(btc_book, rid)
+    outcome, out, err = _promote(btc_book, rid, mode=mode)
     assert outcome is None
     assert _status(btc_book, rid) == "paper"
-    assert any("--allow-concurrent-dca" in line for line in err)
+    assert sum(1 for line in err if "--allow-concurrent-dca" in line) == 1
+    [gate] = [line for line in out if "sleeve_sell gate" in line]
+    assert gate.endswith(f"{dca_status} dca on BTC-USD: yes")
 
-    outcome, out, _err = _promote(btc_book, rid, allow_concurrent_dca=True)
+    outcome, out, _err = _promote(btc_book, rid, mode=mode, allow_concurrent_dca=True)
     assert outcome is not None and outcome.new_status == "live"
     assert _status(btc_book, rid) == "live"
     assert out[-1] == f"rule {rid} (reverse_dca): status -> live"
 
 
 @pytest.mark.parametrize(
-    ("product", "status"), [("BTC-USD", "paper"), ("BTC-USD", "candidate"), ("ETH-USD", "live")]
+    ("mode", "product", "status"),
+    [
+        ("paper", "BTC-USD", "live"),
+        ("paper", "BTC-USD", "candidate"),
+        ("paper", "ETH-USD", "paper"),
+        ("live", "BTC-USD", "paper"),
+        ("live", "BTC-USD", "candidate"),
+        ("live", "ETH-USD", "live"),
+    ],
 )
-def test_only_a_live_dca_on_the_same_product_is_concurrent(btc_book, product, status) -> None:
+def test_only_the_cycles_dca_on_the_same_product_is_concurrent(
+    btc_book, mode, product, status
+) -> None:
     rid = _paper_reverse(btc_book, days_in_paper=61)
     _review(btc_book, rid)
     btc_book.insert_rule(
         "dca", {"product_id": product, "cadence_days": 7, "budget_usd": "40"}, status=status
     )
-    outcome, _out, _err = _promote(btc_book, rid)
+    outcome, out, _err = _promote(btc_book, rid, mode=mode)
     assert outcome is not None and outcome.new_status == "live"
+    [gate] = [line for line in out if "sleeve_sell gate" in line]
+    assert gate.endswith(" dca on BTC-USD: no")
 
 
 def test_force_is_refused_for_a_sleeve_rule(btc_book) -> None:
@@ -864,8 +883,9 @@ def test_the_cli_flag_reaches_the_gate(tmp_path, valid_config_path) -> None:
     )
     file_repo._conn.commit()
     _review(file_repo, rid)
+    # The fixture config is a PAPER profile, so its cycle's dca is a `paper` one (R40).
     file_repo.insert_rule(
-        "dca", {"product_id": "BTC-USD", "cadence_days": 7, "budget_usd": "40"}, status="live"
+        "dca", {"product_id": "BTC-USD", "cadence_days": 7, "budget_usd": "40"}, status="paper"
     )
     args = ["--db", str(db), "--config", str(valid_config_path), "rules", "promote", str(rid)]
 
@@ -997,3 +1017,98 @@ def test_allow_concurrent_dca_at_candidate_has_no_effect_and_says_so(btc_book) -
     assert _status(btc_book, rid) == "paper"
     notice = [line for line in out if "--allow-concurrent-dca" in line and "no effect" in line]
     assert len(notice) == 1
+
+
+# -- a peeking rule is refused at ANY cache length and cadence alignment (#929, R44) -------------
+#
+# The series starts on UTC day `start`, so `start % cadence` moves the rule's cadence days to every
+# alignment relative to the cache's first bar, warmup and last bar; lengths past 200 bars are where
+# a strided sample of truncation ends could alias against a cadence and never land on it.
+
+_LENGTHS = [60, 81, 120, 121, 250, 401, 733]
+_STARTS = [0, 1, 13, 29]
+_CADENCES = [7, 30]
+
+
+class _CadencePeek(ReverseDca):
+    """Fires about bar t-1 whenever bar t-1 is a cadence day, priced off bar t's close: the
+    decision at t-1 exists only once t is visible -- lookahead at every cadence day."""
+
+    def reduce_signal(self, holding, candles_by_tf, costs):
+        days = candles_by_tf.get(Granularity.ONE_DAY, [])
+        if len(days) < 2 or (days[-2].ts // _DAY) % self.params["cadence_days"] != 0:
+            return None
+        return Reduction(
+            self.product_id, Decimal("0.001"), self.name, {}, days[-1].close, days[-2].ts
+        )
+
+
+def _rising_from(start: int, n: int) -> list[Candle]:
+    return [_sleeve_candle(start + i, str(100 + i)) for i in range(n)]
+
+
+@pytest.mark.parametrize("cadence", _CADENCES)
+@pytest.mark.parametrize("start", _STARTS)
+@pytest.mark.parametrize("n", _LENGTHS)
+def test_a_peeking_rule_is_refused_whatever_the_length_and_alignment(
+    repo, monkeypatch, n, start, cadence
+) -> None:
+    repo.upsert_candles("BTC-USD", Granularity.ONE_DAY, _rising_from(start, n))
+    monkeypatch.setitem(agent.RULE_REGISTRY, "reverse_dca", _CadencePeek)
+    rid = _sleeve_rule(repo, cadence_days=cadence)
+    outcome, _out, err = _promote(repo, rid)
+    assert outcome is None
+    assert _status(repo, rid) == "candidate"
+    # Wherever a cadence bar t-1 (with t cached) lies past warmup, the refusal is a DIVERGENCE,
+    # not merely "nothing compared".
+    peekable = any((start + i - 1) % cadence == 0 for i in range(bias.DEFAULT_WARMUP + 1, n))
+    assert any("fails the lookahead check" in line for line in err) is peekable
+
+
+@pytest.mark.parametrize("cadence", _CADENCES)
+@pytest.mark.parametrize("start", _STARTS)
+@pytest.mark.parametrize("n", _LENGTHS)
+def test_the_shipped_rule_compares_at_every_cadence_bar_whatever_the_length(
+    repo, n, start, cadence
+) -> None:
+    """The control: the shipped rule over the same caches is compared at EVERY cadence bar past
+    warmup -- no stride may alias past one -- and promotes whenever there is at least one."""
+    repo.upsert_candles("BTC-USD", Granularity.ONE_DAY, _rising_from(start, n))
+    rid = _sleeve_rule(repo, cadence_days=cadence, min_hold_days=0)
+    outcome, out, err = _promote(repo, rid)
+    cadence_bars = sum(1 for i in range(bias.DEFAULT_WARMUP, n) if (start + i) % cadence == 0)
+    [line] = [line for line in out if "sleeve_sell gate" in line]
+    assert f"({cadence_bars} compared)" in line
+    assert (outcome is not None and outcome.new_status == "paper") is (cadence_bars > 0)
+
+
+def test_days_a_rule_sat_disabled_never_count_toward_its_paper_days(btc_book) -> None:
+    """Plan R49: `rules enable` restores a disabled rule at `candidate`, and every step back into
+    `paper` (the sleeve gate's candidate -> paper transition) stamps `promoted_at` afresh -- so a
+    rule that sat in paper for 100 days, was disabled, and came back starts its 60 paper days
+    again from the day it re-entered paper. Its old proposals' review does not carry the days."""
+    import time
+
+    rid = _paper_reverse(btc_book, days_in_paper=100)
+    _review(btc_book, rid)
+    apply_rule_disable(btc_book, rid)
+    apply_rule_enable(btc_book, rid)
+    assert _status(btc_book, rid) == "candidate"
+
+    now = int(time.time())
+    out, err = _collect()
+    back = attempt_promotion(
+        btc_book, _config(), rid, now_ts=now, echo=out.append, echo_err=err.append
+    )
+    assert back.new_status == "paper"
+    row = {r["id"]: r for r in btc_book.get_rules()}[rid]
+    assert now - 5 <= int(row["promoted_at"]) <= now + 5
+
+    out, err = _collect()
+    with pytest.raises(RulesRefused):
+        attempt_promotion(
+            btc_book, _config(), rid, now_ts=now + 86_400, echo=out.append, echo_err=err.append
+        )
+    assert _status(btc_book, rid) == "paper"
+    [gate] = [line for line in out if "sleeve_sell gate" in line]
+    assert "days in paper 1 (need 60)" in gate

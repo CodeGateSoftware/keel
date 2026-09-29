@@ -924,8 +924,9 @@ def run_rule_lookahead(
     "--allow-concurrent-dca",
     is_flag=True,
     default=False,
-    help="A reverse_dca rule only: promote it paper -> live even though a live dca rule buys the "
-    "same product (a round trip at two fees, spec Q2). Refused on any other rule.",
+    help="A reverse_dca rule only: promote it paper -> live even though a dca rule this profile's "
+    "cycle runs (paper on a paper profile, live otherwise) buys the same product (a round trip "
+    "at two fees, spec Q2). Refused on any other rule.",
 )
 @click.pass_context
 @with_disclaimer
@@ -970,7 +971,8 @@ def rules_promote(
     A SLEEVE-SELL rule (`reverse_dca`) takes its own gate instead (spec §3.7): the lookahead
     check on its `reduce_signal`, then candidate -> paper on that alone, and paper -> live after
     60 days in paper with at least one reviewed paper proposal (`keel dca proposals review`).
-    A live `dca` on the same product refuses paper -> live unless `--allow-concurrent-dca` is
+    A `dca` on the same product that this profile's cycle runs (`paper` on a paper profile,
+    `live` otherwise, R40) refuses paper -> live unless `--allow-concurrent-dca` is
     passed. `--force` is refused for it. In this build a `live` sleeve-sell rule still only
     records proposals: nothing is placed.
     """
@@ -1104,6 +1106,7 @@ def attempt_promotion(
             repo,
             row,
             rule,
+            dca_status="paper" if config.auto_trade.mode == "paper" else "live",
             allow_concurrent_dca=allow_concurrent_dca,
             now_ts=int(time.time()) if now_ts is None else now_ts,
             sink=sink,
@@ -1312,7 +1315,8 @@ def _sleeve_lookahead(
     check walked ONE_DAY anchors (so `n_bars_checked > 0`) and compared NOTHING, and
     `verdict == "clean" and n_bars_checked > 0` read that as a pass.
 
-    **The fix: one harness call per TRUNCATION.** For every sampled end index `e` from
+    **The fix: one harness call per TRUNCATION.** For EVERY end index `e` (stride 1, never
+    sampled -- a stride can alias against a cadence and skip every firing day) from
     `bias_mod.DEFAULT_WARMUP` to `len(daily) - 1` (a day past warmup the rule could have been
     judged on), the ONE harness runs again on `daily[: e + 1]` alone -- a `sample_step` past
     that truncation's own length collapses `lookahead_analysis`'s own walk to just its warmup
@@ -1331,12 +1335,12 @@ def _sleeve_lookahead(
     """
     detect = _reduction_as_detect(rule)
     n = len(daily)
-    stride = max(1, -(-n // 200))
-    last_index = n - 1
-    ends = set(range(bias_mod.DEFAULT_WARMUP, n, stride))
-    if last_index >= bias_mod.DEFAULT_WARMUP:
-        ends.add(last_index)
-    ordered_ends = sorted(ends)
+    # EVERY end past warmup, never a stride: a cadence rule fires on one day in `cadence_days`,
+    # and a stride sharing a factor with it can alias past every one of them for good (stride 3
+    # never lands on a multiple of 30 from 50), leaving a peeking rule uncompared and the shipped
+    # one falsely refused. Each end costs a few `reduce_signal` calls on a slice.
+    stride = 1
+    ordered_ends = list(range(bias_mod.DEFAULT_WARMUP, n))
 
     # A sample_step past the FULL series' own length: inside each per-truncation call, the only
     # indices ever walked are that truncation's warmup bar, its own final bar, and (if within
@@ -1404,11 +1408,17 @@ def _reviewed_paper_proposals(repo: Repository, rule_id: int) -> int:
     )
 
 
-def _live_dca_on(repo: Repository, product_id: str) -> bool:
-    """Spec Q2 / §6 failure mode (a): a `live` `dca` rule buys `product_id`."""
+def _cycle_dca_on(repo: Repository, product_id: str, dca_status: str) -> bool:
+    """Spec Q2 / §6 failure mode (a): a `dca` rule at `dca_status` buys `product_id`.
+
+    `dca_status` is the status this profile's cycle RUNS (R40, the reading
+    `DistributionRow.dca_collision` and doctor's `sleeve.buy_and_sell_same_asset` share): `paper`
+    on a paper profile, `live` otherwise. A dca the cycle does not load buys nothing, so it makes
+    no round trip; a `paper` dca on a paper profile does, exactly as a `live` one does on a live
+    profile."""
     return any(
         r["kind"] == "dca" and (r["params"] or {}).get("product_id") == product_id
-        for r in repo.get_rules("live")
+        for r in repo.get_rules(dca_status)
     )
 
 
@@ -1417,6 +1427,7 @@ def _promote_sleeve_sell(
     row: dict[str, Any],
     rule: Rule,
     *,
+    dca_status: str,
     allow_concurrent_dca: bool,
     now_ts: int,
     sink: Callable[[str], None],
@@ -1428,7 +1439,7 @@ def _promote_sleeve_sell(
     `promotion.sleeve_sell_gate`, then the one-step transition -- or a `RulesRefused` naming
     every failing condition, with nothing written.
 
-    **The lookahead truncates at every sampled end of the product's cached ONE_DAY bars**
+    **The lookahead truncates at EVERY end of the product's cached ONE_DAY bars**
     (`_sleeve_lookahead`, issue #929/plan R44), past `bias.DEFAULT_WARMUP` rather than the
     rule's `lookback_days`: `reduce_signal` has no indicator warmup region -- its gates are a
     trailing max and comparisons on the bar itself -- so its early decisions are real decisions,
@@ -1437,13 +1448,14 @@ def _promote_sleeve_sell(
     been promoted on, so Axis A gets a comparison wherever the rule fires, not only at the one
     anchor the untruncated series happens to end on. **A check that compared nothing is not a
     pass** (#440's fail-closed rule, sharpened by #929): no cached daily bars, too few to reach
-    one anchor, or a rule that never fired at any sampled truncation (`n_compared == 0`) all
+    one anchor, or a rule that never fired at any truncation (`n_compared == 0`) all
     refuse, each named.
 
     **Concurrency (Q2) is read for `reverse_dca` only**: it is the kind whose monthly sale beside
-    a weekly buy the spec names (§6 failure mode a). **`--allow-concurrent-dca` is a paper ->
-    live condition only** (Q2); passed at any other step it has no effect, and this prints one
-    line saying so rather than silently accepting a flag that does nothing.
+    a weekly buy the spec names (§6 failure mode a). The dca that counts is one at `dca_status`,
+    the status this profile's cycle runs (R40, `_cycle_dca_on`). **`--allow-concurrent-dca` is a
+    paper -> live condition only** (Q2); passed at any other step it has no effect, and this
+    prints one line saying so rather than silently accepting a flag that does nothing.
     """
     rule_id = int(row["id"])
     kind = row["kind"]
@@ -1488,7 +1500,7 @@ def _promote_sleeve_sell(
     lookahead_clean = report.n_divergences == 0 and n_compared > 0
 
     reviewed = _reviewed_paper_proposals(repo, rule_id)
-    concurrent = kind == "reverse_dca" and _live_dca_on(repo, product_id)
+    concurrent = kind == "reverse_dca" and _cycle_dca_on(repo, product_id, dca_status)
     promoted_at = row.get("promoted_at")
     ok, reasons = promotion_mod.sleeve_sell_gate(
         status=row["status"],
@@ -1508,7 +1520,7 @@ def _promote_sleeve_sell(
         f"rule {rule_id} ({kind}): sleeve_sell gate -- lookahead {report.verdict} over "
         f"{report.n_bars_checked} daily bars ({n_compared} compared); days in paper {in_paper} "
         f"(need {promotion_mod.SLEEVE_SELL_MIN_PAPER_DAYS}); reviewed paper proposals {reviewed}; "
-        f"live dca on {product_id}: {'yes' if concurrent else 'no'}"
+        f"{dca_status} dca on {product_id}: {'yes' if concurrent else 'no'}"
     )
     if not ok:
         for reason in reasons:
@@ -1533,7 +1545,8 @@ def _promote_sleeve_sell(
     )
     if concurrent and allow_concurrent_dca:
         sink(
-            f"  --allow-concurrent-dca: a live dca buys {product_id} beside this rule's sales -- "
+            f"  --allow-concurrent-dca: a {dca_status} dca buys {product_id} beside this rule's "
+            "sales -- "
             "a round trip at two fees, promoted on the operator's record (spec Q2)"
         )
     if target == "live":
