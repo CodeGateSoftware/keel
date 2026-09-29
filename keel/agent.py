@@ -1196,10 +1196,18 @@ def _handle_reductions(
        never reads `position_rule:`).
     2. **One proposal per product per UTC day (R14).** A second run the same day -- the hourly
        retry after a non-zero exit -- writes nothing and logs `sleeve.already_proposed_today`.
-    3. **Each rule waits for its own bar.** A rule whose bar is not ready (`entry_bar_ready`, the
-       gate the entries use) is not asked this run: with R14 making the day's first proposal its
-       only one, asking on yesterday's bar would spend the day on a stale close. It does NOT
-       withhold anything else (R31).
+    3. **Each rule is skipped when its bar is not ready, and the day's proposal is LOST, not
+       carried forward (#917).** A rule whose bar is not ready (`entry_bar_ready`, the gate the
+       entries use) is not asked this run: with R14 making the day's first proposal its only
+       one, asking on yesterday's bar would spend the day on a stale close, and routing the skip
+       through `blocked_entries` (as the entries do) would withhold THIS cycle's DCA buy too --
+       neither is acceptable. There is no hourly retry to catch this up the way a blocked ENTRY
+       gets one: the LaunchAgent's hourly trigger only re-runs a cycle whose exit was non-zero,
+       which this skip does not cause, and this deployment trades once per UTC day regardless.
+       So the proposal that would have fired today is simply gone -- the same accepted cost as
+       R14's one-proposal-per-day cap -- and `agent.reduction_bar_not_ready` logs it at WARNING,
+       with the bar it was missing, so an operator can see what was lost. It does NOT withhold
+       anything else on this product or any other (R31).
     4. **A rule that raises costs that rule**, never the other kinds on this product.
     5. **Arbitration is a fixed order** (`sleeve.ARBITRATION_ORDER`); every loser is recorded
        `superseded`, naming the winner, and a superseded row does not reopen the day.
@@ -1229,12 +1237,21 @@ def _handle_reductions(
         gate = _entry_gate_granularity(rule, granularities)
         readiness = None if gate is None else freshness.entry_bar_ready(candles_by_tf, gate, now_ts)
         if readiness is not None and not readiness.ready:
+            # WARNING, not INFO (#917): unlike a blocked ENTRY, this proposal is not merely
+            # delayed to the hourly retry -- there isn't one. The LaunchAgent's hourly trigger
+            # only re-runs a cycle whose exit was non-zero (a blocked entry does that; this skip
+            # does not), and this deployment trades once per UTC day regardless, so a proposal
+            # skipped here is LOST for the day, not carried forward -- the same accepted cost as
+            # R14's one-proposal-per-day cap. `expected_ts`/`stored_ts` mirror the entry gate's
+            # own `agent.entry_bar_not_ready` log so an operator can see what bar was missing.
             log_event(
                 logger,
-                logging.INFO,
+                logging.WARNING,
                 "agent.reduction_bar_not_ready",
                 product=product_id,
                 rule=rule.name,
+                expected_ts=readiness.expected_ts,
+                stored_ts=readiness.stored_ts,
                 reason=readiness.reason,
             )
             continue
@@ -1313,7 +1330,16 @@ def _handle_reductions(
         )
         return [
             *results,
-            ReduceResult(product_id, winner.name, pid, "vetoed", [], 0, refusal),
+            ReduceResult(
+                product_id,
+                winner.name,
+                pid,
+                "vetoed",
+                [],
+                0,
+                refusal,
+                total_qty=min(winning.qty, holding.qty),
+            ),
         ]
     return [
         *results,
@@ -1944,6 +1970,14 @@ def run_once(
     their feeds never gate the entries and they never own an exit. Under the kill switch the
     cycle returns before any of it, so no reduction reads the venue either.
 
+    Two more things nothing about sleeve rules may cost the DCA buy on (P8 review, held
+    question): `_sleeve_rules` itself is called wrapped -- a malformed legacy `paper` row that
+    makes `repo.get_rules("paper")` raise costs an EMPTY sleeve-rule set for this cycle, never
+    the cycle. And the poll is split in two: entry-rule products are polled exactly as before,
+    in their own `market_feed.poll_once` call; sleeve-ONLY products (on no entry/exit rule) are
+    polled in a SECOND, wrapped call, because `poll_once` has no per-product isolation and a
+    live cycle's poll set now includes sleeve products a delisted-id 404 could take down.
+
     The venue session is read and RECORDED first, before any gate can return (FR-9) -- a
     session-bound venue's clock answer under its own namespaced keys, with the interval
     this deployment actually cycles at (`interval_sec`, which `loop` threads in; the config
@@ -2018,14 +2052,40 @@ def run_once(
             )
             if promotion.promotion_class_of(rule) != promotion.SLEEVE_SELL
         ]
-        sleeve_rules = _sleeve_rules(repo, config)
-        products = sorted(
-            {p for p in (getattr(r, "product_id", None) for r in rules) if p}
-            | {str(getattr(r, "product_id")) for r, _status in sleeve_rules}
-        )
+        # `_sleeve_rules` reads `repo.get_rules("paper")` even in a LIVE cycle (R16), and a
+        # malformed legacy `paper` row raising out of that read must not cost this cycle's DCA
+        # buy -- wrapped exactly like a bad row inside `_sleeve_rules` itself is, just one layer
+        # further out (P8 review, held question).
+        try:
+            sleeve_rules = _sleeve_rules(repo, config)
+        except Exception:  # noqa: BLE001 -- a broken rules read must not cost the cycle
+            log_exception(logger, "agent.sleeve_rules_failed")
+            sleeve_rules = []
+        entry_products = sorted({p for p in (getattr(r, "product_id", None) for r in rules) if p})
+        sleeve_products = {str(getattr(r, "product_id")) for r, _status in sleeve_rules}
+        # Sleeve-only products (not already polled for an entry/exit rule) are polled in a
+        # SEPARATE, wrapped call (P8 review, held question). `market_feed.poll_once` has no
+        # per-product isolation -- one product's failure (a venue 404 for a delisted id, say)
+        # raises out of the WHOLE call -- and a live cycle's poll set now includes sleeve-only
+        # products that were never part of that contract. Polling the entry-rule products first,
+        # exactly as before, keeps their poll un-endangered by a sleeve product's feed; a failure
+        # in the second call just leaves that product stale or lagging, which the existing
+        # freshness/readiness gates already handle. `polled` stays the sum of what was written
+        # (nothing from a call that raised before returning).
+        sleeve_only_products = sorted(sleeve_products - set(entry_products))
+        products = sorted(set(entry_products) | sleeve_products)
         granularities = list(config.market_data.granularities)
 
-        polled = market_feed.poll_once(broker, repo, products, granularities, now_ts=now_ts)
+        polled = market_feed.poll_once(broker, repo, entry_products, granularities, now_ts=now_ts)
+        if sleeve_only_products:
+            try:
+                polled += market_feed.poll_once(
+                    broker, repo, sleeve_only_products, granularities, now_ts=now_ts
+                )
+            except Exception:  # noqa: BLE001 -- a sleeve product's feed must not cost the cycle
+                log_exception(
+                    logger, "agent.sleeve_feed_poll_failed", products=sleeve_only_products
+                )
         log_event(
             logger,
             logging.INFO,

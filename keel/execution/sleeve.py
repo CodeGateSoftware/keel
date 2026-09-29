@@ -32,8 +32,12 @@ every sleeve-sell kind, the live cycle and the sim size and refuse by one defini
 - **R14, "one sleeve SELL per product per UTC day" is one `sell_proposals` row per product per
   UTC day, whatever its decision, `superseded` rows excluded** (`proposed_today`). The
   LaunchAgent retries hourly after a non-zero exit; a proposal per run would spam the operator.
-- **R15, a rule's `cooldown_days` is enforced here, from the rule's last non-superseded
-  proposal** (`last_proposal_ts`). A rule has no state; the proposals table is the state.
+- **R15, a rule's `cooldown_days` is enforced here, from the rule's last proposal that could
+  have BECOME a sale** -- decision `preview` or `placed` only (`last_proposal_ts`, #915). A rule
+  has no state; the proposals table is the state. `vetoed` (the cooldown's own refusal, or any
+  other sleeve cap), `declined` and `failed` rows are deliberately EXCLUDED: a rule that fires
+  every day writes a fresh `vetoed` row at `now_ts` each time it is refused, and reading those
+  would let a veto re-arm the very cooldown that produced it, so the cooldown would never expire.
 - **§3.6, arbitration is a fixed order** (`ARBITRATION_ORDER`), not configurable. The kinds that
   are NOT built (`band_rebalance`, `rotation`; spec §5, §8) are named so rail 10's vocabulary
   and the order are decided once.
@@ -279,11 +283,25 @@ def proposed_today(repo: Repository, product_id: str, now_ts: int) -> bool:
     )
 
 
+#: R15's cooldown reads only these decisions (#915): a proposal that could have BECOME a sale.
+_COOLDOWN_DECISIONS = frozenset({"preview", "placed"})
+
+
 def last_proposal_ts(repo: Repository, rule_id: int | None) -> int | None:
-    """R15: the `ts` of rule `rule_id`'s newest non-superseded proposal, or `None`."""
+    """R15: the `ts` of rule `rule_id`'s newest `preview` or `placed` proposal, or `None`
+    (#915).
+
+    Deliberately NOT every non-superseded row: `vetoed` (whether from the cooldown itself or
+    any other sleeve cap), `declined` and `failed` are refusals, not proposals a sale might
+    have followed from. A rule that fires every cycle writes a FRESH `vetoed` row at `now_ts`
+    each time it is refused, so counting those would let a veto re-arm its own cooldown --
+    the cooldown would never expire.
+    """
     if rule_id is None:
         return None
-    rows = [p for p in repo.get_sell_proposals(rule_id=rule_id) if p["decision"] != "superseded"]
+    rows = [
+        p for p in repo.get_sell_proposals(rule_id=rule_id) if p["decision"] in _COOLDOWN_DECISIONS
+    ]
     return int(rows[0]["ts"]) if rows else None
 
 
