@@ -441,9 +441,11 @@ def proposal_replay(
     that bar (it reads completed daily bars only), at `SellCosts(fee_pct, slippage_pct)`. The
     proposal is made the day after the bar (R43), so that is `now_ts` for the sleeve caps:
     `sleeve.sleeve_refusal` -- the same-day-DCA exclusion, from each of `dca_rules`' own `detect`
-    over the same prefix (as `agent._dca_fires_today` asks it), `min_hold_days` on the lots the
-    sale would consume (R12), and the rule's `cooldown_days` from its last replayed sale (R15).
-    A refused bar is a `ReplayVeto` and is not carried forward. A bar that passes sells
+    over the same prefix (as `agent._dca_fires_today` asks it -- **a `detect` that RAISES counts
+    as firing**, mirroring that function's own rule verbatim: "the refusal is the direction that
+    costs nothing"), `min_hold_days` on the lots the sale would consume (R12), and the rule's
+    `cooldown_days` from its last replayed sale (R15). A refused bar is a `ReplayVeto` and is not
+    carried forward. A bar that passes sells
     `min(reduction.qty, held)`, sliced by `sleeve.slice_qty` when `max_per_order_usd` is given
     (no venue increment: this asks no venue), and the replay books that first leg -- what a
     proposal row records -- with the whole sale's leg count beside it.
@@ -458,6 +460,16 @@ def proposal_replay(
     costs = SellCosts(fee_pct, slippage_pct, sleeve.FALLBACK_FEE_SOURCE)
     product_id = str(getattr(rule, "product_id", ""))
     params = getattr(rule, "params", {}) or {}
+
+    def _dca_fires(d: Rule, prefix: dict[Granularity, list[Candle]]) -> bool:
+        """`agent._dca_fires_today`'s own rule, mirrored: a `detect` that RAISES counts as
+        firing -- refusing the sale costs nothing, and a broken dca rule must not silently let
+        a round trip through."""
+        try:
+            return d.detect(prefix) is not None
+        except Exception:  # noqa: BLE001 -- fail toward vetoing the sale, never the replay
+            return True
+
     if not daily:
         return ProposalReplay(
             product_id, fee_pct, slippage_pct, 0, None, None, (), (), Decimal("0"), Decimal("0")
@@ -485,7 +497,7 @@ def proposal_replay(
             holding=holding,
             rule_kind=reduction.reason,
             rule_params=params,
-            dca_fires_today=any(d.detect(prefix) is not None for d in dca_rules),
+            dca_fires_today=any(_dca_fires(d, prefix) for d in dca_rules),
             last_rule_proposal_ts=last_sale_ts,
             now_ts=now_ts,
         )
