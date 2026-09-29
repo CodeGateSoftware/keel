@@ -139,18 +139,55 @@ def holding_of(repo: Repository, product_id: str, mark: Decimal | None = None) -
 
 
 def unverified_fill_orders(repo: Repository, product_id: str) -> list[int]:
-    """The ids of `product_id`'s filled LIVE BUYs the venue never sized (`filled_quantity` NULL).
+    """The ids of `product_id`'s unsized filled LIVE BUYs that could have booked a lot the
+    product STILL HOLDS open (#912).
 
-    A tranche booked from one of these carries the ORDERED size, which overstates the base the
-    venue delivered by about the fee (#900) until the backfill runs. `positions` does not name
-    its entry order, so this cannot say WHICH tranche; it says the product's holding rests on at
-    least one such row, which is what a proposal sized from that holding must disclose.
+    `filled_quantity` NULL is the starting filter: a tranche booked from such an order carries
+    the ORDERED size, which overstates the base the venue delivered by about the fee (#900)
+    until the backfill runs. `positions` does not name its entry order (no backfill exists yet,
+    #900 open), so this cannot say WHICH open lot a given order booked -- but it can rule out orders
+    that could not have booked ANY open lot, which the naive "every such BUY the product ever
+    had" reading does not: a tranche closes, its entry order does not stop being unsized, and on
+    a product that DCAs regularly (BTC) the list would never empty and would say nothing about
+    the CURRENT holding.
+
+    The match is `agent._open_tranche`'s own contract: when the venue gave no `filled_quantity`
+    the tranche is booked at the ORDERED `qty` (`executor.delivered_qty(order) or order["qty"]`),
+    at `opened_at=now_ts` of the cycle whose order carried `created_at=now_ts`
+    (`executor._order_row`). So an order matches an open lot when the lot's ORIGINAL size --
+    `qty + realized_qty`, a partial exit only ever lowers `qty` and raises `realized_qty`, and a
+    NULL `realized_qty` already reads as zero (`_position_row_to_dict`) -- equals the order's
+    `qty`, AND the lot opened no earlier than the order and no more than one day after it
+    (`0 <= lot.opened_at - order.created_at <= 86_400`): the deployment cycles once a UTC day, and
+    the LaunchAgent's hourly retries after a non-zero exit land inside that same day. Each open
+    lot is claimed by at most one order, oldest order first, so two orders of the same size do
+    not both name the one lot that could have absorbed only one of them.
     """
-    return [
-        int(order["id"])
-        for order in repo.get_orders(mode="live", product_id=product_id, status="filled")
-        if order["side"] == Side.BUY.value and order.get("filled_quantity") is None
+    lots = [
+        (int(p["id"]), p["qty"] + p["realized_qty"], int(p["opened_at"]))
+        for p in repo.get_open_positions(product_id)
     ]
+    candidates = sorted(
+        (
+            order
+            for order in repo.get_orders(mode="live", product_id=product_id, status="filled")
+            if order["side"] == Side.BUY.value and order.get("filled_quantity") is None
+        ),
+        key=lambda order: int(order["created_at"]),
+    )
+    claimed: set[int] = set()
+    matched: list[int] = []
+    for order in candidates:
+        order_qty = order["qty"]
+        created_at = int(order["created_at"])
+        for lot_id, original_size, opened_at in lots:
+            if lot_id in claimed:
+                continue
+            if original_size == order_qty and 0 <= opened_at - created_at <= _DAY:
+                claimed.add(lot_id)
+                matched.append(int(order["id"]))
+                break
+    return matched
 
 
 def sell_costs(repo: Repository, config: Any, product_id: str) -> SellCosts:

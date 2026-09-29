@@ -589,24 +589,28 @@ def test_the_sale_is_clamped_to_what_the_venue_holds(repo: Repository) -> None:
 def test_a_holding_resting_on_unsized_fills_is_disclosed_on_the_proposal(
     repo: Repository,
 ) -> None:
-    """#900: `positions` cannot name its entry order, so the proposal names the product's filled
-    BUYs the venue never sized -- the rows a pre-#905 tranche was booked from."""
+    """#900/#912: `positions` cannot name its entry order, so the proposal names the product's
+    filled BUYs the venue never sized that could have booked the CURRENTLY OPEN lot -- `_held`
+    (called by `_run` below) opens a 0.002 BTC lot at `opened_at=0`, so the fixture's unsized
+    order matches it on both size and clock. The sized fill is excluded on its own terms (it
+    carries a `filled_quantity`), never reaching the size/time match at all."""
     fill = dict(
         mode="live",
         product_id="BTC-USD",
         side="BUY",
         order_type="market",
-        qty=D("0.001"),
+        qty=D("0.002"),
         status="filled",
-        created_at=1,
-        updated_at=1,
+        created_at=0,
+        updated_at=0,
     )
     unsized = repo.insert_order(fill)
-    repo.insert_order(fill | {"filled_quantity": D("0.00099")})
+    sized = repo.insert_order(fill | {"filled_quantity": D("0.00199")})
 
     row = _proposal(repo, _run(repo, SpyBroker()))
 
     assert row["rails"]["unverified_fill_orders"] == [unsized]
+    assert sized not in row["rails"]["unverified_fill_orders"]
 
 
 def test_a_holding_on_sized_fills_discloses_none(repo: Repository) -> None:

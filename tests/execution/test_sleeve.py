@@ -368,9 +368,19 @@ def test_last_proposal_ts_is_the_rules_newest_non_superseded_row() -> None:
 
 def test_unverified_fill_orders_names_the_filled_buys_the_venue_never_sized() -> None:
     """P7 carried item c (#900): a tranche booked from a BUY with no `filled_quantity` carries
-    the ORDERED size, which overstates the base by about the fee until the backfill runs."""
+    the ORDERED size, which overstates the base by about the fee until the backfill runs. This
+    order is named only because its size and timing match a CURRENTLY OPEN lot (#912) -- so the
+    fixture opens one at the same size (`_order`'s `qty`) and the same clock (`created_at=0`)."""
     repo = _repo()
     unsized = repo.insert_order(_order(mode="live", side=Side.BUY.value, qty=D("0.001")))
+    repo.open_position(
+        product_id="BTC-USD",
+        rule_name="dca",
+        opened_at=0,
+        qty=D("0.001"),
+        entry_fill=D("100000"),
+        entry_fee=D("0"),
+    )
     repo.insert_order(
         _order(mode="live", side=Side.BUY.value, qty=D("0.001")) | {"filled_quantity": D("0.00099")}
     )
@@ -379,3 +389,69 @@ def test_unverified_fill_orders_names_the_filled_buys_the_venue_never_sized() ->
     repo.insert_order(_order(mode="paper", side=Side.BUY.value, qty=D("1")))
     assert sleeve.unverified_fill_orders(repo, "BTC-USD") == [unsized]
     assert sleeve.unverified_fill_orders(repo, "PAXG-USD") == []
+
+
+def test_unverified_fill_orders_excludes_a_closed_tranche_and_a_sized_open_one() -> None:
+    """#912: the old behaviour named every unsized filled BUY the product ever had, so once a
+    tranche closed it never left the list, and BTC's would never empty. An unsized BUY whose
+    tranche has since CLOSED could not have booked any lot that is still open -- and an open lot
+    booked from a SIZED fill needs no unsized order to explain it -- so both are excluded."""
+    repo = _repo()
+    repo.insert_order(_order(mode="live", side=Side.BUY.value, qty=D("0.001")))
+    closed = repo.open_position(
+        product_id="BTC-USD",
+        rule_name="dca",
+        opened_at=0,
+        qty=D("0.001"),
+        entry_fill=D("100000"),
+        entry_fee=D("0"),
+    )
+    repo.close_position(closed, closed_at=100)
+    repo.insert_order(
+        _order(mode="live", side=Side.BUY.value, qty=D("0.002"))
+        | {"filled_quantity": D("0.00199"), "created_at": 200}
+    )
+    repo.open_position(
+        product_id="BTC-USD",
+        rule_name="dca",
+        opened_at=200,
+        qty=D("0.00199"),
+        entry_fill=D("100000"),
+        entry_fee=D("0"),
+    )
+    assert sleeve.unverified_fill_orders(repo, "BTC-USD") == []
+
+
+def test_unverified_fill_orders_matches_an_unsized_buy_to_its_open_lot() -> None:
+    """#912: the size the tranche was booked at (`agent._open_tranche`, no `filled_quantity` ->
+    the ORDERED `qty`) and the cycle it was opened in (`opened_at`, within one day of the order's
+    `created_at`) are what tie an unsized order to the lot it could have booked."""
+    repo = _repo()
+    unsized = repo.insert_order(
+        _order(mode="live", side=Side.BUY.value, qty=D("0.001")) | {"created_at": 500}
+    )
+    repo.open_position(
+        product_id="BTC-USD",
+        rule_name="dca",
+        opened_at=500 + DAY,  # right at the one-day edge: still a match
+        qty=D("0.001"),
+        entry_fill=D("100000"),
+        entry_fee=D("0"),
+    )
+    assert sleeve.unverified_fill_orders(repo, "BTC-USD") == [unsized]
+
+
+def test_unverified_fill_orders_excludes_a_size_mismatch() -> None:
+    """#912: an unsized BUY whose ordered `qty` does not equal any open lot's original size (`qty
+    + realized_qty`) could not have booked one, so it is not named."""
+    repo = _repo()
+    repo.insert_order(_order(mode="live", side=Side.BUY.value, qty=D("0.001")))
+    repo.open_position(
+        product_id="BTC-USD",
+        rule_name="dca",
+        opened_at=0,
+        qty=D("0.002"),
+        entry_fill=D("100000"),
+        entry_fee=D("0"),
+    )
+    assert sleeve.unverified_fill_orders(repo, "BTC-USD") == []
