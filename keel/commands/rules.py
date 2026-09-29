@@ -397,6 +397,9 @@ def rules_backtest(
             )
             return
         if fee_sensitivity_pct is not None:
+            # An unknown id is refused as unknown first: the flag is judged only against a rule
+            # that exists.
+            _rule_row_or_refuse(repo, rule_id, echo_err)
             raise click.BadParameter(
                 "applies only to a sleeve-sell rule's proposal replay; rule "
                 f"{rule_id} is backtested at config.fees.taker_pct",

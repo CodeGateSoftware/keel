@@ -761,3 +761,14 @@ def test_a_fee_rate_that_leaves_no_room_for_slippage_is_refused_not_a_traceback(
     assert result.exit_code == 1
     assert isinstance(result.exception, SystemExit)
     assert "slippage" in result.output
+
+
+def test_an_unknown_id_with_the_sensitivity_flag_is_refused_as_unknown(
+    tmp_path, valid_config_path
+) -> None:
+    """Round-3 review: the id is refused before the flag is judged, so the operator reads the
+    real problem -- the rule does not exist -- not a flag complaint about a missing rule."""
+    _file_repo(tmp_path / "t.db")
+    result = _backtest(tmp_path, valid_config_path, 999, "--fee-sensitivity-pct", "0.01")
+    assert result.exit_code == 1
+    assert "Error: no rule with id 999" in result.output.splitlines()
