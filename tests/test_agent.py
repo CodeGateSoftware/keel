@@ -6101,6 +6101,39 @@ def test_a_repeat_check_that_raises_costs_neither_the_proposal_nor_its_alert(rep
     ]
 
 
+def test_a_stored_reverse_dca_row_proposes_its_distribution_through_the_real_builder(repo):
+    """P9 end to end, with NO `_build_rule` patch: a real `reverse_dca` row, stored as `rules
+    add` stores it (JSON-plain strings), is rebuilt by `_sleeve_rules`, asked on day 60 -- a
+    30-day cadence day -- and its $100 net target reaches `executor.reduce` as one preview,
+    sized gross at the fallback fee plus the product's slippage. Nothing is placed."""
+    repo.insert_rule(
+        "reverse_dca",
+        {"product_id": PRODUCT, "target_usd": "100", "min_price_floor": "60000"},
+        status="live",
+    )
+    _seed_open_position(repo, PRODUCT, Decimal("0.01"), Decimal("50000"), ts=0, rule_name="dca")
+    now = _history(repo, 61, price="100000")
+    broker = _HoldingBroker()
+
+    result = run_once(broker, repo, _config(), now_ts=now)
+
+    assert [(r.rule_kind, r.decision) for r in result.reduce_results] == [
+        ("reverse_dca", "preview")
+    ]
+    [row] = repo.get_sell_proposals()
+    costs = sleeve.sell_costs(repo, _config(), PRODUCT)
+    gross = Decimal("100") / (1 - costs.fee_pct - costs.slippage_pct)
+    assert (row["rule_kind"], row["rule_status"], row["decision"], row["legs"]) == (
+        "reverse_dca",
+        "live",
+        "preview",
+        1,
+    )
+    assert row["qty"] == gross / Decimal("100000")
+    assert row["trigger"]["cadence_day"] == 60 and row["trigger"]["target_usd"] == "100"
+    assert broker.place_calls == [] and broker.cancel_calls == []
+
+
 def test_a_young_tranche_is_refused_by_min_hold_days(repo, monkeypatch):
     """#916: no cycle test used to reach `_handle_reductions`' `min_hold_days` refusal -- the
     FIFO tranche the sale would consume is only 10 days old, younger than the default 30, so the
