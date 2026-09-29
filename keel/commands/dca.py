@@ -21,6 +21,12 @@ log is written by the cycle (P7/P8), never by a reader -- so there is no TTY bra
 `_common._open_repo_ro` refuses a missing `--db` path or a stale schema at a terminal exactly as it
 does off one, and a v21 database is the operator's `keel migrate`, not a side effect of reading.
 
+**`keel dca distribute --preview` opens read-only ALWAYS, too** (#857, P10): what each
+`reverse_dca` rule's next cadence day would do, on today's cached close. It writes nothing -- no
+proposal row, no state -- and builds no broker, so its fee is the `config.fees.taker_pct` fallback,
+labelled as such (plan R25, `dca plan`'s precedent). The per-cycle proposal is where the venue's
+previewed fee is recorded.
+
 Both openers are reached as `_common.<name>(ctx)` -- module attribute access, never a name bound
 by `from ... import ...` -- for the same reason `_common`'s own docstring gives for
 `_is_interactive`: it is the one patch point a test can rebind no matter which module the calling
@@ -47,6 +53,10 @@ from keel.commands.dca_plan import (
     parse_weight,
     render_dca_plan,
 )
+
+#: The last line `keel dca distribute --preview` prints: in this build no sleeve sale is placed,
+#: by any path (S1, S2).
+DISTRIBUTE_PREVIEW_FOOTER = "preview only: nothing is placed."
 
 #: The `[Y]/[E]/[N]` prompt's per-choice label, keyed by letter. One table, so the loop's prompt
 #: line and its retry message cannot disagree about what each letter means.
@@ -203,3 +213,27 @@ def proposals_show_cmd(ctx: click.Context, proposal_id: int) -> None:
         raise click.ClickException(f"no sell proposal #{proposal_id}")
     for line in sleeve_report.render_proposal(row):
         click.echo(line)
+
+
+@dca_group.command("distribute")
+@click.option(
+    "--preview",
+    is_flag=True,
+    default=False,
+    help="Show what each reverse_dca rule's next cadence day would do. Required: it is the only "
+    "mode in this build.",
+)
+@click.pass_context
+@with_disclaimer
+def distribute_cmd(ctx: click.Context, preview: bool) -> None:
+    """What each `reverse_dca` rule's next cadence day would sell, on today's cached close: the
+    gates, the size, the fee at the fallback rate, rail 2's legs, and whether a dca buy falls on
+    the same day. Writes nothing and asks no venue."""
+    if not preview:
+        raise click.UsageError("pass --preview: it is the only mode in this build.")
+    config = _load_cfg(ctx)
+    repo = _common._open_repo_ro(ctx)
+    rows = sleeve_report.distribution_rows(repo, config, now_ts=int(time.time()))
+    for line in sleeve_report.render_distribution(rows):
+        click.echo(line)
+    click.echo(DISTRIBUTE_PREVIEW_FOOTER)

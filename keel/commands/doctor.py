@@ -1986,6 +1986,101 @@ def _unprotected_fix(products: tuple[str, ...], pending_sells: dict[str, list[in
     return f"{reconcile_first} | {', '.join(plain)}: {plain_advice}"
 
 
+#: Spec §6 (b): a `reverse_dca` floor under this fraction of the latest close protects nothing.
+PRICE_FLOOR_STALE_FRACTION = Decimal("0.5")
+
+
+def sleeve_rule_findings(
+    rules: list[dict[str, Any]],
+    closes: dict[str, Decimal],
+    *,
+    managed_status: str = "live",
+) -> list[Finding]:
+    """Spec §6's failure modes (a) and (b) for `reverse_dca` (#857, plan P10). ALWAYS exactly two
+    findings, `OK` when there is nothing to report -- the shape `ledger_drift_findings` uses, so
+    a deployment with no sleeve rules still lists both names.
+
+    * `sleeve.buy_and_sell_same_asset` (a) -- a `dca` that BUYS a product beside a `reverse_dca`
+      that SELLS it. Legal, and a round trip: every unit bought and later distributed pays two
+      taker legs at the venue's fee. No rate is written into the text (spec §2.2, Q5: the live
+      rate is never a literal), and the pipeline's same-day-DCA refusal stops only the days the
+      two cadences share, not the round trip.
+    * `sleeve.price_floor_stale` (b) -- a `reverse_dca` whose `min_price_floor` is strictly under
+      `PRICE_FLOOR_STALE_FRACTION` of the product's latest daily close: the market has run so far
+      above the floor that it no longer keeps a distribution from selling low. A product with no
+      close in `closes` is not judged -- no verdict is invented without a price.
+
+    **Only rules the cycle actually runs count**, by `agent._sleeve_rules`' and `agent.run_once`'s
+    own statuses: on a live profile a `live` dca buys and a `paper` or `live` reverse_dca proposes
+    (R16); on a paper profile (`managed_status="paper"`) both are `paper`. A candidate or disabled
+    row buys and proposes nothing, so it names no risk.
+
+    WARN, never FAIL: both are the operator's choices, each with a cost doctor names.
+    """
+    sell_statuses = {"paper"} if managed_status == "paper" else {"paper", "live"}
+    buying = {
+        str((r.get("params") or {}).get("product_id"))
+        for r in rules
+        if r["kind"] == "dca" and r["status"] == managed_status
+    }
+    sellers = [r for r in rules if r["kind"] == "reverse_dca" and r["status"] in sell_statuses]
+
+    both = sorted({str((r.get("params") or {}).get("product_id")) for r in sellers} & buying)
+    if both:
+        same = Finding(
+            "sleeve.buy_and_sell_same_asset",
+            WARN,
+            f"{len(both)} product(s) bought by a dca rule and distributed by a reverse_dca rule",
+            f"{', '.join(both)}: each unit bought and later distributed is a round trip of two "
+            "taker legs at the venue's fee; the pipeline refuses only the days both cadences share",
+            "if the round trip is not intended, `keel rules disable <id>` the dca or the "
+            "reverse_dca rule on that product (`keel rules list` shows both)",
+            products=tuple(both),
+        )
+    else:
+        same = Finding(
+            "sleeve.buy_and_sell_same_asset",
+            OK,
+            "no product is both bought by dca and distributed by reverse_dca",
+            "-",
+            "-",
+        )
+
+    stale: list[tuple[str, Decimal, Decimal]] = []
+    for rule in sellers:
+        params = rule.get("params") or {}
+        product = str(params.get("product_id"))
+        close = closes.get(product)
+        if close is None or params.get("min_price_floor") is None:
+            continue
+        floor = Decimal(str(params["min_price_floor"]))
+        if floor < PRICE_FLOOR_STALE_FRACTION * close:
+            stale.append((product, floor, close))
+    if stale:
+        floor_finding = Finding(
+            "sleeve.price_floor_stale",
+            WARN,
+            f"{len(stale)} reverse_dca floor(s) under half the latest close",
+            "; ".join(
+                f"{product}: floor {floor} against a close of {close}"
+                for product, floor, close in stale
+            )
+            + " -- the floor no longer keeps a distribution from selling low",
+            "raise the floor: `keel rules disable <id>` the rule and `keel rules add` a "
+            "reverse_dca with a `min_price_floor` near today's market",
+            products=tuple(sorted({product for product, _, _ in stale})),
+        )
+    else:
+        floor_finding = Finding(
+            "sleeve.price_floor_stale",
+            OK,
+            "every judged reverse_dca floor is at least half the latest close",
+            "-",
+            "-",
+        )
+    return [same, floor_finding]
+
+
 def doctor_exit_code(findings: list[Finding]) -> int:
     """Faults fail the run; deliberate halts and warnings do not."""
     return 1 if any(f.status == FAIL for f in findings) else 0
@@ -2274,6 +2369,23 @@ def gather_findings(repo: Any, config: Any, log_lines: Iterable[str], now_ts: in
         },
         increments=increments,
         fee_base=open_tranche_fee_base(repo.get_open_positions(), repo.get_orders(mode="live")),
+    )
+
+    # #857 (plan P10): spec §6's reverse_dca failure modes (a) and (b), over EVERY rule row and
+    # each seller's latest cached daily close. No close, no verdict (`sleeve_rule_findings`).
+    all_rules = repo.get_rules()
+    sleeve_closes: dict[str, Decimal] = {}
+    for row in all_rules:
+        if row["kind"] != "reverse_dca":
+            continue
+        product = str((row.get("params") or {}).get("product_id"))
+        daily = repo.get_candles(product, Granularity.ONE_DAY)
+        if daily:
+            sleeve_closes[product] = daily[-1].close
+    findings += sleeve_rule_findings(
+        all_rules,
+        sleeve_closes,
+        managed_status="paper" if config.auto_trade.mode == "paper" else "live",
     )
 
     from keel.data import freshness as freshness_mod

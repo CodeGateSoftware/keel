@@ -5953,6 +5953,9 @@ def test_a_stale_sleeve_product_is_not_proposed(repo, monkeypatch):
 
     assert result.stale_products == [PRODUCT]
     assert result.reduce_results == [] and repo.get_sell_proposals() == []
+    # The notification's wording keys on this (`feed.stale_open_position`, P10 carried item): no
+    # entry/exit rule watches PRODUCT, only the sleeve rule does.
+    assert result.sleeve_only_products == [PRODUCT]
 
 
 def test_nothing_held_asks_no_rule_and_records_nothing(repo, monkeypatch):
