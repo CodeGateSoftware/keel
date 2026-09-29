@@ -958,7 +958,8 @@ def test_a_peeking_rule_is_refused_even_when_the_cache_ends_off_its_firing_day(
     outcome, _out, err = _promote(repo, rid)
     assert outcome is None
     assert _status(repo, rid) == "candidate"
-    assert any("lookahead" in line for line in err)
+    # A DIVERGENCE refusal, not the weaker "compared nothing" one.
+    assert sum(1 for line in err if "fails the lookahead check" in line) == 1
 
 
 def test_reverse_dca_over_a_non_cadence_ending_cache_still_compares_and_promotes(repo) -> None:
@@ -1112,3 +1113,18 @@ def test_days_a_rule_sat_disabled_never_count_toward_its_paper_days(btc_book) ->
     assert _status(btc_book, rid) == "paper"
     [gate] = [line for line in out if "sleeve_sell gate" in line]
     assert "days in paper 1 (need 60)" in gate
+
+
+def test_a_decision_claiming_a_bar_inside_warmup_is_not_counted_as_compared(repo, monkeypatch):
+    """#932: at 51 bars the only truncation is e=50, where the peeking rule claims bar 49 --
+    below `DEFAULT_WARMUP`, a bar the harness never walks, so nothing is compared there. That
+    is an un-run check: refused, and the summary says 0 compared."""
+    repo.upsert_candles("BTC-USD", Granularity.ONE_DAY, _rising_from(0, bias.DEFAULT_WARMUP + 1))
+    monkeypatch.setitem(agent.RULE_REGISTRY, "reverse_dca", _CadencePeek)
+    rid = _sleeve_rule(repo, cadence_days=7)
+    outcome, out, err = _promote(repo, rid)
+    assert outcome is None
+    assert _status(repo, rid) == "candidate"
+    [gate] = [line for line in out if "sleeve_sell gate" in line]
+    assert "(0 compared)" in gate
+    assert sum(1 for line in err if "compared nothing" in line) == 1

@@ -1321,9 +1321,10 @@ def _sleeve_lookahead(
     judged on), the ONE harness runs again on `daily[: e + 1]` alone -- a `sample_step` past
     that truncation's own length collapses `lookahead_analysis`'s own walk to just its warmup
     bar, its final bar and its full run's claimed anchor, exactly as a single run over that
-    truncated history would. Each truncation whose full run FIRES is one real comparison
-    (`n_compared`); a truncation whose full run does not fire has nothing to diff there, same as
-    the module's own honesty about a rule that never fires.
+    truncated history would. Each truncation whose full run FIRES on a bar past warmup -- one
+    the harness actually walks (#932) -- is one real comparison (`n_compared`); a truncation
+    whose full run does not fire has nothing to diff there, same as the module's own honesty
+    about a rule that never fires.
 
     Divergences across every truncation are deduplicated on `(bar_ts, field, prefix_value,
     full_value)` -- the same bar firing at more than one truncation must not double-count -- with
@@ -1355,8 +1356,14 @@ def _sleeve_lookahead(
 
     for e in ordered_ends:
         candles_by_tf = {Granularity.ONE_DAY: daily[: e + 1]}
-        if detect(candles_by_tf) is not None:
-            n_compared += 1
+        # A comparison happens only where the harness walks the claimed bar: its index must be
+        # past warmup (#932). A decision claiming a warmup bar, or a bar outside this slice, is
+        # never diffed, so it is not counted.
+        claim = detect(candles_by_tf)
+        if claim is not None:
+            claimed = next((i for i, c in enumerate(daily[: e + 1]) if c.ts == claim.ts), None)
+            if claimed is not None and claimed >= bias_mod.DEFAULT_WARMUP:
+                n_compared += 1
         sub = bias_mod.lookahead_analysis(
             detect,
             candles_by_tf,
