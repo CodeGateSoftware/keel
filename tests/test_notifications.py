@@ -15,6 +15,7 @@ raises and never trades -- notify-only, per #444's scope.
 
 from __future__ import annotations
 
+import dataclasses
 import json
 from decimal import Decimal
 
@@ -655,6 +656,15 @@ def test_one_event_per_notifying_proposal_in_the_cycle():
         )
     )
     assert [e.fields["proposal_id"] for e in events if e.key == "sleeve.proposal"] == [6, 7]
+
+
+def test_a_repeated_refusal_is_recorded_but_does_not_notify_again():
+    """P9's carried item: a cooldown vetoing daily wrote 29 alerts in a row. A result that
+    repeats its product's previous refusal (`repeats_previous`, set by the cycle from the
+    proposals table) is silent; the first veto and every transition still notify."""
+    repeated = dataclasses.replace(_proposal("vetoed", proposal_id=8), repeats_previous=True)
+    events = _state(sleeve=(_proposal("vetoed", proposal_id=7), repeated))
+    assert [e.fields["proposal_id"] for e in events if e.key == "sleeve.proposal"] == [7]
 
 
 def test_a_sliced_proposal_names_the_whole_sale_and_its_legs():

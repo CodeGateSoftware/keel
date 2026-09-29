@@ -33,11 +33,12 @@ from keel.agent import RULE_REGISTRY, build_rule_from_params
 from keel.strategy.rules.base import ParamSpec, Rule
 from keel.strategy.rules.dca import Dca
 from keel.strategy.rules.turtle_breakout import TurtleBreakout
+from tests.strategy.rule_conformance import minimal_params
 
 
 def _space(kind: str) -> tuple[ParamSpec, ...]:
     """The declaration read the way every consumer reads it: off a constructed rule."""
-    return build_rule_from_params(kind, {"product_id": "BTC-USD"}).param_space()
+    return build_rule_from_params(kind, minimal_params(kind)).param_space()
 
 
 # -- 1. the declarations are exact, and they are the ones tuning pinned ---------------------------
@@ -133,7 +134,7 @@ def test_every_declared_dimension_is_persisted_by_describe(kind: str) -> None:
     """A declared dimension must also be a parameter the row PERSISTS: a space over a knob
     that `describe()["params"]` drops (pullback's non-persisted `granularity`) would count
     cells no stored rule could ever carry."""
-    rule = build_rule_from_params(kind, {"product_id": "BTC-USD"})
+    rule = build_rule_from_params(kind, minimal_params(kind))
     persisted = set(rule.describe()["params"])
     for spec in rule.param_space():
         assert spec.kwarg in persisted, f"{kind}.{spec.kwarg}: not persisted"

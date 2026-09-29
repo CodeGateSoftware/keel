@@ -1795,12 +1795,18 @@ def position_watch_findings(
       always False -- so membership has to agree with what can actually close the tranche: kind
       as well as product. A DCA tranche whose rule was demoted is unmanaged too: unmanaged
       inventory is unmanaged with or without a stop. Only ENTRY/EXIT rule kinds count: a
-      `sleeve_sell` rule proposes and cannot exit, so it manages nothing (plan Review Focus 5; P9
-      adds the exclusion and its test). Its fix line names `keel positions close` only when
-      `managed_status != "paper"` (#902): `declared_close_target` refuses a declared close on
-      EVERY paper profile outright, so pointing a paper operator at that command sends them to a
-      write that can never succeed there -- the only real way out on paper is re-promoting the
-      rule.
+      `sleeve_sell` rule proposes and cannot exit, so it manages nothing (plan Review Focus 5).
+      The (product, kind) key IS that exclusion, with no filter of its own: a tranche's
+      `rule_name` is the kind of the entry rule that opened it, a sleeve-sell kind never opens
+      one (it is loaded apart from the entry path, R31), so a live `reverse_dca` row on PAXG
+      keys `(PAXG-USD, reverse_dca)` and can never match the `(PAXG-USD, turtle_breakout)`
+      tranche. `all_rules` stays the FULL row set on purpose (#885): filtering it by status is
+      what #880/#881 had to undo, and a class filter would exclude nothing the key does not.
+      Pinned end to end by `test_a_sleeve_sell_rule_does_not_count_as_managing_a_position`.
+      Its fix line names `keel positions close` only when `managed_status != "paper"` (#902):
+      `declared_close_target` refuses a declared close on EVERY paper profile outright, so
+      pointing a paper operator at that command sends them to a write that can never succeed
+      there -- the only real way out on paper is re-promoting the rule.
     * `position.unprotected` -- an open tranche with a recorded `initial_stop > 0`, no resting
       bracket (`reconcile._has_resting_bracket`, passed in as `resting`), and no retry record.
       The third clause makes it the complement of the reconcile sweep, not a duplicate. DCA

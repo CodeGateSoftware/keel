@@ -2,9 +2,14 @@
 
 from __future__ import annotations
 
+import dataclasses
 from decimal import Decimal
 
-from keel.commands.doctor import OK, WARN, position_watch_findings
+import pytest
+
+from keel.commands.doctor import OK, WARN, gather_findings, position_watch_findings
+from keel.config import load_config
+from tests.commands.test_doctor import _seeded_repo
 
 #: PAXG tranche 3 exactly as #811 printed it from the live database.
 PAXG_TRANCHE_3 = {
@@ -324,3 +329,53 @@ def test_a_single_kind_of_advice_keeps_its_one_part_fix() -> None:
     assert none_pending["position.unprotected"].fix == (
         "doctor cannot re-place a bracket; place one at the venue or close the tranche"
     )
+
+
+# -- Review Focus 5 (plan P9 Task 9.3, #888): a sleeve-sell rule manages nothing ----------------
+
+
+@pytest.mark.parametrize("mode", ["live", "paper"])
+def test_a_sleeve_sell_rule_does_not_count_as_managing_a_position(
+    tmp_path, valid_config_path, mode
+) -> None:
+    """A `reverse_dca` on PAXG at the profile's MANAGED status can only PROPOSE; #811's
+    `position.unmanaged` must still fire on the turtle tranche whose exit rule was demoted.
+
+    Not vacuous under either profile (#884, #888): the config's mode is set explicitly and the
+    sleeve rule carries the status that mode manages at (`live` on a live profile, `paper` on a
+    paper one), so it WOULD be eligible if eligibility were decided by product and status alone.
+    The positive control on the same repo proves the fixture can produce `OK`: a turtle rule at
+    that same status does manage the tranche. Through `gather_findings` end to end, on the full
+    `repo.get_rules()` row set -- the #880/#881 wiring, untouched -- so the demoted turtle row is
+    still there for the WARN to name its status.
+    """
+    base = load_config(valid_config_path)
+    config = dataclasses.replace(base, auto_trade=dataclasses.replace(base.auto_trade, mode=mode))
+    repo = _seeded_repo(tmp_path / "keel.db")
+    repo.open_position(
+        product_id="PAXG-USD",
+        rule_name="turtle_breakout",
+        opened_at=1,
+        qty=Decimal("0.0132"),
+        entry_fill=Decimal("4673.23"),
+        entry_fee=Decimal("0.73"),
+    )
+    repo.insert_rule("turtle_breakout", {"product_id": "PAXG-USD"}, status="disabled")
+    repo.insert_rule(
+        "reverse_dca",
+        {"product_id": "PAXG-USD", "target_usd": "10", "min_price_floor": "1"},
+        status=mode,
+    )
+
+    found = {f.name: f for f in gather_findings(repo, config, [], now_ts=10)}
+    unmanaged = found["position.unmanaged"]
+    assert unmanaged.status == WARN
+    assert unmanaged.products == ("PAXG-USD",)
+    # Exactly the one tranche, naming the demoted turtle row's status rather than "no rule" --
+    # the #880 half that #885 protects.
+    [tranche] = unmanaged.detail.split(" -- ")[0].split("; ")
+    assert tranche == "PAXG-USD tranche 1 (turtle_breakout, disabled, qty 0.0132)"
+
+    repo.insert_rule("turtle_breakout", {"product_id": "PAXG-USD"}, status=mode)
+    control = {f.name: f for f in gather_findings(repo, config, [], now_ts=10)}
+    assert control["position.unmanaged"].status == OK

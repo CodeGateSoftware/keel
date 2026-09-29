@@ -2988,6 +2988,11 @@ class ReduceResult:
     -- of which the row's `qty` is only the first leg (also recorded as the row's
     `rails.total_qty`). Without it a sliced proposal reads "sell one leg, N legs" and nowhere says
     how much the sale is. `None` when no sale was sized at all (`nothing_held`, `superseded`).
+
+    `repeats_previous` is set by the cycle (`agent._handle_reductions`), never here: `True` when
+    this row is a refusal that repeats its product's previous one
+    (`sleeve.repeats_previous_refusal`). The row is recorded either way; `sleeve.proposal` is
+    sent only when it is `False`, so a veto repeated daily is one alert, not one per day.
     """
 
     product_id: str
@@ -2998,6 +3003,7 @@ class ReduceResult:
     legs: int
     reason: str
     total_qty: Decimal | None = None
+    repeats_previous: bool = False
 
 
 def reduce(

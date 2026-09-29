@@ -305,6 +305,64 @@ def last_proposal_ts(repo: Repository, rule_id: int | None) -> int | None:
     return int(rows[0]["ts"]) if rows else None
 
 
+def _refusal_reason(proposal: Mapping[str, Any]) -> tuple[Any, ...]:
+    """What a proposal was refused FOR, as a comparable key: its kind, its sleeve cap, and the
+    NAMES of the rails that vetoed it -- each violation's text up to its first colon, the
+    `name: detail` convention every rail in `guards.py` writes. The detail carries live numbers
+    (a feed's age), so comparing whole strings would call a stale feed two days running news."""
+    rails = proposal.get("rails") or {}
+    return (
+        proposal.get("rule_kind"),
+        rails.get("sleeve"),
+        tuple(sorted({str(v).split(":", 1)[0].strip() for v in rails.get("violations") or []})),
+    )
+
+
+def repeats_previous_refusal(repo: Repository, product_id: str, proposal_id: int | None) -> bool:
+    """Whether proposal `proposal_id` is a REFUSAL that repeats its product's previous proposal:
+    both `vetoed`, on the IMMEDIATELY PRECEDING UTC day, by the same kind, for the same reason
+    (`_refusal_reason`). The P9 ruling on P8's `sleeve.proposal`: a 30-day cooldown vetoing daily
+    sent 29 alerts in a row.
+
+    The row is still recorded every day -- it is the audit trail, and R14/R15 read it -- and
+    this answers only whether it is NEWS. "Previous" is the product's newest non-`superseded`
+    proposal before this one (`get_sell_proposals`' own newest-first order), whatever its rule,
+    so the first veto after a preview, a change of reason, and the preview after a run of vetoes
+    are all transitions and all notify. A `preview` is never a repeat: each is a distinct sale
+    the operator acts on by its own id.
+
+    **The day bound is load-bearing, not cosmetic (#919).** `reverse_dca` writes a proposal row
+    only on its own cadence days, so an identical monthly veto on day 60 and day 90 are each the
+    product's newest-and-only earlier row at the time -- with no bound on "previous" the second
+    would read as a repeat of an alert sent a MONTH ago, silencing exactly the lost month spec
+    §6's failure mode (d) requires an alert to explain. Bounding "previous" to the immediately
+    preceding UTC day (`current.ts // 86400 - previous.ts // 86400 == 1`) means a repeat can only
+    ever suppress an alert that fired YESTERDAY, so a cadence rule's every cadence-day veto still
+    notifies, while a daily-firing rule's 29 identical alerts still collapse to one.
+
+    **No state beyond the proposals table.** The notification layer still writes exactly one key
+    (R19): the table this reads is the one `executor.reduce` and `_handle_reductions` already
+    write, so remembering what was said costs nothing new.
+
+    Fails OPEN: an id the product does not have reads as news (`False`), never as silence.
+    """
+    if proposal_id is None:
+        return False
+    rows = [
+        p for p in repo.get_sell_proposals(product_id=product_id) if p["decision"] != "superseded"
+    ]
+    position = next((i for i, p in enumerate(rows) if p["id"] == proposal_id), None)
+    if position is None or position + 1 >= len(rows):
+        return False
+    current, previous = rows[position], rows[position + 1]
+    return (
+        current["decision"] == "vetoed"
+        and previous["decision"] == "vetoed"
+        and int(current["ts"]) // _DAY - int(previous["ts"]) // _DAY == 1
+        and _refusal_reason(current) == _refusal_reason(previous)
+    )
+
+
 def sleeve_refusal(
     *,
     reduction: Reduction,

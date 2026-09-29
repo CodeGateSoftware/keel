@@ -47,7 +47,7 @@ from decimal import Decimal
 from types import ModuleType
 from typing import Protocol
 
-from keel.agent import RULE_REGISTRY, build_rule_from_params
+from keel.agent import build_rule_from_params, seedable_kinds
 from keel.research.cscv import pbo as cscv_pbo
 from keel.strategy.backtest import SLIPPAGE_FLOOR_PCT, TAKER_FEE_PCT, backtest
 from keel.strategy.rules.base import ParamSpec
@@ -117,9 +117,14 @@ def _declared_space(kind: str) -> tuple[ParamSpec, ...]:
 #: `Rule.param_space()` declaration at import, so this dict cannot disagree with the rule --
 #: a bound moves where the rule declares it and nowhere else. The literal this used to be
 #: is gone on purpose; `tests/research/test_tuning.py` pins the equivalence.
+#:
+#: Over the SEEDABLE kinds (`agent.seedable_kinds`, plan R20), not the whole registry: a
+#: sleeve-sell kind (`reverse_dca`) is a spend plan with nothing to sweep, and its required
+#: params mean it cannot be defaults-constructed from `product_id` alone -- at import time here,
+#: that would be a `TypeError` in every module that imports this one.
 SEARCH_SPACES: dict[str, dict[str, tuple]] = {
     kind: space
-    for kind in RULE_REGISTRY
+    for kind in seedable_kinds()
     if (space := {spec.name: spec.bounds for spec in _declared_space(kind)})
 }
 

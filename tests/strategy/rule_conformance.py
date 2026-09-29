@@ -53,12 +53,28 @@ from __future__ import annotations
 import copy
 import inspect
 import json
+from decimal import Decimal
 from typing import Any
 
 from keel import agent
 from keel.strategy import engine, promotion
+from keel.strategy.reduction import Holding, Reduction, SellCosts
 from keel.strategy.rules.base import ParamSpec, Rule, Setup
 from keel.types import Candle, Granularity
+
+#: The params a registered kind cannot be constructed without, beyond `product_id` -- as JSON
+#: plain strings, the `rules.params` shape. Registry-wide tests that used to build every kind
+#: from `{"product_id": ...}` alone read this, so a kind with required params (`reverse_dca`,
+#: plan R20) is still COVERED by them rather than excluded. `tests/strategy/test_rule_contract.py`
+#: pins it against every constructor's own required parameters, so it cannot drift.
+REQUIRED_PARAMS: dict[str, dict[str, str]] = {
+    "reverse_dca": {"target_usd": "100", "min_price_floor": "60000"},
+}
+
+
+def minimal_params(kind: str, product_id: str = "BTC-USD") -> dict[str, Any]:
+    """The smallest JSON-plain params `agent.build_rule_from_params(kind, ...)` accepts."""
+    return {"product_id": product_id, **REQUIRED_PARAMS.get(kind, {})}
 
 
 class RuleConformanceTests:
@@ -252,4 +268,99 @@ class RuleConformanceTests:
         )
 
 
-__all__ = ["RuleConformanceTests"]
+class ReductionConformanceTests:
+    """The contract a sleeve-sell rule is held to (#857, plan P9 Task 9.2).
+
+    `detect()` never fires for these rules, so `RuleConformanceTests` above would check nothing:
+    every one of its assertions reads a `Setup`. This mixin's firing fixture is a `(holding,
+    candles)` pair `reduce_signal` actually fires on, and `test_the_firing_fixture_actually_fires`
+    pins it -- the same anti-tautology discipline, one hook wider. Subclass it and supply
+    `rule()`, `holding()` and `firing_candles()`.
+    """
+
+    COSTS = SellCosts(Decimal("0.012"), Decimal("0.0005"), "fallback:config.fees.taker_pct")
+
+    def rule(self) -> Rule:
+        raise NotImplementedError("conformance subclasses must supply a rule() factory")
+
+    def holding(self) -> Holding:
+        raise NotImplementedError("conformance subclasses must supply a holding() fixture")
+
+    def firing_candles(self) -> dict[Granularity, list[Candle]]:
+        raise NotImplementedError(
+            "conformance subclasses must supply a firing_candles() fixture the rule reduces on"
+        )
+
+    def _fired(self) -> Reduction:
+        red = self.rule().reduce_signal(
+            self.holding(), copy.deepcopy(self.firing_candles()), self.COSTS
+        )
+        assert red is not None, "the firing fixture must fire, or every test below is vacuous"
+        return red
+
+    def test_the_firing_fixture_actually_fires(self) -> None:
+        self._fired()
+
+    def test_reduce_signal_is_deterministic_across_repeated_calls(self) -> None:
+        """The SAME instance, three calls, identical inputs -> one `Reduction` (sampled, not
+        proven -- see the module docstring)."""
+        rule = self.rule()
+        first = rule.reduce_signal(self.holding(), copy.deepcopy(self.firing_candles()), self.COSTS)
+        assert first is not None, "firing_candles() did not fire on the first call"
+        for _ in range(2):
+            again = rule.reduce_signal(
+                self.holding(), copy.deepcopy(self.firing_candles()), self.COSTS
+            )
+            assert again == first
+
+    def test_reduce_signal_mutates_neither_candles_nor_holding(self) -> None:
+        candles, holding = self.firing_candles(), self.holding()
+        snapshot = (copy.deepcopy(candles), copy.deepcopy(holding))
+        assert self.rule().reduce_signal(holding, candles, self.COSTS) is not None
+        assert (candles, holding) == snapshot
+
+    def test_never_more_than_is_held(self) -> None:
+        red = self._fired()
+        assert 0 < red.qty <= self.holding().qty
+        assert red.product_id == self.holding().product_id
+
+    def test_it_never_enters_and_never_exits(self) -> None:
+        rule = self.rule()
+        assert rule.detect(self.firing_candles()) is None
+        assert rule.exit_signal(None, self.firing_candles()) is False  # type: ignore[arg-type]
+
+    def test_reason_is_the_rule_kind_rail_10_reads(self) -> None:
+        rule = self.rule()
+        assert self._fired().reason == rule.name
+        assert rule.name in agent.RULE_REGISTRY
+
+    def test_describe_round_trips_through_build_rule_from_params(self) -> None:
+        """The cycle rebuilds a sleeve rule from `rules.params` through exactly this hop
+        (`agent._sleeve_rules` -> `_build_rule`). Types as well as values, for the reason
+        `RuleConformanceTests`' own round-trip test gives: `Decimal("2") == 2.0`."""
+        rule = self.rule()
+        shipped = rule.describe()["params"]
+        stored = json.loads(json.dumps(shipped, default=str))
+        rebuilt = agent.build_rule_from_params(rule.name, stored)
+        rebuilt_params = rebuilt.describe()["params"]
+        assert rebuilt_params == shipped
+        for name, value in shipped.items():
+            assert type(rebuilt_params[name]) is type(value), name
+        assert (
+            rebuilt.reduce_signal(self.holding(), self.firing_candles(), self.COSTS)
+            == self._fired()
+        )
+
+    def test_it_is_a_sleeve_sell_rule(self) -> None:
+        rule = self.rule()
+        assert rule.promotion_class == promotion.SLEEVE_SELL
+        assert rule.promotion_class in promotion.RECOGNISED_CLASSES
+        assert rule.accumulates is True
+
+
+__all__ = [
+    "REQUIRED_PARAMS",
+    "ReductionConformanceTests",
+    "RuleConformanceTests",
+    "minimal_params",
+]

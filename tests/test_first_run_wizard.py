@@ -538,3 +538,19 @@ def test_open_repo_calls_migrate_unconditionally() -> None:
         "_open_repo's migrate(conn) call now sits inside an `if` -- a repository opened outside "
         "that branch will never be migrated, and an upgrade stops self-healing"
     )
+
+
+def test_the_wizard_seeds_every_seedable_kind_and_no_sleeve_sell_kind(tmp_path: Path) -> None:
+    """R20: the first-run library is `agent.seedable_kinds()` x the allowlist -- a sleeve-sell
+    kind (`reverse_dca`) is never seeded with invented defaults."""
+    from keel import agent
+
+    config_path, db_path = _fresh_config_and_db(tmp_path)
+    assert seed_rule_library(config_path, db_path, {}).changed is True
+    conn = connect(str(db_path))
+    try:
+        kinds = {row["kind"] for row in Repository(conn).get_rules()}
+    finally:
+        conn.close()
+    assert kinds == set(agent.seedable_kinds())
+    assert "reverse_dca" in agent.RULE_REGISTRY and "reverse_dca" not in kinds

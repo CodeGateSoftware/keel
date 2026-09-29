@@ -94,6 +94,7 @@ from keel.strategy.rules.base import Action, Rule, Setup, Signal, completed_days
 from keel.strategy.rules.cusum_event import CusumEvent
 from keel.strategy.rules.dca import Dca
 from keel.strategy.rules.pullback_continuation import PullbackContinuation
+from keel.strategy.rules.reverse_dca import ReverseDca
 from keel.strategy.rules.rsi_meanrev import RsiMeanReversion
 from keel.strategy.rules.triple_barrier import TripleBarrier
 from keel.strategy.rules.turtle_breakout import TurtleBreakout
@@ -144,7 +145,26 @@ RULE_REGISTRY: dict[str, type[Rule]] = {
     # any fee is charged, so a better exit has no gross edge to harvest. It ships to measure
     # how much a better exit moves that, not to rescue it.
     "triple_barrier": TripleBarrier,
+    # #857, spec §6. The first SELL-side kind: a scheduled cash distribution, preview-only (S2 --
+    # `execution` is `Literal["preview"]`). Registered so `_build_rule` reconstructs a stored row
+    # and `keel rules add --kind reverse_dca` can create one; NOT seedable (plan R20,
+    # `seedable_kinds` below), because its `target_usd`/`min_price_floor` are required and a
+    # seeded seller with invented defaults is what no one should get by accident.
+    "reverse_dca": ReverseDca,
 }
+
+
+def seedable_kinds() -> list[str]:
+    """The registry kinds `rules seed` and the first-run wizard create, in registry order: every
+    kind whose `promotion_class` is not `sleeve_sell` (plan R20).
+
+    `seed_rules_into` builds each kind from `{"product_id": p}` alone. A sleeve-sell kind has
+    required params (`reverse_dca`: `target_usd`, `min_price_floor`), so it could not be seeded
+    at all without inventing them -- and an invented distribution size is exactly the seller no
+    one should acquire by clicking through setup. `keel rules add` is how one is created.
+    """
+    return [kind for kind in RULE_REGISTRY if not _is_sleeve_kind(kind)]
+
 
 # The per-kind coercion tables that used to live here -- `_DECIMAL_PARAMS`, `_GRANULARITY_PARAMS`
 # and a hardcoded `if kind == "pullback_continuation"` tuple branch inside the function below --
@@ -1216,6 +1236,12 @@ def _handle_reductions(
        refusal is recorded `vetoed` with `rails.sleeve`, so a skipped distribution says why and
        is not carried forward (Review Focus 1).
     7. `executor.reduce`, with `offline=True` and no broker on a paper cycle (R18).
+    8. **A repeated refusal is recorded, not re-announced** (`_flag_repeat`, P9): the winner's
+       result carries `repeats_previous` when its row is the same refusal as the product's
+       previous proposal MADE ON THE IMMEDIATELY PRECEDING UTC DAY (#919 -- a cadence rule like
+       `reverse_dca` writes a row only on its own cadence days, so an unbounded "previous" would
+       read a month-old identical veto as a repeat and silence the lost month), and
+       `sleeve.proposal` skips it -- a 30-day cooldown is one alert at its first veto, not 29.
 
     The caller wraps this per product: a database error here costs this product's proposal,
     never the cycle and never another product.
@@ -1330,32 +1356,55 @@ def _handle_reductions(
         )
         return [
             *results,
-            ReduceResult(
-                product_id,
-                winner.name,
-                pid,
-                "vetoed",
-                [],
-                0,
-                refusal,
-                total_qty=min(winning.qty, holding.qty),
+            _flag_repeat(
+                repo,
+                ReduceResult(
+                    product_id,
+                    winner.name,
+                    pid,
+                    "vetoed",
+                    [],
+                    0,
+                    refusal,
+                    total_qty=min(winning.qty, holding.qty),
+                ),
             ),
         ]
     return [
         *results,
-        executor.reduce(
-            winning,
-            broker=None if offline else broker,
-            repo=repo,
-            config=config,
-            holding=holding,
-            costs=costs,
-            rule_id=winner.rule_id,
-            rule_status=winner_status,
-            now_ts=now_ts,
-            offline=offline,
+        _flag_repeat(
+            repo,
+            executor.reduce(
+                winning,
+                broker=None if offline else broker,
+                repo=repo,
+                config=config,
+                holding=holding,
+                costs=costs,
+                rule_id=winner.rule_id,
+                rule_status=winner_status,
+                now_ts=now_ts,
+                offline=offline,
+            ),
         ),
     ]
+
+
+def _flag_repeat(repo: Repository, result: ReduceResult) -> ReduceResult:
+    """`result`, with `repeats_previous` set when its row repeats the product's previous refusal
+    (`sleeve.repeats_previous_refusal`; the P9 ruling on P8's daily `sleeve.proposal`).
+
+    Only the notification reads the flag, and the row is already written by now, so a failure
+    here must cost neither: it is logged and the result goes out UNFLAGGED -- a possible
+    duplicate alert, never a lost proposal or a silenced one (the same fail-open direction as
+    `notifications.reported_windows`).
+    """
+    try:
+        repeats = sleeve.repeats_previous_refusal(repo, result.product_id, result.proposal_id)
+    except Exception:  # noqa: BLE001 -- see the docstring: fail toward the alert
+        log_exception(logger, "agent.repeat_check_failed", product=result.product_id)
+        return result
+    return replace(result, repeats_previous=repeats) if repeats else result
 
 
 def _manage_stops(
