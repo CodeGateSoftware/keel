@@ -99,6 +99,17 @@ them: `guards.check` is broker-less by design, and the book exists only in the p
 module just fetched -- the same preview #332's warning reads (`_preview_book`: one helper,
 two consumers). BUY-only (exits must execute, like rail 17 halting entries not exits) and
 live-only (paper fills are synthetic, see no book, and accrue no evidence about it).
+
+**Sleeve reductions (preview) -- `reduce` (#857, plan P7, R17).** A sleeve-sell rule's
+`Reduction` is not a `Signal` and never reaches `execute`: its one path is `reduce`, which in
+this build runs the SELL's front half only -- cap to the ledger's holding, clamp to the venue's
+(`_clamped_sell_qty`), slice to rail 2 (`sleeve.slice_qty`), `guards.check` unmodified, express
+the spec, `preview_order` -- and records a `sell_proposals` row. It never cancels a resting
+bracket, never writes an `orders` row and never places; `tests/execution/test_sell_side_
+invariants.py` pins that it is not a caller of any of them, so the pinned placement sets stay
+exactly the four pre-existing paths. It swallows a preview failure into the proposal, because a
+cycle must not die on one. Placement arrives only in P18, behind the sells window and a typed
+`yes`.
 """
 
 from __future__ import annotations
@@ -133,8 +144,9 @@ from keel_core.trade_scope import TradeScopeState, VenueTradeScope
 
 from keel.config import Config
 from keel.data.repository import Repository
-from keel.execution import guards, sizing, streak
+from keel.execution import guards, sizing, sleeve, streak
 from keel.execution.guards import OrderIntent
+from keel.strategy.reduction import Holding, Reduction, SellCosts
 from keel.strategy.rules.base import Action, Signal
 from keel.types import Side
 
@@ -2957,6 +2969,212 @@ def _book_scale_out(
         # and has no target to take half off at.
         is_dca=False,
         now_ts=now_ts,
+    )
+
+
+# -- sleeve reductions, preview only (#857, plan P7) -------------------------------------------
+
+
+@dataclass(frozen=True)
+class ReduceResult:
+    """What `reduce` did with one `Reduction`: the proposal it recorded and why.
+
+    `decision` is the proposal row's (`preview` or `vetoed` in this build); `vetoed_by` is the
+    rails' violations, empty for a sleeve-level refusal such as `below_one_increment`, whose
+    reason is on the row's `rails.sleeve`; `legs` is how many per-order legs (one per cycle)
+    the sale needs under rail 2 (R11), `0` when no leg can be expressed.
+    """
+
+    product_id: str
+    rule_kind: str
+    proposal_id: int | None
+    decision: str
+    vetoed_by: list[str]
+    legs: int
+    reason: str
+
+
+def reduce(
+    reduction: Reduction,
+    *,
+    broker: Any,
+    repo: Repository,
+    config: Config,
+    holding: Holding,
+    costs: SellCosts,
+    rule_id: int | None,
+    rule_status: str,
+    now_ts: int,
+    offline: bool = False,
+) -> ReduceResult:
+    """A sleeve `Reduction`, taken as far as the venue's quote and no further (plan R17).
+
+    PREVIEW ONLY IN THIS BUILD. The order is `scale_out`'s front half and nothing of its back
+    half: size to what is held, clamp to what the VENUE holds (#667, the one entry point every
+    SELL uses), slice to rail 2 (R11), build the SELL intent, `guards.check`, express the spec,
+    `preview_order` -- then RECORD one proposal (`sleeve.record_proposal`) and stop.
+
+    It never calls `_clear_resting_bracket` (that CANCELS at the exchange), `insert_order`, or
+    `place_order`/`_run_order`: a proposal must not touch the venue's order book or keel's
+    `orders` table. `tests/execution/test_sell_side_invariants.py` pins that by AST scan, and
+    `tests/execution/test_reduce.py` with spies for every decision.
+
+    **Never more than is held (#900).** The sale is capped at the ledger's `holding.qty`, then
+    clamped to the venue's `Balance.total`, so a tranche booked before #905 at its ORDERED size
+    cannot size a sale the account cannot fill. The proposal's `rails.unverified_fill_orders`
+    names the filled BUYs the venue never sized, which such a tranche was booked from.
+
+    **Never raises for a venue failure (Review Focus 4).** A preview that throws is recorded
+    with the fallback fee and `rails.preview_error`, because a cycle must not die on a proposal
+    -- the DCA buy after it in the same cycle is the operator's plan. A `TradeScopeDenied` is
+    ALSO recorded against the venue's trade scope, exactly as `_run_order` records a denied
+    preview (#233): the venue has falsified the credential, and rail 20 then vetoes the next
+    BUY cleanly rather than that BUY's own preview raising out of the cycle. A venue answer
+    whose fee is not a fact -- zero, a synthetic estimate, or one carrying errors -- also falls
+    back, and says why in `rails.fee_fallback_reason`.
+
+    `offline=True` (paper, R18) touches no broker: the offline rails run, their skipped list is
+    recorded, and the fee is the fallback. `broker=None` with `offline=False` is a DIFFERENT
+    case -- every rail still runs (nothing is skipped) -- and is recorded with
+    `rails.fee_fallback_reason` set to say the venue was never asked, so the row cannot be read
+    as a preview that merely fell back on its own.
+    """
+    product_id = reduction.product_id
+    live = not offline and broker is not None
+    rails: dict[str, Any] = {
+        "violations": [],
+        "skipped": [],
+        "preview_error": None,
+        "fee_fallback_reason": None,
+        "unverified_fill_orders": sleeve.unverified_fill_orders(repo, product_id),
+    }
+
+    def _record(sale: Reduction, decision: str, fee: Decimal, source: str, legs: int) -> int:
+        return sleeve.record_proposal(
+            repo,
+            reduction=sale,
+            rule_id=rule_id,
+            rule_status=rule_status,
+            holding=holding,
+            costs=costs,
+            decision=decision,
+            rails=rails,
+            expected_fee=fee,
+            fee_source=source,
+            legs=legs,
+            now_ts=now_ts,
+        )
+
+    def _sleeve_veto(why: str, reason: str, sale: Reduction | None = None) -> ReduceResult:
+        # `sale` is the CAPPED reduction (post holding-cap, post venue-clamp) when one exists --
+        # `below_one_increment` is reached only after `total` is computed, so the row must record
+        # what was actually being sold, not the rule's uncapped ask (#911). `nothing_held` is
+        # reached BEFORE any cap is meaningful (`total <= 0`), and a `Reduction` of qty <= 0
+        # cannot even be built, so it falls back to the original `reduction` -- its net is NULL
+        # regardless, since there is no lot for `record_proposal` to consume.
+        priced = reduction if sale is None else sale
+        rails["sleeve"] = why
+        fee = priced.qty * priced.expected_price * costs.fee_pct
+        pid = _record(priced, "vetoed", fee, costs.fee_source, 0)
+        return ReduceResult(product_id, reduction.reason, pid, "vetoed", [], 0, reason)
+
+    total = min(reduction.qty, holding.qty)
+    if total <= 0:
+        return _sleeve_veto("nothing_held", "the ledger holds nothing of this product to sell")
+
+    increment: Decimal | None = None
+    held: Decimal | None = None
+    if live:
+        increment = _base_increment_for(broker, repo, product_id, now_ts)
+        total, held = _clamped_sell_qty(broker, repo, product_id, total, now_ts)
+    leg_qty, legs = sleeve.slice_qty(
+        total,
+        reduction.expected_price,
+        max_per_order_usd=config.caps.max_per_order_usd,
+        base_increment=increment,
+    )
+    if legs == 0:
+        return _sleeve_veto(
+            "below_one_increment",
+            "one leg cannot be expressed in the venue's increment",
+            replace(reduction, qty=total),
+        )
+
+    leg = replace(reduction, qty=leg_qty)
+    fallback_fee = leg_qty * reduction.expected_price * costs.fee_pct
+    intent = OrderIntent(
+        product_id=product_id,
+        side=Side.SELL,
+        qty=leg_qty,
+        entry=reduction.expected_price,
+        stop=None,
+        notional=sizing.spend(leg_qty, reduction.expected_price),
+        is_dca=False,  # no rail reads `is_dca` on a sell (spec §3.2)
+        rule_kind=reduction.reason,
+        rule_id=rule_id,
+        base_increment=increment,
+        available_base=held,
+    )
+    verdict = guards.check(intent, repo, config, now_ts, offline=offline)
+    rails["violations"] = list(verdict.violations)
+    rails["skipped"] = list(verdict.skipped_rails)
+    if not verdict.ok:
+        pid = _record(leg, "vetoed", fallback_fee, costs.fee_source, legs)
+        return ReduceResult(
+            product_id,
+            reduction.reason,
+            pid,
+            "vetoed",
+            list(verdict.violations),
+            legs,
+            "vetoed by guards",
+        )
+
+    fee, source = fallback_fee, costs.fee_source
+    if live:
+        try:
+            preview = broker.preview_order(_order_spec(intent))
+        except TradeScopeDenied as exc:
+            _try_record_trade_scope_refuted(repo, str(exc), now_ts, intent, None)
+            _log_trade_scope_refusal(intent, None)
+            rails["preview_error"] = repr(exc)
+        except Exception as exc:  # noqa: BLE001 -- see the docstring: never die on a proposal
+            log_venue_failure(logger, "executor.reduce_preview_failed", product=product_id)
+            rails["preview_error"] = repr(exc)
+        else:
+            if preview.synthetic:
+                rails["fee_fallback_reason"] = "preview is a synthetic estimate"
+            elif preview.errors:
+                rails["fee_fallback_reason"] = "venue preview reported errors: " + "; ".join(
+                    preview.errors
+                )
+            elif not preview.est_fee.is_finite() or preview.est_fee <= 0:
+                rails["fee_fallback_reason"] = "venue preview carried no commission"
+            else:
+                fee, source = preview.est_fee, sleeve.VENUE_FEE_SOURCE
+    elif not offline:
+        # `broker is None` with `offline=False`: `live` is False for lack of a broker, not
+        # because the caller asked to skip the venue (that is `offline=True`, which already
+        # skips every state rail and needs no further explanation). Every rail above still ran
+        # in full -- `rails["skipped"]` is empty, unlike the offline path -- so without this the
+        # row reads exactly like a preview that fell back on its own, when the venue was in fact
+        # never asked at all.
+        rails["fee_fallback_reason"] = "no broker: the venue was not asked for a quote"
+
+    pid = _record(leg, "preview", fee, source, legs)
+    log_event(
+        logger,
+        logging.INFO,
+        "executor.reduction_proposed",
+        product=product_id,
+        rule=reduction.reason,
+        rule_id=rule_id,
+        proposal_id=pid,
+        legs=legs,
+        fee_source=source,
+    )
+    return ReduceResult(
+        product_id, reduction.reason, pid, "preview", [], legs, "preview only: nothing placed"
     )
 
 

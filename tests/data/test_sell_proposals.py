@@ -150,6 +150,20 @@ def test_an_update_refuses_a_column_the_table_does_not_have() -> None:
     assert [e.event_type for e in audit.read_events(repo._conn)] == ["sell_proposal_recorded"]  # noqa: SLF001
 
 
+def test_an_insert_refuses_a_key_the_table_does_not_have() -> None:
+    """The insert's sibling rule (P7 carried item b): `update_sell_proposal` refuses a key that
+    is not a column, and so does the insert. Silently dropping one would record a proposal that
+    looks complete while a figure its writer meant to store -- a misspelt `expected_net_pnl`,
+    say -- is NULL, which this table reads as "not recorded". `id` is the row's identity, which
+    the database assigns. A refused row leaves neither row nor event."""
+    repo = _repo()
+    for bad in ("expected_net_pnI", "id"):
+        with pytest.raises(ValueError, match=bad):
+            repo.insert_sell_proposal(_row(**{bad: 1}))
+    assert repo.get_sell_proposals() == []
+    assert audit.read_events(repo._conn) == []  # noqa: SLF001
+
+
 def test_a_decision_outside_the_vocabulary_is_refused() -> None:
     """`decision` is a closed vocabulary (spec §3.8: preview / superseded / vetoed / declined /
     placed, plus R34's failed). A typo is a proposal no reader recognises."""

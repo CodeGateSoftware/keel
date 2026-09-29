@@ -1514,7 +1514,16 @@ class Repository:
         `legs` defaults to 1 -- a sale that fits one order -- and every other absent key is NULL,
         which the NOT NULL columns refuse. `decision` must be in `SELL_PROPOSAL_DECISIONS`,
         checked BEFORE the transaction opens, so a refused row leaves neither row nor event.
+
+        A key that is not one of the table's columns is REFUSED, not dropped -- the same rule
+        `update_sell_proposal` applies, and for a sharper reason here: this table reads NULL as
+        "not recorded", so a misspelt figure would be stored as a proposal that looks complete
+        and silently lacks it. `id` is refused too; the database assigns it. (`insert_order`
+        drops unknown keys, but it is not this table's sibling; `update_sell_proposal` is.)
         """
+        unknown = sorted(set(row) - set(_SELL_PROPOSAL_COLUMNS))
+        if unknown:
+            raise ValueError(f"sell_proposals has no insertable column(s) {unknown}")
         values: dict[str, Any] = {col: row.get(col) for col in _SELL_PROPOSAL_COLUMNS}
         self._check_sell_proposal_decision(values["decision"])
         if values["legs"] is None:

@@ -211,6 +211,14 @@ class Reduction:
     ts: int
 
     def __post_init__(self) -> None:
+        # Finiteness FIRST, and not only for the message: `Decimal("NaN") <= 0` raises
+        # `InvalidOperation` rather than answering, so the positivity checks below cannot be the
+        # ones to refuse it, and `Infinity` passes them outright -- an infinite `qty` would reach
+        # every FIFO lot and an infinite price would size an infinite gross. Every refusal here
+        # is a `ValueError`, so a caller catches one type.
+        for name, value in (("qty", self.qty), ("expected_price", self.expected_price)):
+            if not value.is_finite():
+                raise ValueError(f"Reduction.{name} must be a finite number, got {value}")
         if self.qty <= 0:
             raise ValueError(f"Reduction.qty must be positive, got {self.qty}")
         if self.expected_price <= 0:

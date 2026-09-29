@@ -143,3 +143,23 @@ def test_sell_costs_refuse_rates_that_make_net_from_gross_undefined(fee, slip) -
 def test_sell_costs_accept_the_fallback_rate() -> None:
     costs = SellCosts(D("0.012"), D("0.0005"), "fallback:config.fees.taker_pct")
     assert (costs.fee_pct, costs.slippage_pct) == (D("0.012"), D("0.0005"))
+
+
+@pytest.mark.parametrize(
+    "qty,price",
+    [
+        (D("Infinity"), D("1")),
+        (D("1"), D("Infinity")),
+        (D("NaN"), D("1")),
+        (D("1"), D("NaN")),
+        (D("sNaN"), D("1")),
+        (D("1"), D("-Infinity")),
+    ],
+    ids=["inf-qty", "inf-price", "nan-qty", "nan-price", "snan-qty", "neg-inf-price"],
+)
+def test_a_reduction_refuses_a_non_finite_size_or_price_with_value_error(qty, price) -> None:
+    """A size or price that is not a finite number is not a proposal: an infinite `qty` would
+    reach every FIFO lot, and a NaN would raise `InvalidOperation` from the first comparison
+    instead of the `ValueError` every other refusal here raises (P7 carried item a)."""
+    with pytest.raises(ValueError, match="finite"):
+        Reduction("BTC-USD", qty, "reverse_dca", {}, price, 0)
