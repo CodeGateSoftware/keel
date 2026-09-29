@@ -21,6 +21,16 @@ log is written by the cycle (P7/P8), never by a reader -- so there is no TTY bra
 `_common._open_repo_ro` refuses a missing `--db` path or a stale schema at a terminal exactly as it
 does off one, and a v21 database is the operator's `keel migrate`, not a side effect of reading.
 
+**`keel dca proposals review <id>` is the one proposals verb that writes** (#857, P12, plan R23):
+it stamps `reviewed_ts` -- the input spec §3.7's paper -> live gate counts -- after a `[y/N]` at a
+terminal, and only there. It follows `dca plan`'s posture, not the typed-`yes` gate's: marking a
+proposal reviewed releases no order and places nothing (a `live` sleeve-sell rule is preview-only
+in this build), so it is not a capability row, and `_require_interactive_confirmation` would be
+ceremony. Interactivity is decided first, exactly as above: off a TTY it opens read-only, prints
+the proposal and `not a terminal: nothing written.`, and exits 0. A `superseded` proposal was never
+its rule's decision and cannot be reviewed (exit 1); an already-reviewed one keeps its FIRST review
+time -- the gate reads whether a review happened, and the audit chain already holds when.
+
 **`keel dca distribute --preview` opens read-only ALWAYS, too** (#857, P10): what each
 `reverse_dca` rule's next cadence day would do, on today's cached close. It writes nothing -- no
 proposal row, no state -- and builds no broker, so its fee is the `config.fees.taker_pct` fallback,
@@ -36,6 +46,7 @@ command lives in.
 from __future__ import annotations
 
 import time
+from datetime import UTC, datetime
 from decimal import Decimal
 
 import click
@@ -181,8 +192,9 @@ def _edit_weights(editable: tuple[tuple[str, Decimal], ...]) -> dict[str, Decima
 
 @dca_group.group("proposals")
 def proposals_group() -> None:
-    """The sleeve's sell-proposals log (read-only): what each sleeve-sell rule proposed, the
-    rails' answer, and the fee it would have paid."""
+    """The sleeve's sell-proposals log: what each sleeve-sell rule proposed, the rails' answer,
+    and the fee it would have paid. `list` and `show` read; `review` marks one reviewed at a
+    terminal."""
 
 
 @proposals_group.command("list")
@@ -213,6 +225,44 @@ def proposals_show_cmd(ctx: click.Context, proposal_id: int) -> None:
         raise click.ClickException(f"no sell proposal #{proposal_id}")
     for line in sleeve_report.render_proposal(row):
         click.echo(line)
+
+
+@proposals_group.command("review")
+@click.argument("proposal_id", type=int)
+@click.pass_context
+@with_disclaimer
+def proposals_review_cmd(ctx: click.Context, proposal_id: int) -> None:
+    """Mark one proposal reviewed, at a terminal, after a [y/N]: the evidence `keel rules
+    promote` needs to take a sleeve-sell rule from paper to live. Releases no order and places
+    nothing. Off a terminal: prints the proposal and writes nothing."""
+    # R20: decide interactivity FIRST, once, before the database is touched at all.
+    interactive = _common._is_interactive()
+    repo = _common._open_repo(ctx) if interactive else _common._open_repo_ro(ctx)
+    row = repo.get_sell_proposal(proposal_id)
+    if row is None:
+        raise click.ClickException(f"no sell proposal #{proposal_id}")
+    for line in sleeve_report.render_proposal(row):
+        click.echo(line)
+    if row["decision"] == "superseded":
+        raise click.ClickException(
+            f"proposal #{proposal_id} was superseded by {row.get('superseded_by') or 'another'} "
+            "kind: it was never its rule's decision, so it cannot be reviewed."
+        )
+    if row["reviewed_ts"] is not None:
+        when = datetime.fromtimestamp(int(row["reviewed_ts"]), UTC).strftime("%Y-%m-%d")
+        click.echo(f"already reviewed on {when}: nothing written.")
+        return
+    if not interactive:
+        click.echo("")
+        click.echo("not a terminal: nothing written.")
+        return
+    if not click.confirm(
+        "Mark this proposal reviewed? It releases no order and places nothing", default=False
+    ):
+        click.echo("not reviewed: nothing written.")
+        return
+    repo.update_sell_proposal(proposal_id, reviewed_ts=int(time.time()))
+    click.echo(f"proposal #{proposal_id} marked reviewed.")
 
 
 @dca_group.command("distribute")
