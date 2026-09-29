@@ -142,26 +142,42 @@ def unverified_fill_orders(repo: Repository, product_id: str) -> list[int]:
     """The ids of `product_id`'s unsized filled LIVE BUYs that could have booked a lot the
     product STILL HOLDS open (#912).
 
-    `filled_quantity` NULL is the starting filter: a tranche booked from such an order carries
-    the ORDERED size, which overstates the base the venue delivered by about the fee (#900)
-    until the backfill runs. `positions` does not name its entry order (no backfill exists yet,
-    #900 open), so this cannot say WHICH open lot a given order booked -- but it can rule out orders
-    that could not have booked ANY open lot, which the naive "every such BUY the product ever
-    had" reading does not: a tranche closes, its entry order does not stop being unsized, and on
-    a product that DCAs regularly (BTC) the list would never empty and would say nothing about
-    the CURRENT holding.
+    **Every filled live BUY is a candidate owner, sized or not.** `agent._open_tranche` books a
+    tranche at `executor.delivered_qty(order) or order["qty"]` -- the venue's `filled_quantity`
+    when it gave one, the ordered `qty` otherwise -- so a SIZED order owns a lot exactly as much
+    as an unsized one; only its booked size differs. (`delivered_qty` is spelled out here as
+    `order.get("filled_quantity") or order["qty"]` rather than imported: `executor` already
+    imports this module, so the reverse import would cycle. The two reads agree -- `delivered_qty`
+    returns `filled_quantity` only when it is not `None` and `> 0`, exactly what `or` gives for a
+    `Decimal`.) Leaving sized orders out of the candidate pool -- the pre-#912-fix-up reading --
+    lets an unsized order claim a SIZED fill's tranche merely because their ordered `qty` happens
+    to match, which is wrong: that lot already has an owner, and the venue told us its size
+    directly.
 
-    The match is `agent._open_tranche`'s own contract: when the venue gave no `filled_quantity`
-    the tranche is booked at the ORDERED `qty` (`executor.delivered_qty(order) or order["qty"]`),
-    at `opened_at=now_ts` of the cycle whose order carried `created_at=now_ts`
-    (`executor._order_row`). So an order matches an open lot when the lot's ORIGINAL size --
-    `qty + realized_qty`, a partial exit only ever lowers `qty` and raises `realized_qty`, and a
-    NULL `realized_qty` already reads as zero (`_position_row_to_dict`) -- equals the order's
-    `qty`, AND the lot opened no earlier than the order and no more than one day after it
-    (`0 <= lot.opened_at - order.created_at <= 86_400`): the deployment cycles once a UTC day, and
-    the LaunchAgent's hourly retries after a non-zero exit land inside that same day. Each open
-    lot is claimed by at most one order, oldest order first, so two orders of the same size do
-    not both name the one lot that could have absorbed only one of them.
+    **Each open lot has exactly one owner: the candidate closest before it opened.** A lot's
+    ORIGINAL size is `qty + realized_qty` -- a partial exit only ever lowers `qty` and raises
+    `realized_qty`, and a NULL `realized_qty` already reads as zero (`_position_row_to_dict`), so
+    this is what the lot was booked at even after a scale-out shrank `qty`. A candidate matches a
+    lot when its booked size equals that original size and the lot opened no earlier than the
+    order and no more than one day after it (`0 <= lot.opened_at - order.created_at <= 86_400`):
+    the deployment cycles once a UTC day, and the LaunchAgent's hourly retries after a non-zero
+    exit land inside that same day. Candidates are walked closest-created_at-first (ties broken
+    by the higher order id), and each claims the first still-unclaimed matching lot it finds --
+    so the order nearest a lot's `opened_at` gets first claim on it. This is why "oldest order
+    first" is wrong: a DCA that buys the same size on consecutive days has an order from
+    YESTERDAY that is within the one-day window of TODAY's lot too, and oldest-first would let it
+    claim today's lot before today's own, closer order is even considered -- leaving today's
+    order to wrongly name a different, stale lot, or none.
+
+    `positions` does not name its entry order (no backfill exists yet, #900 open), so none of
+    this can say for CERTAIN which open lot a given order booked -- but it can rule out orders
+    that could not have booked ANY open lot (a tranche closes, its entry order does not stop
+    being unsized) and orders a sized fill's match already accounts for, which the naive "every
+    unsized BUY the product ever had" reading does neither.
+
+    Only UNSIZED owners are named in the RESULT (`filled_quantity is None`): a sized order's fill
+    is already observed and needs no verification -- but it still competes for lots like any
+    other candidate, which is the whole point of including it.
     """
     lots = [
         (int(p["id"]), p["qty"] + p["realized_qty"], int(p["opened_at"]))
@@ -171,23 +187,24 @@ def unverified_fill_orders(repo: Repository, product_id: str) -> list[int]:
         (
             order
             for order in repo.get_orders(mode="live", product_id=product_id, status="filled")
-            if order["side"] == Side.BUY.value and order.get("filled_quantity") is None
+            if order["side"] == Side.BUY.value
         ),
-        key=lambda order: int(order["created_at"]),
+        key=lambda order: (int(order["created_at"]), int(order["id"])),
+        reverse=True,
     )
     claimed: set[int] = set()
-    matched: list[int] = []
+    owners: list[dict[str, Any]] = []
     for order in candidates:
-        order_qty = order["qty"]
+        order_qty = order.get("filled_quantity") or order["qty"]
         created_at = int(order["created_at"])
         for lot_id, original_size, opened_at in lots:
             if lot_id in claimed:
                 continue
             if original_size == order_qty and 0 <= opened_at - created_at <= _DAY:
                 claimed.add(lot_id)
-                matched.append(int(order["id"]))
+                owners.append(order)
                 break
-    return matched
+    return sorted(int(order["id"]) for order in owners if order.get("filled_quantity") is None)
 
 
 def sell_costs(repo: Repository, config: Any, product_id: str) -> SellCosts:

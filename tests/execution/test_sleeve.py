@@ -458,3 +458,116 @@ def test_unverified_fill_orders_excludes_a_size_mismatch() -> None:
         entry_fee=D("0"),
     )
     assert sleeve.unverified_fill_orders(repo, "BTC-USD") == []
+
+
+def test_unverified_fill_orders_matches_a_partly_sold_lot_by_its_original_size() -> None:
+    """A scale-out lowers `qty` and raises `realized_qty` (`reduce_position`); the SIZE an order
+    could have booked is the lot's ORIGINAL size, `qty + realized_qty`, not what remains open. A
+    lot opened at 0.001 and since sold down to 0.0006 (0.0004 realized) still matches the unsized
+    order that could have booked the full 0.001 (kills a mutant that drops `+ realized_qty`)."""
+    repo = _repo()
+    unsized = repo.insert_order(_order(mode="live", side=Side.BUY.value, qty=D("0.001")))
+    position_id = repo.open_position(
+        product_id="BTC-USD",
+        rule_name="dca",
+        opened_at=0,
+        qty=D("0.001"),
+        entry_fill=D("100000"),
+        entry_fee=D("0"),
+    )
+    repo.reduce_position(
+        position_id,
+        remaining_qty=D("0.0006"),
+        realized_qty=D("0.0004"),
+        realized_proceeds=D("40"),
+        realized_fees=D("0"),
+    )
+    assert sleeve.unverified_fill_orders(repo, "BTC-USD") == [unsized]
+
+
+def test_unverified_fill_orders_claims_a_lot_for_only_one_of_two_matching_orders() -> None:
+    """Two unsized BUYs of the same size both satisfy the size/time match for the one open lot,
+    but a lot has exactly one owner: once claimed by the closer order, the earlier one finds no
+    unclaimed lot left to match (kills a mutant that drops marking the lot claimed, which would
+    let both orders claim it and list two ids)."""
+    repo = _repo()
+    earlier = repo.insert_order(_order(mode="live", side=Side.BUY.value, qty=D("0.001")))
+    closer = repo.insert_order(
+        _order(mode="live", side=Side.BUY.value, qty=D("0.001")) | {"created_at": 100}
+    )
+    repo.open_position(
+        product_id="BTC-USD",
+        rule_name="dca",
+        opened_at=100,
+        qty=D("0.001"),
+        entry_fill=D("100000"),
+        entry_fee=D("0"),
+    )
+    assert earlier != closer
+    assert sleeve.unverified_fill_orders(repo, "BTC-USD") == [closer]
+
+
+def test_unverified_fill_orders_excludes_a_lot_opened_before_the_order() -> None:
+    """A lot opened BEFORE its candidate order cannot be that order's tranche -- the order had
+    not even been placed yet (kills a mutant that drops the `0 <=` lower bound, which would let
+    a negative gap through)."""
+    repo = _repo()
+    repo.insert_order(
+        _order(mode="live", side=Side.BUY.value, qty=D("0.001")) | {"created_at": 1000}
+    )
+    repo.open_position(
+        product_id="BTC-USD",
+        rule_name="dca",
+        opened_at=999,  # one second BEFORE the order's created_at
+        qty=D("0.001"),
+        entry_fill=D("100000"),
+        entry_fee=D("0"),
+    )
+    assert sleeve.unverified_fill_orders(repo, "BTC-USD") == []
+
+
+def test_unverified_fill_orders_prefers_the_closer_of_two_consecutive_day_orders() -> None:
+    """#912 held edge case: an unsized BUY at t=0 whose own lot has since closed, and a second
+    unsized BUY of the same size exactly one day later whose lot is still open. The naive
+    "oldest order first" reading lets the t=0 order claim the t=86400 lot (it is within the
+    one-day window too) even though it is not this lot's entry -- the CLOSER order is the
+    right owner. B is the lot's owner; A, now unmatched, is not named."""
+    repo = _repo()
+    order_a = repo.insert_order(_order(mode="live", side=Side.BUY.value, qty=D("0.001")))
+    order_b = repo.insert_order(
+        _order(mode="live", side=Side.BUY.value, qty=D("0.001")) | {"created_at": DAY}
+    )
+    repo.open_position(
+        product_id="BTC-USD",
+        rule_name="dca",
+        opened_at=DAY,
+        qty=D("0.001"),
+        entry_fill=D("100000"),
+        entry_fee=D("0"),
+    )
+    assert order_a != order_b
+    assert sleeve.unverified_fill_orders(repo, "BTC-USD") == [order_b]
+
+
+def test_unverified_fill_orders_lets_a_sized_order_own_its_lot() -> None:
+    """A SIZED order's tranche is booked at `filled_quantity`, so a sized order can own a lot
+    too -- and when it does, an unsized order of the same ordered `qty` must not claim that
+    tranche instead. `S` (sized, `filled_quantity=0.00099`, `created_at=10`) is the closer,
+    correct owner of the lot opened at t=10; `U` (unsized, `qty=0.00099`, `created_at=0`) is
+    farther and is left unmatched -- `S` is sized, so nothing is returned."""
+    repo = _repo()
+    sized = repo.insert_order(
+        _order(mode="live", side=Side.BUY.value, qty=D("0.00099"))
+        | {"filled_quantity": D("0.00099"), "created_at": 10}
+    )
+    unsized = repo.insert_order(_order(mode="live", side=Side.BUY.value, qty=D("0.00099")))
+    repo.open_position(
+        product_id="BTC-USD",
+        rule_name="dca",
+        opened_at=10,
+        qty=D("0.00099"),
+        entry_fill=D("100000"),
+        entry_fee=D("0"),
+    )
+    assert sized != unsized
+    assert sleeve.unverified_fill_orders(repo, "BTC-USD") == []
