@@ -172,6 +172,7 @@ def test_newest_first_and_filterable() -> None:
     assert [p["id"] for p in repo.get_sell_proposals()] == [c, b, a]
     assert [p["id"] for p in repo.get_sell_proposals(product_id="BTC-USD")] == [c, a]
     assert [p["id"] for p in repo.get_sell_proposals(rule_id=9)] == [b]
+    assert [p["id"] for p in repo.get_sell_proposals(rule_id=7)] == [c, a]
     assert [p["id"] for p in repo.get_sell_proposals(since_ts=2)] == [c, b]
     assert [p["id"] for p in repo.get_sell_proposals(limit=2)] == [c, b]
     assert [p["id"] for p in repo.get_sell_proposals(product_id="BTC-USD", since_ts=2)] == [c]
@@ -197,3 +198,12 @@ def test_an_update_to_a_missing_proposal_raises_and_chains_nothing() -> None:
     with pytest.raises(LookupError, match="42"):
         repo.update_sell_proposal(42, reviewed_ts=200)
     assert audit.read_events(repo._conn) == []  # noqa: SLF001
+
+
+def test_legs_defaults_to_one_order() -> None:
+    """A sale that fits one order is one leg; only rail 2's slicing (P7) records more."""
+    repo = _repo()
+    row = _row()
+    del row["legs"]
+    got = repo.get_sell_proposal(repo.insert_sell_proposal(row))
+    assert got is not None and got["legs"] == 1
