@@ -24,6 +24,7 @@ from keel_core.notifications import NotificationSettings, send_event
 from keel import notifications
 from keel.commands.doctor import attestation_findings, rail_state_findings
 from keel.config import AutoTradeConfig, Caps, Config, MarketDataConfig
+from keel.execution.executor import ReduceResult
 from keel.notifications import (
     _ATTESTATION_FINDINGS,
     ALLOWANCE_NEARING_USED_PCT,
@@ -80,6 +81,7 @@ def _state(
     unplaced: tuple[UnplacedSetup, ...] = (),
     stale: tuple[str, ...] = (),
     held: tuple[str, ...] = (),
+    sleeve: tuple[ReduceResult, ...] = (),
 ):
     return events_from_state(
         attestation_findings=attestation if attestation is not None else _attestation(NOW),
@@ -89,6 +91,7 @@ def _state(
         unplaced_setups=unplaced,
         stale_products=stale,
         held_products=held,
+        sleeve_proposals=sleeve,
     )
 
 
@@ -285,10 +288,13 @@ class _LoopResult:
     """The tail-of-cycle facts the wiring derives from -- duck-typed to `LoopResult`'s
     notification-relevant fields."""
 
-    def __init__(self, *, enter_signals=(), enter_results=(), stale_products=()) -> None:
+    def __init__(
+        self, *, enter_signals=(), enter_results=(), stale_products=(), reduce_results=()
+    ) -> None:
         self.enter_signals = list(enter_signals)
         self.enter_results = list(enter_results)
         self.stale_products = list(stale_products)
+        self.reduce_results = list(reduce_results)
 
 
 def _recording_transport(calls: list[tuple[str, str]]):
@@ -409,6 +415,7 @@ class TestEveryTaxonomyEventSurvivesDelivery:
         "setup.unplaced",
         "allowance.nearing_exhaustion",
         "feed.stale_open_position",
+        "sleeve.proposal",
     }
 
     @staticmethod
@@ -423,6 +430,12 @@ class TestEveryTaxonomyEventSurvivesDelivery:
             ),
             stale=("ETH-USD",),
             held=("ETH-USD",),  # stale feed under an open position
+            # #857: a sliced sleeve proposal, whose total is a Decimal -- the same trap.
+            sleeve=(
+                ReduceResult(
+                    "BTC-USD", "reverse_dca", 4, "preview", [], 4, "", total_qty=Decimal("0.0015")
+                ),
+            ),
         )
 
     @pytest.mark.parametrize("fmt", ["plain", "slack"])
@@ -595,3 +608,83 @@ def test_a_deployment_that_never_attested_a_posture_is_told(monkeypatch):
 
     assert sent == 1
     assert "rail 22" in calls[0][1]
+
+
+# -- sleeve.proposal (#857, plan P8 Task 8.3, R19) ----------------------------------------------
+
+
+def _proposal(decision: str, *, proposal_id: int = 4, legs: int = 1, total=None) -> ReduceResult:
+    return ReduceResult("BTC-USD", "reverse_dca", proposal_id, decision, [], legs, "", total)
+
+
+def test_a_new_sleeve_proposal_notifies_once_with_its_id():
+    events = _state(sleeve=(_proposal("preview"),))
+
+    [event] = [e for e in events if e.key == "sleeve.proposal"]
+    assert event.fields["proposal_id"] == 4
+    assert (event.fields["product"], event.fields["rule_kind"], event.fields["decision"]) == (
+        "BTC-USD",
+        "reverse_dca",
+        "preview",
+    )
+    assert event.message.endswith("keel dca proposals show 4")
+
+
+def test_a_vetoed_proposal_notifies_too():
+    """A vetoed proposal is a decision the operator should see (a skipped distribution says why
+    on the row); only arbitration's losers are silent."""
+    [event] = _state(sleeve=(_proposal("vetoed", proposal_id=9),))
+    assert (event.key, event.fields["proposal_id"], event.fields["decision"]) == (
+        "sleeve.proposal",
+        9,
+        "vetoed",
+    )
+
+
+def test_a_superseded_proposal_does_not_notify():
+    events = _state(sleeve=(_proposal("superseded", proposal_id=5, legs=0),))
+    assert [e for e in events if e.key == "sleeve.proposal"] == []
+
+
+def test_one_event_per_notifying_proposal_in_the_cycle():
+    events = _state(
+        sleeve=(
+            _proposal("superseded", proposal_id=5, legs=0),
+            _proposal("preview", proposal_id=6),
+            _proposal("vetoed", proposal_id=7),
+        )
+    )
+    assert [e.fields["proposal_id"] for e in events if e.key == "sleeve.proposal"] == [6, 7]
+
+
+def test_a_sliced_proposal_names_the_whole_sale_and_its_legs():
+    """P7's held question: the row's `qty` is the first leg. The notification carries the
+    TOTAL and the leg count, as text, so the operator reads the size of the sale."""
+    [event] = _state(sleeve=(_proposal("preview", legs=4, total=Decimal("0.0015")),))
+
+    assert (event.fields["total_qty"], event.fields["legs"]) == ("0.0015", 4)
+    assert "sell 0.0015 over 4 legs" in event.message
+
+
+def test_the_wiring_derives_sleeve_proposals_from_the_cycle_result():
+    """`notify_after_cycle` reads `result.reduce_results` (R19) and writes nothing new: the
+    write list is still exactly the #793 ledger key, and here not even that."""
+    calls: list[tuple[str, str]] = []
+    repo = _Repo(withdrawals_attested_at=NOW)
+    repo.cash_posture = _healthy_posture()
+    config = _config_with(NotificationSettings(events=frozenset({"sleeve.proposal"})))
+
+    sent = notify_after_cycle(
+        repo,
+        config,
+        _LoopResult(reduce_results=[_proposal("preview", proposal_id=11)]),
+        NOW,
+        url="https://alerts.example/hook",
+        transport=_recording_transport(calls),
+    )
+
+    assert sent == 1
+    [(_url, body)] = calls
+    payload = json.loads(body)
+    assert (payload["event"], payload["proposal_id"]) == ("sleeve.proposal", 11)
+    assert repo.state_writes == []

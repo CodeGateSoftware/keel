@@ -1936,7 +1936,13 @@ def run_once(
     interval_sec: float | None = None,
 ) -> LoopResult:
     """One agent cycle: (kill-switch / market-session gates) -> poll -> evaluate -> exits
-    -> entries.
+    -> entries -> stop management -> sleeve reductions (PROPOSALS only, #857).
+
+    The reductions are LAST, after every order this cycle places: `_handle_reductions` is
+    preview-only, wrapped per product, and cannot withhold, delay or veto the cycle's DCA buy.
+    Sleeve-sell rules are loaded apart from the entry/exit rules (`_sleeve_rules`, R31), so
+    their feeds never gate the entries and they never own an exit. Under the kill switch the
+    cycle returns before any of it, so no reduction reads the venue either.
 
     The venue session is read and RECORDED first, before any gate can return (FR-9) -- a
     session-bound venue's clock answer under its own namespaced keys, with the interval

@@ -85,12 +85,17 @@ class EventSpec:
 #:   allowance (see `keel.notifications.ALLOWANCE_NEARING_USED_PCT`).
 #: * `feed.stale_open_position` -- staleness on a product with an open position, where the
 #:   exits ride on data that has stopped arriving.
+#: * `sleeve.proposal` (#857) -- the cycle recorded a sleeve-sell proposal (`preview` or
+#:   `vetoed`; arbitration's `superseded` losers are silent). The taxonomy's first `info` event:
+#:   in this build a proposal is PREVIEW-ONLY and places nothing, so it is a report, not a
+#:   warning. It rides the cycle's result (`LoopResult.reduce_results`), not a repo key.
 EVENTS: tuple[EventSpec, ...] = (
     EventSpec("attestation.expiring", "attestation", WARN),
     EventSpec("rail.armed", "rail", WARN),
     EventSpec("setup.unplaced", "execution", WARN),
     EventSpec("allowance.nearing_exhaustion", "allowance", WARN),
     EventSpec("feed.stale_open_position", "data", WARN),
+    EventSpec("sleeve.proposal", "execution", INFO),
 )
 
 EVENTS_BY_KEY: dict[str, EventSpec] = {spec.key: spec for spec in EVENTS}

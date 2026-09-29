@@ -214,3 +214,10 @@ def test_no_url_means_no_delivery_attempt_at_all():
     assert send_event("", _expiry_event(), settings, transport=sink) is False
 
     assert sink.calls == []
+
+
+def test_sleeve_proposal_is_an_info_execution_event():
+    """#857 (plan P8, R19): a sleeve proposal is a REPORT -- preview-only, it places nothing --
+    so it is the taxonomy's first `info` event, routed with the other execution facts."""
+    spec = EVENTS_BY_KEY["sleeve.proposal"]
+    assert (spec.category, spec.severity) == ("execution", "info")
