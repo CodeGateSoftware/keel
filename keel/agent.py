@@ -1973,10 +1973,11 @@ def run_once(
     Two more things nothing about sleeve rules may cost the DCA buy on (P8 review, held
     question): `_sleeve_rules` itself is called wrapped -- a malformed legacy `paper` row that
     makes `repo.get_rules("paper")` raise costs an EMPTY sleeve-rule set for this cycle, never
-    the cycle. And the poll is split in two: entry-rule products are polled exactly as before,
-    in their own `market_feed.poll_once` call; sleeve-ONLY products (on no entry/exit rule) are
-    polled in a SECOND, wrapped call, because `poll_once` has no per-product isolation and a
-    live cycle's poll set now includes sleeve products a delisted-id 404 could take down.
+    the cycle. And sleeve-ONLY products (on no entry/exit rule) are not part of the cycle's
+    `products` at all: they are polled in a SECOND, wrapped `poll_once` call inside the
+    reduction step, AFTER the entries, so a venue error or a slow poll there cannot delay or
+    abort the buy; and because they never join `products`, rail 11's equity is marked over
+    exactly the products it always was (a held sleeve-only product stays valued at cost).
 
     The venue session is read and RECORDED first, before any gate can return (FR-9) -- a
     session-bound venue's clock answer under its own namespaced keys, with the interval
@@ -2061,31 +2062,19 @@ def run_once(
         except Exception:  # noqa: BLE001 -- a broken rules read must not cost the cycle
             log_exception(logger, "agent.sleeve_rules_failed")
             sleeve_rules = []
-        entry_products = sorted({p for p in (getattr(r, "product_id", None) for r in rules) if p})
-        sleeve_products = {str(getattr(r, "product_id")) for r, _status in sleeve_rules}
-        # Sleeve-only products (not already polled for an entry/exit rule) are polled in a
-        # SEPARATE, wrapped call (P8 review, held question). `market_feed.poll_once` has no
-        # per-product isolation -- one product's failure (a venue 404 for a delisted id, say)
-        # raises out of the WHOLE call -- and a live cycle's poll set now includes sleeve-only
-        # products that were never part of that contract. Polling the entry-rule products first,
-        # exactly as before, keeps their poll un-endangered by a sleeve product's feed; a failure
-        # in the second call just leaves that product stale or lagging, which the existing
-        # freshness/readiness gates already handle. `polled` stays the sum of what was written
-        # (nothing from a call that raised before returning).
-        sleeve_only_products = sorted(sleeve_products - set(entry_products))
-        products = sorted(set(entry_products) | sleeve_products)
+        # `products` is the ENTRY/EXIT rules' products, exactly as before P8: it drives the poll
+        # below, the pre-pass, the main pass, the prices rail 11's equity is marked at and the
+        # paper seed. A sleeve-ONLY product (on no entry/exit rule) is deliberately not in it: it
+        # is polled and read by the reduction step at the END of the cycle (see REDUCTIONS),
+        # after the entries, so its feed can neither delay nor abort the DCA buy, and equity is
+        # marked over the same products it always was. `LoopResult.products` reports the union.
+        products = sorted({p for p in (getattr(r, "product_id", None) for r in rules) if p})
+        sleeve_only_products = sorted(
+            {str(getattr(r, "product_id")) for r, _status in sleeve_rules} - set(products)
+        )
         granularities = list(config.market_data.granularities)
 
-        polled = market_feed.poll_once(broker, repo, entry_products, granularities, now_ts=now_ts)
-        if sleeve_only_products:
-            try:
-                polled += market_feed.poll_once(
-                    broker, repo, sleeve_only_products, granularities, now_ts=now_ts
-                )
-            except Exception:  # noqa: BLE001 -- a sleeve product's feed must not cost the cycle
-                log_exception(
-                    logger, "agent.sleeve_feed_poll_failed", products=sleeve_only_products
-                )
+        polled = market_feed.poll_once(broker, repo, products, granularities, now_ts=now_ts)
         log_event(
             logger,
             logging.INFO,
@@ -2545,13 +2534,41 @@ def run_once(
         # never the cycle and never another product. Preview-only: `executor.reduce` places,
         # cancels and writes no order (S1). A stale product is skipped, as it is everywhere else
         # in the cycle; a paper cycle runs offline with no broker (R18).
+        #
+        # Sleeve-ONLY products are polled HERE, in their own wrapped `poll_once` -- after the
+        # buy, never before it. `poll_once` has no per-product isolation (one product's 404
+        # raises out of the whole call), so a failure costs these products' proposals and
+        # nothing else: an unpolled product is then stale, and skipped like any stale product.
+        if sleeve_only_products:
+            try:
+                polled += market_feed.poll_once(
+                    broker, repo, sleeve_only_products, granularities, now_ts=now_ts
+                )
+            except Exception:  # noqa: BLE001 -- a sleeve product's feed must not cost the cycle
+                log_exception(
+                    logger, "agent.sleeve_feed_poll_failed", products=sleeve_only_products
+                )
         reduce_results: list[ReduceResult] = []
         for product_id in sorted({str(getattr(r, "product_id")) for r, _status in sleeve_rules}):
-            # A stale product never got a series in the pre-pass, so it is skipped here too.
-            sleeve_candles = candles_by_tf_by_product.get(product_id)
-            if sleeve_candles is None:
-                continue
             try:
+                sleeve_candles = candles_by_tf_by_product.get(product_id)
+                if product_id in sleeve_only_products:
+                    if finest is not None and not market_feed.is_fresh(
+                        repo, product_id, finest, now_ts, max_age_sec
+                    ):
+                        stale_products.append(product_id)
+                        log_event(
+                            logger,
+                            logging.INFO,
+                            "agent.feed_stale",
+                            product=product_id,
+                            finest=finest,
+                            max_age_sec=max_age_sec,
+                        )
+                        continue
+                    sleeve_candles = {g: repo.get_candles(product_id, g) for g in granularities}
+                if sleeve_candles is None:
+                    continue  # an entry product the pre-pass found stale
                 product_reductions = _handle_reductions(
                     product_id,
                     sleeve_rules,
@@ -2584,7 +2601,7 @@ def run_once(
             skip_reason=None,
             mode=reported_mode,
             polled=polled,
-            products=products,
+            products=sorted(set(products) | set(sleeve_only_products)),
             stale_products=stale_products,
             enter_signals=enter_signals,
             enter_results=enter_results,

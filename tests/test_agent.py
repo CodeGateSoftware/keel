@@ -5410,7 +5410,7 @@ class _HoldingBroker(FakeBroker):
         self.balance_reads = 0
         # Every venue ORDER call, in the order it was made, with its product and side -- so a
         # test can pin that the cycle's BUY went out before any sleeve SELL was even quoted.
-        self.sequence: list[tuple[str, str, Side]] = []
+        self.sequence: list[tuple[str, str, Side | None]] = []
         # `(product, exception)`: a SELL preview on that product raises it.
         self.sell_preview_raises: dict[str, Exception] = {}
 
@@ -5420,6 +5420,12 @@ class _HoldingBroker(FakeBroker):
             *super().get_balances(),
             *(Balance(currency=c, available=q, total=q) for c, q in self.base.items()),
         ]
+
+    def get_candles(
+        self, product_id: str, granularity: Granularity, start: int, end: int
+    ) -> list[Candle]:
+        self.sequence.append(("candles", product_id, None))
+        return super().get_candles(product_id, granularity, start, end)
 
     def preview_order(self, spec: OrderSpec) -> Preview:
         self.sequence.append(("preview", spec.product_id, spec.side))
@@ -5854,9 +5860,13 @@ def test_reductions_run_after_the_entries_so_a_denied_sell_preview_cannot_stop_t
         (_AlwaysReduceRule("ADA-USD"), "live"),
     )
     now = _history(repo, 41)
-    _history(repo, 41, product="ADA-USD")
+    # ADA's stored tail is one bar short; the venue serves day 40, so the cycle must POLL it.
+    _history(repo, 40, product="ADA-USD")
     _held_since_day_0(repo, "ADA-USD")
-    broker = _HoldingBroker(base={"BTC": Decimal("1000"), "ADA": Decimal("1000")})
+    broker = _HoldingBroker(
+        series={("ADA-USD", Granularity.ONE_DAY): [_candle(40 * DAY, "100")]},
+        base={"BTC": Decimal("1000"), "ADA": Decimal("1000")},
+    )
     broker.sell_preview_raises["ADA-USD"] = TradeScopeDenied("403 read-only")
     config = _config(allowlist=["ADA", "BTC", "ETH", "PAXG"])
 
@@ -5866,6 +5876,9 @@ def test_reductions_run_after_the_entries_so_a_denied_sell_preview_cannot_stop_t
     buy = broker.sequence.index(("place", PRODUCT, Side.BUY))
     sell_quote = broker.sequence.index(("preview", "ADA-USD", Side.SELL))
     assert buy < sell_quote, "the DCA BUY must be placed before any sleeve SELL is quoted"
+    # ADA is on no entry rule, so its feed is polled only by the reduction step -- after the buy.
+    ada_polls = [i for i, call in enumerate(broker.sequence) if call[:2] == ("candles", "ADA-USD")]
+    assert ada_polls and min(ada_polls) > buy, "a sleeve-only product is polled after the buy"
     assert [r.placed for r in result.enter_results] == [True]
     [row] = repo.get_sell_proposals()
     assert row["decision"] == "preview" and "403 read-only" in row["rails"]["preview_error"]
@@ -6104,6 +6117,7 @@ class _RaisingCandlesBroker(_HoldingBroker):
         self, product_id: str, granularity: Granularity, start: int, end: int
     ) -> list[Candle]:
         if product_id == self.raises_for:
+            self.sequence.append(("candles", product_id, None))
             raise RuntimeError("404 delisted")
         return super().get_candles(product_id, granularity, start, end)
 
@@ -6169,3 +6183,59 @@ def test_a_dca_whose_detect_raises_counts_as_firing(repo):
     )
 
     assert fires is True
+
+
+def test_a_sleeve_only_products_poll_runs_after_the_buy_and_its_failure_costs_nothing(
+    repo, monkeypatch
+):
+    """Coordinator constraint (a): a sleeve-only product's feed is polled AFTER the entries, so a
+    venue error -- or a slow poll -- there can neither delay nor abort the day's DCA buy. The
+    failure costs that product's proposal, and the cycle still completes."""
+    _seed_rules(
+        repo,
+        monkeypatch,
+        (Dca(product_id=PRODUCT, cadence_days=1), "live"),
+        (_AlwaysReduceRule("ADA-USD"), "live"),
+    )
+    now = _history(repo, 41)
+    _held_since_day_0(repo, "ADA-USD")
+    broker = _RaisingCandlesBroker(raises_for="ADA-USD", base={"ADA": Decimal("1000")})
+    config = _config(allowlist=["ADA", "BTC", "ETH", "PAXG"])
+
+    result = run_once(broker, repo, config, now_ts=now)
+
+    buy = broker.sequence.index(("place", PRODUCT, Side.BUY))
+    ada_polls = [i for i, call in enumerate(broker.sequence) if call[:2] == ("candles", "ADA-USD")]
+    assert ada_polls and min(ada_polls) > buy
+    assert result.skipped is False and [r.placed for r in result.enter_results] == [True]
+    assert result.stale_products == ["ADA-USD"], "no series, so the reduction step skips it"
+    assert result.reduce_results == [] and repo.get_sell_proposals() == []
+
+
+def _held_paxg_equity(repo, monkeypatch, *, with_sleeve_rule: bool) -> Decimal:
+    """One live cycle: a due BTC DCA, and 1 PAXG held at a cost of 80 whose stored close is 100.
+    No entry rule polls PAXG, so equity has always valued it AT COST (`_mark_to_market_parts`)."""
+    rules: list[tuple[Rule, str]] = [(Dca(product_id=PRODUCT, cadence_days=1), "live")]
+    if with_sleeve_rule:
+        rules.append((_AlwaysReduceRule("PAXG-USD"), "live"))
+    _seed_rules(repo, monkeypatch, *rules)
+    now = _history(repo, 41)
+    _history(repo, 41, product="PAXG-USD")
+    _held_since_day_0(repo, "PAXG-USD")
+    broker = _HoldingBroker(base={"PAXG": Decimal("1")})
+
+    run_once(broker, repo, _config(), now_ts=now)
+
+    [point] = repo.get_equity_points()
+    return point.equity
+
+
+@pytest.mark.parametrize("with_sleeve_rule", [False, True], ids=["no-sleeve-rule", "sleeve-rule"])
+def test_a_sleeve_rule_does_not_move_equity(repo, monkeypatch, with_sleeve_rule):
+    """Coordinator constraint (b): rail 11's equity is byte-identical to origin/main's whether or
+    not a sleeve rule exists. Without one, it is origin/main's computation unchanged (cash plus
+    PAXG at its cost, 80); with one, the sleeve product is NOT added to the products equity is
+    marked over, so it is still 80 -- not the fresh close of 100."""
+    equity = _held_paxg_equity(repo, monkeypatch, with_sleeve_rule=with_sleeve_rule)
+
+    assert equity == Decimal("1000000") + Decimal("80")
