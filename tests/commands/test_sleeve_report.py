@@ -108,9 +108,34 @@ def test_the_size_is_the_rules_own_net_to_gross_arithmetic_at_the_fallback_fee(r
     assert row.fee_usd == row.qty * close * D("0.012")
 
 
-def test_a_cadence_day_that_is_today_is_today(repo) -> None:
+def test_the_bar_a_cycle_today_judges_is_yesterdays_close(repo) -> None:
+    """#921: at now=211*DAY+3_600 (today=211), the newest completed bar is 210 -- exactly what
+    `tests/test_agent.py::test_a_distribution_on_a_dca_buy_day_is_recorded_vetoed_not_carried`
+    pins the live cycle judging at this same instant. 210 is also a multiple of the 7-day dca's
+    cadence, so the collision fires (Review Focus 1)."""
+    _seed(repo)
+    [row] = distribution_rows(repo, _config(), now_ts=211 * DAY + 3_600)
+    assert row.next_cadence_ts == 210 * DAY
+    assert row.dca_collision is True
+
+
+def test_todays_own_bar_has_not_closed_so_the_next_cadence_bar_skips_it(repo) -> None:
+    """#921: at now=210*DAY+3_600 (today=210), yesterday's bar (209) is off the rule's 30-day
+    cadence, and bar 210 -- though on cadence -- has not closed (it closes tonight): no cycle,
+    not even one still to run later today, has judged it. This is the exact bug: the old
+    formula named 210 here, promising a sale on the one day no cycle ever makes it. The next bar
+    any cycle can actually judge is 240."""
     _seed(repo)
     [row] = distribution_rows(repo, _config(), now_ts=210 * DAY + 3_600)
+    assert row.next_cadence_ts == 240 * DAY
+
+
+def test_a_cadence_bar_several_days_out_is_named_ahead_of_time(repo) -> None:
+    """Contrast with the case above: a cadence-aligned bar in the FAR future (unclosed, just
+    like bar 210 was at now=210*DAY) is named plainly. Only a bar landing on `today` itself is
+    skipped -- the far-future case is unambiguous, since it is nobody's "today"."""
+    _seed(repo)
+    [row] = distribution_rows(repo, _config(), now_ts=201 * DAY)
     assert row.next_cadence_ts == 210 * DAY
 
 
@@ -238,7 +263,8 @@ def _row(**over: Any) -> DistributionRow:
 
 def test_an_open_row_renders_its_size_fee_source_and_gates() -> None:
     assert render_distribution([_row()]) == [
-        "rule 20 (paper) BTC-USD next cadence 2026-09-29: sell 0.00102 over 1 leg"
+        "rule 20 (paper) BTC-USD cadence bar 2026-09-29, proposed 2026-09-30: "
+        "sell 0.00102 over 1 leg"
         "  gross $101.99  fee $1.22 (fallback:config.fees.taker_pct)"
         "  gates price_floor=open drawdown=open floor_qty=open",
     ]
@@ -247,7 +273,8 @@ def test_an_open_row_renders_its_size_fee_source_and_gates() -> None:
 def test_a_colliding_row_says_the_pipeline_will_veto_it() -> None:
     lines = render_distribution([_row(dca_collision=True, legs=3)])
     assert lines == [
-        "rule 20 (paper) BTC-USD next cadence 2026-09-29: sell 0.00102 over 3 legs"
+        "rule 20 (paper) BTC-USD cadence bar 2026-09-29, proposed 2026-09-30: "
+        "sell 0.00102 over 3 legs"
         "  gross $101.99  fee $1.22 (fallback:config.fees.taker_pct)"
         "  gates price_floor=open drawdown=open floor_qty=open",
         "  a dca buy falls on the same day: the pipeline records it vetoed (same_day_dca), "
@@ -258,14 +285,16 @@ def test_a_colliding_row_says_the_pipeline_will_veto_it() -> None:
 def test_a_closed_row_names_the_gate_and_prints_no_size() -> None:
     row = _row(gates={"price_floor": False}, qty=None, gross_usd=None, fee_usd=None, legs=0)
     assert render_distribution([row]) == [
-        "rule 20 (paper) BTC-USD next cadence 2026-09-29: no sale  gates price_floor=closed",
+        "rule 20 (paper) BTC-USD cadence bar 2026-09-29, proposed 2026-09-30: "
+        "no sale  gates price_floor=closed",
     ]
 
 
 def test_a_row_with_no_close_says_so() -> None:
     row = _row(gates={}, qty=None, gross_usd=None, fee_usd=None, legs=0)
     assert render_distribution([row]) == [
-        "rule 20 (paper) BTC-USD next cadence 2026-09-29: no sale  no cached daily close",
+        "rule 20 (paper) BTC-USD cadence bar 2026-09-29, proposed 2026-09-30: "
+        "no sale  no cached daily close",
     ]
 
 

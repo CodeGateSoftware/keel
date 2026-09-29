@@ -22,12 +22,20 @@ is counted in UTC and the log must read in the same days the rule is enforced in
 
 **One distribution, one line** (`render_distribution`, for `keel dca distribute --preview`):
 
-    rule <id> (<status>) <product> next cadence <YYYY-MM-DD>: sell <qty> over <k> leg(s)
+    rule <id> (<status>) <product> cadence bar <YYYY-MM-DD>, proposed <YYYY-MM-DD>: sell <qty>
+    over <k> leg(s)
       gross $<g>  fee $<f> (fallback:config.fees.taker_pct)  gates <gate>=open ...
 
 (one line; wrapped here), or `no sale  gates ... <gate>=closed` naming the gate the rule stopped
 at, or `no sale  no cached daily close`. The fee source is always the fallback: the CLI previews
 ask no venue (R25).
+
+**The bar and the day it is proposed are different dates, and both print (#921).** `Dca.detect`
+and `ReverseDca.reduce_signal` decide on the latest COMPLETED daily bar (`completed_days`,
+`keel/strategy/rules/base.py`): a bar stamped day `d` closes at `(d + 1) * 86_400`, so the
+earliest any cycle judges it -- and records the proposal `render_proposal_line` shows -- is UTC
+day `d + 1`, never day `d` itself. A line naming only the bar day reads as a promise of a sale on
+that day, which no cycle ever makes; naming both is unambiguous.
 
 **NULL is "unrecorded", never zero.** A proposal whose rule row id, cost basis or net P&L was not
 recorded prints `unrecorded` there -- a `$0.00` net would read as a break-even sale that nobody
@@ -117,7 +125,17 @@ NO_DISTRIBUTION_RULES = "no reverse_dca rule at a status this profile's cycle ru
 
 @dataclass(frozen=True)
 class DistributionRow:
-    """What one `reverse_dca` rule's NEXT cadence day would do, on today's cached close.
+    """What one `reverse_dca` rule's next cadence BAR would do, on today's cached close, and
+    when that would actually be proposed.
+
+    `next_cadence_ts` is the BAR's own ts (`next_cadence_day(...) * 86_400`) -- the completed
+    daily candle, epoch-aligned to the rule's cadence, that `ReverseDca.reduce_signal` (and
+    `Dca.detect`, for the collision check) would read. Neither rule decides the day it PROPOSES
+    on that bar: a bar stamped day `d` closes at `(d + 1) * 86_400`, so the earliest cycle to
+    judge it runs on UTC day `d + 1` (`completed_days`, `keel/strategy/rules/base.py`) -- one day
+    after the date this field names. `render_distribution` prints both dates (#921); nothing on
+    this row is renamed to hold the proposal day, because it is always `next_cadence_ts + 86_400`
+    and a second field would only be able to disagree with it.
 
     `rule_id` is the `rules.id`; `None` only for a rule built without a row, printed
     `unrecorded`. `gates` holds the gates the rule judged, in its own order, up to the first
@@ -140,9 +158,29 @@ class DistributionRow:
 
 
 def next_cadence_day(today: int, cadence_days: int) -> int:
-    """The smallest UTC day number `d >= today` with `d % cadence_days == 0` -- the epoch-aligned
-    cadence `ReverseDca` and `Dca` both read (`latest.ts // 86400 % cadence_days == 0`)."""
-    return today + (-today) % cadence_days
+    """The next UTC day number a cadence-`cadence_days` rule's BAR will be judged on, seen from
+    `today` (`now_ts // 86_400`).
+
+    `Dca.detect` and `ReverseDca.reduce_signal` both decide on the latest COMPLETED daily bar
+    (`completed_days`, `keel/strategy/rules/base.py`): a bar stamped day `d` closes at
+    `(d + 1) * 86_400`, so the newest bar ANY cycle running today (or later) can already have
+    judged is `today - 1` -- yesterday's, closed at this morning's UTC rollover. That is this
+    search's anchor, not `today` itself: the smallest `d >= today - 1` with
+    `d % cadence_days == 0`.
+
+    But if that smallest `d` lands on exactly `today`, it is skipped, moving on to
+    `d + cadence_days`. `today`'s own bar has not closed -- it closes tonight -- so no cycle has
+    judged it yet, not even one that might still run later today; reporting it as "next" is
+    exactly #921's bug (`sleeve_report`'s module docstring): it named a bar on the day it also
+    claimed as the day it fires, when the earliest ANY cycle judges that bar is tomorrow. Landing
+    on the next occurrence instead, `today + cadence_days`, carries no such promise: it is
+    strictly in the future for every cycle that could possibly run today.
+    """
+    anchor = today - 1
+    day = anchor + (-anchor) % cadence_days
+    if day == today:
+        day += cadence_days
+    return day
 
 
 def distribution_rows(repo: Any, config: Any, now_ts: int) -> list[DistributionRow]:
@@ -154,10 +192,11 @@ def distribution_rows(repo: Any, config: Any, now_ts: int) -> list[DistributionR
     because no cycle would ask it.
 
     **The decision is the rule's own arithmetic, not a copy of it.** The latest cached daily bar
-    is re-stamped to the next cadence day and handed, alone with its history, to the rule's
-    `reduce_signal`; the cadence gate therefore passes by construction and the floor, drawdown and
-    `floor_qty` gates are judged on today's close. The rule stops at its first closed gate, and so
-    does the row (`DistributionRow.gates`).
+    is re-stamped to the next cadence BAR day (`next_cadence_day`, #921) and handed, alone with
+    its history, to the rule's `reduce_signal`; the cadence gate therefore passes by construction
+    and the floor, drawdown and `floor_qty` gates are judged on today's close. The rule stops at
+    its first closed gate, and so does the row (`DistributionRow.gates`). The bar day is not the
+    day the sale is proposed on -- see `DistributionRow`'s docstring.
 
     **The size is priced as the proposal would be on the fallback** (`sleeve.sell_costs`: the
     `config.fees.taker_pct` rate and the product's liquidity-scaled slippage): gross is the sale's
@@ -169,8 +208,9 @@ def distribution_rows(repo: Any, config: Any, now_ts: int) -> list[DistributionR
 
     **`dca_collision` is the pipeline's same-day-DCA refusal, read ahead** (spec §3.4, Review
     Focus 1): a `dca` rule on the product at the status this profile's cycle runs, whose cadence
-    also falls on that day. The pipeline records that day's proposal `vetoed` (`same_day_dca`)
-    and does not carry it forward.
+    also falls on the cadence BAR day (the same day `_dca_fires_today`'s `Dca.detect` would see,
+    since both rules read the same restamped bar). The pipeline records that day's proposal
+    `vetoed` (`same_day_dca`) and does not carry it forward.
     """
     # Lazy: the agent imports this package's siblings, and a report must not pull the cycle's
     # whole import graph in at module load.
@@ -260,8 +300,12 @@ def distribution_rows(repo: Any, config: Any, now_ts: int) -> list[DistributionR
 
 def render_distribution(rows: list[DistributionRow]) -> list[str]:
     """One line per row -- the module docstring's distribution format -- and, under a SALE whose
-    day is also a dca buy day, one indented line saying the pipeline will veto it. A row with a
-    closed gate gets no such line: the rule proposes nothing, so there is nothing to veto."""
+    bar is also a dca buy day, one indented line saying the pipeline will veto it. A row with a
+    closed gate gets no such line: the rule proposes nothing, so there is nothing to veto.
+
+    The head names the cadence BAR and the day it is proposed on (bar + 1 day, #921): the bar is
+    what the rule judges, the proposal day is when a cycle judging it actually records something,
+    and a line naming only one of the two reads as a promise for the wrong day."""
     if not rows:
         return [NO_DISTRIBUTION_RULES]
     from keel.execution.sleeve import FALLBACK_FEE_SOURCE, SAME_DAY_DCA
@@ -269,9 +313,10 @@ def render_distribution(rows: list[DistributionRow]) -> list[str]:
     lines: list[str] = []
     for row in rows:
         rule = _UNRECORDED if row.rule_id is None else str(row.rule_id)
+        proposed_ts = row.next_cadence_ts + _DAY
         head = (
             f"rule {rule} ({row.status}) {row.product_id} "
-            f"next cadence {_day(row.next_cadence_ts)}: "
+            f"cadence bar {_day(row.next_cadence_ts)}, proposed {_day(proposed_ts)}: "
         )
         gates = "  gates " + " ".join(
             f"{name}={'open' if ok else 'closed'}" for name, ok in row.gates.items()
