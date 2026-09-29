@@ -76,6 +76,12 @@ EVENT_STORES: Mapping[str, str] = {
     # timeline's `provenance` column carries, not this one: the chain's job is that a row cannot
     # be altered quietly, and that is the same job whatever the row claims.
     "journal_recorded": "journal",
+    # #857, spec §3.8: a sleeve-sell proposal is chained so it "cannot be deleted without
+    # breaking the chain". The spec names these `sleeve.proposal` and `sleeve.placed`; here they
+    # take this vocabulary's `<store>_<verb>` form, and a placement is an `updated` event on the
+    # proposal (its `decision` and `order_id`) beside the `order_placed` event of the SELL itself.
+    "sell_proposal_recorded": "sell_proposals",
+    "sell_proposal_updated": "sell_proposals",
 }
 
 

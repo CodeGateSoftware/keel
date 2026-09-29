@@ -4,8 +4,8 @@ Standard-library `sqlite3` only (no ORM) per the design spec §6. `connect()` re
 `sqlite3.Connection` configured with a `Row` factory (dict-like row access) and foreign keys
 enabled. `migrate()` idempotently creates the §6 tables (`transactions`, `candles`,
 `orders`, `rules`, `signals`, `backtests`, `pnl_daily`, `agent_state`, `broker_subscriptions`,
-`trade_outcomes`, `positions`, `journal`, `venue_trade_scopes`) plus their indexes and a
-`schema_version` marker table.
+`trade_outcomes`, `positions`, `journal`, `venue_trade_scopes`, `sell_proposals`) plus their
+indexes and a `schema_version` marker table.
 
 Money and prices are stored as `TEXT` holding the exact `str(Decimal(...))` representation so
 they round-trip without floating-point error; `repository.py` owns that conversion.
@@ -20,7 +20,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
-SCHEMA_VERSION = 21
+SCHEMA_VERSION = 22
 
 # Creation order matters for readability (and for backends that validate FK targets eagerly);
 # SQLite itself only checks FK targets at DML time, but we still declare referenced tables first.
@@ -177,6 +177,50 @@ _SCHEMA_STATEMENTS: tuple[str, ...] = (
     """,
     "CREATE INDEX IF NOT EXISTS idx_positions_open ON positions (product_id, status)",
     "CREATE INDEX IF NOT EXISTS idx_positions_bracket ON positions (bracket_order_id)",
+    # One row per `Reduction` a sleeve-sell rule proposed, EXECUTED OR NOT (#857, spec §3.8). The
+    # proposal is the product and the fill is optional: until the gated placement path ships,
+    # nothing is placed, so every row is `preview`, `vetoed` or `superseded`. Money is TEXT and
+    # timestamps INTEGER, the conventions every other table here keeps; `trigger` and `rails` are
+    # JSON objects (what fired, and the rails' answer: violations and skipped checks).
+    #
+    # `rule_id` carries NO foreign key, and not for `positions.rule_id`'s parity reason -- this is
+    # a new table, so fresh and migrated databases get the same DDL and could both enforce one.
+    # It is left unconstrained because the row is an AUDIT RECORD of what a rule proposed: deleting
+    # the rule row must neither be refused because of it nor orphan it into an IntegrityError.
+    # `order_id` does reference `orders(id)`: it is written only when a sale is placed, by the
+    # same process that inserted that order row, and an order row is never deleted.
+    #
+    # NULL means NOT RECORDED, never zero: `vwae`/`cost_basis`/`expected_net_pnl` are NULL when no
+    # lot fed the figure, and `superseded_by`/`order_id`/`reviewed_ts` until those things happen.
+    """
+    CREATE TABLE IF NOT EXISTS sell_proposals (
+        id               INTEGER PRIMARY KEY AUTOINCREMENT,
+        ts               INTEGER NOT NULL,
+        product_id       TEXT    NOT NULL,
+        rule_id          INTEGER,
+        rule_kind        TEXT    NOT NULL,
+        rule_status      TEXT    NOT NULL,
+        qty              TEXT    NOT NULL,
+        expected_price   TEXT    NOT NULL,
+        vwae             TEXT,
+        cost_basis       TEXT,
+        expected_gross   TEXT    NOT NULL,
+        expected_fee     TEXT    NOT NULL,
+        fee_source       TEXT    NOT NULL,
+        expected_net_pnl TEXT,
+        legs             INTEGER NOT NULL DEFAULT 1,
+        trigger          TEXT    NOT NULL,
+        rails            TEXT    NOT NULL,
+        decision         TEXT    NOT NULL,
+        superseded_by    TEXT,
+        order_id         INTEGER,
+        reviewed_ts      INTEGER,
+        FOREIGN KEY (order_id) REFERENCES orders(id)
+    )
+    """,
+    # (product_id, ts): R14's "one proposal per product per UTC day" is a range read on exactly
+    # this pair, every cycle.
+    "CREATE INDEX IF NOT EXISTS idx_sell_proposals_product_ts ON sell_proposals (product_id, ts)",
     """
     CREATE TABLE IF NOT EXISTS transactions (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1077,6 +1121,23 @@ def _migrate_v21_positions_rule_id(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE positions ADD COLUMN rule_id INTEGER")
 
 
+def _migrate_v22_sell_proposals(conn: sqlite3.Connection) -> None:
+    """v22 adds `sell_proposals` (#857). Table creation is handled by `_SCHEMA_STATEMENTS`; there
+    is deliberately NO backfill -- the `_migrate_v17_candle_series_feed` /
+    `_migrate_v19_equity_points` pattern: `migrate()` runs every `IF NOT EXISTS` statement before
+    the version loop, so a database stamped at v21 picks the table and its index up from that
+    pass alone, and this step is a genuine no-op.
+
+    Additive only: no existing table, column or row is touched, which is what makes it safe to
+    run as `keel --db <db> migrate` against the live database at deploy.
+
+    A row asserts that a sleeve-sell rule evaluated the book at a moment and proposed a sale, with
+    the rails' answer and the fee it would have paid. No such evaluation happened before this
+    version, so there is nothing true to seed; an empty table correctly says no rule has proposed
+    anything yet.
+    """
+
+
 _MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
     2: _migrate_v2_broker_subscriptions,
     3: _migrate_v3_trade_outcomes,
@@ -1098,6 +1159,7 @@ _MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
     19: _migrate_v19_equity_points,
     20: _migrate_v20_provenance_and_attest_windows,
     21: _migrate_v21_positions_rule_id,
+    22: _migrate_v22_sell_proposals,
 }
 
 
