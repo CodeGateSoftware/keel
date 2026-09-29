@@ -132,11 +132,10 @@ def test_todays_own_cadence_bar_is_next_and_is_proposed_tomorrow(repo) -> None:
 
 
 def test_a_cadence_bar_several_days_out_is_named_ahead_of_time(repo) -> None:
-    """Contrast with the case above: a cadence-aligned bar in the FAR future (unclosed, just
-    like bar 210 was at now=210*DAY) is named plainly. Only a bar landing on `today` itself is
-    skipped -- the far-future case is unambiguous, since it is nobody's "today"."""
+    """Far from any cadence bar (today=185, yesterday's bar 184 off cadence), the next bar is
+    the one a month's cadence lands on, 25 days out, and it is named plainly."""
     _seed(repo)
-    [row] = distribution_rows(repo, _config(), now_ts=201 * DAY)
+    [row] = distribution_rows(repo, _config(), now_ts=185 * DAY + 3_600)
     assert row.next_cadence_ts == 210 * DAY
 
 
