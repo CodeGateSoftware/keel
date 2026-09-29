@@ -143,8 +143,9 @@ def test_the_footer_says_nothing_is_placed() -> None:
     assert dca_cli.DISTRIBUTE_PREVIEW_FOOTER == dca_cli.PREVIEW_FOOTER
 
 
-@pytest.mark.parametrize("args", [(), ("--view", "lots"), ("--view", "bands")])
+@pytest.mark.parametrize("args", [(), ("--view", "lots"), ("--view", "bands"), ("--view", "gain")])
 def test_trim_without_preview_is_a_usage_error(deployment, args) -> None:  # noqa: F811
+    """The missing mode is named first, whatever `--view` says: `--preview` is eager."""
     result = _trim(deployment, *args)
     assert result.exit_code == 2
     assert _PREVIEW_REQUIRED in result.output.splitlines()
