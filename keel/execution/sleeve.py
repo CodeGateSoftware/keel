@@ -8,19 +8,69 @@ filled entry with no tranche (the orders say more), or #798's out-of-band sale (
 the venue). Each is a doctor finding (`ledger.drift`, `ledger.venue_drift`), never an assumption
 a sale is sized from.
 
-Read-only. Nothing here writes, and nothing here holds a broker: these are the quantities doctor
-compares, and doctor is pinned read-only and broker-free (`gather_findings`).
+Nothing here holds a broker: these are the quantities doctor compares, and doctor is pinned
+read-only and broker-free (`gather_findings`). Everything is read-only but ONE writer,
+`record_proposal`, which is the only function in keel that writes a `sell_proposals` row for the
+sell pipeline (`executor.reduce` records through it; P8's arbitration will too).
+
+**The sell pipeline's shared policy (P7, plan R11-R15, spec §3.4 and §3.6).** One module, so
+every sleeve-sell kind, the live cycle and the sim size and refuse by one definition:
+
+- **R11, rail 2 is a slicing obligation, and the slicer is here, not in each rule.**
+  `slice_qty` floors to the venue's `base_increment` and caps each leg at `max_per_order_usd`;
+  it returns the leg and how many legs (one per cycle, so days) the sale needs. A rule cannot
+  know the increment or the config cap, and a rule's `qty` is an upper bound: the slicer only
+  ever lowers it. The cap division FLOORS, so a leg is never rounded a hair over the cap and
+  then vetoed by the very rail it was sliced for.
+- **R12, `min_hold_days` reads the tranches the FIFO sale would CONSUME,** not the product's
+  newest. Under a weekly DCA the newest tranche is always young, so the spec's literal "after
+  the newest tranche" would refuse every distribution forever; its stated purpose -- never
+  realise a tranche bought this week -- is about the consumed ones.
+- **R13, `sleeve_exit` is exempt from `min_hold_days`** (`MIN_HOLD_EXEMPT_KINDS`): a
+  whole-sleeve exit consumes this week's tranche by definition. The same-day-DCA refusal and
+  the one-per-day cap still apply to it.
+- **R14, "one sleeve SELL per product per UTC day" is one `sell_proposals` row per product per
+  UTC day, whatever its decision, `superseded` rows excluded** (`proposed_today`). The
+  LaunchAgent retries hourly after a non-zero exit; a proposal per run would spam the operator.
+- **R15, a rule's `cooldown_days` is enforced here, from the rule's last non-superseded
+  proposal** (`last_proposal_ts`). A rule has no state; the proposals table is the state.
+- **§3.6, arbitration is a fixed order** (`ARBITRATION_ORDER`), not configurable. The kinds that
+  are NOT built (`band_rebalance`, `rotation`; spec §5, §8) are named so rail 10's vocabulary
+  and the order are decided once.
+
+**Fees are never a literal (spec §2.2, Q5).** `sell_costs` prices at `config.fees.taker_pct`
+and labels it `FALLBACK_FEE_SOURCE`; the venue's previewed commission, when there is one,
+replaces it on the proposal (`VENUE_FEE_SOURCE`), and that is decided in `executor.reduce`.
 """
 
 from __future__ import annotations
 
-from collections.abc import Iterable
-from decimal import Decimal
+from collections.abc import Iterable, Mapping
+from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal, localcontext
 from typing import Any
 
 from keel.data.repository import Repository
-from keel.strategy.reduction import Holding
+from keel.strategy.reduction import Holding, Reduction, SellCosts
 from keel.types import Side
+
+#: How a proposal's fee was priced when the venue did not quote one (spec §2.2).
+FALLBACK_FEE_SOURCE = "fallback:config.fees.taker_pct"
+#: The venue's own previewed commission (`Preview.est_fee`) -- the fact, when there is one.
+VENUE_FEE_SOURCE = "venue_preview"
+
+#: `sleeve_refusal`'s answers, which P8 records as `rails.sleeve` on a vetoed proposal.
+SAME_DAY_DCA = "same_day_dca"
+MIN_HOLD = "min_hold_days"
+COOLDOWN = "cooldown_days"
+
+DEFAULT_MIN_HOLD_DAYS = 30
+#: R13: kinds whose sale consumes this week's tranche by definition.
+MIN_HOLD_EXEMPT_KINDS = frozenset({"sleeve_exit"})
+#: Spec §3.6, fixed and not configurable. `band_rebalance`/`rotation` are NOT built (spec §5,
+#: §8); they are named so rail 10's vocabulary and this order are decided once.
+ARBITRATION_ORDER = ("sleeve_exit", "reverse_dca", "profit_take", "band_rebalance", "rotation")
+
+_DAY = 86_400
 
 
 def ledger_qty(positions: Iterable[dict[str, Any]]) -> Decimal:
@@ -86,3 +136,162 @@ def holding_of(repo: Repository, product_id: str, mark: Decimal | None = None) -
     reports the gap before a sale is proposed.
     """
     return Holding.from_rows(product_id, repo.get_open_positions(product_id), mark)
+
+
+def unverified_fill_orders(repo: Repository, product_id: str) -> list[int]:
+    """The ids of `product_id`'s filled LIVE BUYs the venue never sized (`filled_quantity` NULL).
+
+    A tranche booked from one of these carries the ORDERED size, which overstates the base the
+    venue delivered by about the fee (#900) until the backfill runs. `positions` does not name
+    its entry order, so this cannot say WHICH tranche; it says the product's holding rests on at
+    least one such row, which is what a proposal sized from that holding must disclose.
+    """
+    return [
+        int(order["id"])
+        for order in repo.get_orders(mode="live", product_id=product_id, status="filled")
+        if order["side"] == Side.BUY.value and order.get("filled_quantity") is None
+    ]
+
+
+def sell_costs(repo: Repository, config: Any, product_id: str) -> SellCosts:
+    """The rates a sleeve rule sizes against (R6): `config.fees.taker_pct`, labelled as the
+    fallback, and the product's one liquidity-scaled slippage (`backtest_slippage`)."""
+    # Lazy, as `doctor.gather_findings` imports it: keeps click out of the cycle's import graph.
+    from keel.commands.rules import backtest_slippage
+
+    slippage, _measured = backtest_slippage(repo, product_id)
+    return SellCosts(config.fees.taker_pct, slippage, FALLBACK_FEE_SOURCE)
+
+
+def slice_qty(
+    qty: Decimal, price: Decimal, *, max_per_order_usd: Decimal, base_increment: Decimal | None
+) -> tuple[Decimal, int]:
+    """`(leg_qty, legs)`: one leg at or under `max_per_order_usd`, floored to `base_increment`,
+    and how many such legs sell `qty` (R11). `(0, 0)` means no leg can be expressed.
+
+    `base_increment=None` means unknown, and the leg is sent unquantized -- `_order_spec`'s rule
+    for a SELL (#516), never a refusal.
+    """
+    with localcontext() as ctx:
+        # FLOOR, not the default HALF_EVEN: `50 / 3` would round UP to a leg worth a hair over
+        # the cap, which rail 2 then vetoes -- the one outcome slicing exists to prevent.
+        ctx.rounding = ROUND_FLOOR
+        cap_qty = max_per_order_usd / price
+    sellable = qty
+    leg = min(qty, cap_qty)
+    if base_increment is not None and base_increment > 0:
+        increment = base_increment
+
+        def _floor(value: Decimal) -> Decimal:
+            return (value / increment).to_integral_value(rounding=ROUND_FLOOR) * increment
+
+        # Legs are counted over what CAN be sold: a remainder under one increment is dust the
+        # venue cannot express, and a leg for it would be a day the sale never completes.
+        sellable = _floor(qty)
+        leg = _floor(leg)
+    if leg <= 0:
+        return Decimal("0"), 0
+    legs = int((sellable / leg).to_integral_value(rounding=ROUND_CEILING))
+    return leg, legs
+
+
+def proposed_today(repo: Repository, product_id: str, now_ts: int) -> bool:
+    """R14: whether `product_id` already has a non-superseded proposal this UTC day."""
+    start = now_ts - now_ts % _DAY
+    return any(
+        p["decision"] != "superseded"
+        for p in repo.get_sell_proposals(product_id=product_id, since_ts=start)
+    )
+
+
+def last_proposal_ts(repo: Repository, rule_id: int | None) -> int | None:
+    """R15: the `ts` of rule `rule_id`'s newest non-superseded proposal, or `None`."""
+    if rule_id is None:
+        return None
+    rows = [p for p in repo.get_sell_proposals(rule_id=rule_id) if p["decision"] != "superseded"]
+    return int(rows[0]["ts"]) if rows else None
+
+
+def sleeve_refusal(
+    *,
+    reduction: Reduction,
+    holding: Holding,
+    rule_kind: str,
+    rule_params: Mapping[str, Any],
+    dca_fires_today: bool,
+    last_rule_proposal_ts: int | None,
+    now_ts: int,
+) -> str | None:
+    """The sleeve cap that refuses this `Reduction`, or `None` (spec §3.4; R12, R13, R15).
+
+    Checked in the pipeline BEFORE an intent is built, so a refusal here costs nothing at the
+    venue. Returns `SAME_DAY_DCA`, `MIN_HOLD` or `COOLDOWN`; R14's one-per-day cap is
+    `proposed_today`, read by the caller before a rule is even asked.
+    """
+    if dca_fires_today:
+        return SAME_DAY_DCA
+    if rule_kind not in MIN_HOLD_EXEMPT_KINDS:
+        min_hold = int(rule_params.get("min_hold_days", DEFAULT_MIN_HOLD_DAYS))
+        if any(
+            now_ts - lot.opened_at < min_hold * _DAY for lot, _ in holding.fifo_legs(reduction.qty)
+        ):
+            return MIN_HOLD
+    cooldown = int(rule_params.get("cooldown_days", 0))
+    if (
+        cooldown
+        and last_rule_proposal_ts is not None
+        and now_ts - last_rule_proposal_ts < cooldown * _DAY
+    ):
+        return COOLDOWN
+    return None
+
+
+def record_proposal(
+    repo: Repository,
+    *,
+    reduction: Reduction,
+    rule_id: int | None,
+    rule_status: str,
+    holding: Holding,
+    costs: SellCosts,
+    decision: str,
+    rails: dict[str, Any],
+    expected_fee: Decimal,
+    fee_source: str,
+    legs: int,
+    now_ts: int,
+    superseded_by: str | None = None,
+) -> int:
+    """THE one proposal writer (spec §3.8): one `sell_proposals` row for `reduction`.
+
+    `expected_gross` is the leg's notional less slippage; `expected_net_pnl` is that less the
+    fee and the FIFO, fee-inclusive basis of the units the sale consumes (`Holding.fifo_cost`).
+    With no lot to consume, the net is NULL -- not recorded -- rather than a gross against a
+    zero basis, which would read as a profit the ledger cannot show. The repository refuses a
+    key that is not a column and a decision outside `SELL_PROPOSAL_DECISIONS`.
+    """
+    gross = reduction.qty * reduction.expected_price * (Decimal("1") - costs.slippage_pct)
+    consumed = holding.fifo_legs(reduction.qty)
+    net = gross - expected_fee - holding.fifo_cost(reduction.qty) if consumed else None
+    return repo.insert_sell_proposal(
+        dict(
+            ts=now_ts,
+            product_id=reduction.product_id,
+            rule_id=rule_id,
+            rule_kind=reduction.reason,
+            rule_status=rule_status,
+            qty=reduction.qty,
+            expected_price=reduction.expected_price,
+            vwae=holding.vwae,
+            cost_basis=holding.cost_basis,
+            expected_gross=gross,
+            expected_fee=expected_fee,
+            fee_source=fee_source,
+            expected_net_pnl=net,
+            legs=legs,
+            trigger=reduction.trigger,
+            rails=rails,
+            decision=decision,
+            superseded_by=superseded_by,
+        )
+    )
