@@ -49,7 +49,7 @@ def test_fresh_database_is_stamped_at_the_current_version() -> None:
     conn = db.connect(":memory:")
     db.migrate(conn)
     version = conn.execute("SELECT version FROM schema_version").fetchone()["version"]
-    assert version == db.SCHEMA_VERSION == 21
+    assert version == db.SCHEMA_VERSION
 
 
 def test_fresh_database_gets_no_subscription_row() -> None:
@@ -624,7 +624,7 @@ def test_v14_migration_bumps_the_stored_version() -> None:
     conn = _v12_database()
     db.migrate(conn)
     stamped = conn.execute("SELECT version FROM schema_version").fetchone()["version"]
-    assert stamped == db.SCHEMA_VERSION == 21
+    assert stamped == db.SCHEMA_VERSION
 
 
 def test_v14_migration_step_is_not_blocked_by_another_venues_existing_row() -> None:
@@ -785,7 +785,7 @@ def test_v15_migration_bumps_the_stored_version() -> None:
     conn = _v12_database()
     db.migrate(conn)
     stamped = conn.execute("SELECT version FROM schema_version").fetchone()["version"]
-    assert stamped == db.SCHEMA_VERSION == 21
+    assert stamped == db.SCHEMA_VERSION
 
 
 def test_v15_the_12_to_15_chain_creates_the_table_with_the_column_already_present() -> None:
@@ -887,7 +887,7 @@ def test_an_existing_orders_table_gains_the_submit_book_by_ALTER() -> None:
     assert row["submit_best_bid"] is None
     assert row["submit_best_ask"] is None
     stamped = conn.execute("SELECT version FROM schema_version").fetchone()["version"]
-    assert stamped == db.SCHEMA_VERSION == 21
+    assert stamped == db.SCHEMA_VERSION
 
 
 def test_v16_is_idempotent_per_column() -> None:
@@ -1047,7 +1047,7 @@ def test_migration_to_v20_adds_the_columns_and_the_new_tables() -> None:
     assert "idx_cycle_balances_mode_currency_ts" in index_names
 
     stamped = conn.execute("SELECT version FROM schema_version").fetchone()["version"]
-    assert stamped == db.SCHEMA_VERSION == 21
+    assert stamped == db.SCHEMA_VERSION
 
 
 def test_v19_database_gains_v20_columns_as_NULL_no_backfill() -> None:
@@ -1094,7 +1094,7 @@ def test_v19_database_gains_v20_columns_as_NULL_no_backfill() -> None:
     assert instrument_row["attest_due_ts"] is None
 
     stamped = conn.execute("SELECT version FROM schema_version").fetchone()["version"]
-    assert stamped == db.SCHEMA_VERSION == 21
+    assert stamped == db.SCHEMA_VERSION
 
 
 def test_v20_is_idempotent_per_column() -> None:
@@ -1165,7 +1165,7 @@ def test_v20_on_a_pre_v11_chain_does_not_duplicate_columns() -> None:
     assert {"cycle_balances", "audit_events"} <= table_names
 
     stamped = conn.execute("SELECT version FROM schema_version").fetchone()["version"]
-    assert stamped == db.SCHEMA_VERSION == 21
+    assert stamped == db.SCHEMA_VERSION
 
 
 def test_cycle_balances_accepts_null_and_round_trips_a_decimal_string() -> None:
@@ -1313,7 +1313,7 @@ def test_a_v20_database_gains_rule_id_as_NULL_no_backfill() -> None:
     assert row["rule_name"] == "turtle_breakout"
     assert row["rule_id"] is None, "a pre-v21 tranche must read unknown, not a guessed owner"
     stamped = conn.execute("SELECT version FROM schema_version").fetchone()["version"]
-    assert stamped == db.SCHEMA_VERSION == 21
+    assert stamped == db.SCHEMA_VERSION
 
 
 def test_v21_is_idempotent_on_a_database_that_already_has_the_column() -> None:
@@ -1326,3 +1326,137 @@ def test_v21_is_idempotent_on_a_database_that_already_has_the_column() -> None:
 
     columns = [row["name"] for row in conn.execute("PRAGMA table_info(positions)")]
     assert columns.count("rule_id") == 1
+
+
+# -- v22: sell_proposals (#857) ----------------------------------------------------------------
+
+_V22_COLUMNS = {
+    "id",
+    "ts",
+    "product_id",
+    "rule_id",
+    "rule_kind",
+    "rule_status",
+    "qty",
+    "expected_price",
+    "vwae",
+    "cost_basis",
+    "expected_gross",
+    "expected_fee",
+    "fee_source",
+    "expected_net_pnl",
+    "legs",
+    "trigger",
+    "rails",
+    "decision",
+    "superseded_by",
+    "order_id",
+    "reviewed_ts",
+}
+
+
+def test_migration_to_v22_creates_sell_proposals() -> None:
+    conn = db.connect(":memory:")
+    db.migrate(conn)
+    columns = {row["name"] for row in conn.execute("PRAGMA table_info(sell_proposals)")}
+    assert columns == _V22_COLUMNS
+    indexes = {row["name"] for row in conn.execute("PRAGMA index_list(sell_proposals)")}
+    assert "idx_sell_proposals_product_ts" in indexes
+    assert db.SCHEMA_VERSION >= 22
+
+
+def test_a_v21_database_gains_an_empty_sell_proposals_table() -> None:
+    conn = db.connect(":memory:")
+    conn.execute("CREATE TABLE IF NOT EXISTS schema_version (version INTEGER NOT NULL)")
+    conn.execute("INSERT INTO schema_version (version) VALUES (21)")
+    conn.commit()
+    db.migrate(conn)
+    assert conn.execute("SELECT COUNT(*) AS n FROM sell_proposals").fetchone()["n"] == 0
+    stamped = conn.execute("SELECT version FROM schema_version").fetchone()["version"]
+    assert stamped == db.SCHEMA_VERSION
+
+
+def test_v22_is_idempotent() -> None:
+    conn = db.connect(":memory:")
+    db.migrate(conn)
+    db._migrate_v22_sell_proposals(conn)
+    db.migrate(conn)
+    columns = {row["name"] for row in conn.execute("PRAGMA table_info(sell_proposals)")}
+    assert columns == _V22_COLUMNS
+
+
+def _dump_existing_tables(conn: sqlite3.Connection) -> dict[str, list[tuple[object, ...]]]:
+    """Every row of every table EXCEPT `sell_proposals` and `schema_version`, keyed by table --
+    what the deploy's `keel migrate` must leave byte-for-byte alone."""
+    names = [
+        row["name"]
+        for row in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' "
+            "ORDER BY name"
+        )
+    ]
+    return {
+        name: [tuple(r) for r in conn.execute(f"SELECT * FROM {name} ORDER BY rowid")]
+        for name in names
+        if name not in {"sell_proposals", "schema_version"}
+    }
+
+
+def test_the_deploy_migrate_takes_a_populated_v21_file_to_v22_touching_no_row(tmp_path) -> None:
+    """The live deployment reaches v22 by `keel --db <db> migrate`, on a FILE (WAL), holding
+    orders, tranches and an audit chain. v22 is additive: the new table arrives empty, every
+    pre-existing row is untouched, and the audit chain still verifies."""
+    from click.testing import CliRunner
+
+    from keel.cli import cli
+    from keel.data import audit
+
+    path = tmp_path / "live.db"
+    conn = db.connect(path)
+    db.migrate(conn)
+    # Wind the file back to exactly v21: v22 adds one table and one index and nothing else.
+    conn.execute("DROP INDEX IF EXISTS idx_sell_proposals_product_ts")
+    conn.execute("DROP TABLE IF EXISTS sell_proposals")
+    conn.execute("UPDATE schema_version SET version = 21")
+    conn.commit()
+    repo = Repository(conn)
+    order_id = repo.insert_order(
+        {
+            "mode": "live",
+            "product_id": "BTC-USD",
+            "side": "BUY",
+            "order_type": "market",
+            "qty": Decimal("0.00046"),
+            "status": "filled",
+            "actual_fill": Decimal("108700.12"),
+            "fee": Decimal("0.45"),
+            "created_at": 1_780_000_000,
+        }
+    )
+    repo.update_order(order_id, status="filled", updated_at=1_780_000_060)
+    conn.execute(
+        "INSERT INTO positions (product_id, rule_name, opened_at, qty, entry_fill, entry_fee, "
+        "rule_id) VALUES ('BTC-USD', 'dca', 1780000000, '0.00046', '108700.12', '0.45', 7)"
+    )
+    conn.commit()
+    repo.append_journal_entry(ts=1_780_000_100, chart_note="pre-v22 note")
+    before = _dump_existing_tables(conn)
+    events_before = len(audit.read_events(conn))
+    assert "sell_proposals" not in {
+        r["name"] for r in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
+    }
+    conn.close()
+
+    result = CliRunner().invoke(cli, ["--db", str(path), "migrate"])
+
+    assert result.exit_code == 0, result.output
+    assert f"schema 21 -> {db.SCHEMA_VERSION}" in result.output
+    after_conn = db.connect(path)
+    stamped = after_conn.execute("SELECT version FROM schema_version").fetchone()["version"]
+    assert stamped == db.SCHEMA_VERSION
+    assert after_conn.execute("SELECT COUNT(*) AS n FROM sell_proposals").fetchone()["n"] == 0
+    assert _dump_existing_tables(after_conn) == before
+    assert len(before["orders"]) == 1 and len(before["positions"]) == 1
+    assert len(before["journal"]) == 1 and len(before["audit_events"]) == events_before == 3
+    state = audit.chain_state(after_conn)
+    assert state.errors == () and state.event_count == events_before
