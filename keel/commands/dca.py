@@ -16,6 +16,11 @@ that REFUSES a missing `--db` path or a stale schema rather than creating or mig
 because either of those, under a plain read-write connection, would itself be a write. At a TTY
 the opener is `_common._open_repo`, the ordinary read-write one `[Y]` needs to insert rows.
 
+**`keel dca proposals list|show` open read-only ALWAYS** (#857). They never write -- the proposals
+log is written by the cycle (P7/P8), never by a reader -- so there is no TTY branch to take:
+`_common._open_repo_ro` refuses a missing `--db` path or a stale schema at a terminal exactly as it
+does off one, and a v21 database is the operator's `keel migrate`, not a side effect of reading.
+
 Both openers are reached as `_common.<name>(ctx)` -- module attribute access, never a name bound
 by `from ... import ...` -- for the same reason `_common`'s own docstring gives for
 `_is_interactive`: it is the one patch point a test can rebind no matter which module the calling
@@ -29,7 +34,7 @@ from decimal import Decimal
 
 import click
 
-from keel.commands import _common
+from keel.commands import _common, sleeve_report
 from keel.commands._common import _bound_venue_or_default, _load_cfg, with_disclaimer
 from keel.commands.assets import screen_product
 from keel.commands.dca_plan import (
@@ -50,7 +55,8 @@ _CHOICE_LABELS = {"Y": "[Y] Approve", "E": "[E] Edit weights", "N": "[N] Cancel"
 
 @click.group("dca")
 def dca_group() -> None:
-    """Plan a multi-asset DCA schedule (writes `candidate` rules only, on approval)."""
+    """Plan a multi-asset DCA schedule (writes `candidate` rules only, on approval), and read the
+    sleeve's sell-proposals log."""
 
 
 @dca_group.command("plan")
@@ -161,3 +167,39 @@ def _edit_weights(editable: tuple[tuple[str, Decimal], ...]) -> dict[str, Decima
             except DcaPlanError as exc:
                 click.echo(f"  {exc}")
     return edited
+
+
+@dca_group.group("proposals")
+def proposals_group() -> None:
+    """The sleeve's sell-proposals log (read-only): what each sleeve-sell rule proposed, the
+    rails' answer, and the fee it would have paid."""
+
+
+@proposals_group.command("list")
+@click.option("--product", default=None, help="Only this product, e.g. BTC-USD.")
+@click.pass_context
+@with_disclaimer
+def proposals_list_cmd(ctx: click.Context, product: str | None) -> None:
+    """Every recorded sell proposal, newest first, one line each. Writes nothing."""
+    repo = _common._open_repo_ro(ctx)
+    rows = repo.get_sell_proposals(product_id=product)
+    if not rows:
+        click.echo("no sell proposals recorded" + (f" for {product}" if product else "") + ".")
+        return
+    for row in rows:
+        click.echo(sleeve_report.render_proposal_line(row))
+
+
+@proposals_group.command("show")
+@click.argument("proposal_id", type=int)
+@click.pass_context
+@with_disclaimer
+def proposals_show_cmd(ctx: click.Context, proposal_id: int) -> None:
+    """One proposal in full: its trigger, the rails' answer, the fee and its source, and the
+    legs rail 2's slicing needs. Writes nothing."""
+    repo = _common._open_repo_ro(ctx)
+    row = repo.get_sell_proposal(proposal_id)
+    if row is None:
+        raise click.ClickException(f"no sell proposal #{proposal_id}")
+    for line in sleeve_report.render_proposal(row):
+        click.echo(line)
