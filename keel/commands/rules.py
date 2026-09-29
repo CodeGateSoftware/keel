@@ -1221,7 +1221,8 @@ def seed_rules_into(
 @click.option(
     "--kinds",
     default=None,
-    help="Comma-separated rule kinds (default: every kind in agent.RULE_REGISTRY).",
+    help="Comma-separated rule kinds (default: every seedable kind -- the registry less its "
+    "sleeve-sell kinds, which `rules add` creates).",
 )
 @click.option(
     "--status",
@@ -1255,6 +1256,11 @@ def rules_seed(
     so the resulting rows are exactly what `agent._build_rule` already knows how to
     reconstruct -- they still start at `candidate` and must clear `rules promote` before they can
     trade `paper`/`live`.
+
+    Only SEEDABLE kinds (`agent.seedable_kinds()`, plan R20): a sleeve-sell kind such as
+    `reverse_dca` has required params no constructor default can supply, so it is never seeded
+    -- by default it is left out, and naming it in `--kinds` is refused before anything is
+    written. `keel rules add` creates one.
 
     Idempotent by (kind, product_id): re-running this with no `--force` skips any pair that
     already has a rule row of any status, so it's safe to call repeatedly (e.g. from a setup
@@ -1294,13 +1300,27 @@ def rules_seed(
     if kinds:
         kind_list = [k.strip() for k in kinds.split(",") if k.strip()]
     else:
-        kind_list = list(agent.RULE_REGISTRY)
+        kind_list = agent.seedable_kinds()
 
     unknown_kinds = [k for k in kind_list if k not in agent.RULE_REGISTRY]
     if unknown_kinds:
         click.echo(
             f"Error: unknown rule kind(s) {unknown_kinds!r}; known kinds: "
             f"{sorted(agent.RULE_REGISTRY)!r}",
+            err=True,
+        )
+        ctx.exit(1)
+        return
+    # Plan R20: a sleeve-sell kind is registered but never seeded. Named here, before anything is
+    # written, rather than reaching `seed_rules_into`, which would build it from `product_id`
+    # alone and crash on its required params.
+    seedable = set(agent.seedable_kinds())
+    unseedable = [k for k in kind_list if k not in seedable]
+    if unseedable:
+        click.echo(
+            f"Error: {unseedable!r} cannot be seeded: a sleeve-sell kind has required params no "
+            f"default can supply. Create one with `keel rules add --kind <kind> --product <id> "
+            f"--params '{{...}}'`.",
             err=True,
         )
         ctx.exit(1)
@@ -1943,7 +1963,9 @@ def describe_params(kind: str) -> dict[str, ParamHelp]:
     # ONE source for "does the row persist this param?": the constructed rule's own
     # `describe()["params"]` -- exactly the dict `add_rule_row` stores and
     # `agent._build_rule` rebuilds from. A kind whose defaults cannot even construct
-    # offers everything it accepts (the honest fallback; no registered kind hits it).
+    # offers everything it accepts -- the honest fallback, and `reverse_dca`'s path: its
+    # `target_usd`/`min_price_floor` are required (plan R20), and it persists every kwarg it
+    # accepts but `name`, so "everything it accepts" is exactly what it persists.
     # The SAME instance supplies the declared space, so the help's ranges are the rule's
     # own declaration (`param_space()`) and can never restate a range it did not declare.
     try:

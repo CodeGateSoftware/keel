@@ -50,6 +50,7 @@ from keel.data.db import connect, migrate
 from keel.data.repository import Repository
 from keel.strategy import backtest as backtest_mod
 from keel.types import Candle, Granularity
+from tests.strategy.rule_conformance import minimal_params
 
 NOW_TS = 1_800_000_000
 
@@ -144,7 +145,7 @@ def test_describe_params_covers_every_kind_and_every_param_minus_identity() -> N
     for kind, rule_cls in agent.RULE_REGISTRY.items():
         params = describe_params(kind)
         persisted = set(
-            agent.build_rule_from_params(kind, {"product_id": "BTC-USD"}).describe()["params"]
+            agent.build_rule_from_params(kind, minimal_params(kind)).describe()["params"]
         )
         accepted = {
             name

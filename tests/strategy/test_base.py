@@ -261,7 +261,15 @@ def test_every_registered_rule_proposes_no_reduction_by_default() -> None:
             for i in range(30)
         ]
     }
-    kinds = sorted(RULE_REGISTRY)
+    from keel.strategy import promotion
+
+    # The ENTRY kinds: a sleeve-sell kind (`reverse_dca`, P9) overrides the hook by design, and
+    # its own tests pin what it proposes.
+    kinds = sorted(
+        kind
+        for kind, cls in RULE_REGISTRY.items()
+        if promotion.promotion_class_of(cls) != promotion.SLEEVE_SELL
+    )
     assert len(kinds) >= 6, kinds
     proposals = {
         kind: build_rule_from_params(kind, {"product_id": "BTC-USD"}).reduce_signal(

@@ -33,6 +33,7 @@ import pytest
 from keel.agent import RULE_REGISTRY, build_rule_from_params
 from keel.strategy.rules.base import Rule, Setup
 from keel.types import Candle, Granularity
+from tests.strategy.rule_conformance import minimal_params
 
 # -- layer 1: a rule's own declaration drives the coercion ---------------------------------
 
@@ -280,7 +281,7 @@ def test_a_stored_rule_row_rebuilds_identically(kind: str) -> None:
     TYPES as well as values: `Decimal("2") == 2.0` and `Granularity.ONE_HOUR == "ONE_HOUR"` are
     both true, so an equality-only assertion passes against exactly the regression this guards.
     """
-    shipped = RULE_REGISTRY[kind](product_id="BTC-USD")
+    shipped = build_rule_from_params(kind, minimal_params(kind))
     stored = json.loads(json.dumps(shipped.describe()["params"], default=str))
 
     rebuilt = build_rule_from_params(kind, {**stored, "product_id": "BTC-USD"})
@@ -306,7 +307,7 @@ def test_a_stored_rule_row_rebuilds_with_real_decimals_on_its_attributes(kind: s
     (`keel/strategy/exit_policy.py`'s own docstring relies on those arriving coerced).
     """
     rule_cls = RULE_REGISTRY[kind]
-    shipped = rule_cls(product_id="BTC-USD")
+    shipped = build_rule_from_params(kind, minimal_params(kind))
     stored = json.loads(json.dumps(shipped.describe()["params"], default=str))
     rebuilt = build_rule_from_params(kind, {**stored, "product_id": "BTC-USD"})
 
@@ -322,3 +323,19 @@ def test_a_stored_rule_row_rebuilds_with_real_decimals_on_its_attributes(kind: s
 
     for name in rule_cls.tuple_params:
         assert isinstance(getattr(rebuilt, name, ()), tuple), f"{kind}.{name}"
+
+
+@pytest.mark.parametrize("kind", sorted(RULE_REGISTRY))
+def test_required_params_names_exactly_each_kinds_required_constructor_params(kind: str) -> None:
+    """`rule_conformance.REQUIRED_PARAMS` is what lets the registry-wide tests above construct a
+    kind with required params (`reverse_dca`) instead of skipping it. Pinned against the
+    constructor's own signature, so a kind gaining or losing a required param fails HERE."""
+    from tests.strategy.rule_conformance import REQUIRED_PARAMS
+
+    required = {
+        name
+        for name, param in inspect.signature(RULE_REGISTRY[kind]).parameters.items()
+        if param.default is inspect.Parameter.empty and name not in ("self", "product_id")
+    }
+    assert required == set(REQUIRED_PARAMS.get(kind, {})), kind
+    assert build_rule_from_params(kind, minimal_params(kind)).product_id == "BTC-USD"

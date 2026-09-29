@@ -1253,9 +1253,13 @@ def test_rules_seed_populates_products_times_kinds(tmp_path, valid_config_path):
 
     assert result.exit_code == 0, result.output
     rows = repo.get_rules("candidate")
-    # valid_config_path's allowlist is BTC/ETH/PAXG (3 products) x all of RULE_REGISTRY (N kinds).
-    assert len(rows) == 3 * len(RULE_REGISTRY)
-    assert f"seeded={3 * len(RULE_REGISTRY)} skipped=0" in result.output
+    # valid_config_path's allowlist is BTC/ETH/PAXG (3 products) x every SEEDABLE kind: the
+    # registry less its sleeve-sell kinds (plan R20), which are never seeded.
+    seedable = agent.seedable_kinds()
+    assert len(rows) == 3 * len(seedable)
+    assert f"seeded={3 * len(seedable)} skipped=0" in result.output
+    assert {row["kind"] for row in rows} == set(seedable)
+    assert "reverse_dca" in RULE_REGISTRY and "reverse_dca" not in seedable
 
 
 def test_rules_seed_is_idempotent(tmp_path, valid_config_path):
@@ -1270,8 +1274,8 @@ def test_rules_seed_is_idempotent(tmp_path, valid_config_path):
     second = runner.invoke(cli, args)
 
     assert second.exit_code == 0, second.output
-    assert f"seeded=0 skipped={3 * len(RULE_REGISTRY)}" in second.output
-    assert len(repo.get_rules()) == 3 * len(RULE_REGISTRY)
+    assert f"seeded=0 skipped={3 * len(agent.seedable_kinds())}" in second.output
+    assert len(repo.get_rules()) == 3 * len(agent.seedable_kinds())
 
 
 def test_rules_seed_force_reseeds_even_when_present(tmp_path, valid_config_path):
@@ -1286,8 +1290,33 @@ def test_rules_seed_force_reseeds_even_when_present(tmp_path, valid_config_path)
     second = runner.invoke(cli, [*args, "--force"])
 
     assert second.exit_code == 0, second.output
-    assert f"seeded={3 * len(RULE_REGISTRY)} skipped=0" in second.output
-    assert len(repo.get_rules()) == 2 * 3 * len(RULE_REGISTRY)
+    assert f"seeded={3 * len(agent.seedable_kinds())} skipped=0" in second.output
+    assert len(repo.get_rules()) == 2 * 3 * len(agent.seedable_kinds())
+
+
+def test_rules_seed_refuses_a_sleeve_sell_kind_by_name_and_writes_nothing(
+    tmp_path, valid_config_path
+):
+    """R20: `--kinds reverse_dca` is refused, naming the kind and `rules add`, not built from
+    `{"product_id": p}` alone (which its required `target_usd` makes a crash)."""
+    db_path = tmp_path / "test.db"
+    repo = _repo_at(db_path)
+    result = CliRunner().invoke(
+        cli,
+        [
+            "--db",
+            str(db_path),
+            "--config",
+            str(valid_config_path),
+            "rules",
+            "seed",
+            "--kinds",
+            "dca,reverse_dca",
+        ],
+    )
+    assert result.exit_code == 1
+    assert "reverse_dca" in result.output and "rules add" in result.output
+    assert repo.get_rules() == []
 
 
 def test_rules_seed_respects_products_and_kinds_options(tmp_path, valid_config_path):

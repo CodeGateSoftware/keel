@@ -1046,7 +1046,10 @@ def create_database(_config_path: Path, db_path: Path, _values: dict[str, str]) 
 
 
 def seed_rule_library(config_path: Path, db_path: Path, _values: dict[str, str]) -> ActionResult:
-    """Seed one CANDIDATE rule per (kind, allowlisted product).
+    """Seed one CANDIDATE rule per (seedable kind, allowlisted product).
+
+    Seedable is `agent.seedable_kinds()` (plan R20): a sleeve-sell kind (`reverse_dca`) is never
+    seeded, because its required params have no honest default.
 
     Candidates trade nothing. Promoting one is a separate, deliberate, human step -- which is why
     seeding is mechanical and promotion is not.
@@ -1070,7 +1073,9 @@ def seed_rule_library(config_path: Path, db_path: Path, _values: dict[str, str])
     try:
         outcome = seed_rules_into(
             Repository(conn),
-            list(agent.RULE_REGISTRY),
+            # Seedable kinds only (plan R20): a sleeve-sell kind needs params no default can
+            # honestly supply, and is created with `keel rules add`.
+            agent.seedable_kinds(),
             products,
             status="candidate",
             force=False,

@@ -1323,3 +1323,76 @@ def test_the_printed_params_are_the_stored_params(tmp_path, valid_config_path):
     assert result.exit_code == 0, result.output
     stored = repo.get_rules()[0]["params"]
     assert json.dumps(stored, sort_keys=True) in result.output
+
+
+# -- reverse_dca (#857, plan P9 Task 9.2): registered for `rules add`, preview-only (S2) -------
+
+
+def test_rules_add_writes_a_reverse_dca_candidate(tmp_path, valid_config_path):
+    result = _add(
+        tmp_path,
+        valid_config_path,
+        "--kind",
+        "reverse_dca",
+        "--product",
+        "BTC-USD",
+        "--params",
+        '{"target_usd": "100", "min_price_floor": "60000"}',
+    )
+    assert result.exit_code == 0, result.output
+    [row] = _repo(tmp_path).get_rules()
+    assert (row["kind"], row["status"]) == ("reverse_dca", "candidate")
+    rule = _build_rule(row)
+    assert rule.params["target_usd"] == Decimal("100")
+    assert rule.params["min_price_floor"] == Decimal("60000")
+    assert rule.params["execution"] == "preview"
+
+
+def test_rules_add_refuses_execution_auto_and_writes_nothing(tmp_path, valid_config_path):
+    result = _add(
+        tmp_path,
+        valid_config_path,
+        "--kind",
+        "reverse_dca",
+        "--product",
+        "BTC-USD",
+        "--params",
+        '{"target_usd": "100", "min_price_floor": "60000", "execution": "auto"}',
+    )
+    assert result.exit_code == 1
+    # Refused for its PARAM, not for an unknown kind (which also exits 1 and writes nothing).
+    assert "unknown rule kind" not in result.output
+    assert "execution" in result.output and "'preview'" in result.output
+    assert _repo(tmp_path).get_rules() == []
+
+
+def test_rules_add_refuses_a_reverse_dca_without_its_required_target(tmp_path, valid_config_path):
+    result = _add(
+        tmp_path,
+        valid_config_path,
+        "--kind",
+        "reverse_dca",
+        "--product",
+        "BTC-USD",
+        "--params",
+        '{"min_price_floor": "60000"}',
+    )
+    assert result.exit_code == 1 and "target_usd" in result.output
+    assert "unknown rule kind" not in result.output
+    assert _repo(tmp_path).get_rules() == []
+
+
+def test_rules_add_refuses_a_non_positive_target(tmp_path, valid_config_path):
+    result = _add(
+        tmp_path,
+        valid_config_path,
+        "--kind",
+        "reverse_dca",
+        "--product",
+        "BTC-USD",
+        "--params",
+        '{"target_usd": "0", "min_price_floor": "60000"}',
+    )
+    assert result.exit_code == 1 and "target_usd" in result.output
+    assert "unknown rule kind" not in result.output
+    assert _repo(tmp_path).get_rules() == []

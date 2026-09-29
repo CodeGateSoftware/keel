@@ -15,10 +15,12 @@ from __future__ import annotations
 
 from decimal import Decimal
 
+from keel.strategy.reduction import Holding, Lot
 from keel.strategy.rules.base import Rule
 from keel.strategy.rules.dca import Dca
+from keel.strategy.rules.reverse_dca import ReverseDca
 from keel.types import Candle, Granularity
-from tests.strategy.rule_conformance import RuleConformanceTests
+from tests.strategy.rule_conformance import ReductionConformanceTests, RuleConformanceTests
 from tests.strategy.test_dca import _candle as _dca_candle
 from tests.strategy.test_pullback import _bullish_pullback_candles
 from tests.strategy.test_pullback import _rule as _pullback_rule
@@ -60,3 +62,18 @@ class TestTurtleBreakoutConformance(RuleConformanceTests):
 
     def firing_candles(self) -> dict[Granularity, list[Candle]]:
         return {Granularity.ONE_DAY: _breakout_candles()}
+
+
+class TestReverseDcaConformance(ReductionConformanceTests):
+    def rule(self) -> Rule:
+        return ReverseDca("BTC-USD", target_usd=Decimal("100"), min_price_floor=Decimal("1"))
+
+    def holding(self) -> Holding:
+        return Holding(
+            "BTC-USD", (Lot(1, "dca", 0, Decimal("0.01"), Decimal("50000"), Decimal("0")),)
+        )
+
+    def firing_candles(self) -> dict[Granularity, list[Candle]]:
+        # Day 60 is a 30-day cadence boundary; one bar at 100000 is its own lookback high, so
+        # the drawdown gate passes and the floor of 1 is far below.
+        return {Granularity.ONE_DAY: [_dca_candle(day=60, price="100000")]}

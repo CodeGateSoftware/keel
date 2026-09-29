@@ -639,3 +639,44 @@ def test_handle_reductions_reaches_no_placement_cancel_or_order_writer() -> None
     for name in sorted(_REDUCE_FORBIDDEN_REACHES | {"roll_stop_to", "_manage_stops"}):
         assert _calls_in(only, "keel.agent", {name}) == set(), name
     assert _calls_via_attr(only, "keel.agent", "executor", _ORDER_REACHING_NAMES) == set()
+
+
+# -- S2: v1 execution is preview-only (P9 makes this non-vacuous) -------------------------------
+
+
+def _sleeve_sell_kinds() -> dict[str, type]:
+    from keel.agent import RULE_REGISTRY
+    from keel.strategy import promotion
+
+    return {
+        kind: cls
+        for kind, cls in RULE_REGISTRY.items()
+        if promotion.promotion_class_of(cls) == promotion.SLEEVE_SELL
+    }
+
+
+def test_every_sleeve_sell_kind_is_preview_only() -> None:
+    """S2: every registered `sleeve_sell` class declares `execution: Literal["preview"]` -- ONE
+    choice, so `rules add` can offer nothing else -- and its constructor refuses `"auto"`."""
+    import inspect
+    from typing import Literal, get_args, get_origin, get_type_hints
+
+    kinds = _sleeve_sell_kinds()
+    assert "reverse_dca" in kinds, "vacuous until the first kind ships -- P9 ships it"
+    for kind, cls in kinds.items():
+        hint = get_type_hints(cls.__init__)["execution"]
+        assert get_origin(hint) is Literal, kind
+        assert get_args(hint) == ("preview",), kind
+        assert inspect.signature(cls).parameters["execution"].default == "preview", kind
+
+
+def test_no_sleeve_sell_kind_is_seedable() -> None:
+    """R20: registered (so `_build_rule` and `rules add` know it), never seeded."""
+    from keel import agent
+
+    kinds = _sleeve_sell_kinds()
+    assert kinds, "vacuous without a sleeve-sell kind"
+    seedable = agent.seedable_kinds()
+    assert set(kinds).isdisjoint(seedable)
+    # Nothing else is dropped: every non-sleeve kind is still seeded, in registry order.
+    assert seedable == [k for k in agent.RULE_REGISTRY if k not in kinds]

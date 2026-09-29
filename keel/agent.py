@@ -94,6 +94,7 @@ from keel.strategy.rules.base import Action, Rule, Setup, Signal, completed_days
 from keel.strategy.rules.cusum_event import CusumEvent
 from keel.strategy.rules.dca import Dca
 from keel.strategy.rules.pullback_continuation import PullbackContinuation
+from keel.strategy.rules.reverse_dca import ReverseDca
 from keel.strategy.rules.rsi_meanrev import RsiMeanReversion
 from keel.strategy.rules.triple_barrier import TripleBarrier
 from keel.strategy.rules.turtle_breakout import TurtleBreakout
@@ -144,7 +145,26 @@ RULE_REGISTRY: dict[str, type[Rule]] = {
     # any fee is charged, so a better exit has no gross edge to harvest. It ships to measure
     # how much a better exit moves that, not to rescue it.
     "triple_barrier": TripleBarrier,
+    # #857, spec §6. The first SELL-side kind: a scheduled cash distribution, preview-only (S2 --
+    # `execution` is `Literal["preview"]`). Registered so `_build_rule` reconstructs a stored row
+    # and `keel rules add --kind reverse_dca` can create one; NOT seedable (plan R20,
+    # `seedable_kinds` below), because its `target_usd`/`min_price_floor` are required and a
+    # seeded seller with invented defaults is what no one should get by accident.
+    "reverse_dca": ReverseDca,
 }
+
+
+def seedable_kinds() -> list[str]:
+    """The registry kinds `rules seed` and the first-run wizard create, in registry order: every
+    kind whose `promotion_class` is not `sleeve_sell` (plan R20).
+
+    `seed_rules_into` builds each kind from `{"product_id": p}` alone. A sleeve-sell kind has
+    required params (`reverse_dca`: `target_usd`, `min_price_floor`), so it could not be seeded
+    at all without inventing them -- and an invented distribution size is exactly the seller no
+    one should acquire by clicking through setup. `keel rules add` is how one is created.
+    """
+    return [kind for kind in RULE_REGISTRY if not _is_sleeve_kind(kind)]
+
 
 # The per-kind coercion tables that used to live here -- `_DECIMAL_PARAMS`, `_GRANULARITY_PARAMS`
 # and a hardcoded `if kind == "pullback_continuation"` tuple branch inside the function below --
