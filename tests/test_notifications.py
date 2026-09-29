@@ -20,7 +20,7 @@ import json
 from decimal import Decimal
 
 import pytest
-from keel_core.notifications import NotificationSettings, send_event
+from keel_core.notifications import EVENTS_BY_KEY, WARN, NotificationSettings, send_event
 
 from keel import notifications
 from keel.commands.doctor import attestation_findings, rail_state_findings
@@ -83,6 +83,7 @@ def _state(
     stale: tuple[str, ...] = (),
     held: tuple[str, ...] = (),
     sleeve: tuple[ReduceResult, ...] = (),
+    sleeve_only: tuple[str, ...] = (),
 ):
     return events_from_state(
         attestation_findings=attestation if attestation is not None else _attestation(NOW),
@@ -93,6 +94,7 @@ def _state(
         stale_products=stale,
         held_products=held,
         sleeve_proposals=sleeve,
+        sleeve_only_products=sleeve_only,
     )
 
 
@@ -224,6 +226,38 @@ def test_feed_staleness_fires_only_for_a_product_with_an_open_position():
     assert without_position == []
 
 
+def test_a_rule_managed_product_keeps_the_exit_wording():
+    """The original case, unchanged: a product an entry/exit rule watches rides its exits on the
+    feed, so a stale feed is exactly that."""
+    [event] = _state(stale=("BTC-USD",), held=("BTC-USD",), sleeve_only=("PAXG-USD",))
+    assert event.key == "feed.stale_open_position"
+    assert event.fields == {"product": "BTC-USD", "watched_by": "rules"}
+    assert event.message == (
+        "feed for BTC-USD is stale while a position is open -- the cycle skipped it, so its "
+        "rule-driven exits are riding on stopped data"
+    )
+
+
+def test_a_product_only_a_sleeve_rule_watches_says_its_proposals_are_paused():
+    """P8 polls a held product that only a sleeve-sell rule watches (PAXG under a reverse_dca).
+    No rule exits it -- a sleeve rule proposes and never exits (plan Review Focus 5) -- so "rule-
+    driven exits are riding on stopped data" is false there. What the stale feed stops is the
+    sleeve rule's proposals: `run_once` skips the product before `_handle_reductions`. Same key,
+    same WARN."""
+    [event] = _state(stale=("PAXG-USD",), held=("PAXG-USD",), sleeve_only=("PAXG-USD",))
+    assert event.key == "feed.stale_open_position"
+    assert EVENTS_BY_KEY[event.key].severity == WARN
+    assert event.fields == {"product": "PAXG-USD", "watched_by": "sleeve"}
+    assert event.message == (
+        "feed for PAXG-USD is stale while a position is open -- the cycle skipped it, so the "
+        "sleeve-sell rule watching it proposes nothing until the feed resumes; no rule exits it"
+    )
+
+
+def test_a_sleeve_only_product_that_is_not_held_is_still_silent():
+    assert _state(stale=("PAXG-USD",), held=(), sleeve_only=("PAXG-USD",)) == []
+
+
 def test_a_fully_healthy_state_produces_no_events_at_all():
     assert _state() == []
 
@@ -290,12 +324,19 @@ class _LoopResult:
     notification-relevant fields."""
 
     def __init__(
-        self, *, enter_signals=(), enter_results=(), stale_products=(), reduce_results=()
+        self,
+        *,
+        enter_signals=(),
+        enter_results=(),
+        stale_products=(),
+        reduce_results=(),
+        sleeve_only_products=(),
     ) -> None:
         self.enter_signals = list(enter_signals)
         self.enter_results = list(enter_results)
         self.stale_products = list(stale_products)
         self.reduce_results = list(reduce_results)
+        self.sleeve_only_products = list(sleeve_only_products)
 
 
 def _recording_transport(calls: list[tuple[str, str]]):
@@ -698,3 +739,28 @@ def test_the_wiring_derives_sleeve_proposals_from_the_cycle_result():
     payload = json.loads(body)
     assert (payload["event"], payload["proposal_id"]) == ("sleeve.proposal", 11)
     assert repo.state_writes == []
+
+
+def test_the_wiring_reads_which_stale_products_only_a_sleeve_rule_watches():
+    """`notify_after_cycle` hands `result.sleeve_only_products` to the pure derivation, so a
+    stale, held product that only a sleeve rule watches is worded as paused proposals."""
+    calls: list[tuple[str, str]] = []
+    repo = _Repo(withdrawals_attested_at=NOW, held=("PAXG-USD", "BTC-USD"))
+    repo.cash_posture = _healthy_posture()
+    config = _config_with(NotificationSettings(events=frozenset({"feed.stale_open_position"})))
+
+    sent = notify_after_cycle(
+        repo,
+        config,
+        _LoopResult(stale_products=["BTC-USD", "PAXG-USD"], sleeve_only_products=["PAXG-USD"]),
+        NOW,
+        url="https://alerts.example/hook",
+        transport=_recording_transport(calls),
+    )
+
+    assert sent == 2
+    payloads = sorted((json.loads(body) for _url, body in calls), key=lambda p: p["product"])
+    assert [(p["event"], p["product"], p["watched_by"]) for p in payloads] == [
+        ("feed.stale_open_position", "BTC-USD", "rules"),
+        ("feed.stale_open_position", "PAXG-USD", "sleeve"),
+    ]

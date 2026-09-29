@@ -122,6 +122,7 @@ def events_from_state(
     stale_products: Sequence[str],
     held_products: Sequence[str],
     sleeve_proposals: Sequence[ReduceResult] = (),
+    sleeve_only_products: Sequence[str] = (),
 ) -> list[NotificationEvent]:
     """Derive the #444 events from doctor's findings plus the cycle facts. Pure.
 
@@ -129,6 +130,11 @@ def events_from_state(
     per-product: one event per stale product WITH a position, because that is a per-position
     fact). Numbers ride in the message (doctor's own detail strings carry the days remaining)
     and in `fields` where they are structural (`pct_used`, `count`).
+
+    `sleeve_only_products` is the cycle's `LoopResult.sleeve_only_products` (#857, P10): a stale,
+    held product in it is watched by a sleeve-sell rule alone, which never exits, so its
+    `feed.stale_open_position` says the rule's proposals are paused rather than that exits ride
+    on stopped data (`watched_by="sleeve"`, not `"rules"`). Same key, same WARN.
 
     `sleeve_proposals` is the cycle's `LoopResult.reduce_results` (#857, plan R19): one
     `sleeve.proposal` per proposal the operator should look at -- `preview` or `vetoed` -- and
@@ -228,13 +234,27 @@ def events_from_state(
             )
         )
 
+    sleeve_only = set(sleeve_only_products)
     for product in sorted(set(stale_products) & set(held_products)):
+        if product in sleeve_only:
+            # Only a sleeve-sell rule watches it (P10's carried item): no rule of this product's
+            # exits anything -- a sleeve rule proposes and never exits (plan Review Focus 5) --
+            # so what the stale feed stops is the proposals `run_once` skips it before.
+            consequence = (
+                "the sleeve-sell rule watching it proposes nothing until the feed resumes; "
+                "no rule exits it"
+            )
+            watched_by = "sleeve"
+        else:
+            consequence = "its rule-driven exits are riding on stopped data"
+            watched_by = "rules"
         events.append(
             notification_event(
                 "feed.stale_open_position",
                 f"feed for {product} is stale while a position is open -- the cycle skipped "
-                f"it, so its rule-driven exits are riding on stopped data",
+                f"it, so {consequence}",
                 product=product,
+                watched_by=watched_by,
             )
         )
 
@@ -343,6 +363,7 @@ def notify_after_cycle(
             stale_products=result.stale_products,
             held_products=repo.held_products(),
             sleeve_proposals=result.reduce_results,
+            sleeve_only_products=result.sleeve_only_products,
         )
         # #793: an attestation alert goes out ONCE for the window it reports. Applied here and
         # not in `events_from_state`, which stays pure: the ledger is a repo read, and the

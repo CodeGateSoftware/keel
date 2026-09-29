@@ -84,7 +84,9 @@ class EventSpec:
 #: * `allowance.nearing_exhaustion` -- month-to-date BUY spend nearing the in-force rail-14
 #:   allowance (see `keel.notifications.ALLOWANCE_NEARING_USED_PCT`).
 #: * `feed.stale_open_position` -- staleness on a product with an open position, where the
-#:   exits ride on data that has stopped arriving.
+#:   exits ride on data that has stopped arriving. On a product only a sleeve-sell rule watches
+#:   (#857), no rule exits it, and what stops is that rule's proposals; the message says so and
+#:   `watched_by` is `sleeve` rather than `rules`. Same key, same severity.
 #: * `sleeve.proposal` (#857) -- the cycle recorded a sleeve-sell proposal (`preview` or
 #:   `vetoed`; arbitration's `superseded` losers are silent). The taxonomy's first `info` event:
 #:   in this build a proposal is PREVIEW-ONLY and places nothing, so it is a report, not a

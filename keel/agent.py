@@ -1959,6 +1959,11 @@ class LoopResult:
     # cycle -- one PROPOSAL each (preview-only in this build), including the `superseded` losers
     # of arbitration. `notifications.events_from_state` derives `sleeve.proposal` from it (R19).
     reduce_results: list[ReduceResult] = field(default_factory=list)
+    # #857 (plan P10): the products this cycle polled ONLY for a sleeve-sell rule -- no entry/exit
+    # rule watches them. `notifications.events_from_state` words `feed.stale_open_position` for
+    # them by what a stale feed actually stops there (the rule's proposals), not by the exits no
+    # rule of theirs can take.
+    sleeve_only_products: list[str] = field(default_factory=list)
     # Paper-forward observability (P4 Task 9): the synthetic account's equity + Rail 11's
     # drawdown scalars for THIS cycle. `None` in every non-paper cycle -- there is no synthetic
     # account to report on -- so all existing `LoopResult(...)` constructions stay valid.
@@ -2657,6 +2662,7 @@ def run_once(
             exit_results=exit_results,
             blocked_entries=blocked_entries,
             reduce_results=reduce_results,
+            sleeve_only_products=list(sleeve_only_products),
             paper_equity=result_paper_equity,
             drawdown_total_pct=result_drawdown_total_pct,
             drawdown_weekly_pct=result_drawdown_weekly_pct,
