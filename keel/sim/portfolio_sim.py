@@ -1076,6 +1076,17 @@ def _process_reductions(
     being out of proportion to a fidelity test) -- so the realised P&L `reduce_dca` returns is
     AVERAGE-cost, not FIFO. The FIFO-faithful figure is `report.accumulation_table`'s row, which
     carries the pinned hand computation.
+
+    **The booked leg is clamped to the averaged lot (#926).** `_reduction_check_holding`'s
+    lots are a FRESH Decimal re-summation of every buy less every prior sell, every cycle --
+    a different sequence of additions/subtractions than the account's one lot, which is shrunk
+    by a single subtraction per sale (`SimAccount.reduce_dca`). The two are the same number in
+    exact arithmetic, but Decimal rounds each op to context precision, so on a sell-all leg
+    (sized to `holding.qty`, the rebuilt total) the rebuild can round a few units of the last
+    significant digit ABOVE what the lot actually holds. Exactly as live's `executor.reduce`
+    clamps every SELL to the venue's holding (`_clamped_sell_qty`) rather than trust a
+    ledger figure that can drift from it by rounding dust, the leg booked here is clamped to
+    the lot -- never MORE than what `reduce_dca` can actually sell.
     """
     day = now_ts // _SECONDS_PER_DAY
     lot = account.dca_positions.get(asset)
@@ -1100,7 +1111,9 @@ def _process_reductions(
     decided.add((asset, day))
     if sale.refusal is not None or fill_bar is None:
         return  # refused, or no next bar to fill at -- the distribution is lost, not carried
-    leg = sale.leg_qty
+    # #926: the rebuilt FIFO holding can round a few units above the account's actual lot --
+    # clamp to what `reduce_dca` can sell, as live clamps every sell to the venue's holding.
+    leg = min(sale.leg_qty, lot.qty)
     if monthly_volume_cap is not None:
         remaining = monthly_volume_cap - account.month_volume(now_ts)
         if leg * sale.reduction.expected_price > remaining:

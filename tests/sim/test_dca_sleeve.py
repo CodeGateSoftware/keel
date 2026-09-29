@@ -1063,3 +1063,73 @@ def test_cooldown_refuses_the_repeat_sale_and_allows_it_once_elapsed_in_the_acco
     )
 
     assert [s.decision_ts // _DAY for s in result.dca_sells] == [11, 31]
+
+
+# ---------------------------------------------------------------------------
+# (l) #926: the booked leg is clamped to the averaged lot, not the rebuilt FIFO holding
+# ---------------------------------------------------------------------------
+
+#: 92 daily closes, hand-picked by a scratch search (round(random.uniform(30000, 45000), 2),
+#: seed 1) and then fixed here as literals -- no `random` at test time. Irregular, non-terminal
+#: prices are what makes `_reduction_check_holding`'s per-buy FIFO re-summation (many small
+#: subtractions) and the account's single running-total lot (one subtraction per sale) round
+#: differently in Decimal's last few of 28 significant digits: by day 91 the FIFO rebuild's
+#: total is 6e-30 units ABOVE what `account.dca_positions["BTC"]` actually holds.
+_926_CLOSES = {
+    d: p
+    for d, p in enumerate(
+        [
+            "32015.46", "42711.51", "41456.62", "33826.04", "37431.53", "36742.37", "39773.89",
+            "41830.85", "31407.89", "30425.21", "42536.48", "36491.51", "41434.2", "30031.59",
+            "36680.81", "40823.1", "33431.43", "44179.06", "43521.41", "30458.85", "30381.69",
+            "38121.19", "44087.24", "35718.06", "33248.99", "36331.75", "30435.61", "33325.37",
+            "36568.31", "37437.18", "33496.27", "33463.0", "33281.72", "36894.05", "34346.72",
+            "30322.35", "42563.67", "38346.81", "39634.42", "32788.59", "44888.15", "42899.2",
+            "31813.35", "34990.43", "40822.27", "40667.88", "44046.61", "36331.6", "42450.54",
+            "40054.58", "34550.53", "38813.71", "43237.19", "42692.96", "37579.26", "38835.03",
+            "30517.89", "33641.1", "41961.06", "36214.71", "32595.11", "38231.98", "40545.61",
+            "40117.29", "35620.55", "36584.42", "37626.4", "41676.64", "37814.08", "35898.83",
+            "37345.4", "30443.62", "30652.31", "40550.73", "44747.82", "38897.76", "35904.0",
+            "32555.24", "37533.58", "44731.15", "41557.85", "38094.26", "42904.35", "33482.64",
+            "37706.57", "44287.01", "38666.92", "36886.98", "34039.19", "38219.94", "44356.74",
+            "30085.64",
+        ]  # fmt: skip
+    )
+}  # fmt: skip
+
+
+def test_a_sale_that_would_oversell_the_averaged_lot_is_clamped_to_it() -> None:
+    """#926, a regression from #924's FIFO refusal-check rebuild: `decide_sleeve_sale` sizes the
+    sell-all leg off `_reduction_check_holding`'s rebuilt FIFO total (`holding.qty`), which by
+    day 91 rounds a few 1e-30 units ABOVE `account.dca_positions["BTC"].qty`, the account's one
+    averaged lot the sale actually books against (`SimAccount.reduce_dca`). Unclamped, that
+    leg is larger than the lot and `reduce_dca` raises `ValueError`, aborting the run.
+
+    Weekly $50 `Dca` and a `$240`-net `ReverseDca` (30-day cadence, no hold/drawdown gate) on
+    `_926_CLOSES`: three distributions fall due (days 31, 61, 91), each smaller than the last as
+    the sleeve is drawn down, and the third empties it -- the one that trips the rounding drift.
+    """
+    market = _hourly_market(_926_CLOSES, 92)
+    rules: list[Rule] = [
+        Dca("BTC-USD", cadence_days=7),
+        _rev(target_usd=Decimal("240"), min_hold_days=0, max_drawdown_pct=Decimal("100")),
+    ]
+
+    result = _run_account(rules, market, fee=Decimal("0.006"), slippage=Decimal("0.0013"))
+
+    assert [s.decision_ts // _DAY for s in result.dca_sells] == [31, 61, 91]
+    total_bought = sum((b.qty for b in result.dca_buys), _ZERO)
+    total_sold = sum((s.qty for s in result.dca_sells), _ZERO)
+    # Nothing is oversold: the sim ran to completion (the abort this test guards against would
+    # have raised before this line) and every unit ever bought was, in total, exactly accounted
+    # for by a sale -- none short, none over.
+    assert total_sold == total_bought
+
+    # The sell-all leg: booked (not lost to the abort), and the lot it drew down is gone --
+    # the clamp made the leg equal to what remained, not the (larger) rebuilt FIFO figure.
+    last_sale = result.dca_sells[-1]
+    assert last_sale.qty > 0
+    assert "BTC" not in result.dca_positions
+
+    row = portfolio_sim.dca_sleeve(result)["BTC"]
+    assert (row.qty, row.distributions, row.units_sold) == (_ZERO, 3, total_sold)
