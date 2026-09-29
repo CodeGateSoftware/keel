@@ -1153,18 +1153,43 @@ def test_one_bar_diverging_in_many_truncations_is_counted_once() -> None:
     assert [(d.bar_ts, d.field) for d in report.divergences] == [(60 * _DAY, "setup_present")]
 
 
-def test_the_promote_path_accepts_a_missing_config_for_a_sleeve_rule(btc_book) -> None:
-    """`attempt_promotion`'s docstring allows `config=None`: the sleeve route then reads the dca
-    status as `live` (the conservative reading, R40) instead of crashing."""
+@pytest.mark.parametrize("dca_status", ["candidate", "paper", "live"])
+def test_the_promote_path_accepts_a_missing_config_for_a_sleeve_rule(btc_book, dca_status) -> None:
+    """`attempt_promotion`'s docstring allows `config=None`: with no profile to say which status
+    its cycle runs, the sleeve route counts ANY non-disabled dca on the product as concurrent --
+    the stricter reading (P12's held question). Reading `live` alone would miss a paper dca on
+    a paper profile, which buys exactly as a live one does on a live profile."""
     rid = _paper_reverse(btc_book, days_in_paper=61)
     _review(btc_book, rid)
     btc_book.insert_rule(
-        "dca", {"product_id": "BTC-USD", "cadence_days": 7, "budget_usd": "40"}, status="live"
+        "dca", {"product_id": "BTC-USD", "cadence_days": 7, "budget_usd": "40"}, status=dca_status
     )
     out, err = _collect()
     with pytest.raises(RulesRefused):
         attempt_promotion(
             btc_book, None, rid, now_ts=_SLEEVE_NOW, echo=out.append, echo_err=err.append
         )
+    assert _status(btc_book, rid) == "paper"
+    assert sum(1 for line in err if "--allow-concurrent-dca" in line) == 1
     [gate] = [line for line in out if "sleeve_sell gate" in line]
-    assert gate.endswith("live dca on BTC-USD: yes")
+    assert gate.endswith("non-disabled dca on BTC-USD: yes")
+
+
+def test_a_missing_config_ignores_a_disabled_dca_and_one_on_another_product(btc_book) -> None:
+    """The control for the stricter no-config reading: a disabled dca buys nothing, and a dca on
+    another product makes no round trip on this one."""
+    rid = _paper_reverse(btc_book, days_in_paper=61)
+    _review(btc_book, rid)
+    btc_book.insert_rule(
+        "dca", {"product_id": "BTC-USD", "cadence_days": 7, "budget_usd": "40"}, status="disabled"
+    )
+    btc_book.insert_rule(
+        "dca", {"product_id": "ETH-USD", "cadence_days": 7, "budget_usd": "40"}, status="live"
+    )
+    out, err = _collect()
+    outcome = attempt_promotion(
+        btc_book, None, rid, now_ts=_SLEEVE_NOW, echo=out.append, echo_err=err.append
+    )
+    assert outcome.new_status == "live"
+    [gate] = [line for line in out if "sleeve_sell gate" in line]
+    assert gate.endswith("non-disabled dca on BTC-USD: no")
