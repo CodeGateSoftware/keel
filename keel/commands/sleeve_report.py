@@ -48,6 +48,14 @@ cadence bar the rule fired on -- `<YYYY-MM-DD> bar: sell ...` or `<YYYY-MM-DD> b
 -- and one `terminal` line. It is a MECHANICAL replay of the rule's own proposals: a description
 with no threshold, never evidence for choosing parameters (the research freeze, 2026-09-27).
 
+**The trim report, per tranche and per asset** (`lots_view`/`render_lots` and
+`bands_view`/`render_bands`, for `keel dca trim --preview`, P13): the lots report lists every open
+tranche in the FIFO order a sale consumes it, with its unrealised and if-sold-now P&L, and says
+it is not tax advice (spec §8.2); the bands report shows each target asset's weight against its
+band, and says on every run that band trimming was tested and not adopted (#831) -- a display,
+never a proposal (spec §5). Both mark at the latest cached daily close and print `mark none`,
+never a zero, without one.
+
 **The fee source is always printed beside the fee.** A venue-previewed commission and the
 `config.fees.taker_pct` fallback are different kinds of number (the plan's Global Constraints:
 "every fallback records its source"), and a fee shown without its source reads as the venue's.
@@ -59,7 +67,7 @@ import json
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from decimal import Decimal
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 
 from keel.commands.doctor import _money
 
@@ -610,4 +618,352 @@ def render_replay(
             f"{_usd(replay.terminal_with)} ({_plain(replay.units_left)} units + "
             f"{_usd(replay.cash_usd)} cash), without {_usd(replay.terminal_without)}"
         )
+    return lines
+
+
+# -- keel dca trim --preview --view lots (P13, spec §8.1) -------------------------------------
+
+#: Printed once on every lots report, spec §8.2: keel records no jurisdiction, asserts no tax law
+#: and computes no tax number. A realised figure here is P&L, not a tax outcome.
+NOT_TAX_ADVICE = (
+    "not tax advice: keel records no jurisdiction and computes no tax (spec §8.2); "
+    "'if sold now' is P&L after fee and slippage, nothing more"
+)
+#: Printed once under the head: the order IS the information (Review Focus 3).
+LOTS_FIFO_NOTE = "FIFO order -- a sale consumes these top to bottom"
+#: What the lots report prints when the ledger holds no open tranche.
+NO_OPEN_LOTS = "no open tranches in the positions ledger."
+
+
+@dataclass(frozen=True)
+class LotRow:
+    """One open `positions` tranche as a sale would meet it (spec §8.1).
+
+    `entry_fee_share` and `cost` are `Lot`'s own (`keel/strategy/reduction.py`): the entry fee
+    prorated to the units still held, and the fee-inclusive basis of those units (spec Q4).
+    `fee_pct` and `slippage_pct` are the rates the figures below are priced at --
+    `sleeve.sell_costs`, the fallback fee and the product's liquidity-scaled slippage (R25).
+
+    `mark` is the product's latest cached daily close, and every figure that needs one is
+    `None` without it -- `unrealised` (marked value less `cost`) and `realised_if_sold` (what
+    selling the tranche alone at the mark would book: notional less slippage, less the fee on
+    the notional, less `cost` -- `sleeve.record_proposal`'s definitions). A missing mark is
+    missing data, not a total loss (`keel/commands/positions.py`, "what is absent stays
+    absent")."""
+
+    product_id: str
+    position_id: int
+    rule_name: str
+    opened_at: int
+    qty: Decimal
+    entry_fill: Decimal
+    entry_fee_share: Decimal
+    cost: Decimal
+    fee_pct: Decimal
+    slippage_pct: Decimal
+    mark: Decimal | None
+    unrealised: Decimal | None
+    realised_if_sold: Decimal | None
+
+
+def _daily_mark(repo: Any, product_id: str) -> Decimal | None:
+    """The latest cached ONE_DAY close, or `None`: the bar the sleeve-sell rules decide on."""
+    from keel.types import Granularity
+
+    daily = repo.get_candles(product_id, Granularity.ONE_DAY)
+    return daily[-1].close if daily else None
+
+
+def lots_view(repo: Any, config: Any, product_id: str | None = None) -> list[LotRow]:
+    """Every open tranche, one `LotRow` each (spec §8.1). READ-ONLY: it writes nothing and builds
+    no broker (R25).
+
+    **The tranches are `sleeve.holding_of`'s** -- the `positions` ledger, every rule's tranche
+    (no `rule_name` filter, R8), oldest first -- so the order printed is the order `book_exit`
+    consumes: on PAXG, turtle tranche 3 is the first row (Review Focus 3). Products are listed
+    in product-id order; `product_id` narrows to one.
+
+    **Not `keel pnl`** (spec §8.1): that command is FIFO over the imported `transactions`
+    table. This reads `positions` only, and the two are kept apart rather than reconciled
+    under one flag.
+    """
+    from keel.execution import sleeve
+
+    products = sorted({str(p["product_id"]) for p in repo.get_open_positions(product_id)})
+    rows: list[LotRow] = []
+    for product in products:
+        mark = _daily_mark(repo, product)
+        costs = sleeve.sell_costs(repo, config, product)
+        for lot in sleeve.holding_of(repo, product, mark).lots:
+            cost = lot.cost
+            if mark is None:
+                unrealised = realised = None
+            else:
+                notional = lot.qty * mark
+                unrealised = notional - cost
+                realised = (
+                    notional * (Decimal("1") - costs.slippage_pct) - notional * costs.fee_pct - cost
+                )
+            rows.append(
+                LotRow(
+                    product_id=product,
+                    position_id=lot.position_id,
+                    rule_name=lot.rule_name,
+                    opened_at=lot.opened_at,
+                    qty=lot.qty,
+                    entry_fill=lot.entry_fill,
+                    entry_fee_share=lot.entry_fee_share,
+                    cost=cost,
+                    fee_pct=costs.fee_pct,
+                    slippage_pct=costs.slippage_pct,
+                    mark=mark,
+                    unrealised=unrealised,
+                    realised_if_sold=realised,
+                )
+            )
+    return rows
+
+
+def render_lots(rows: Sequence[LotRow]) -> list[str]:
+    """The lots report: a head naming the fee source, `LOTS_FIFO_NOTE`, one heading per product
+    over its tranches, and `NOT_TAX_ADVICE` last. One line per tranche:
+
+        #<id> <rule> opened <YYYY-MM-DD> qty <q> @ <fill>  fee share $<f>  cost $<c>
+        mark <m>  unrealised $<u>  if sold now $<r> (fee <pct>, slippage <pct>)
+
+    (one line; wrapped here), or `mark none (no cached daily close)` in place of everything
+    after `cost` when there is no mark."""
+    from keel.execution.sleeve import FALLBACK_FEE_SOURCE
+
+    lines = [
+        f"lots -- fees at the fallback rate ({FALLBACK_FEE_SOURCE}); no venue asked",
+        LOTS_FIFO_NOTE,
+    ]
+    if not rows:
+        lines.append(NO_OPEN_LOTS)
+    product: str | None = None
+    for row in rows:
+        if row.product_id != product:
+            product = row.product_id
+            lines.append(product)
+        head = (
+            f"  #{row.position_id} {row.rule_name} opened {_day(row.opened_at)} "
+            f"qty {_plain(row.qty)} @ {_plain(row.entry_fill)}"
+            f"  fee share {_usd(row.entry_fee_share)}  cost {_usd(row.cost)}"
+        )
+        if row.mark is None:
+            lines.append(head + "  mark none (no cached daily close)")
+            continue
+        lines.append(
+            head
+            + f"  mark {_plain(row.mark)}  unrealised {_usd(row.unrealised)}"
+            + f"  if sold now {_usd(row.realised_if_sold)}"
+            + f" (fee {_pct(row.fee_pct)}, slippage {_pct(row.slippage_pct)})"
+        )
+    lines.append(NOT_TAX_ADVICE)
+    return lines
+
+
+# -- keel dca trim --preview --view bands (P13, spec §5, read-only) ---------------------------
+
+#: Spec §5's band: `max(BAND_REL x target, BAND_ABS_FLOOR)` either side of the target weight --
+#: the parameters the spec gives the `band_rebalance` kind it recommends NOT building. They are
+#: display constants here, not a rule's params: nothing trades on them.
+BAND_REL = Decimal("0.15")
+BAND_ABS_FLOOR = Decimal("0.015")
+
+#: Printed once under the bands head: what the view is, and what it is not.
+BANDS_NOT_A_RECOMMENDATION = (
+    "a read-only drift display, not a recommendation: 'size to target' is arithmetic on the "
+    "band, and nothing here proposes, records or places a trade"
+)
+#: Printed once on every bands report, after the rows (spec §5, "Evidence status"; the research
+#: freeze of 2026-09-27). It claims no edge for trading to these bands, because none was found.
+BANDS_NOT_ADOPTED = (
+    "band trimming was tested and not adopted (#831): pre-registered and bootstrapped, it was "
+    "not better than static DCA after fees, so no performance edge is claimed for these bands "
+    "and keel builds no band_rebalance rule"
+)
+#: Printed once on every bands report (spec §5 and §2.5): the redeploy leg is a BUY.
+BANDS_REDEPLOY_NOTE = (
+    "a redeploy leg would spend this month's rail-14 buy cap and meet rail 8; the fee drag "
+    "counts both legs"
+)
+#: What the bands report prints when no target asset is held.
+NO_BAND_ROWS = "nothing held in the target_weights assets: no weights to compare."
+
+BandStatus = Literal["over", "under", "within"]
+
+
+def _weight_pct(fraction: Decimal) -> str:
+    return f"{fraction * 100:.2f}%"
+
+
+def bands_incomplete_line(assets: Sequence[str]) -> str:
+    return (
+        f"incomplete: no cached daily close for {', '.join(assets)} -- no weight is computed "
+        "from a partial sleeve"
+    )
+
+
+def bands_untargeted_line(products: Sequence[str]) -> str:
+    return f"held but not in target_weights, not weighed: {', '.join(products)}"
+
+
+@dataclass(frozen=True)
+class BandRow:
+    """One target asset's weight against its target (spec §5).
+
+    `target_weight` is the config's `target_weights` entry normalised over the positive
+    weights (as `keel dca plan` renormalises); `weight` is `value_usd` over the sleeve's total
+    marked value; `band` is `max(BAND_REL x target, BAND_ABS_FLOOR)`. `status` is `over` only
+    when `weight > target + band` and `under` only when `weight < target - band` -- the spec's
+    strict trigger, so a weight ON the edge is `within`.
+
+    `candidate_sell_usd` and `fee_drag_usd` are set only when `over`: the dollars that would
+    bring the weight back to the target, and what the two legs of that round trip would cost --
+    the sell leg at this product's slippage, the redeploy BUY leg at the shortfall-weighted
+    slippage of the underweight assets, both at the fallback fee (R25). Numbers for the
+    operator's question, never a proposal (spec §5: band rebalancing is not built)."""
+
+    asset: str
+    target_weight: Decimal
+    weight: Decimal
+    band: Decimal
+    status: BandStatus
+    value_usd: Decimal
+    candidate_sell_usd: Decimal | None
+    fee_drag_usd: Decimal | None
+
+
+@dataclass(frozen=True)
+class BandsReport:
+    """`bands_view`'s result. `incomplete` names the held target assets with no cached daily
+    close; when it is non-empty `rows` is empty, because every weight's denominator would be
+    wrong. `untargeted` names held products whose asset has no positive target weight: they
+    are not in the sleeve the weights are taken over, and the report says so rather than
+    dropping them silently."""
+
+    rows: tuple[BandRow, ...]
+    incomplete: tuple[str, ...]
+    untargeted: tuple[str, ...]
+
+
+def bands_view(repo: Any, config: Any) -> BandsReport:
+    """Each target asset's weight against `config.target_weights`, its band, and -- when over
+    -- the size back to target and its two-leg fee drag (spec §5). READ-ONLY: it writes
+    nothing, builds no broker and proposes nothing (R25).
+
+    **Only a display.** Spec §5 recommends building neither steering nor band rebalancing, and
+    #831's bootstrap found band trimming no better than static DCA after fees; the rendered
+    report says so on every run (`BANDS_NOT_ADOPTED`).
+
+    **The sleeve is the target assets' holdings.** Each is `sleeve.holding_of` over the asset's
+    product in the settlement currency (`_history_product`), every rule's tranches (R8), marked
+    at the latest cached daily close. A held target with no mark makes the whole report
+    `incomplete` -- one missing value would mis-state every weight -- and a target that is not
+    held weighs zero and needs no mark.
+    """
+    from keel.commands._products import _history_product
+    from keel.commands.dca_plan import _weights_by_asset
+    from keel.execution import sleeve
+    from keel.execution.guards import _asset
+
+    weights_raw = _weights_by_asset(config.target_weights, "target_weights")
+    positive = {asset: w for asset, w in weights_raw.items() if w > 0}
+    total_weight = sum(positive.values(), Decimal("0"))
+    targets = {asset: w / total_weight for asset, w in positive.items()}
+    quote = config.quote_currency
+
+    held_products = sorted({str(p["product_id"]) for p in repo.get_open_positions()})
+    untargeted = tuple(p for p in held_products if _asset(p).upper() not in targets)
+
+    values: dict[str, Decimal] = {}
+    products: dict[str, str] = {}
+    incomplete: list[str] = []
+    for asset in targets:
+        product = _history_product(asset, quote)
+        products[asset] = product
+        holding = sleeve.holding_of(repo, product)
+        if holding.qty <= 0:
+            values[asset] = Decimal("0")
+            continue
+        mark = _daily_mark(repo, product)
+        if mark is None:
+            incomplete.append(asset)
+            continue
+        values[asset] = holding.qty * mark
+    total = sum(values.values(), Decimal("0"))
+    if incomplete or total <= 0:
+        return BandsReport((), tuple(incomplete), untargeted)
+
+    weights = {asset: values[asset] / total for asset in targets}
+    slippage = {
+        asset: sleeve.sell_costs(repo, config, products[asset]).slippage_pct for asset in targets
+    }
+    fee = config.fees.taker_pct
+    shortfalls = {a: targets[a] - weights[a] for a in targets if weights[a] < targets[a]}
+    shortfall_total = sum(shortfalls.values(), Decimal("0"))
+    buy_slippage = (
+        sum((slippage[a] * s for a, s in shortfalls.items()), Decimal("0")) / shortfall_total
+        if shortfall_total > 0
+        else Decimal("0")
+    )
+
+    rows: list[BandRow] = []
+    for asset, target in targets.items():
+        weight = weights[asset]
+        band = max(BAND_REL * target, BAND_ABS_FLOOR)
+        status: BandStatus
+        candidate = drag = None
+        if weight > target + band:
+            status = "over"
+            candidate = (weight - target) * total
+            drag = candidate * (fee + slippage[asset]) + candidate * (fee + buy_slippage)
+        elif weight < target - band:
+            status = "under"
+        else:
+            status = "within"
+        rows.append(BandRow(asset, target, weight, band, status, values[asset], candidate, drag))
+    return BandsReport(tuple(rows), (), untargeted)
+
+
+def render_bands(report: BandsReport) -> list[str]:
+    """The bands report: a head naming the band and the fee source,
+    `BANDS_NOT_A_RECOMMENDATION`, one line per target asset --
+
+        <asset> target <t>%  weight <w>%  band ±<b>%  <status>  value $<v>
+        [size to target $<c>  two-leg fee drag $<d>]
+
+    (one line; wrapped here; the bracketed part only when over) -- or the incomplete / empty
+    line, the untargeted line when there is one, then `BANDS_REDEPLOY_NOTE` and
+    `BANDS_NOT_ADOPTED`, on every run."""
+    from keel.execution.sleeve import FALLBACK_FEE_SOURCE
+
+    lines = [
+        f"bands -- weights against config target_weights, band = max({_weight_pct(BAND_REL)} x "
+        f"target, {_weight_pct(BAND_ABS_FLOOR)}); fees at the fallback rate "
+        f"({FALLBACK_FEE_SOURCE}), per-product slippage; no venue asked",
+        BANDS_NOT_A_RECOMMENDATION,
+    ]
+    if report.incomplete:
+        lines.append(bands_incomplete_line(report.incomplete))
+    elif not report.rows:
+        lines.append(NO_BAND_ROWS)
+    for row in report.rows:
+        line = (
+            f"  {row.asset} target {_weight_pct(row.target_weight)}  "
+            f"weight {_weight_pct(row.weight)}  band ±{_weight_pct(row.band)}  {row.status}  "
+            f"value {_usd(row.value_usd)}"
+        )
+        if row.candidate_sell_usd is not None:
+            line += (
+                f"  size to target {_usd(row.candidate_sell_usd)}"
+                f"  two-leg fee drag {_usd(row.fee_drag_usd)}"
+            )
+        lines.append(line)
+    if report.untargeted:
+        lines.append(bands_untargeted_line(report.untargeted))
+    lines.append(BANDS_REDEPLOY_NOTE)
+    lines.append(BANDS_NOT_ADOPTED)
     return lines

@@ -18,7 +18,18 @@ from keel_core.config import AutoTradeConfig, FeesConfig
 
 from keel.commands import sleeve_report
 from keel.commands.rules import backtest_slippage
-from keel.commands.sleeve_report import DistributionRow, distribution_rows, render_distribution
+from keel.commands.sleeve_report import (
+    BandRow,
+    BandsReport,
+    DistributionRow,
+    LotRow,
+    bands_view,
+    distribution_rows,
+    lots_view,
+    render_bands,
+    render_distribution,
+    render_lots,
+)
 from keel.data.db import connect, migrate
 from keel.data.repository import Repository
 from keel.execution import sleeve
@@ -793,3 +804,358 @@ def test_a_rule_that_never_fires_prints_one_nothing_line_per_fee_line(
     assert [lines[i + 1] for i in fee_at] == ["  the rule proposed nothing over these bars"] * 2
     assert sum(1 for line in lines if "the rule proposed nothing" in line) == 2
     assert not any(" bar: " in line for line in lines)
+
+
+# -- keel dca trim --preview --view lots (P13 Task 13.1, spec §8.1, Review Focus 3) -----------
+
+
+def test_the_mixed_paxg_ledger_lists_turtle_tranche_3_first_with_its_realisable_pnl(repo) -> None:
+    """Review Focus 3: PAXG's oldest open row is turtle tranche 3, so a FIFO sale consumes it
+    first -- the lots view lists it first and names its rule."""
+    repo.open_position(
+        product_id="PAXG-USD",
+        rule_name="turtle_breakout",
+        opened_at=1,
+        qty=D("0.0132"),
+        entry_fill=D("4673.23"),
+        entry_fee=D("0.73"),
+    )
+    repo.open_position(
+        product_id="PAXG-USD",
+        rule_name="dca",
+        opened_at=2,
+        qty=D("0.01"),
+        entry_fill=D("4400"),
+        entry_fee=D("0.40"),
+    )
+    repo.upsert_candles("PAXG-USD", Granularity.ONE_DAY, [_candle(10, "4300")])
+
+    rows = lots_view(repo, _config())
+
+    assert [(r.position_id, r.rule_name) for r in rows] == [(1, "turtle_breakout"), (2, "dca")]
+    first = rows[0]
+    assert first.cost == D("0.0132") * D("4673.23") + D("0.73")
+    assert first.mark == D("4300")
+    assert first.unrealised == D("0.0132") * D("4300") - (D("0.0132") * D("4673.23") + D("0.73"))
+    costs = sleeve.sell_costs(repo, _config(), "PAXG-USD")
+    assert (first.fee_pct, first.slippage_pct) == (costs.fee_pct, costs.slippage_pct)
+    assert first.realised_if_sold == (
+        D("0.0132") * D("4300") * (1 - costs.slippage_pct)
+        - D("0.0132") * D("4300") * costs.fee_pct
+        - first.cost
+    )
+
+
+def test_a_scaled_out_lot_carries_only_its_share_of_the_entry_fee(repo) -> None:
+    """`Lot.entry_fee_share` (spec §3.3, Q4): a tranche half sold keeps half its entry fee."""
+    pid = repo.open_position(
+        product_id="BTC-USD",
+        rule_name="dca",
+        opened_at=1,
+        qty=D("0.02"),
+        entry_fill=D("50000"),
+        entry_fee=D("2"),
+    )
+    repo._conn.execute(
+        "UPDATE positions SET qty = ?, realized_qty = ? WHERE id = ?", ("0.01", "0.01", pid)
+    )
+    repo.upsert_candles("BTC-USD", Granularity.ONE_DAY, [_candle(10, "60000")])
+    [row] = lots_view(repo, _config())
+    assert (row.qty, row.entry_fee_share, row.cost) == (D("0.01"), D("1"), D("501"))
+
+
+def test_no_mark_means_no_pnl_rather_than_a_total_loss(repo) -> None:
+    repo.open_position(
+        product_id="BTC-USD",
+        rule_name="dca",
+        opened_at=1,
+        qty=D("0.001"),
+        entry_fill=D("100000"),
+        entry_fee=D("0"),
+    )
+    [row] = lots_view(repo, _config())
+    assert row.mark is None and row.unrealised is None and row.realised_if_sold is None
+    assert row.cost == D("100")
+
+
+def test_the_mark_is_the_latest_cached_daily_close(repo) -> None:
+    repo.open_position(
+        product_id="BTC-USD",
+        rule_name="dca",
+        opened_at=1,
+        qty=D("0.001"),
+        entry_fill=D("100000"),
+        entry_fee=D("0"),
+    )
+    repo.upsert_candles(
+        "BTC-USD", Granularity.ONE_DAY, [_candle(10, "90000"), _candle(11, "95000")]
+    )
+    repo.upsert_candles("BTC-USD", Granularity.ONE_HOUR, [_candle(12, "1")])
+    [row] = lots_view(repo, _config())
+    assert row.mark == D("95000")
+
+
+def test_products_group_in_order_and_a_product_filter_narrows(repo) -> None:
+    for product, opened_at in (("PAXG-USD", 1), ("BTC-USD", 2), ("PAXG-USD", 3)):
+        repo.open_position(
+            product_id=product,
+            rule_name="dca",
+            opened_at=opened_at,
+            qty=D("0.01"),
+            entry_fill=D("100"),
+            entry_fee=D("0"),
+        )
+    rows = lots_view(repo, _config())
+    assert [(r.product_id, r.position_id) for r in rows] == [
+        ("BTC-USD", 2),
+        ("PAXG-USD", 1),
+        ("PAXG-USD", 3),
+    ]
+    assert [r.position_id for r in lots_view(repo, _config(), product_id="PAXG-USD")] == [1, 3]
+
+
+def _lot_row(**overrides: Any) -> LotRow:
+    base: dict[str, Any] = dict(
+        product_id="PAXG-USD",
+        position_id=3,
+        rule_name="turtle_breakout",
+        opened_at=1_700_000_000,
+        qty=D("0.0132"),
+        entry_fill=D("4673.23"),
+        entry_fee_share=D("0.73"),
+        cost=D("62.418636"),
+        fee_pct=D("0.012"),
+        slippage_pct=D("0.01"),
+        mark=D("4300"),
+        unrealised=D("-5.658636"),
+        realised_if_sold=D("-6.907236"),
+    )
+    base.update(overrides)
+    return LotRow(**base)
+
+
+def test_the_rendered_report_says_what_it_is_not() -> None:
+    lines = render_lots([])
+    assert lines.count(sleeve_report.NOT_TAX_ADVICE) == 1
+    assert lines.count(sleeve_report.LOTS_FIFO_NOTE) == 1
+    assert sleeve_report.NO_OPEN_LOTS in lines
+
+
+def test_the_not_tax_advice_line_says_so() -> None:
+    assert "not tax advice" in sleeve_report.NOT_TAX_ADVICE
+    assert "top to bottom" in sleeve_report.LOTS_FIFO_NOTE
+
+
+def test_a_rendered_lot_names_its_tranche_its_rule_and_the_fallback_fee() -> None:
+    lines = render_lots([_lot_row(), _lot_row(position_id=4, rule_name="dca")])
+    head, *rest = lines
+    source = sleeve.FALLBACK_FEE_SOURCE
+    assert head == f"lots -- fees at the fallback rate ({source}); no venue asked"
+    lot_lines = [line for line in rest if line.startswith("  #")]
+    assert [line.split()[0:2] for line in lot_lines] == [["#3", "turtle_breakout"], ["#4", "dca"]]
+    assert lines.count("PAXG-USD") == 1, "one product heading over its lots"
+    assert sleeve_report.NO_OPEN_LOTS not in lines
+
+
+def test_a_rendered_lot_without_a_mark_prints_no_pnl() -> None:
+    [line] = [
+        text
+        for text in render_lots([_lot_row(mark=None, unrealised=None, realised_if_sold=None)])
+        if text.startswith("  #")
+    ]
+    assert "mark none" in line and "$0.00" not in line
+
+
+# -- keel dca trim --preview --view bands (P13 Task 13.2, spec §5, read-only) -----------------
+
+
+def _hold(repo: Repository, product: str, *, qty: str, mark: str | None) -> None:
+    """One `dca` tranche of `product`, and one daily candle at `mark` when there is one."""
+    repo.open_position(
+        product_id=product,
+        rule_name="dca",
+        opened_at=1,
+        qty=D(qty),
+        entry_fill=D("1"),
+        entry_fee=D("0"),
+    )
+    if mark is not None:
+        repo.upsert_candles(product, Granularity.ONE_DAY, [_candle(10, mark)])
+
+
+_HALVES = {"BTC": D("0.5"), "ETH": D("0.5")}
+
+
+def test_an_overweight_asset_shows_its_candidate_sell_and_both_legs_fees(repo) -> None:
+    """band = max(0.15 x w, 0.015); BTC target .5 -> band .075; held at .6 -> over."""
+    _hold(repo, "BTC-USD", qty="0.006", mark="100000")  # $600
+    _hold(repo, "ETH-USD", qty="0.1", mark="4000")  # $400
+    report = bands_view(repo, _config(target_weights=_HALVES))
+    btc = next(r for r in report.rows if r.asset == "BTC")
+    assert (btc.target_weight, btc.weight, btc.band, btc.status) == (
+        D("0.5"),
+        D("0.6"),
+        D("0.075"),
+        "over",
+    )
+    assert btc.value_usd == D("600")
+    assert btc.candidate_sell_usd == D("100")
+    fee = _config().fees.taker_pct
+    btc_slip, _ = backtest_slippage(repo, "BTC-USD")
+    eth_slip, _ = backtest_slippage(repo, "ETH-USD")
+    # The sell leg at BTC's slippage, the redeploy leg into the one underweight asset at ETH's.
+    assert btc.fee_drag_usd == D("100") * (fee + btc_slip) + D("100") * (fee + eth_slip)
+    assert btc.fee_drag_usd >= 2 * D("100") * fee
+
+
+def test_an_underweight_asset_has_no_candidate_sell(repo) -> None:
+    _hold(repo, "BTC-USD", qty="0.006", mark="100000")
+    _hold(repo, "ETH-USD", qty="0.1", mark="4000")
+    report = bands_view(repo, _config(target_weights=_HALVES))
+    assert [(r.asset, r.status, r.candidate_sell_usd, r.fee_drag_usd) for r in report.rows] == [
+        ("BTC", "over", D("100"), report.rows[0].fee_drag_usd),
+        ("ETH", "under", None, None),
+    ]
+    assert report.rows[0].fee_drag_usd is not None
+
+
+def test_a_weight_on_the_band_edge_is_within_not_over(repo) -> None:
+    """The spec's trigger is strict: `weight > target + band` (§5). .575 and .425 sit on the two
+    edges of a .5 target's .075 band."""
+    _hold(repo, "BTC-USD", qty="0.00575", mark="100000")  # $575
+    _hold(repo, "ETH-USD", qty="0.10625", mark="4000")  # $425
+    report = bands_view(repo, _config(target_weights=_HALVES))
+    assert [(r.weight, r.status, r.candidate_sell_usd) for r in report.rows] == [
+        (D("0.575"), "within", None),
+        (D("0.425"), "within", None),
+    ]
+
+
+def test_a_small_target_gets_the_absolute_band_floor(repo) -> None:
+    """max(0.15 x .05, 0.015) = 0.015: the floor, not the relative band."""
+    _hold(repo, "BTC-USD", qty="0.0095", mark="100000")
+    _hold(repo, "ETH-USD", qty="0.0125", mark="4000")
+    report = bands_view(repo, _config(target_weights={"BTC": D("0.95"), "ETH": D("0.05")}))
+    eth = next(r for r in report.rows if r.asset == "ETH")
+    assert eth.band == D("0.015")
+    btc = next(r for r in report.rows if r.asset == "BTC")
+    assert btc.band == D("0.95") * D("0.15")
+
+
+def test_the_targets_are_normalised_over_the_positive_weights(repo) -> None:
+    _hold(repo, "BTC-USD", qty="0.005", mark="100000")
+    _hold(repo, "ETH-USD", qty="0.125", mark="4000")
+    report = bands_view(
+        repo, _config(target_weights={"BTC": D("2"), "ETH": D("2"), "PAXG": D("0")})
+    )
+    assert [(r.asset, r.target_weight, r.weight) for r in report.rows] == [
+        ("BTC", D("0.5"), D("0.5")),
+        ("ETH", D("0.5"), D("0.5")),
+    ]
+
+
+def test_an_unheld_target_reads_zero_weight_and_needs_no_mark(repo) -> None:
+    _hold(repo, "BTC-USD", qty="0.01", mark="100000")
+    report = bands_view(repo, _config(target_weights=_HALVES))
+    assert report.incomplete == ()
+    assert [(r.asset, r.value_usd, r.weight, r.status) for r in report.rows] == [
+        ("BTC", D("1000"), D("1"), "over"),
+        ("ETH", D("0"), D("0"), "under"),
+    ]
+
+
+def test_a_missing_mark_makes_the_whole_report_incomplete_not_wrong(repo) -> None:
+    _hold(repo, "BTC-USD", qty="0.006", mark="100000")
+    _hold(repo, "ETH-USD", qty="0.1", mark=None)
+    report = bands_view(repo, _config(target_weights=_HALVES))
+    assert report.incomplete == ("ETH",) and report.rows == ()
+
+
+def test_a_held_asset_outside_the_targets_is_named_and_not_weighed(repo) -> None:
+    _hold(repo, "BTC-USD", qty="0.005", mark="100000")
+    _hold(repo, "ETH-USD", qty="0.125", mark="4000")
+    _hold(repo, "DOGE-USD", qty="1000", mark="1")
+    report = bands_view(repo, _config(target_weights=_HALVES))
+    assert report.untargeted == ("DOGE-USD",)
+    assert [(r.asset, r.weight) for r in report.rows] == [("BTC", D("0.5")), ("ETH", D("0.5"))]
+
+
+def test_nothing_held_in_the_targets_is_no_rows(repo) -> None:
+    report = bands_view(repo, _config(target_weights=_HALVES))
+    assert (report.rows, report.incomplete, report.untargeted) == ((), (), ())
+
+
+def _band_row(**overrides: Any) -> BandRow:
+    base: dict[str, Any] = dict(
+        asset="BTC",
+        target_weight=D("0.5"),
+        weight=D("0.6"),
+        band=D("0.075"),
+        status="over",
+        value_usd=D("600"),
+        candidate_sell_usd=D("100"),
+        fee_drag_usd=D("2.51"),
+    )
+    base.update(overrides)
+    return BandRow(**base)
+
+
+def test_the_bands_report_says_band_trimming_was_tested_and_not_adopted() -> None:
+    report = BandsReport(rows=(_band_row(),), incomplete=(), untargeted=())
+    lines = render_bands(report)
+    for note in (
+        sleeve_report.BANDS_NOT_A_RECOMMENDATION,
+        sleeve_report.BANDS_NOT_ADOPTED,
+        sleeve_report.BANDS_REDEPLOY_NOTE,
+    ):
+        assert lines.count(note) == 1, note
+    assert lines.index(sleeve_report.BANDS_NOT_ADOPTED) > lines.index(
+        next(line for line in lines if line.startswith("  BTC "))
+    )
+
+
+def test_the_bands_notes_carry_the_831_finding_and_the_rails() -> None:
+    assert "tested and not adopted (#831)" in sleeve_report.BANDS_NOT_ADOPTED
+    assert "rail-14" in sleeve_report.BANDS_REDEPLOY_NOTE
+    assert "rail 8" in sleeve_report.BANDS_REDEPLOY_NOTE
+    assert "not a recommendation" in sleeve_report.BANDS_NOT_A_RECOMMENDATION
+
+
+def test_an_incomplete_report_prints_no_weights_and_names_the_missing_marks() -> None:
+    lines = render_bands(BandsReport(rows=(), incomplete=("ETH", "SOL"), untargeted=()))
+    assert sleeve_report.bands_incomplete_line(("ETH", "SOL")) in lines
+    assert not any(line.startswith("  ") for line in lines), "no asset row is printed"
+    assert lines.count(sleeve_report.BANDS_NOT_ADOPTED) == 1
+
+
+def test_an_empty_report_says_so_and_still_carries_the_notes() -> None:
+    lines = render_bands(BandsReport(rows=(), incomplete=(), untargeted=()))
+    assert lines.count(sleeve_report.NO_BAND_ROWS) == 1
+    assert lines.count(sleeve_report.BANDS_NOT_ADOPTED) == 1
+
+
+def test_a_rendered_row_prints_the_candidate_only_when_over() -> None:
+    lines = render_bands(
+        BandsReport(
+            rows=(
+                _band_row(),
+                _band_row(
+                    asset="ETH",
+                    weight=D("0.4"),
+                    status="under",
+                    value_usd=D("400"),
+                    candidate_sell_usd=None,
+                    fee_drag_usd=None,
+                ),
+            ),
+            incomplete=(),
+            untargeted=("DOGE-USD",),
+        )
+    )
+    rows = [line for line in lines if line.startswith("  ")]
+    assert [line.split()[0] for line in rows] == ["BTC", "ETH"]
+    assert [("size to target" in line, "fee drag" in line) for line in rows] == [
+        (True, True),
+        (False, False),
+    ]
+    assert sleeve_report.bands_untargeted_line(("DOGE-USD",)) in lines
