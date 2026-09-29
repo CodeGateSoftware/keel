@@ -216,3 +216,129 @@ def test_a_stale_schema_is_refused_not_migrated(
     after = keel_db.connect(db)
     assert after.execute("SELECT version FROM schema_version").fetchone()["version"] == 21
     assert not keel_db.table_present(after, "sell_proposals")
+
+
+# -- keel dca proposals review <id> (P12 Task 12.4, R23) ----------------------------------------
+#
+# A `[y/N]` at a terminal, NOT a capability row: marking a proposal reviewed releases no order and
+# places nothing -- it is the paper -> live gate's input (spec §3.7), and in this build `live` is
+# preview-only too. Off a terminal it prints and writes nothing, opening the database read-only.
+
+
+def _review(deployment_pair, pid, input=None):
+    db, config = deployment_pair
+    return CliRunner().invoke(
+        cli,
+        ["--db", str(db), "--config", str(config), "dca", "proposals", "review", str(pid)],
+        input=input,
+    )
+
+
+def _review_events(db: Path, pid: int) -> list[dict]:
+    conn = keel_db.connect(str(db))
+    try:
+        from keel.data.audit import read_events
+
+        return [
+            e.payload
+            for e in read_events(conn)
+            if e.event_type == "sell_proposal_updated" and e.entity_id == str(pid)
+        ]
+    finally:
+        conn.close()
+
+
+def test_off_a_tty_review_writes_nothing(deployment, monkeypatch) -> None:  # noqa: F811
+    monkeypatch.setattr(_common, "_is_interactive", lambda: False)
+    db, _config = deployment
+    pid = _repo(db).insert_sell_proposal(_row())
+    watcher = sqlite3.connect(str(db))
+    before = watcher.execute("PRAGMA data_version").fetchone()[0]
+
+    result = _review(deployment, pid)
+
+    assert result.exit_code == 0, result.output
+    assert "not a terminal: nothing written." in result.output.splitlines()
+    assert _repo(db).get_sell_proposal(pid)["reviewed_ts"] is None
+    assert watcher.execute("PRAGMA data_version").fetchone()[0] == before
+    watcher.close()
+
+
+@pytest.mark.parametrize(("answer", "reviewed"), [("y\n", True), ("n\n", False), ("\n", False)])
+def test_at_a_tty_the_answer_decides(deployment, monkeypatch, answer, reviewed) -> None:  # noqa: F811
+    monkeypatch.setattr(_common, "_is_interactive", lambda: True)
+    db, _config = deployment
+    pid = _repo(db).insert_sell_proposal(_row())
+
+    result = _review(deployment, pid, input=answer)
+
+    assert result.exit_code == 0, result.output
+    row = _repo(db).get_sell_proposal(pid)
+    assert (row["reviewed_ts"] is not None) is reviewed
+    # The write is on the audit chain, or it did not happen: one event, carrying exactly it.
+    events = _review_events(db, pid)
+    assert len(events) == (1 if reviewed else 0)
+    if reviewed:
+        assert events[0] == {"reviewed_ts": row["reviewed_ts"]}
+
+
+def test_the_prompt_shows_the_proposal_it_is_about(deployment, monkeypatch) -> None:  # noqa: F811
+    monkeypatch.setattr(_common, "_is_interactive", lambda: True)
+    db, _config = deployment
+    pid = _repo(db).insert_sell_proposal(_row(ts=_TS1))
+    stored = _repo(db).get_sell_proposal(pid)
+
+    result = _review(deployment, pid, input="n\n")
+
+    lines = result.output.splitlines()
+    rendered = sleeve_report.render_proposal(stored)
+    start = lines.index(rendered[0])
+    assert lines[start : start + len(rendered)] == rendered
+
+
+def test_a_superseded_proposal_cannot_be_reviewed(deployment, monkeypatch) -> None:  # noqa: F811
+    monkeypatch.setattr(_common, "_is_interactive", lambda: True)
+    db, _config = deployment
+    pid = _repo(db).insert_sell_proposal(_row(decision="superseded"))
+
+    result = _review(deployment, pid, input="y\n")
+
+    assert result.exit_code == 1
+    assert "superseded" in result.output
+    assert _repo(db).get_sell_proposal(pid)["reviewed_ts"] is None
+    assert _review_events(db, pid) == []
+
+
+def test_an_already_reviewed_proposal_keeps_its_first_review(deployment, monkeypatch) -> None:  # noqa: F811
+    monkeypatch.setattr(_common, "_is_interactive", lambda: True)
+    db, _config = deployment
+    repo = _repo(db)
+    pid = repo.insert_sell_proposal(_row())
+    repo.update_sell_proposal(pid, reviewed_ts=_TS1)
+
+    result = _review(deployment, pid, input="y\n")
+
+    assert result.exit_code == 0, result.output
+    assert _repo(db).get_sell_proposal(pid)["reviewed_ts"] == _TS1
+    assert len(_review_events(db, pid)) == 1  # the seeding update only
+
+
+@pytest.mark.parametrize("interactive", [False, True])
+def test_review_of_a_missing_id_exits_1(deployment, monkeypatch, interactive) -> None:  # noqa: F811
+    monkeypatch.setattr(_common, "_is_interactive", lambda: interactive)
+    result = _review(deployment, 999, input="y\n")
+    assert result.exit_code == 1
+    assert "no sell proposal #999" in result.output
+
+
+def test_off_a_tty_review_refuses_a_missing_database_rather_than_creating_it(
+    tmp_path: Path, valid_config_path, monkeypatch
+) -> None:
+    """R20: off a terminal review is a read, so it opens read-only -- a missing `--db` path is
+    refused, not created (a read-write opener would create and migrate it)."""
+    monkeypatch.setattr(_common, "_is_interactive", lambda: False)
+    db = tmp_path / "absent.db"
+    result = _review((db, valid_config_path), 1)
+    assert result.exit_code == 1
+    assert "read-only command" in result.output
+    assert not db.exists()

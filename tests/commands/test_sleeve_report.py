@@ -314,3 +314,482 @@ def test_a_closed_row_on_a_dca_day_says_nothing_of_a_veto() -> None:
         dca_collision=True,
     )
     assert len(render_distribution([row])) == 1
+
+
+# -- proposal replay (P12 Task 12.3, spec §3.7, R29) -------------------------------------------
+#
+# A FIDELITY check of the replay, not a verdict: synthetic candles and hand-computed figures. The
+# research freeze (2026-09-27) holds -- no sweep, nothing appended to the trials ledger.
+
+_FEE = D("0.012")
+_SLIP = D("0.0005")
+
+
+def _rising(days: int) -> list[Candle]:
+    """Close 100 + d on day d: every 30-day cadence bar clears the floor and the drawdown gate."""
+    return [_candle(d, str(100 + d)) for d in range(days)]
+
+
+def _reverse(**params: Any) -> Any:
+    from keel.strategy.rules.reverse_dca import ReverseDca
+
+    return ReverseDca("BTC-USD", **{"target_usd": D("10"), "min_price_floor": D("1"), **params})
+
+
+def test_the_replay_lists_every_reduction_and_is_deterministic() -> None:
+    from keel.commands.sleeve_report import proposal_replay
+
+    first = proposal_replay(_reverse(), _rising(91), fee_pct=_FEE, slippage_pct=_SLIP)
+    assert [r.day for r in first.rows] == [30, 60, 90]
+    assert first == proposal_replay(_reverse(), _rising(91), fee_pct=_FEE, slippage_pct=_SLIP)
+
+
+def test_the_first_cadence_bar_is_vetoed_by_min_hold_as_the_pipeline_would() -> None:
+    """Day 0 is a cadence bar too, but the synthetic lot was bought on day 0 and the proposal
+    for bar 0 is made on day 1: one day held < 30 (`sleeve_refusal`, R12)."""
+    from keel.commands.sleeve_report import proposal_replay
+    from keel.execution.sleeve import MIN_HOLD
+
+    replay = proposal_replay(_reverse(), _rising(91), fee_pct=_FEE, slippage_pct=_SLIP)
+    assert [(v.day, v.reason) for v in replay.vetoed] == [(0, MIN_HOLD)]
+
+
+def test_each_sale_is_hand_computed_against_the_fifo_lot() -> None:
+    """Bar 30, close 130: gross from net is 10 / (1 - 0.012 - 0.0005), qty = gross / 130. The
+    realised P&L is the leg's notional less slippage, less the fee on the notional, less the
+    basis of the units consumed from the one lot bought at 100."""
+    from keel.commands.sleeve_report import proposal_replay
+
+    replay = proposal_replay(_reverse(), _rising(91), fee_pct=_FEE, slippage_pct=_SLIP)
+    row = replay.rows[0]
+    qty = D("10") / (D("1") - _FEE - _SLIP) / D("130")
+    notional = qty * D("130")
+    assert (row.qty, row.price) == (qty, D("130"))
+    assert row.gross_usd == notional * (D("1") - _SLIP)
+    assert row.fee_usd == notional * _FEE
+    assert row.cost_basis == qty * D("100")
+    assert row.realised_pnl == row.gross_usd - row.fee_usd - row.cost_basis
+    assert row.legs is None  # no cap supplied: legs are not claimed
+
+
+def test_the_terminal_value_is_with_and_without_the_rule() -> None:
+    from keel.commands.sleeve_report import proposal_replay
+
+    replay = proposal_replay(_reverse(), _rising(91), fee_pct=_FEE, slippage_pct=_SLIP)
+    sold = sum((r.qty for r in replay.rows), D("0"))
+    cash = sum((r.gross_usd - r.fee_usd for r in replay.rows), D("0"))
+    assert replay.final_close == D("190")
+    assert replay.units_left == D("1") - sold
+    assert replay.cash_usd == cash
+    assert replay.terminal_with == (D("1") - sold) * D("190") + cash
+    assert replay.terminal_without == D("190")
+
+
+def test_a_cap_slices_a_sale_into_legs_and_the_proposal_sells_the_first() -> None:
+    """The live pipeline's rail-2 slicing (`sleeve.slice_qty`): a $10 target under a $4 cap
+    needs 3 legs, and a proposal row carries its FIRST leg -- so does the replay."""
+    from keel.commands.sleeve_report import proposal_replay
+    from keel.execution import sleeve
+
+    replay = proposal_replay(
+        _reverse(), _rising(91), fee_pct=_FEE, slippage_pct=_SLIP, max_per_order_usd=D("4")
+    )
+    row = replay.rows[0]
+    whole = D("10") / (D("1") - _FEE - _SLIP) / D("130")
+    leg, legs = sleeve.slice_qty(whole, D("130"), max_per_order_usd=D("4"), base_increment=None)
+    assert legs == 3
+    assert (row.qty, row.legs) == (leg, 3)
+
+
+def test_a_same_day_dca_vetoes_the_sale_and_it_is_not_carried() -> None:
+    """Review Focus 1: with a 30-day dca on the product every distribution bar is a buy bar,
+    so every one is vetoed `same_day_dca`, and none is carried to the next day."""
+    from keel.commands.sleeve_report import proposal_replay
+    from keel.execution.sleeve import SAME_DAY_DCA
+    from keel.strategy.rules.dca import Dca
+
+    dca = Dca("BTC-USD", cadence_days=30)
+    replay = proposal_replay(
+        _reverse(min_hold_days=0), _rising(91), fee_pct=_FEE, slippage_pct=_SLIP, dca_rules=[dca]
+    )
+    assert replay.rows == ()
+    assert [(v.day, v.reason) for v in replay.vetoed] == [
+        (0, SAME_DAY_DCA),
+        (30, SAME_DAY_DCA),
+        (60, SAME_DAY_DCA),
+        (90, SAME_DAY_DCA),
+    ]
+
+
+def test_the_replay_holding_shrinks_fifo_and_floor_qty_stops_it() -> None:
+    """A target larger than what floor_qty leaves: the first sale takes the holding down to the
+    floor, and every later bar proposes nothing (the rule's own floor_qty gate)."""
+    from keel.commands.sleeve_report import proposal_replay
+
+    rule = _reverse(target_usd=D("1000"), floor_qty=D("0.5"))
+    replay = proposal_replay(rule, _rising(91), fee_pct=_FEE, slippage_pct=_SLIP)
+    assert [r.day for r in replay.rows] == [30]
+    assert replay.rows[0].qty == D("0.5")
+    assert replay.units_left == D("0.5")
+
+
+def test_no_daily_candles_replays_nothing() -> None:
+    from keel.commands.sleeve_report import proposal_replay
+
+    replay = proposal_replay(_reverse(), [], fee_pct=_FEE, slippage_pct=_SLIP)
+    assert (replay.rows, replay.vetoed, replay.n_bars) == ((), (), 0)
+
+
+def _file_repo(db) -> Repository:
+    conn = connect(str(db))
+    migrate(conn)
+    return Repository(conn)
+
+
+def _backtest(tmp_path, valid_config_path, rid, *extra):
+    from click.testing import CliRunner
+
+    from keel.cli import cli
+
+    return CliRunner().invoke(
+        cli,
+        [
+            "--db",
+            str(tmp_path / "t.db"),
+            "--config",
+            str(valid_config_path),
+            "rules",
+            "backtest",
+            str(rid),
+            *extra,
+        ],
+    )
+
+
+def _fee_lines(output: str) -> list[str]:
+    return [line for line in output.splitlines() if line.startswith("fee line:")]
+
+
+def test_the_sensitivity_row_exists_only_when_the_operator_supplies_a_rate(
+    tmp_path, valid_config_path
+) -> None:
+    repo = _file_repo(tmp_path / "t.db")
+    repo.upsert_candles("BTC-USD", Granularity.ONE_DAY, _rising(91))
+    rid = repo.insert_rule(
+        "reverse_dca",
+        {"product_id": "BTC-USD", "target_usd": "10", "min_price_floor": "1"},
+        status="candidate",
+    )
+
+    plain = _backtest(tmp_path, valid_config_path, rid)
+    both = _backtest(tmp_path, valid_config_path, rid, "--fee-sensitivity-pct", "0.009")
+
+    assert plain.exit_code == 0, plain.output
+    assert both.exit_code == 0, both.output
+    assert _fee_lines(plain.output) == ["fee line: 1.2000% (fallback:config.fees.taker_pct)"]
+    assert _fee_lines(both.output) == [
+        "fee line: 1.2000% (fallback:config.fees.taker_pct)",
+        "fee line: 0.9000% (operator-supplied sensitivity)",
+    ]
+
+
+def test_the_replay_says_it_is_a_description_not_evidence(tmp_path, valid_config_path) -> None:
+    """The research freeze: the output states plainly what the replay is and is not."""
+    repo = _file_repo(tmp_path / "t.db")
+    repo.upsert_candles("BTC-USD", Granularity.ONE_DAY, _rising(91))
+    rid = repo.insert_rule(
+        "reverse_dca",
+        {"product_id": "BTC-USD", "target_usd": "10", "min_price_floor": "1"},
+        status="candidate",
+    )
+    out = _backtest(tmp_path, valid_config_path, rid).output
+    assert sleeve_report.REPLAY_DISCLAIMER in out.splitlines()
+    sales = [line for line in out.splitlines() if " bar: sell " in line]
+    vetoes = [line for line in out.splitlines() if " bar: vetoed " in line]
+    assert (len(sales), len(vetoes)) == (3, 1)
+    assert sum(1 for line in out.splitlines() if line.startswith("  terminal ")) == 1
+
+
+def test_the_sensitivity_flag_is_refused_on_a_rule_with_no_replay(
+    tmp_path, valid_config_path
+) -> None:
+    repo = _file_repo(tmp_path / "t.db")
+    repo.upsert_candles("BTC-USD", Granularity.ONE_DAY, _rising(91))
+    rid = repo.insert_rule("dca", {"product_id": "BTC-USD", "cadence_days": 7}, status="candidate")
+    result = _backtest(tmp_path, valid_config_path, rid, "--fee-sensitivity-pct", "0.01")
+    assert result.exit_code == 2
+    assert "No such option" not in result.output
+    assert "only to a sleeve-sell rule's proposal replay" in result.output
+
+
+@pytest.mark.parametrize("rate", ["-0.001", "1", "abc"])
+def test_a_rate_outside_zero_to_one_is_a_usage_error(tmp_path, valid_config_path, rate) -> None:
+    repo = _file_repo(tmp_path / "t.db")
+    rid = repo.insert_rule(
+        "reverse_dca",
+        {"product_id": "BTC-USD", "target_usd": "10", "min_price_floor": "1"},
+        status="candidate",
+    )
+    result = _backtest(tmp_path, valid_config_path, rid, "--fee-sensitivity-pct", rate)
+    assert result.exit_code == 2
+    assert "No such option" not in result.output
+
+
+def test_no_cached_daily_bars_is_a_named_refusal(tmp_path, valid_config_path) -> None:
+    repo = _file_repo(tmp_path / "t.db")
+    rid = repo.insert_rule(
+        "reverse_dca",
+        {"product_id": "BTC-USD", "target_usd": "10", "min_price_floor": "1"},
+        status="candidate",
+    )
+    result = _backtest(tmp_path, valid_config_path, rid)
+    assert result.exit_code == 1
+    assert "no cached ONE_DAY candles for BTC-USD" in result.output
+    assert "granularity" not in result.output
+
+
+def test_no_live_fee_rate_is_hardcoded_anywhere_in_keel() -> None:
+    """Spec §2.2 / Q5, plan R29: the tier can change, and the preview is the fact. The 0.9% row
+    exists only when the operator types --fee-sensitivity-pct."""
+    import re
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[2] / "keel"
+    files = list(root.rglob("*.py"))
+    assert len(files) > 100  # the scan reaches the package, not an empty glob
+    hits = [str(p) for p in files if re.search(r"\b0\.009\b", p.read_text())]
+    assert hits == []
+
+
+def test_a_cooldown_param_is_enforced_from_the_last_replayed_sale() -> None:
+    """R15 as the pipeline applies it (`sleeve_refusal` reads `cooldown_days` off the rule's
+    params): with a 45-day cooldown a 30-day cadence sells on bar 30, is refused on bar 60 (30
+    days after the bar-30 proposal), and sells again on bar 90 (60 days after it). A vetoed bar
+    does not re-arm the cooldown (#915)."""
+    from keel.commands.sleeve_report import proposal_replay
+    from keel.execution.sleeve import COOLDOWN, MIN_HOLD
+
+    rule = _reverse()
+    rule.params["cooldown_days"] = 45
+    replay = proposal_replay(rule, _rising(121), fee_pct=_FEE, slippage_pct=_SLIP)
+    assert [r.day for r in replay.rows] == [30, 90]
+    assert [(v.day, v.reason) for v in replay.vetoed] == [
+        (0, MIN_HOLD),
+        (60, COOLDOWN),
+        (120, COOLDOWN),
+    ]
+
+
+def test_a_raising_dca_detect_counts_as_firing_not_a_crash() -> None:
+    """Mirrors `agent._dca_fires_today`'s own rule: "a DCA whose detect RAISES counts as
+    firing -- the refusal is the direction that costs nothing." A stub dca rule whose `detect`
+    always raises must veto every bar it would otherwise judge, exactly as `Dca("BTC-USD",
+    cadence_days=30)` does in `test_a_same_day_dca_vetoes_the_sale_and_it_is_not_carried`."""
+    from keel.commands.sleeve_report import proposal_replay
+    from keel.execution.sleeve import SAME_DAY_DCA
+
+    class _RaisingDca:
+        def detect(self, candles_by_tf: Any) -> Any:
+            raise RuntimeError("boom")
+
+    replay = proposal_replay(
+        _reverse(min_hold_days=0),
+        _rising(91),
+        fee_pct=_FEE,
+        slippage_pct=_SLIP,
+        dca_rules=[_RaisingDca()],
+    )
+    assert replay.rows == ()
+    assert [(v.day, v.reason) for v in replay.vetoed] == [
+        (0, SAME_DAY_DCA),
+        (30, SAME_DAY_DCA),
+        (60, SAME_DAY_DCA),
+        (90, SAME_DAY_DCA),
+    ]
+
+
+# -- issue #930: `run_proposal_replay`'s own logic (rules.py ~476) has no test ------------------
+
+
+@pytest.fixture
+def live_config_path(write_config: Any) -> Any:
+    """The same valid config, `auto_trade.mode: live` -- for the half of R40's reading
+    (`run_proposal_replay`'s `dca_status`) `valid_config_path` (paper) cannot exercise."""
+    from tests.conftest import VALID_CONFIG_YAML
+
+    text = VALID_CONFIG_YAML.replace("mode: paper", "mode: live")
+    assert "mode: live" in text and "mode: paper" not in text
+    return write_config(text)
+
+
+def test_a_paper_dca_on_the_same_product_vetoes_every_distribution_bar(
+    tmp_path, valid_config_path
+) -> None:
+    """R40's reading on a paper profile: the `paper` dca rules on the same product are replayed
+    through their own `detect`, so every cadence-30 distribution bar collides with the
+    cadence-30 dca and is vetoed `same_day_dca` (Review Focus 1)."""
+    from keel.execution.sleeve import SAME_DAY_DCA
+
+    repo = _file_repo(tmp_path / "t.db")
+    repo.upsert_candles("BTC-USD", Granularity.ONE_DAY, _rising(91))
+    rid = repo.insert_rule(
+        "reverse_dca",
+        {"product_id": "BTC-USD", "target_usd": "10", "min_price_floor": "1"},
+        status="candidate",
+    )
+    dca_id = repo.insert_rule("dca", {"product_id": "BTC-USD", "cadence_days": 30}, status="paper")
+    result = _backtest(tmp_path, valid_config_path, rid)
+    assert result.exit_code == 0, result.output
+    lines = result.output.splitlines()
+    [head] = [line for line in lines if line.startswith("  same-day dca:")]
+    assert head == (
+        f"  same-day dca: 1 dca rule(s) at status paper on BTC-USD replayed (ids {dca_id})"
+    )
+    vetoed = [line for line in lines if f"bar: vetoed ({SAME_DAY_DCA})" in line]
+    sold = [line for line in lines if " bar: sell " in line]
+    # Bars 0, 30, 60, 90: day 0 is a cadence bar for BOTH rules too (0 % 30 == 0), so it
+    # collides same as the later ones (`test_a_same_day_dca_vetoes_the_sale_and_it_is_not_carried`
+    # pins the same four bars for the non-CLI replay).
+    assert (len(vetoed), len(sold)) == (4, 0)
+
+
+def test_a_live_dca_or_a_dca_on_another_product_is_not_replayed_on_a_paper_profile(
+    tmp_path, valid_config_path
+) -> None:
+    """A paper profile's cycle runs `paper` dca rules (R40); a `live` dca on the same product,
+    and a `paper` dca on a DIFFERENT product, are neither one the cycle would run beside this
+    sale, so neither is replayed and neither vetoes anything."""
+    repo = _file_repo(tmp_path / "t.db")
+    repo.upsert_candles("BTC-USD", Granularity.ONE_DAY, _rising(91))
+    rid = repo.insert_rule(
+        "reverse_dca",
+        {"product_id": "BTC-USD", "target_usd": "10", "min_price_floor": "1"},
+        status="candidate",
+    )
+    repo.insert_rule("dca", {"product_id": "BTC-USD", "cadence_days": 30}, status="live")
+    repo.insert_rule("dca", {"product_id": "ETH-USD", "cadence_days": 30}, status="paper")
+    result = _backtest(tmp_path, valid_config_path, rid)
+    assert result.exit_code == 0, result.output
+    lines = result.output.splitlines()
+    [head] = [line for line in lines if line.startswith("  same-day dca:")]
+    assert head == "  same-day dca: no dca rule at status paper on BTC-USD"
+    vetoed = [line for line in lines if "bar: vetoed (same_day_dca)" in line]
+    sold = [line for line in lines if " bar: sell " in line]
+    assert (len(vetoed), len(sold)) == (0, 3)
+
+
+def test_a_live_dca_on_the_same_product_vetoes_under_a_live_profile(
+    tmp_path, live_config_path
+) -> None:
+    """The other half of R40's reading: on a `live`-mode profile the cycle runs `live` dca
+    rules, so a `live` (not `paper`) dca on the same product is the one replayed and vetoing."""
+    repo = _file_repo(tmp_path / "t.db")
+    repo.upsert_candles("BTC-USD", Granularity.ONE_DAY, _rising(91))
+    rid = repo.insert_rule(
+        "reverse_dca",
+        {"product_id": "BTC-USD", "target_usd": "10", "min_price_floor": "1"},
+        status="candidate",
+    )
+    dca_id = repo.insert_rule("dca", {"product_id": "BTC-USD", "cadence_days": 30}, status="live")
+    result = _backtest(tmp_path, live_config_path, rid)
+    assert result.exit_code == 0, result.output
+    lines = result.output.splitlines()
+    [head] = [line for line in lines if line.startswith("  same-day dca:")]
+    assert head == (
+        f"  same-day dca: 1 dca rule(s) at status live on BTC-USD replayed (ids {dca_id})"
+    )
+    vetoed = [line for line in lines if "bar: vetoed (same_day_dca)" in line]
+    sold = [line for line in lines if " bar: sell " in line]
+    assert (len(vetoed), len(sold)) == (4, 0)
+
+
+def test_the_no_config_replay_uses_the_library_default_fee_and_leaves_legs_unsliced(repo) -> None:
+    """The no-config branch (`config is None`): the headline fee is `backtest.TAKER_FEE_PCT`
+    labelled as the library default, `dca_status` defaults to `live`, and with no
+    `max_per_order_usd` every sale row carries `legs unsliced` (no cap to slice against)."""
+    from keel.commands.rules import run_proposal_replay
+
+    repo.upsert_candles("BTC-USD", Granularity.ONE_DAY, _rising(91))
+    rid = repo.insert_rule(
+        "reverse_dca",
+        {"product_id": "BTC-USD", "target_usd": "10", "min_price_floor": "1"},
+        status="candidate",
+    )
+    out: list[str] = []
+    err: list[str] = []
+    run_proposal_replay(repo, None, rid, echo=out.append, echo_err=err.append)
+    assert err == []
+    assert "fee line: 1.2000% (library default: backtest.TAKER_FEE_PCT)" in out
+    sales = [line for line in out if " bar: sell " in line]
+    assert len(sales) == 3
+    assert all(line.endswith("legs unsliced") for line in sales)
+
+
+def test_an_hour_granularity_is_refused_and_a_day_is_accepted(tmp_path, valid_config_path) -> None:
+    repo = _file_repo(tmp_path / "t.db")
+    repo.upsert_candles("BTC-USD", Granularity.ONE_DAY, _rising(91))
+    rid = repo.insert_rule(
+        "reverse_dca",
+        {"product_id": "BTC-USD", "target_usd": "10", "min_price_floor": "1"},
+        status="candidate",
+    )
+    hour = _backtest(tmp_path, valid_config_path, rid, "--granularity", "ONE_HOUR")
+    assert hour.exit_code == 1
+    assert "does not apply" in hour.output
+
+    day = _backtest(tmp_path, valid_config_path, rid, "--granularity", "ONE_DAY")
+    assert day.exit_code == 0, day.output
+
+
+# -- review finding 4a: a fee rate that leaves no room for slippage -----------------------------
+
+
+def test_a_fee_rate_that_leaves_no_room_for_slippage_is_refused_not_a_traceback(
+    tmp_path, valid_config_path
+) -> None:
+    """`--fee-sensitivity-pct 0.9999` passes `_parse_fee_rate` (a fraction in [0, 1)), but
+    `SellCosts` then raises on `fee + slippage >= 1`. The replay must refuse cleanly (exit 1, no
+    traceback) rather than let that `ValueError` reach the terminal uncaught."""
+    repo = _file_repo(tmp_path / "t.db")
+    repo.upsert_candles("BTC-USD", Granularity.ONE_DAY, _rising(91))
+    rid = repo.insert_rule(
+        "reverse_dca",
+        {"product_id": "BTC-USD", "target_usd": "10", "min_price_floor": "1"},
+        status="candidate",
+    )
+    result = _backtest(tmp_path, valid_config_path, rid, "--fee-sensitivity-pct", "0.9999")
+    assert result.exit_code == 1
+    assert isinstance(result.exception, SystemExit)
+    assert "slippage" in result.output
+
+
+def test_an_unknown_id_with_the_sensitivity_flag_is_refused_as_unknown(
+    tmp_path, valid_config_path
+) -> None:
+    """Round-3 review: the id is refused before the flag is judged, so the operator reads the
+    real problem -- the rule does not exist -- not a flag complaint about a missing rule."""
+    _file_repo(tmp_path / "t.db")
+    result = _backtest(tmp_path, valid_config_path, 999, "--fee-sensitivity-pct", "0.01")
+    assert result.exit_code == 1
+    assert "Error: no rule with id 999" in result.output.splitlines()
+
+
+def test_a_rule_that_never_fires_prints_one_nothing_line_per_fee_line(
+    tmp_path, valid_config_path
+) -> None:
+    """#934: a floor above every close -- each fee line says the rule proposed nothing, once,
+    and no sale or veto line appears."""
+    repo = _file_repo(tmp_path / "t.db")
+    repo.upsert_candles("BTC-USD", Granularity.ONE_DAY, _rising(91))
+    rid = repo.insert_rule(
+        "reverse_dca",
+        {"product_id": "BTC-USD", "target_usd": "10", "min_price_floor": "99999"},
+        status="candidate",
+    )
+    lines = _backtest(tmp_path, valid_config_path, rid, "--fee-sensitivity-pct", "0.01").output
+    lines = lines.splitlines()
+    fee_at = [i for i, line in enumerate(lines) if line.startswith("fee line: ")]
+    assert len(fee_at) == 2
+    assert [lines[i + 1] for i in fee_at] == ["  the rule proposed nothing over these bars"] * 2
+    assert sum(1 for line in lines if "the rule proposed nothing" in line) == 2
+    assert not any(" bar: " in line for line in lines)

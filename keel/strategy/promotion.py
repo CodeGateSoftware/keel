@@ -123,10 +123,9 @@ DEFAULT_CLASS = "default"
 TREND_FOLLOW = "trend_follow"
 #: A rule that only ever proposes selling part of a held sleeve (`Rule.reduce_signal`, #857).
 #: It has no entries and so no R, and it must never be judged by a trade floor: it is
-#: deliberately NOT in `_CLASS_FLOORS`. `reverse_dca` (P9) declares it, and until P12 routes a
-#: sleeve-sell rule to its own gate (`sleeve_sell_gate`), `floor_for_class` falls back to the
-#: default floor for it like any other undeclared class, so `rules promote` on one is refused at
-#: 0 trades (no entries, no backtest trades) -- it fails closed, not silently through.
+#: deliberately NOT in `_CLASS_FLOORS`, and `floor_for_class` never receives it --
+#: `commands.rules.attempt_promotion` routes a sleeve-sell rule to its own gate,
+#: `sleeve_sell_gate`, before any backtest runs (plan R10, P12).
 SLEEVE_SELL = "sleeve_sell"
 
 _CLASS_FLOORS: dict[str, PromotionConfig] = {
@@ -792,3 +791,93 @@ def transition(
         return status
 
     return status  # "disabled" (or any unrecognized status): terminal, no-op
+
+
+# -- The sleeve_sell gate (spec §3.7, Q2, Q6; plan P12) -------------------------------------------
+
+#: Spec §3.7's `min_paper_days`: two monthly cadence checks in `paper` before `live`.
+SLEEVE_SELL_MIN_PAPER_DAYS = 60
+
+_SECONDS_PER_DAY = 86_400
+
+
+def sleeve_sell_gate(
+    *,
+    status: str,
+    promoted_at: int | None,
+    reviewed_proposals: int,
+    lookahead_clean: bool,
+    concurrent_live_dca: bool,
+    allow_concurrent_dca: bool,
+    now_ts: int,
+) -> tuple[bool, list[str]]:
+    """Whether a `sleeve_sell` rule may take its next lifecycle step, and every reason it may
+    not -- all of them at once, as `check_floors` reports them (spec §3.7).
+
+    A sleeve-sell rule has no R and no trades in the backtester's sense (it never enters), so
+    G2's floors and G4's PBO are the wrong shape for it, and so is `--force`: that bypass exists
+    for a rule whose backtest cannot REACH the floor, not for one that has no floor. This is its
+    own gate:
+
+    - **candidate -> paper:** the lookahead check passes on `reduce_signal` (through the
+      `Setup`-shaped adapter, plan R21). Nothing else: going to `paper` places nothing, and a
+      `paper` rule's proposals are how the reviewed proposal the next step needs is produced
+      (R16). The proposal replay `keel rules backtest` prints is a description, not a pass mark,
+      so it is not an input here -- there is no threshold to tune to.
+    - **paper -> live:** the lookahead check again, AND at least `SLEEVE_SELL_MIN_PAPER_DAYS`
+      since the rule reached `paper` (`promoted_at`), AND at least one of its `paper` proposals
+      marked reviewed (`keel dca proposals review <id>`): "a rule that never fired in paper is
+      not promoted on silence". A NULL `promoted_at` is "not recorded", never the epoch, so the
+      days cannot be counted and the step is refused. Q6's default is that 60 days and one
+      reviewed proposal are enough FOR `preview` execution, which is all this build has.
+    - **Q2:** a `dca` on the same product refuses `paper -> live` unless the operator typed
+      `--allow-concurrent-dca` -- buying weekly and distributing monthly is a legal round trip at
+      two fees, and the operator says so on the record. The caller decides what counts as
+      concurrent (`concurrent_live_dca`, named for the spec's live case): a `reverse_dca` beside
+      a `dca` the profile's cycle runs -- `live` on a live profile, `paper` on a paper one (plan
+      R40; spec §6 failure mode a).
+
+    **`live` means preview in this build (S2).** Every sleeve-sell kind declares `execution:
+    Literal["preview"]`, so a rule this gate promotes to `live` still only records proposals;
+    no status reached here places an order. That is also why `--allow-concurrent-dca` weakens
+    nothing today. `live`, `disabled` and any unrecognised status have no next step and are
+    refused.
+
+    Pure: the caller (`commands.rules.attempt_promotion`) reads the rule row, the proposals log
+    and the lookahead verdict and hands in the facts.
+    """
+    target = _PROMOTE_NEXT.get(status)
+    if target is None:
+        return False, [f"status {status!r} has no next step for a sleeve_sell rule"]
+
+    reasons: list[str] = []
+    if not lookahead_clean:
+        reasons.append(
+            "lookahead check on reduce_signal did not pass: a decision that changes when future "
+            "bars become visible (or a check that did not run) is not promotable"
+        )
+    if target == "live":
+        if promoted_at is None:
+            reasons.append(
+                "promoted_at is not recorded, so the days in paper cannot be counted -- refusing "
+                "rather than reading NULL as the epoch"
+            )
+        else:
+            days_in_paper = (now_ts - promoted_at) // _SECONDS_PER_DAY
+            if days_in_paper < SLEEVE_SELL_MIN_PAPER_DAYS:
+                reasons.append(
+                    f"{days_in_paper} days in paper < {SLEEVE_SELL_MIN_PAPER_DAYS} "
+                    "(spec §3.7: two monthly checks)"
+                )
+        if reviewed_proposals < 1:
+            reasons.append(
+                "no reviewed paper proposal: a rule that never fired in paper is not promoted on "
+                "silence -- mark one with `keel dca proposals review <id>`"
+            )
+        if concurrent_live_dca and not allow_concurrent_dca:
+            reasons.append(
+                "a dca rule this profile's cycle runs buys this product: distributing beside it "
+                "is a round trip at two fees -- pass --allow-concurrent-dca to promote anyway "
+                "(spec Q2)"
+            )
+    return (not reasons, reasons)

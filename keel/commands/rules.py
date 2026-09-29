@@ -56,7 +56,8 @@ from keel.research import ledger as trials_ledger
 from keel.research import matrix as matrix_mod
 from keel.strategy import backtest as backtest_mod
 from keel.strategy import promotion as promotion_mod
-from keel.strategy.rules.base import ParamSpec
+from keel.strategy.reduction import Holding, Lot, SellCosts
+from keel.strategy.rules.base import ParamSpec, Rule, Setup
 from keel.types import Candle, Granularity
 
 logger = logging.getLogger(__name__)
@@ -323,32 +324,213 @@ def _load_pbo(ctx: click.Context, session: str | None, blocks: int) -> cscv_mod.
         raise  # unreachable: ctx.exit raises SystemExit
 
 
+def _parse_fee_rate(_ctx: click.Context, _param: click.Parameter, value: str | None) -> Any:
+    """`--fee-sensitivity-pct`: a FRACTION in [0, 1), like `config.fees.taker_pct` (0.012 is
+    1.2%). No default: the rate is the operator's to type (plan R29)."""
+    if value is None:
+        return None
+    try:
+        rate = Decimal(value)
+    except ArithmeticError as exc:
+        raise click.BadParameter(f"{value!r} is not a number") from exc
+    if not rate.is_finite() or not 0 <= rate < 1:
+        raise click.BadParameter(f"{value!r} must be a fraction in [0, 1), e.g. 0.012 for 1.2%")
+    return rate
+
+
+def _is_sleeve_sell_row(repo: Repository, rule_id: int) -> bool:
+    """Whether rule `rule_id`'s registered kind is a `sleeve_sell` class -- read off the CLASS, so
+    an unknown id or kind is simply `False` and the ordinary path's own refusal names it."""
+    row = next((r for r in repo.get_rules() if r["id"] == rule_id), None)
+    if row is None:
+        return False
+    cls = agent.RULE_REGISTRY.get(row["kind"])
+    return promotion_mod.promotion_class_of(cls) == promotion_mod.SLEEVE_SELL
+
+
 @rules_group.command("backtest")
 @click.argument("rule_id", type=int)
 @click.option(
     "--granularity", default=None, help="Override the candle granularity (default: the rule's own)."
 )
+@click.option(
+    "--fee-sensitivity-pct",
+    default=None,
+    callback=_parse_fee_rate,
+    help="A sleeve-sell rule only: also replay its proposals at this taker rate, a fraction "
+    "(0.012 = 1.2%), printed as a second fee line labelled operator-supplied. No default.",
+)
 @click.pass_context
 @with_disclaimer
-def rules_backtest(ctx: click.Context, rule_id: int, granularity: str | None) -> None:
+def rules_backtest(
+    ctx: click.Context,
+    rule_id: int,
+    granularity: str | None,
+    fee_sensitivity_pct: Decimal | None,
+) -> None:
     """Backtest a stored rule against its historical candles (read-only).
 
     The output states the fee rate the fills were priced at. That is not decoration: a profit
     factor is a statement about net edge, and at this strategy's cost-to-edge ratio the fee is
     the dominant term, not a rounding detail -- prior numbers printed without it turned out to
     be maker-priced against a taker fill model (#247).
+
+    A SLEEVE-SELL rule (`reverse_dca`) has no entries to backtest, so it gets its proposal
+    replay instead (spec §3.7): every proposal it would have made over the cached daily bars,
+    each with its realised P&L against a synthetic FIFO lot, and the terminal value with and
+    without the rule -- at `config.fees.taker_pct`, plus one line at `--fee-sensitivity-pct` when
+    the operator passes it. A mechanical description, not a pass mark.
     """
+    repo = _open_repo(ctx)
+    config = _optional_cfg(ctx)
+    echo_err = lambda message: click.echo(message, err=True)  # noqa: E731
     try:
+        if _is_sleeve_sell_row(repo, rule_id):
+            run_proposal_replay(
+                repo,
+                config,
+                rule_id,
+                granularity_opt=granularity,
+                fee_sensitivity_pct=fee_sensitivity_pct,
+                echo=click.echo,
+                echo_err=echo_err,
+            )
+            return
+        if fee_sensitivity_pct is not None:
+            # An unknown id is refused as unknown first: the flag is judged only against a rule
+            # that exists.
+            _rule_row_or_refuse(repo, rule_id, echo_err)
+            raise click.BadParameter(
+                "applies only to a sleeve-sell rule's proposal replay; rule "
+                f"{rule_id} is backtested at config.fees.taker_pct",
+                param_hint="--fee-sensitivity-pct",
+            )
         run_rule_backtest(
-            _open_repo(ctx),
-            _optional_cfg(ctx),
+            repo,
+            config,
             rule_id,
             granularity_opt=granularity,
             echo=click.echo,
-            echo_err=lambda message: click.echo(message, err=True),
+            echo_err=echo_err,
         )
     except RulesRefused:
         ctx.exit(1)
+
+
+def run_proposal_replay(
+    repo: Repository,
+    config: Any | None,
+    rule_id: int,
+    *,
+    granularity_opt: str | None = None,
+    fee_sensitivity_pct: Decimal | None = None,
+    echo: Callable[[str], None] = _noop,
+    echo_err: Callable[[str], None] = _noop,
+) -> tuple[RulesOutcome, list[Any]]:
+    """THE `rules backtest` service for a `sleeve_sell` rule: its proposal replay (spec §3.7),
+    echoed through `sleeve_report.render_replay`. Read-only: nothing is written, nothing is
+    appended to the trials ledger, and no venue is asked.
+
+    **Fees (plan R29).** The headline line is at `config.fees.taker_pct`, labelled
+    `fallback:config.fees.taker_pct` (the label every sleeve fallback carries), or at
+    `backtest.TAKER_FEE_PCT` labelled as the library default when no config loads -- the two
+    agree by construction (`_backtest_fee`). A second line exists ONLY when the operator passes
+    `fee_sensitivity_pct`, labelled operator-supplied: the measured live rate is never a
+    constant in keel (spec §2.2, Q5).
+
+    **Everything else is the live pipeline's.** Slippage is the product's one liquidity-scaled
+    rate (`backtest_slippage`). The rail-2 cap is `config.caps.max_per_order_usd` (unsliced
+    without a config). The same-day-DCA exclusion replays the `dca` rules on the product at the
+    status this profile's cycle runs (`paper` on a paper profile, `live` otherwise -- R40's
+    reading), each through its own `detect`.
+
+    Refusals: an unknown id; a `--granularity` other than ONE_DAY (a sleeve-sell rule decides on
+    completed daily bars); no cached ONE_DAY candles, named as such; a headline or
+    `--fee-sensitivity-pct` rate that leaves `fee + slippage >= 1` (`SellCosts.__post_init__`
+    would otherwise raise `ValueError` uncaught -- sizing gross from net is undefined there).
+    """
+    from keel.commands import sleeve_report
+    from keel.execution import sleeve
+
+    row = _rule_row_or_refuse(repo, rule_id, echo_err)
+    rule = agent._build_rule(row)
+    kind = row["kind"]
+    if granularity_opt and Granularity(granularity_opt) != Granularity.ONE_DAY:
+        echo_err(
+            f"Error: rule {rule_id} ({kind}) is a sleeve-sell rule and decides on completed "
+            f"ONE_DAY bars; --granularity {granularity_opt} does not apply."
+        )
+        raise RulesRefused("sleeve-sell replay is daily")
+    product_id = rule.product_id
+    daily = repo.get_candles(product_id, Granularity.ONE_DAY)
+    if not daily:
+        echo_err(
+            f"Error: rule {rule_id} ({kind}): no cached ONE_DAY candles for {product_id} -- "
+            "nothing to replay. Its proposals are replayed over cached daily bars; fetch them "
+            "first."
+        )
+        raise RulesRefused(f"no daily candles for {product_id}")
+
+    if config is None:
+        fee_pct, fee_label = backtest_mod.TAKER_FEE_PCT, "library default: backtest.TAKER_FEE_PCT"
+        max_per_order: Decimal | None = None
+        dca_status = "live"
+    else:
+        fee_pct, fee_label = config.fees.taker_pct, sleeve.FALLBACK_FEE_SOURCE
+        max_per_order = config.caps.max_per_order_usd
+        dca_status = "paper" if config.auto_trade.mode == "paper" else "live"
+    slippage_pct, measured = backtest_slippage(repo, product_id)
+    dca_rows = [
+        r
+        for r in repo.get_rules(dca_status)
+        if r["kind"] == "dca" and (r["params"] or {}).get("product_id") == product_id
+    ]
+    dca_rules = [agent._build_rule(r) for r in dca_rows]
+    dca_note = (
+        f"{len(dca_rules)} dca rule(s) at status {dca_status} on {product_id} replayed "
+        f"(ids {', '.join(str(r['id']) for r in dca_rows)})"
+        if dca_rules
+        else f"no dca rule at status {dca_status} on {product_id}"
+    )
+
+    rates = [(fee_pct, fee_label)]
+    if fee_sensitivity_pct is not None:
+        rates.append((fee_sensitivity_pct, "operator-supplied sensitivity"))
+    for rate, label in rates:
+        if rate + slippage_pct >= 1:
+            echo_err(
+                f"Error: rule {rule_id} ({kind}): {label} fee {rate} + slippage {slippage_pct} "
+                ">= 1 -- sizing gross from net (spec §6) is undefined there. Nothing was replayed."
+            )
+            raise RulesRefused(f"rule {rule_id}: fee {rate} + slippage {slippage_pct} >= 1")
+    replays = [
+        (
+            sleeve_report.proposal_replay(
+                rule,
+                daily,
+                fee_pct=rate,
+                slippage_pct=slippage_pct,
+                max_per_order_usd=max_per_order,
+                dca_rules=dca_rules,
+            ),
+            label,
+        )
+        for rate, label in rates
+    ]
+    sink, recorded = _line_sink(echo)
+    for line in sleeve_report.render_replay(
+        rule_id=rule_id,
+        kind=kind,
+        replays=replays,
+        slippage_measured=measured,
+        max_per_order_usd=max_per_order,
+        dca_note=dca_note,
+    ):
+        sink(line)
+    return (
+        RulesOutcome(lines=tuple(recorded), rule_id=rule_id, new_status=row["status"]),
+        [replay for replay, _label in replays],
+    )
 
 
 @dataclass(frozen=True)
@@ -741,6 +923,14 @@ def run_rule_lookahead(
     "pass. Use `keel trials list` to find the session your parameter sweep recorded under.",
 )
 @click.option("--pbo-blocks", default=16, show_default=True, help="S: number of CSCV row blocks.")
+@click.option(
+    "--allow-concurrent-dca",
+    is_flag=True,
+    default=False,
+    help="A reverse_dca rule only: promote it paper -> live even though a dca rule this profile's "
+    "cycle runs (paper on a paper profile, live otherwise) buys the same product (a round trip "
+    "at two fees, spec Q2). Refused on any other rule.",
+)
 @click.pass_context
 @with_disclaimer
 def rules_promote(
@@ -750,6 +940,7 @@ def rules_promote(
     force: bool,
     pbo_session: str | None,
     pbo_blocks: int,
+    allow_concurrent_dca: bool,
 ) -> None:
     """Re-run a rule's backtest and advance its lifecycle status if it clears the gate.
 
@@ -779,6 +970,14 @@ def rules_promote(
     NEVER produce `min_trades` (default 100) trades -- without a bypass such a rule could never
     reach `paper` status, yet the whole point of a paper-forward is to accrue the out-of-sample
     trades the backtest can't. Use deliberately and audit the (loud) warning this prints.
+
+    A SLEEVE-SELL rule (`reverse_dca`) takes its own gate instead (spec §3.7): the lookahead
+    check on its `reduce_signal`, then candidate -> paper on that alone, and paper -> live after
+    60 days in paper with at least one reviewed paper proposal (`keel dca proposals review`).
+    A `dca` on the same product that this profile's cycle runs (`paper` on a paper profile,
+    `live` otherwise, R40) refuses paper -> live unless `--allow-concurrent-dca` is
+    passed. `--force` is refused for it. In this build a `live` sleeve-sell rule still only
+    records proposals: nothing is placed.
     """
     try:
         attempt_promotion(
@@ -798,6 +997,7 @@ def rules_promote(
             # verdict); the console uses the service's default. Called at the exact point
             # the old command body called it, so stdout/stderr interleaving is unchanged.
             load_pbo=lambda session, blocks: _load_pbo(ctx, session, blocks),
+            allow_concurrent_dca=allow_concurrent_dca,
             echo=click.echo,
             echo_err=lambda message: click.echo(message, err=True),
         )
@@ -815,6 +1015,8 @@ def attempt_promotion(
     pbo_session: str | None = None,
     pbo_blocks: int = 16,
     load_pbo: Callable[[str | None, int], cscv_mod.PBOResult | None] | None = None,
+    allow_concurrent_dca: bool = False,
+    now_ts: int | None = None,
     echo: Callable[[str], None] = _noop,
     echo_err: Callable[[str], None] = _noop,
 ) -> RulesOutcome:
@@ -834,11 +1036,42 @@ def attempt_promotion(
     FORCE carries no gate HERE (the CLI's `--force` is a flag the operator already typed at
     a terminal); the strategy console's retry flow runs its own TYPED gate before calling
     with `force=True` -- the O3 contract is the front-end's to keep, never the service's to
-    assume."""
+    assume.
+
+    **A `sleeve_sell` rule takes its own gate, never this one** (spec §3.7, plan R10/R21, P12):
+    it has no entries, so no backtest trades and no R, and a trade floor would refuse it at 0
+    trades forever. `_promote_sleeve_sell` runs the lookahead check on `reduce_signal` and
+    `promotion.sleeve_sell_gate`, and refuses (`RulesRefused`) rather than printing a
+    non-promotion. `--force` is refused for it -- spec §3.7: the bypass exists for a rule whose
+    backtest cannot REACH the floor, not for one that has no floor, and it would skip the 60 paper
+    days and the reviewed proposal outright. `allow_concurrent_dca` (spec Q2) applies only to a
+    sleeve-sell rule and is refused on any other, so a flag that would do nothing is never silently
+    accepted. `now_ts` is the clock the paper-day count reads (default: now)."""
     if load_pbo is None:
         load_pbo = lambda session, blocks: _load_pbo_for(session, blocks, echo_err)  # noqa: E731
     sink, recorded = _line_sink(echo)
     row = _rule_row_or_refuse(repo, rule_id, echo_err)
+
+    # The class is read off the registered CLASS, not a built rule: the force path below never
+    # built one, and must not start refusing a row whose params no longer construct.
+    sleeve_sell = (
+        promotion_mod.promotion_class_of(agent.RULE_REGISTRY.get(row["kind"]))
+        == promotion_mod.SLEEVE_SELL
+    )
+    if allow_concurrent_dca and not sleeve_sell:
+        echo_err(
+            f"Error: rule {rule_id} ({row['kind']}): --allow-concurrent-dca applies only to a "
+            "sleeve_sell rule (spec Q2), and this is not one. Nothing was promoted."
+        )
+        raise RulesRefused(f"rule {rule_id}: --allow-concurrent-dca does not apply")
+    if sleeve_sell and force:
+        echo_err(
+            f"Error: rule {rule_id} ({row['kind']}) is a sleeve_sell rule: --force does not apply. "
+            "It exists for a rule whose backtest cannot reach the floor, not for one that has no "
+            "floor (spec §3.7), and it would skip the paper days and the reviewed proposal. Run "
+            f"`keel rules promote {rule_id}` without it. Nothing was promoted."
+        )
+        raise RulesRefused(f"rule {rule_id}: --force refused for a sleeve_sell rule")
 
     if force:
         target = promotion_mod.next_status(row["status"])
@@ -871,6 +1104,21 @@ def attempt_promotion(
     if callable(config):
         config = config()
     rule = agent._build_rule(row)
+    if sleeve_sell:
+        return _promote_sleeve_sell(
+            repo,
+            row,
+            rule,
+            # R40; with no config the conservative reading is `live` (never a quieter one).
+            dca_status=(
+                "paper" if config is not None and config.auto_trade.mode == "paper" else "live"
+            ),
+            allow_concurrent_dca=allow_concurrent_dca,
+            now_ts=int(time.time()) if now_ts is None else now_ts,
+            sink=sink,
+            recorded=recorded,
+            echo_err=echo_err,
+        )
 
     # The lookahead gate (issue #440, C1a): a rule whose at-bar decision changes when future
     # bars are visible reads information it could not have had, and is not promotable -- wired
@@ -1004,6 +1252,323 @@ def attempt_promotion(
     )
     sink(f"rule {rule_id} ({row['kind']}): status -> {new_status}")
     return RulesOutcome(lines=tuple(recorded), rule_id=rule_id, new_status=new_status)
+
+
+# -- the sleeve_sell route (spec §3.7, plan R21, P12) ----------------------------------------------
+
+#: The fixed costs the lookahead adapter sizes a `Reduction` at. Fixed, not the deployment's: the
+#: harness diffs the rule's decision against itself on two views of the same bars, so the rates
+#: only have to be the same in both -- and the library defaults are the ones every backtest's
+#: headline uses (`backtest.TAKER_FEE_PCT`, `backtest.SLIPPAGE_FLOOR_PCT`).
+_LOOKAHEAD_COSTS = SellCosts(
+    backtest_mod.TAKER_FEE_PCT,
+    backtest_mod.SLIPPAGE_FLOOR_PCT,
+    "lookahead:backtest.TAKER_FEE_PCT",
+)
+
+
+def _reduction_as_detect(rule: Rule) -> Callable[[dict[Granularity, list[Candle]]], Setup | None]:
+    """`reduce_signal` in `Rule.detect`'s shape, so the ONE lookahead harness
+    (`bias.lookahead_analysis`) runs on a sleeve-sell rule too (plan R21).
+
+    The mapping: `entry = reduction.expected_price`, `stop = 0`, `target = reduction.qty`,
+    `ts = reduction.ts` -- the harness diffs presence and those three prices at a bar both views
+    claim, so a decision whose price or size moves once future bars exist diverges exactly as an
+    entry rule's would. The holding is a fixed synthetic one: one lot of 1 unit bought at the
+    FIRST daily close, fee-free, so it is identical in every prefix view of the same series and
+    cannot itself be the thing that differs. No daily bars is `None`: nothing to decide on.
+
+    Wrapping keeps one harness (R21's reason): a second, sell-side lookahead check is a second
+    definition of "lookahead" to drift. A deliberately peeking test rule proves the adapter is
+    not vacuous (`tests/commands/test_rules_services.py`).
+    """
+
+    def _detect(candles_by_tf: dict[Granularity, list[Candle]]) -> Setup | None:
+        days = candles_by_tf.get(Granularity.ONE_DAY) or []
+        if not days:
+            return None
+        holding = Holding(
+            rule.product_id,
+            (Lot(0, "dca", days[0].ts, Decimal("1"), days[0].close, Decimal("0")),),
+        )
+        reduction = rule.reduce_signal(holding, candles_by_tf, _LOOKAHEAD_COSTS)
+        if reduction is None:
+            return None
+        return Setup(
+            product_id=rule.product_id,
+            direction="long",
+            entry=reduction.expected_price,
+            stop=Decimal("0"),
+            target=reduction.qty,
+            context={"reason": reduction.reason},
+            ts=reduction.ts,
+        )
+
+    return _detect
+
+
+def _sleeve_lookahead(
+    rule: Rule, daily: list[Candle], rule_id: str
+) -> tuple[bias_mod.LookaheadReport, int]:
+    """The sleeve-sell lookahead check (issue #929, plan R44): truncation-diff `reduce_signal`
+    at every day the rule could have been PROMOTED on, not just at the cached series' own end.
+
+    **Why the single full-series run is vacuous most days.** `bias_mod.lookahead_analysis` run
+    ONCE over the whole cached series compares Axis A only at the full run's own claimed anchor
+    (`Setup.ts`); a rule that never fires on that one run has nothing to diff and reads `clean`
+    honestly, but for `reverse_dca` the full run fires only when the LAST cached bar happens to
+    land on the rule's cadence day -- about one day in `cadence_days`. Every other day, the old
+    check walked ONE_DAY anchors (so `n_bars_checked > 0`) and compared NOTHING, and
+    `verdict == "clean" and n_bars_checked > 0` read that as a pass.
+
+    **The fix: one harness call per TRUNCATION.** For EVERY end index `e` (stride 1, never
+    sampled -- a stride can alias against a cadence and skip every firing day) from
+    `bias_mod.DEFAULT_WARMUP` to `len(daily) - 1` (a day past warmup the rule could have been
+    judged on), the ONE harness runs again on `daily[: e + 1]` alone -- a `sample_step` past
+    that truncation's own length collapses `lookahead_analysis`'s own walk to just its warmup
+    bar, its final bar and its full run's claimed anchor, exactly as a single run over that
+    truncated history would. Each truncation whose full run FIRES on a bar past warmup -- one
+    the harness actually walks (#932) -- is one real comparison (`n_compared`); a truncation
+    whose full run does not fire has nothing to diff there, same as the module's own honesty
+    about a rule that never fires.
+
+    Divergences across every truncation are deduplicated on `(bar_ts, field, prefix_value,
+    full_value)` -- the same bar firing at more than one truncation must not double-count -- with
+    the first five kept for `render_lines` and the true total counted. `n_bars_checked` on the
+    aggregate report is truncations WALKED, not anchors compared; `n_compared` (returned beside
+    the report, and the caller's to refuse on) is truncations whose full run had a decision at
+    all. A rule that fires nowhere over the cached history has `n_compared == 0`: an UN-RUN
+    check, which the caller refuses same as no cached bars at all.
+    """
+    detect = _reduction_as_detect(rule)
+    n = len(daily)
+    # EVERY end past warmup, never a stride: a cadence rule fires on one day in `cadence_days`,
+    # and a stride sharing a factor with it can alias past every one of them for good (stride 3
+    # never lands on a multiple of 30 from 50), leaving a peeking rule uncompared and the shipped
+    # one falsely refused. Each end costs a few `reduce_signal` calls on a slice.
+    stride = 1
+    ordered_ends = list(range(bias_mod.DEFAULT_WARMUP, n))
+
+    # A sample_step past the FULL series' own length: inside each per-truncation call, the only
+    # indices ever walked are that truncation's warmup bar, its own final bar, and (if within
+    # range) its full run's claimed anchor -- see `lookahead_analysis`'s own indices logic.
+    walk_stride = n + 1
+    max_divergences = 5
+
+    kept: list[bias_mod.LookaheadDivergence] = []
+    seen: set[tuple[int, str, str, str]] = set()
+    n_divergences = 0
+    n_compared = 0
+
+    for e in ordered_ends:
+        candles_by_tf = {Granularity.ONE_DAY: daily[: e + 1]}
+        # A comparison happens only where the harness walks the claimed bar: its index must be
+        # past warmup (#932). A decision claiming a warmup bar, or a bar outside this slice, is
+        # never diffed, so it is not counted.
+        claim = detect(candles_by_tf)
+        if claim is not None:
+            claimed = next((i for i, c in enumerate(daily[: e + 1]) if c.ts == claim.ts), None)
+            if claimed is not None and claimed >= bias_mod.DEFAULT_WARMUP:
+                n_compared += 1
+        sub = bias_mod.lookahead_analysis(
+            detect,
+            candles_by_tf,
+            rule_id=rule_id,
+            sample_step=walk_stride,
+            warmup=bias_mod.DEFAULT_WARMUP,
+            max_divergences=max_divergences,
+        )
+        for divergence in sub.divergences:
+            key = (
+                divergence.bar_ts,
+                divergence.field,
+                divergence.prefix_value,
+                divergence.full_value,
+            )
+            if key in seen:
+                continue
+            seen.add(key)
+            n_divergences += 1
+            if len(kept) < max_divergences:
+                kept.append(divergence)
+
+    report = bias_mod.LookaheadReport(
+        rule_id=rule_id,
+        n_bars_checked=len(ordered_ends),
+        divergences=tuple(kept),
+        n_divergences=n_divergences,
+        sample_step=stride,
+        anchor_granularity=Granularity.ONE_DAY.value,
+        notes=(
+            bias_mod.HIGHER_TF_NOT_RUN_NOTE,
+            f"{n_compared} of {len(ordered_ends)} truncation(s) had a decision to compare",
+        ),
+    )
+    return report, n_compared
+
+
+def _reviewed_paper_proposals(repo: Repository, rule_id: int) -> int:
+    """How many of rule `rule_id`'s proposals made IN PAPER the operator has marked reviewed
+    (`keel dca proposals review <id>`) -- spec §3.7's paper->live evidence. A proposal the rule
+    made at another status is not paper evidence, and a `superseded` one was never the rule's
+    decision (review refuses one anyway)."""
+    return sum(
+        1
+        for p in repo.get_sell_proposals(rule_id=rule_id)
+        if p["rule_status"] == "paper"
+        and p["reviewed_ts"] is not None
+        and p["decision"] != "superseded"
+    )
+
+
+def _cycle_dca_on(repo: Repository, product_id: str, dca_status: str) -> bool:
+    """Spec Q2 / §6 failure mode (a): a `dca` rule at `dca_status` buys `product_id`.
+
+    `dca_status` is the status this profile's cycle RUNS (R40, the reading
+    `DistributionRow.dca_collision` and doctor's `sleeve.buy_and_sell_same_asset` share): `paper`
+    on a paper profile, `live` otherwise. A dca the cycle does not load buys nothing, so it makes
+    no round trip; a `paper` dca on a paper profile does, exactly as a `live` one does on a live
+    profile."""
+    return any(
+        r["kind"] == "dca" and (r["params"] or {}).get("product_id") == product_id
+        for r in repo.get_rules(dca_status)
+    )
+
+
+def _promote_sleeve_sell(
+    repo: Repository,
+    row: dict[str, Any],
+    rule: Rule,
+    *,
+    dca_status: str,
+    allow_concurrent_dca: bool,
+    now_ts: int,
+    sink: Callable[[str], None],
+    recorded: list[str],
+    echo_err: Callable[[str], None],
+) -> RulesOutcome:
+    """`attempt_promotion`'s route for a `sleeve_sell` rule: the lookahead check on
+    `reduce_signal` through `_reduction_as_detect` and `_sleeve_lookahead`, then
+    `promotion.sleeve_sell_gate`, then the one-step transition -- or a `RulesRefused` naming
+    every failing condition, with nothing written.
+
+    **The lookahead truncates at EVERY end of the product's cached ONE_DAY bars**
+    (`_sleeve_lookahead`, issue #929/plan R44), past `bias.DEFAULT_WARMUP` rather than the
+    rule's `lookback_days`: `reduce_signal` has no indicator warmup region -- its gates are a
+    trailing max and comparisons on the bar itself -- so its early decisions are real decisions,
+    and a 200-bar skip would leave most caches with nothing to walk. Truncating (rather than one
+    run over the whole series) asks the gate's actual question at every day the rule could have
+    been promoted on, so Axis A gets a comparison wherever the rule fires, not only at the one
+    anchor the untruncated series happens to end on. **A check that compared nothing is not a
+    pass** (#440's fail-closed rule, sharpened by #929): no cached daily bars, too few to reach
+    one anchor, or a rule that never fired at any truncation (`n_compared == 0`) all
+    refuse, each named.
+
+    **Concurrency (Q2) is read for `reverse_dca` only**: it is the kind whose monthly sale beside
+    a weekly buy the spec names (§6 failure mode a). The dca that counts is one at `dca_status`,
+    the status this profile's cycle runs (R40, `_cycle_dca_on`). **`--allow-concurrent-dca` is a
+    paper -> live condition only** (Q2); passed at any other step it has no effect, and this
+    prints one line saying so rather than silently accepting a flag that does nothing.
+    """
+    rule_id = int(row["id"])
+    kind = row["kind"]
+    product_id = rule.product_id
+    if allow_concurrent_dca and row["status"] != "paper":
+        sink(
+            f"rule {rule_id} ({kind}): --allow-concurrent-dca has no effect at "
+            f"{row['status']!r} -> {promotion_mod.next_status(row['status'])!r} -- it applies "
+            "only to the paper -> live step (spec Q2)"
+        )
+    daily = repo.get_candles(product_id, Granularity.ONE_DAY)
+    if not daily:
+        echo_err(
+            f"Error: rule {rule_id} ({kind}): no cached ONE_DAY candles for {product_id}, so the "
+            "lookahead check on reduce_signal cannot run -- an un-run check is not a pass. "
+            "Nothing was promoted."
+        )
+        raise RulesRefused(f"rule {rule_id}: no daily candles for the lookahead check")
+    try:
+        report, n_compared = _sleeve_lookahead(rule, daily, str(rule_id))
+    except Exception as exc:
+        echo_err(
+            f"Error: rule {rule_id} ({kind}): lookahead analysis could not run: {exc!r}. An "
+            "un-run check is not a pass, so nothing was promoted."
+        )
+        raise RulesRefused(f"rule {rule_id}: lookahead analysis could not run") from exc
+    if report.verdict == "lookahead_detected":
+        echo_err(
+            f"Error: rule {rule_id} ({kind}) fails the lookahead check -- its reduce_signal "
+            "decision at past bars changes when future bars become visible."
+        )
+        for line in bias_mod.render_lines(report):
+            echo_err(f"  {line}")
+    elif n_compared == 0:
+        echo_err(
+            f"Error: rule {rule_id} ({kind}): reduce_signal never fired over the {len(daily)} "
+            "cached daily bars, so the lookahead check compared nothing -- an un-run check is "
+            "not a pass."
+        )
+    for note in report.notes:
+        sink(f"warning: rule {rule_id} ({kind}): {note}")
+    lookahead_clean = report.n_divergences == 0 and n_compared > 0
+
+    reviewed = _reviewed_paper_proposals(repo, rule_id)
+    concurrent = kind == "reverse_dca" and _cycle_dca_on(repo, product_id, dca_status)
+    promoted_at = row.get("promoted_at")
+    ok, reasons = promotion_mod.sleeve_sell_gate(
+        status=row["status"],
+        promoted_at=None if promoted_at is None else int(promoted_at),
+        reviewed_proposals=reviewed,
+        lookahead_clean=lookahead_clean,
+        concurrent_live_dca=concurrent,
+        allow_concurrent_dca=allow_concurrent_dca,
+        now_ts=now_ts,
+    )
+    in_paper = (
+        "n/a"
+        if row["status"] != "paper" or promoted_at is None
+        else str((now_ts - int(promoted_at)) // 86_400)
+    )
+    sink(
+        f"rule {rule_id} ({kind}): sleeve_sell gate -- lookahead {report.verdict} over "
+        f"{report.n_bars_checked} daily bars ({n_compared} compared); days in paper {in_paper} "
+        f"(need {promotion_mod.SLEEVE_SELL_MIN_PAPER_DAYS}); reviewed paper proposals {reviewed}; "
+        f"{dca_status} dca on {product_id}: {'yes' if concurrent else 'no'}"
+    )
+    if not ok:
+        for reason in reasons:
+            echo_err(f"  - {reason}")
+        echo_err(
+            f"Error: rule {rule_id} ({kind}) stays at {row['status']!r}: nothing was promoted."
+        )
+        raise RulesRefused(f"rule {rule_id}: sleeve_sell gate refused")
+
+    target = promotion_mod.next_status(row["status"])
+    assert target is not None  # noqa: S101 - sleeve_sell_gate refuses a status with no next step
+    repo.update_rule_status(rule_id, target)
+    log_event(
+        logger,
+        logging.INFO,
+        "rules.sleeve_sell_promoted",
+        rule_id=rule_id,
+        kind=kind,
+        from_status=row["status"],
+        to_status=target,
+        allow_concurrent_dca=bool(concurrent and allow_concurrent_dca),
+    )
+    if concurrent and allow_concurrent_dca:
+        sink(
+            f"  --allow-concurrent-dca: a {dca_status} dca buys {product_id} beside this rule's "
+            "sales -- "
+            "a round trip at two fees, promoted on the operator's record (spec Q2)"
+        )
+    if target == "live":
+        sink(
+            "  live is preview-only in this build: the rule records proposals and places nothing "
+            "(S2)"
+        )
+    sink(f"rule {rule_id} ({kind}): status -> {target}")
+    return RulesOutcome(lines=tuple(recorded), rule_id=rule_id, new_status=target)
 
 
 @rules_group.command("demote")
