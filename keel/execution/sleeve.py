@@ -208,6 +208,18 @@ def slice_qty(
 
     `base_increment=None` means unknown, and the leg is sent unquantized -- `_order_spec`'s rule
     for a SELL (#516), never a refusal.
+
+    **Without an increment, legs are counted as `ceil(qty * price / max_per_order_usd)`, not by
+    dividing `qty` by the leg.** `cap_qty = max_per_order_usd / price` is itself a FLOORED,
+    truncated decimal (28 significant digits) whenever the division does not terminate -- `50 /
+    3` never does -- so it is already a hair under the true cap. Re-dividing `qty` by that
+    already-short leg compounds the shortfall into ~1e-26 units of phantom remainder, which
+    `ROUND_CEILING` then turns into a whole extra leg even when `qty` is an EXACT multiple of the
+    cap ($300 at a $50 cap wants 6 legs, not 7). Computing legs straight from `qty * price` over
+    the cap has no such intermediate rounding to compound. This does not apply once
+    `base_increment` floors `qty` and `leg` to whole increments below: there the FLOORED
+    remainder is real dust the venue cannot express, not an artefact of this function's own
+    arithmetic, so `sellable / leg` is exactly what R11 means by "how many legs".
     """
     with localcontext() as ctx:
         # FLOOR, not the default HALF_EVEN: `50 / 3` would round UP to a leg worth a hair over
@@ -226,9 +238,18 @@ def slice_qty(
         # venue cannot express, and a leg for it would be a day the sale never completes.
         sellable = _floor(qty)
         leg = _floor(leg)
-    if leg <= 0:
-        return Decimal("0"), 0
-    legs = int((sellable / leg).to_integral_value(rounding=ROUND_CEILING))
+        if leg <= 0:
+            return Decimal("0"), 0
+        legs = int((sellable / leg).to_integral_value(rounding=ROUND_CEILING))
+    else:
+        if leg <= 0:
+            return Decimal("0"), 0
+        # No increment to floor against, so `sellable / leg` is not used here (see the docstring
+        # above): count legs straight from `qty * price` over the cap instead.
+        with localcontext() as ctx:
+            ctx.rounding = ROUND_CEILING
+            legs = int((qty * price / max_per_order_usd).to_integral_value(rounding=ROUND_CEILING))
+        legs = max(legs, 1)
     return leg, legs
 
 

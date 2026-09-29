@@ -180,10 +180,13 @@ def test_slice_floors_to_the_increment_and_reports_unexpressible_as_zero() -> No
 def test_slice_without_an_increment_never_rounds_a_leg_over_the_cap() -> None:
     """`cap / price` does not terminate for 50 / 3, and the context's default HALF_EVEN rounds
     16.666...6667 UP -- a leg worth a hair over $50, which rail 2 would then veto. The cap
-    division floors, so the leg is at or under the cap exactly."""
+    division floors, so the leg is at or under the cap exactly. Legs are counted independently
+    as `ceil(qty * price / cap)`, never by re-dividing by that (imprecisely floored) leg size --
+    doing so turned an exact multiple of the cap ($300 at a $50 cap) into a phantom 7th leg for
+    ~1e-26 units of dust."""
     leg, legs = sleeve.slice_qty(D("100"), D("3"), max_per_order_usd=D("50"), base_increment=None)
     assert leg * D("3") <= D("50")
-    assert legs == 7  # 100 / 16.666... = 6.000...0x, so a seventh leg carries the remainder
+    assert legs == 6  # 100 * 3 / 50 == 6 exactly: no dust, no extra leg
 
 
 def test_a_sale_under_the_cap_is_one_leg_of_its_own_size() -> None:
