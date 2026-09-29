@@ -1128,3 +1128,43 @@ def test_a_decision_claiming_a_bar_inside_warmup_is_not_counted_as_compared(repo
     [gate] = [line for line in out if "sleeve_sell gate" in line]
     assert "(0 compared)" in gate
     assert sum(1 for line in err if "compared nothing" in line) == 1
+
+
+class _FixedBarPeek(ReverseDca):
+    """Claims bar 60 whenever bar 61 exists: every truncation from e=61 on diverges at the SAME
+    bar (the live view of bar 60 cannot see bar 61, so it never fires there)."""
+
+    def reduce_signal(self, holding, candles_by_tf, costs):
+        days = candles_by_tf.get(Granularity.ONE_DAY, [])
+        if len(days) <= 61:
+            return None
+        return Reduction(
+            self.product_id, Decimal("0.001"), self.name, {}, days[60].close, days[60].ts
+        )
+
+
+def test_one_bar_diverging_in_many_truncations_is_counted_once() -> None:
+    """#933: 120 bars, truncations e=61..119 all find the same divergence at bar 60 -- one
+    divergence, reported once, not 59."""
+    rule = _FixedBarPeek("BTC-USD", target_usd=Decimal("10"), min_price_floor=Decimal("1"))
+    report, n_compared = rules_mod._sleeve_lookahead(rule, _rising_from(0, 120), "1")
+    assert n_compared == 59
+    assert report.n_divergences == 1
+    assert [(d.bar_ts, d.field) for d in report.divergences] == [(60 * _DAY, "setup_present")]
+
+
+def test_the_promote_path_accepts_a_missing_config_for_a_sleeve_rule(btc_book) -> None:
+    """`attempt_promotion`'s docstring allows `config=None`: the sleeve route then reads the dca
+    status as `live` (the conservative reading, R40) instead of crashing."""
+    rid = _paper_reverse(btc_book, days_in_paper=61)
+    _review(btc_book, rid)
+    btc_book.insert_rule(
+        "dca", {"product_id": "BTC-USD", "cadence_days": 7, "budget_usd": "40"}, status="live"
+    )
+    out, err = _collect()
+    with pytest.raises(RulesRefused):
+        attempt_promotion(
+            btc_book, None, rid, now_ts=_SLEEVE_NOW, echo=out.append, echo_err=err.append
+        )
+    [gate] = [line for line in out if "sleeve_sell gate" in line]
+    assert gate.endswith("live dca on BTC-USD: yes")

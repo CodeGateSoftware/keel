@@ -1109,7 +1109,10 @@ def attempt_promotion(
             repo,
             row,
             rule,
-            dca_status="paper" if config.auto_trade.mode == "paper" else "live",
+            # R40; with no config the conservative reading is `live` (never a quieter one).
+            dca_status=(
+                "paper" if config is not None and config.auto_trade.mode == "paper" else "live"
+            ),
             allow_concurrent_dca=allow_concurrent_dca,
             now_ts=int(time.time()) if now_ts is None else now_ts,
             sink=sink,

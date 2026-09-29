@@ -772,3 +772,24 @@ def test_an_unknown_id_with_the_sensitivity_flag_is_refused_as_unknown(
     result = _backtest(tmp_path, valid_config_path, 999, "--fee-sensitivity-pct", "0.01")
     assert result.exit_code == 1
     assert "Error: no rule with id 999" in result.output.splitlines()
+
+
+def test_a_rule_that_never_fires_prints_one_nothing_line_per_fee_line(
+    tmp_path, valid_config_path
+) -> None:
+    """#934: a floor above every close -- each fee line says the rule proposed nothing, once,
+    and no sale or veto line appears."""
+    repo = _file_repo(tmp_path / "t.db")
+    repo.upsert_candles("BTC-USD", Granularity.ONE_DAY, _rising(91))
+    rid = repo.insert_rule(
+        "reverse_dca",
+        {"product_id": "BTC-USD", "target_usd": "10", "min_price_floor": "99999"},
+        status="candidate",
+    )
+    lines = _backtest(tmp_path, valid_config_path, rid, "--fee-sensitivity-pct", "0.01").output
+    lines = lines.splitlines()
+    fee_at = [i for i, line in enumerate(lines) if line.startswith("fee line: ")]
+    assert len(fee_at) == 2
+    assert [lines[i + 1] for i in fee_at] == ["  the rule proposed nothing over these bars"] * 2
+    assert sum(1 for line in lines if "the rule proposed nothing" in line) == 2
+    assert not any(" bar: " in line for line in lines)
