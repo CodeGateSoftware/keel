@@ -1262,8 +1262,46 @@ def attest_asset(config_path: Path, db_path: Path, values: dict[str, str]) -> Ac
     return ActionResult("assets_attested", True, f"attested {asset}")
 
 
+def sleeve_sell_web_refusal(rule_id: int, kind: str) -> str:
+    """What the web promotion says for a `sleeve_sell` rule: it names the terminal command."""
+    return (
+        f"nothing done -- rule {rule_id} ({kind}) is a sleeve-sell rule, and the browser does not "
+        f"promote one. Run `keel rules promote {rule_id}` at a terminal (it takes "
+        "--allow-concurrent-dca when a dca buys the same product)."
+    )
+
+
+def _sleeve_sell_kind(db_path: Path, rule_id: int) -> str | None:
+    """Rule `rule_id`'s kind when its registered class is `sleeve_sell`, else `None` -- read
+    over a read-only connection, off the CLASS (`rules._is_sleeve_sell_row`), so an unknown id
+    or an unreadable database is `None` and the job's own refusal names it."""
+    from keel.commands.rules import _is_sleeve_sell_row
+    from keel.data.repository import Repository
+
+    try:
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    except sqlite3.Error:
+        return None
+    conn.row_factory = sqlite3.Row
+    try:
+        repo = Repository(conn)
+        if not _is_sleeve_sell_row(repo, rule_id):
+            return None
+        return next(str(r["kind"]) for r in repo.get_rules() if r["id"] == rule_id)
+    except sqlite3.Error:
+        return None
+    finally:
+        conn.close()
+
+
 def promote_rule(config_path: Path, db_path: Path, values: dict[str, str]) -> ActionResult:
     """Re-run a rule's backtest and advance it IF it clears the gate -- in the background.
+
+    **A `sleeve_sell` rule is refused here, whatever its status** (#857, P13). Its paper -> live
+    step is the one that decides whether the rule may ever sell, and it runs through the
+    operator's own flow at a terminal: the reviewed proposal, the 60 paper days, and
+    `--allow-concurrent-dca` when a dca buys the same product. A browser can carry none of
+    that, so this names `keel rules promote <id>` and starts no job.
 
     **`force` is hard-wired False and is not a field.** `attempt_promotion`'s own docstring is
     explicit that force "carries no gate HERE ... the O3 contract is the front-end's to keep,
@@ -1279,6 +1317,10 @@ def promote_rule(config_path: Path, db_path: Path, values: dict[str, str]) -> Ac
     if not raw.isdigit():
         return ActionResult("rule_promoted", False, "nothing done -- give a numeric rule id")
     rule_id = int(raw)
+
+    sleeve_kind = _sleeve_sell_kind(db_path, rule_id)
+    if sleeve_kind is not None:
+        return ActionResult("rule_promoted", False, sleeve_sell_web_refusal(rule_id, sleeve_kind))
 
     if jobs.is_running():
         return ActionResult("rule_promoted", False, "a job is already running")
