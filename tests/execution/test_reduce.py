@@ -607,8 +607,9 @@ def test_a_holding_resting_on_unsized_fills_is_disclosed_on_the_proposal(
     """#900/#912: `positions` cannot name its entry order, so the proposal names the product's
     filled BUYs the venue never sized that could have booked the CURRENTLY OPEN lot -- `_held`
     (called by `_run` below) opens a 0.002 BTC lot at `opened_at=0`, so the fixture's unsized
-    order matches it on both size and clock. The sized fill is excluded on its own terms (it
-    carries a `filled_quantity`), never reaching the size/time match at all."""
+    order matches it on both size and clock. The sized fill IS a candidate owner too, but its
+    booked size (its `filled_quantity`, 0.00199) does not match the 0.002 lot, so it owns
+    nothing here -- and a sized owner would not be listed anyway: only unsized owners are."""
     fill = dict(
         mode="live",
         product_id="BTC-USD",
