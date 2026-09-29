@@ -48,8 +48,12 @@ from keel.config import (
 )
 from keel.data.db import connect, migrate
 from keel.data.repository import Repository
+from keel.research import bias
 from keel.strategy import backtest as backtest_mod
+from keel.strategy.reduction import Reduction
+from keel.strategy.rules.reverse_dca import ReverseDca
 from keel.types import Candle, Granularity
+from tests.data.test_sell_proposals import _row as _proposal_row
 from tests.strategy.rule_conformance import minimal_params
 
 NOW_TS = 1_800_000_000
@@ -601,3 +605,274 @@ def test_run_rule_backtest_line_labels_the_units_of_every_figure(repo: Repositor
     assert f"max_drawdown_px={stats.max_drawdown} (px = price units, 1-coin notional)" in out[0]
     assert stats.expectancy_r is None  # this flat series closes no trade that carries R
     assert "expectancy_r=n/a " in out[0]
+
+
+# -- the sleeve_sell route through attempt_promotion (P12 Task 12.2, spec §3.7, plan R21) ---------
+
+_DAY = 86_400
+#: 2026-09-29T00:00:00Z: "now" for the paper-day arithmetic, fixed so no test reads the clock.
+_SLEEVE_NOW = 1_790_640_000
+
+
+def _sleeve_candle(day: int, close: str) -> Candle:
+    c = Decimal(close)
+    return Candle(ts=day * _DAY, open=c, high=c, low=c, close=c, volume=Decimal("1000"))
+
+
+#: 121 daily candles whose close wanders (100 + (7d mod 13)) so a peek has signal: the last close
+#: (day 120: 108) is above the one before it (day 119: 101), which is not above day 118's (107).
+#: So a rule deciding about bar t-1 from bar t's close fires on the full series, claiming bar
+#: 119, while the live view of bar 119 -- which cannot see bar 120 -- does not fire there.
+_WANDER = [_sleeve_candle(d, str(100 + (d * 7) % 13)) for d in range(121)]
+
+
+class _PeekingReduce(ReverseDca):
+    """Decides about bar t-1 using bar t's close -- lookahead by construction, so the adapter
+    must flag it (R21 is not vacuous). Its decision AT a bar changes once the next bar exists."""
+
+    def reduce_signal(self, holding, candles_by_tf, costs):
+        days = candles_by_tf.get(Granularity.ONE_DAY, [])
+        if len(days) < 2 or days[-1].close <= days[-2].close:
+            return None
+        return Reduction(
+            self.product_id, Decimal("0.001"), self.name, {}, days[-2].close, days[-2].ts
+        )
+
+
+def _sleeve_rule(repo: Repository, *, status: str = "candidate", **params: Any) -> int:
+    return repo.insert_rule(
+        "reverse_dca",
+        {"product_id": "BTC-USD", "target_usd": "10", "min_price_floor": "1", **params},
+        status=status,
+        now_ts=_SLEEVE_NOW,
+    )
+
+
+def _paper_reverse(repo: Repository, *, days_in_paper: int) -> int:
+    rid = _sleeve_rule(repo, status="paper")
+    repo._conn.execute(
+        "UPDATE rules SET promoted_at = ? WHERE id = ?",
+        (_SLEEVE_NOW - days_in_paper * _DAY, rid),
+    )
+    repo._conn.commit()
+    return rid
+
+
+def _review(repo: Repository, rule_id: int, *, rule_status: str = "paper") -> int:
+    pid = repo.insert_sell_proposal(_proposal_row(rule_id=rule_id, rule_status=rule_status))
+    repo.update_sell_proposal(pid, reviewed_ts=_SLEEVE_NOW)
+    return pid
+
+
+def _status(repo: Repository, rule_id: int) -> str:
+    return {r["id"]: r["status"] for r in repo.get_rules()}[rule_id]
+
+
+def _promote(repo: Repository, rule_id: int, **kwargs: Any):
+    out, err = _collect()
+    try:
+        outcome = attempt_promotion(
+            repo,
+            _config(),
+            rule_id,
+            now_ts=_SLEEVE_NOW,
+            echo=out.append,
+            echo_err=err.append,
+            **kwargs,
+        )
+    except RulesRefused:
+        return None, out, err
+    return outcome, out, err
+
+
+@pytest.fixture
+def btc_book(repo: Repository) -> Repository:
+    repo.upsert_candles("BTC-USD", Granularity.ONE_DAY, _WANDER)
+    return repo
+
+
+def test_the_lookahead_adapter_flags_a_peeking_sell_rule() -> None:
+    rule = _PeekingReduce("BTC-USD", target_usd=Decimal("10"), min_price_floor=Decimal("1"))
+    report = bias.lookahead_analysis(
+        rules_mod._reduction_as_detect(rule), {Granularity.ONE_DAY: _WANDER}, warmup=5
+    )
+    assert report.verdict == "lookahead_detected"
+    assert [(d.bar_ts, d.field) for d in report.divergences] == [(119 * _DAY, "setup_present")]
+
+
+def test_the_lookahead_adapter_passes_the_real_rule_over_the_same_bars() -> None:
+    """The control: the same harness, the same bars, the shipped rule -- clean, over anchors
+    actually walked, so the peeking verdict above is the peek and not the fixture."""
+    rule = ReverseDca("BTC-USD", target_usd=Decimal("10"), min_price_floor=Decimal("1"))
+    report = bias.lookahead_analysis(
+        rules_mod._reduction_as_detect(rule), {Granularity.ONE_DAY: _WANDER}, warmup=5
+    )
+    assert report.verdict == "clean"
+    assert report.n_bars_checked == 116
+
+
+def test_the_adapter_maps_a_reduction_onto_entry_stop_and_target() -> None:
+    """R21's mapping: entry = the reduction's price, stop = 0, target = its qty, ts = its bar;
+    over a synthetic one-unit lot bought at the first close."""
+    rule = ReverseDca("BTC-USD", target_usd=Decimal("10"), min_price_floor=Decimal("1"))
+    setup = rules_mod._reduction_as_detect(rule)({Granularity.ONE_DAY: _WANDER})
+    assert setup is not None
+    # Day 120 is a 30-day cadence day; close 108. gross = 10 / (1 - 0.012 - 0.0005).
+    gross = Decimal("10") / (Decimal("1") - Decimal("0.012") - Decimal("0.0005"))
+    assert (setup.entry, setup.stop, setup.target, setup.ts) == (
+        Decimal("108"),
+        Decimal("0"),
+        gross / Decimal("108"),
+        120 * _DAY,
+    )
+    assert rules_mod._reduction_as_detect(rule)({}) is None
+
+
+def test_a_sleeve_rule_is_never_judged_by_a_trade_floor(btc_book, monkeypatch) -> None:
+    def _no_backtest(*_a: Any, **_k: Any) -> Any:
+        raise AssertionError("a sleeve_sell rule must never be backtested for a floor")
+
+    monkeypatch.setattr(backtest_mod, "backtest", _no_backtest)
+    rid = _sleeve_rule(btc_book)
+    outcome, out, err = _promote(btc_book, rid)
+    assert outcome is not None and outcome.new_status == "paper"
+    assert _status(btc_book, rid) == "paper"
+    assert err == []
+    joined = "\n".join(out)
+    for word in ("min_trades", "n_trades", "overfitting", "PBO"):
+        assert word not in joined
+    assert out[-1] == f"rule {rid} (reverse_dca): status -> paper"
+
+
+def test_a_peeking_sleeve_rule_is_refused_at_candidate(btc_book, monkeypatch) -> None:
+    monkeypatch.setitem(agent.RULE_REGISTRY, "reverse_dca", _PeekingReduce)
+    rid = _sleeve_rule(btc_book)
+    outcome, _out, err = _promote(btc_book, rid)
+    assert outcome is None
+    assert _status(btc_book, rid) == "candidate"
+    assert any("lookahead" in line for line in err)
+
+
+def test_no_cached_daily_bars_is_a_refusal_not_a_clean_lookahead(repo) -> None:
+    """A check that walked no bar is not a pass (#440's fail-closed rule)."""
+    rid = _sleeve_rule(repo)
+    outcome, _out, err = _promote(repo, rid)
+    assert outcome is None
+    assert _status(repo, rid) == "candidate"
+    assert any("no cached ONE_DAY candles" in line for line in err)
+
+
+def test_paper_to_live_refused_without_a_reviewed_proposal(btc_book) -> None:
+    rid = _paper_reverse(btc_book, days_in_paper=61)
+    outcome, _out, err = _promote(btc_book, rid)
+    assert outcome is None
+    assert _status(btc_book, rid) == "paper"
+    assert any("keel dca proposals review" in line for line in err)
+
+
+def test_paper_to_live_refused_before_sixty_days(btc_book) -> None:
+    rid = _paper_reverse(btc_book, days_in_paper=59)
+    _review(btc_book, rid)
+    outcome, _out, _err = _promote(btc_book, rid)
+    assert outcome is None
+    assert _status(btc_book, rid) == "paper"
+
+
+def test_only_this_rules_own_reviewed_paper_proposals_count(btc_book) -> None:
+    rid = _paper_reverse(btc_book, days_in_paper=61)
+    other = _sleeve_rule(btc_book, status="paper")
+    _review(btc_book, other)  # another rule's proposal
+    _review(btc_book, rid, rule_status="live")  # this rule's, but not made in paper
+    unreviewed = btc_book.insert_sell_proposal(_proposal_row(rule_id=rid, rule_status="paper"))
+    assert unreviewed
+    outcome, _out, _err = _promote(btc_book, rid)
+    assert outcome is None
+    assert _status(btc_book, rid) == "paper"
+
+    _review(btc_book, rid)
+    outcome, _out, _err = _promote(btc_book, rid)
+    assert outcome is not None and outcome.new_status == "live"
+
+
+def test_paper_to_live_refused_beside_a_live_dca_without_the_flag(btc_book) -> None:
+    rid = _paper_reverse(btc_book, days_in_paper=61)
+    _review(btc_book, rid)
+    btc_book.insert_rule(
+        "dca", {"product_id": "BTC-USD", "cadence_days": 7, "budget_usd": "40"}, status="live"
+    )
+    outcome, _out, err = _promote(btc_book, rid)
+    assert outcome is None
+    assert _status(btc_book, rid) == "paper"
+    assert any("--allow-concurrent-dca" in line for line in err)
+
+    outcome, out, _err = _promote(btc_book, rid, allow_concurrent_dca=True)
+    assert outcome is not None and outcome.new_status == "live"
+    assert _status(btc_book, rid) == "live"
+    assert out[-1] == f"rule {rid} (reverse_dca): status -> live"
+
+
+@pytest.mark.parametrize(
+    ("product", "status"), [("BTC-USD", "paper"), ("BTC-USD", "candidate"), ("ETH-USD", "live")]
+)
+def test_only_a_live_dca_on_the_same_product_is_concurrent(btc_book, product, status) -> None:
+    rid = _paper_reverse(btc_book, days_in_paper=61)
+    _review(btc_book, rid)
+    btc_book.insert_rule(
+        "dca", {"product_id": product, "cadence_days": 7, "budget_usd": "40"}, status=status
+    )
+    outcome, _out, _err = _promote(btc_book, rid)
+    assert outcome is not None and outcome.new_status == "live"
+
+
+def test_force_is_refused_for_a_sleeve_rule(btc_book) -> None:
+    """Spec §3.7: `--force` exists for a rule whose backtest cannot REACH the floor, not for one
+    that has no floor -- it would skip the 60 days and the reviewed proposal entirely."""
+    rid = _paper_reverse(btc_book, days_in_paper=1)
+    outcome, _out, err = _promote(btc_book, rid, force=True)
+    assert outcome is None
+    assert _status(btc_book, rid) == "paper"
+    assert any("--force" in line for line in err)
+
+
+def test_allow_concurrent_dca_is_refused_on_a_rule_it_cannot_apply_to(repo) -> None:
+    rid = repo.insert_rule(
+        "dca", {"product_id": "BTC-USD", "cadence_days": 7}, status="candidate", now_ts=NOW_TS
+    )
+    outcome, _out, err = _promote(repo, rid, allow_concurrent_dca=True)
+    assert outcome is None
+    assert _status(repo, rid) == "candidate"
+    assert any("--allow-concurrent-dca" in line for line in err)
+
+
+def test_the_cli_flag_reaches_the_gate(tmp_path, valid_config_path) -> None:
+    """`keel rules promote <id> --allow-concurrent-dca`: refused without the flag, promoted with
+    it -- the option is wired through to `attempt_promotion`, not just declared."""
+    import time
+
+    from click.testing import CliRunner
+
+    from keel.cli import cli
+
+    db = tmp_path / "t.db"
+    conn = connect(str(db))
+    migrate(conn)
+    file_repo = Repository(conn)
+    file_repo.upsert_candles("BTC-USD", Granularity.ONE_DAY, _WANDER)
+    rid = _sleeve_rule(file_repo, status="paper")
+    file_repo._conn.execute(
+        "UPDATE rules SET promoted_at = ? WHERE id = ?", (int(time.time()) - 61 * _DAY, rid)
+    )
+    file_repo._conn.commit()
+    _review(file_repo, rid)
+    file_repo.insert_rule(
+        "dca", {"product_id": "BTC-USD", "cadence_days": 7, "budget_usd": "40"}, status="live"
+    )
+    args = ["--db", str(db), "--config", str(valid_config_path), "rules", "promote", str(rid)]
+
+    refused = CliRunner().invoke(cli, args)
+    assert refused.exit_code == 1
+    assert _status(file_repo, rid) == "paper"
+
+    promoted = CliRunner().invoke(cli, [*args, "--allow-concurrent-dca"])
+    assert promoted.exit_code == 0, promoted.output
+    assert _status(file_repo, rid) == "live"
