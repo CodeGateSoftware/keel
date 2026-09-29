@@ -168,19 +168,12 @@ def next_cadence_day(today: int, cadence_days: int) -> int:
     search's anchor, not `today` itself: the smallest `d >= today - 1` with
     `d % cadence_days == 0`.
 
-    But if that smallest `d` lands on exactly `today`, it is skipped, moving on to
-    `d + cadence_days`. `today`'s own bar has not closed -- it closes tonight -- so no cycle has
-    judged it yet, not even one that might still run later today; reporting it as "next" is
-    exactly #921's bug (`sleeve_report`'s module docstring): it named a bar on the day it also
-    claimed as the day it fires, when the earliest ANY cycle judges that bar is tomorrow. Landing
-    on the next occurrence instead, `today + cadence_days`, carries no such promise: it is
-    strictly in the future for every cycle that could possibly run today.
+    A `d` equal to `today` is kept: that bar closes tonight, so tomorrow's cycle judges it and
+    records its proposal on `d + 1`. It is the next distribution, and the rendered line says so
+    with its two dates (`cadence bar d, proposed d + 1`).
     """
     anchor = today - 1
-    day = anchor + (-anchor) % cadence_days
-    if day == today:
-        day += cadence_days
-    return day
+    return anchor + (-anchor) % cadence_days
 
 
 def distribution_rows(repo: Any, config: Any, now_ts: int) -> list[DistributionRow]:

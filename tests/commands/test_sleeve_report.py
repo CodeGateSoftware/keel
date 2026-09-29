@@ -119,15 +119,16 @@ def test_the_bar_a_cycle_today_judges_is_yesterdays_close(repo) -> None:
     assert row.dca_collision is True
 
 
-def test_todays_own_bar_has_not_closed_so_the_next_cadence_bar_skips_it(repo) -> None:
-    """#921: at now=210*DAY+3_600 (today=210), yesterday's bar (209) is off the rule's 30-day
-    cadence, and bar 210 -- though on cadence -- has not closed (it closes tonight): no cycle,
-    not even one still to run later today, has judged it. This is the exact bug: the old
-    formula named 210 here, promising a sale on the one day no cycle ever makes it. The next bar
-    any cycle can actually judge is 240."""
+def test_todays_own_cadence_bar_is_next_and_is_proposed_tomorrow(repo) -> None:
+    """#921: at now=210*DAY+3_600 (today=210), yesterday's bar (209) is off the 30-day cadence.
+    Bar 210 is on cadence and closes tonight, so tomorrow's cycle judges it and records its
+    proposal on day 211. It is the NEXT distribution. Skipping it to 240 would hide a sale that
+    happens in a day. The line's two dates say "bar 210, proposed 211"."""
     _seed(repo)
     [row] = distribution_rows(repo, _config(), now_ts=210 * DAY + 3_600)
-    assert row.next_cadence_ts == 240 * DAY
+    assert row.next_cadence_ts == 210 * DAY
+    [line, _collision] = render_distribution([row])
+    assert line.startswith("rule 1 (paper) BTC-USD cadence bar 1970-07-30, proposed 1970-07-31: ")
 
 
 def test_a_cadence_bar_several_days_out_is_named_ahead_of_time(repo) -> None:
