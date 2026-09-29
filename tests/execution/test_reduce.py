@@ -720,3 +720,72 @@ def test_a_rails_veto_still_records_the_total(repo: Repository) -> None:
     assert result.decision == "vetoed" and result.legs == 4
     assert result.total_qty == D("0.0015")
     assert D(_proposal(repo, result)["rails"]["total_qty"]) == D("0.0015")
+
+
+# -- rail-2 parity: the sim and guards veto the same oversized distribution (spec §6, P11) ---------
+
+
+def _flat_hourly_market(price: str, days: int) -> dict[str, dict[Any, list[Any]]]:
+    from keel.types import Candle, Granularity
+
+    p = D(price)
+
+    def bar(ts: int) -> Candle:
+        return Candle(ts=ts, open=p, high=p, low=p, close=p, volume=D("10"))
+
+    return {
+        "BTC": {
+            Granularity.ONE_HOUR: [bar(h * 3_600) for h in range(days * 24)],
+            Granularity.ONE_DAY: [bar(d * 86_400) for d in range(days)],
+        }
+    }
+
+
+def test_the_sim_and_guards_agree_on_an_oversized_distribution(repo: Repository) -> None:
+    """Spec §6: a parity test. The account sim sells a $100 distribution under a $50 per-order
+    cap; the leg it FILLED -- sliced by the one slicer live uses (`sleeve.slice_qty`), from the
+    one config both read -- passes rail 2 in `guards.check`, and one increment more is vetoed
+    by it. So the sim never books a leg the live rails would refuse."""
+    from keel.config import SubscriptionConfig
+    from keel.sim import portfolio_sim
+    from keel.strategy.rules.dca import Dca
+    from keel.strategy.rules.reverse_dca import ReverseDca
+
+    cap = D("50")
+    config = _config(
+        caps=Caps(max_exposure_usd=D("1e6"), max_per_asset_pct=D("1"), max_per_order_usd=cap),
+        subscription=SubscriptionConfig(assumed_free_volume_usd=D("1e6"), pacing="opportunistic"),
+    )
+    market = _flat_hourly_market("110000", 61)
+    hourly = market["BTC"][next(iter(market["BTC"]))]
+    result = portfolio_sim.run(
+        [
+            Dca("BTC-USD", cadence_days=7, budget_usd=cap),
+            ReverseDca("BTC-USD", target_usd=D("100"), min_price_floor=D("1")),
+        ],
+        market,
+        config,
+        start_ts=hourly[0].ts,
+        end_ts=hourly[-1].ts,
+        monthly_contribution=D("100000"),
+        fee_pct=config.fees.taker_pct,
+        slippage_pct=D("0"),
+    )
+    [sale] = result.dca_sells
+    assert sale.qty < D("100") / sale.expected_price, "fixture: the distribution must be sliced"
+
+    def _veto(qty: Decimal) -> list[str]:
+        intent = OrderIntent(
+            product_id="BTC-USD",
+            side=Side.SELL,
+            qty=qty,
+            entry=sale.expected_price,
+            stop=None,
+            notional=qty * sale.expected_price,
+            is_dca=False,
+            rule_kind="reverse_dca",
+        )
+        return guards.check(intent, repo, config, NOW_TS, offline=True).violations
+
+    assert not any(v.startswith("per_order_cap") for v in _veto(sale.qty))
+    assert any(v.startswith("per_order_cap") for v in _veto(sale.qty + D("0.00000001")))

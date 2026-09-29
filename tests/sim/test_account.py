@@ -1456,3 +1456,96 @@ def test_the_default_slot_preserves_single_position_behaviour():
     # No slot given -> the second open REPLACES the first, exactly as before.
     assert len(acc.positions_for("BTC")) == 1
     assert acc.position("BTC").qty == Decimal("3")
+
+
+# -- the reverse path: `reduce_dca` (#857, P11) ---------------------------------------------------
+
+
+def _account_with_cash(cash: Decimal) -> SimAccount:
+    """A 1%-fee, no-slippage account holding `cash`: every figure below is hand-computable."""
+    account = SimAccount(Decimal("0.01"), Decimal("0"))
+    account.deposit(cash, 0)
+    return account
+
+
+def _bought(account: SimAccount) -> None:
+    """One DCA unit at 100, through `open` itself, so any fee `open` charges is already in the
+    cash the tests read after it."""
+    account.open(
+        OpenIntent(
+            asset="BTC",
+            qty=Decimal("1"),
+            entry=Decimal("100"),
+            stop=None,
+            notional=Decimal("100"),
+            is_dca=True,
+            rule_kind="dca",
+        ),
+        Decimal("100"),
+        0,
+        dca=True,
+    )
+
+
+def test_reduce_dca_shrinks_the_lot_and_credits_net_cash() -> None:
+    account = _account_with_cash(Decimal("200"))
+    _bought(account)
+    cash_after_buy = account.cash_usdc
+
+    net, fee = account.reduce_dca(
+        "BTC", Decimal("0.25"), Decimal("100"), ts=1, fee_pct=Decimal("0.01")
+    )
+
+    assert (net, fee) == (Decimal("24.75"), Decimal("0.25"))
+    assert account.dca_positions["BTC"].qty == Decimal("0.75")
+    assert account.dca_positions["BTC"].entry_fill == Decimal("100"), "average cost is unchanged"
+    assert account.cash_usdc == cash_after_buy + Decimal("24.75")
+
+
+def test_reduce_dca_realises_pnl_at_the_averaged_lot_cost() -> None:
+    """R32: the account sim's one lot is averaged, so realised P&L is AVERAGE-cost, entry fee
+    included: 24.75 net less 0.25 units x 100 x 1.01 = -0.50."""
+    account = _account_with_cash(Decimal("200"))
+    _bought(account)
+
+    account.reduce_dca("BTC", Decimal("0.25"), Decimal("100"), ts=1, fee_pct=Decimal("0.01"))
+
+    assert account.realized_pnl == Decimal("-0.50")
+
+
+def test_reduce_dca_counts_the_sale_as_volume() -> None:
+    """#86 counts sells: the sale's `qty x price` joins the month's volume."""
+    account = _account_with_cash(Decimal("200"))
+    _bought(account)
+    before = account.month_volume(1)
+
+    account.reduce_dca("BTC", Decimal("0.25"), Decimal("80"), ts=1, fee_pct=Decimal("0.01"))
+
+    assert account.month_volume(1) - before == Decimal("20")
+
+
+def test_reduce_dca_releases_the_sold_share_of_the_at_open_notional() -> None:
+    """The cap bookkeeping measures what is still held: a quarter sold releases a quarter of the
+    $100 at-open notional, and a whole lot sold releases all of it and leaves no lot."""
+    account = _account_with_cash(Decimal("200"))
+    _bought(account)
+
+    account.reduce_dca("BTC", Decimal("0.25"), Decimal("100"), ts=1, fee_pct=Decimal("0.01"))
+    assert account._asset_notional("BTC") == Decimal("75")  # noqa: SLF001
+
+    account.reduce_dca("BTC", Decimal("0.75"), Decimal("100"), ts=2, fee_pct=Decimal("0.01"))
+    assert "BTC" not in account.dca_positions
+    assert account._asset_notional("BTC") == Decimal("0")  # noqa: SLF001
+
+
+@pytest.mark.parametrize(("asset", "qty"), [("BTC", "1.00000001"), ("BTC", "0"), ("ETH", "0.1")])
+def test_reduce_dca_refuses_more_than_the_lot_and_changes_nothing(asset: str, qty: str) -> None:
+    account = _account_with_cash(Decimal("200"))
+    _bought(account)
+    cash, lot = account.cash_usdc, account.dca_positions["BTC"]
+
+    with pytest.raises(ValueError, match="reduce_dca"):
+        account.reduce_dca(asset, Decimal(qty), Decimal("100"), ts=1, fee_pct=Decimal("0.01"))
+
+    assert (account.cash_usdc, account.dca_positions["BTC"]) == (cash, lot)
+    assert account.month_volume(1) == Decimal("100")

@@ -71,7 +71,8 @@ design -- `strategy/rules/dca.py`) permanently froze that asset's rule slot. Bot
 same `cash_usdc` and both are marked-to-market in `exposure_usd`/`mark_to_market`, and both count
 against the SAME per-asset concentration cap (concentration risk doesn't care which order class
 bought the exposure) -- but only the rule slot's position ever `close()`s; DCA lots accumulate via
-`open(..., dca=True)` and are simply carried, never exited, by this ledger.
+`open(..., dca=True)` and are carried, never exited, by this ledger. The one thing that shrinks a
+DCA lot is a sleeve distribution, `reduce_dca` (#857): a partial sale at the lot's average cost.
 
 Bookkeeping notes:
 
@@ -106,7 +107,7 @@ they exercise genuine full-rail parity; `test_month_and_day_volume_include_sell_
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from decimal import Decimal
 
@@ -533,6 +534,50 @@ class SimAccount:
         self.realized_pnl += pnl
         self._volume_log.append((now_ts, fill_price * position.qty))
         return pnl
+
+    def reduce_dca(
+        self, asset: str, qty: Decimal, price: Decimal, ts: int, fee_pct: Decimal
+    ) -> tuple[Decimal, Decimal]:
+        """Sell `qty` units of `asset`'s DCA lot at `price` -- a sleeve distribution (#857,
+        spec §6) -- and return `(net_proceeds, fee)`.
+
+        The one path that shrinks the DCA sleeve; `close` still never touches it. `price` is the
+        EXECUTED price (the caller has already taken slippage off the fill, as
+        `sim.portfolio_sim._process_reductions` does), and `fee_pct` is the rate the sale pays --
+        every sell pays the fee (#836); the caller passes this account's own configured rate.
+
+        - Refuses (`ValueError`, nothing changed) a sale larger than the lot, or of an asset with
+          no lot: a sale of units the ledger does not hold is a bug upstream, not a clamp.
+        - Credits `qty x price x (1 - fee_pct)` and counts `qty x price` as the month's volume
+          (#86 counts sells, as `close` does).
+        - Shrinks the lot and releases the sold share of its at-open notional, so the cap
+          bookkeeping measures what is still held; a lot sold in full is removed, so the next
+          buy starts a fresh lot (and a fresh `entry_ts`, which `min_hold_days` reads).
+        - The lot's average `entry_fill` is unchanged, and the realised P&L is AVERAGE-cost:
+          `net - qty x entry_fill x (1 + self.fee_pct)`, the entry fee `open` charged prorated
+          to the units sold. The sleeve is ONE averaged lot per asset by design (#85), so this
+          cannot be FIFO; `report.accumulation_table`'s row is the FIFO-faithful figure (plan
+          R32). It joins `realized_pnl`, and it is never a rail-16 outcome: DCA is exempt.
+        """
+        lot = self.dca_positions.get(asset)
+        if lot is None or qty <= 0 or qty > lot.qty:
+            held = Decimal("0") if lot is None else lot.qty
+            raise ValueError(f"reduce_dca: cannot sell {qty} {asset}, the DCA lot holds {held}")
+        gross = qty * price
+        fee = gross * fee_pct
+        net = gross - fee
+        remaining = lot.qty - qty
+        notional = self._dca_notional.get(asset, Decimal("0"))
+        if remaining == 0:
+            del self.dca_positions[asset]
+            self._dca_notional.pop(asset, None)
+        else:
+            self.dca_positions[asset] = replace(lot, qty=remaining)
+            self._dca_notional[asset] = notional * remaining / lot.qty
+        self.cash_usdc += net
+        self.realized_pnl += net - qty * lot.entry_fill * (Decimal(1) + self.fee_pct)
+        self._volume_log.append((ts, gross))
+        return net, fee
 
     def position(self, asset: str, slot: str = "") -> OpenPosition | None:
         """One asset+slot's open RULE position, or `None`."""

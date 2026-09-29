@@ -62,13 +62,13 @@ def _dca() -> Dca:
     return Dca("BTC-USD", cadence_days=_CADENCE, budget_usd=_BUDGET)
 
 
-def _config() -> Config:
+def _config(max_per_order_usd: Decimal = Decimal("1000000")) -> Config:
     return Config(
         allowlist=["BTC"],
         target_weights={},
         risk_pct=Decimal("0.02"),
         caps=Caps(
-            max_per_order_usd=Decimal("1000000"),
+            max_per_order_usd=max_per_order_usd,
             max_per_day_usd=Decimal("1000000"),
             max_exposure_usd=Decimal("1000000"),
             max_per_asset_pct=Decimal("1"),
@@ -543,3 +543,131 @@ def test_a_sale_pays_slippage_and_the_fee() -> None:
     gross_notional = out.units_sold * Decimal("100") * (1 - slip)
     assert out.sell_fees == gross_notional * fee
     assert out.distributed_usd == gross_notional - out.sell_fees
+
+
+# ---------------------------------------------------------------------------
+# (h) the reverse path through the ACCOUNT sim (#857, P11): average cost, one averaged lot
+# ---------------------------------------------------------------------------
+
+
+def _hourly_market(closes: dict[int, str], days: int) -> dict[str, dict[Granularity, list[Candle]]]:
+    """`days` epoch-aligned days from day 0, flat within a day at `closes[d]` (the latest key at
+    or before `d`), so a buy decided on day `d`'s first hour fills at day `d`'s price."""
+
+    def price(day: int) -> Decimal:
+        return Decimal(closes[max(k for k in closes if k <= day)])
+
+    def bar(ts: int, p: Decimal) -> Candle:
+        return Candle(ts=ts, open=p, high=p, low=p, close=p, volume=Decimal("10"))
+
+    hourly = [bar(h * _HOUR, price(h * _HOUR // _DAY)) for h in range(days * 24)]
+    daily = [bar(d * _DAY, price(d)) for d in range(days)]
+    return {"BTC": {Granularity.ONE_HOUR: hourly, Granularity.ONE_DAY: daily}}
+
+
+def _run_account(
+    rules: list[Rule],
+    market: dict[str, dict[Granularity, list[Candle]]],
+    *,
+    fee: Decimal = Decimal("0.01"),
+    config: Config | None = None,
+    monthly_volume_cap: Decimal | None = None,
+) -> portfolio_sim.SimResult:
+    hourly = market["BTC"][Granularity.ONE_HOUR]
+    return portfolio_sim.run(
+        rules,
+        market,
+        config or _config(),
+        start_ts=hourly[0].ts,
+        end_ts=hourly[-1].ts,
+        monthly_contribution=Decimal("100000"),
+        fee_pct=fee,
+        slippage_pct=_ZERO,
+        monthly_volume_cap=monthly_volume_cap,
+    )
+
+
+def test_the_account_sim_reproduces_the_hand_computation() -> None:
+    """The edge pass's hand computation, through the account sim: on a flat market the averaged
+    lot's cost IS every lot's, so average cost and FIFO agree. Day 30's decision is taken on day
+    31's first hour and fills at its second, at 100."""
+    result = _run_account([Dca("BTC-USD", cadence_days=7), _rev()], _hourly_market({0: "100"}, 61))
+
+    [sale] = result.dca_sells
+    assert (sale.asset, sale.rule_kind) == ("BTC", "reverse_dca")
+    assert (sale.decision_ts, sale.fill_ts) == (31 * _DAY, 31 * _DAY + _HOUR)
+    assert sale.qty.quantize(_Q8) == Decimal("0.10101010")
+    assert sale.expected_price == sale.fill_price == Decimal("100")
+    assert sale.net_usd.quantize(_CENT) == Decimal("10.00")
+    assert sale.fee_usd.quantize(_CENT) == Decimal("0.10")
+    assert sale.realised_pnl.quantize(_CENT) == Decimal("-0.20")
+
+    row = portfolio_sim.dca_sleeve(result)["BTC"]
+    assert (row.buys, row.distributions) == (9, 1)
+    assert row.qty + sale.qty == Decimal("4.5")
+    assert (row.units_sold, row.distributed_usd, row.sell_fees, row.realised_pnl) == (
+        sale.qty,
+        sale.net_usd,
+        sale.fee_usd,
+        sale.realised_pnl,
+    )
+    assert row.cost_usd == sum((b.cost_usd for b in result.dca_buys), _ZERO) - sale.cost_basis
+
+
+def test_the_account_sim_books_the_sale_at_average_cost_not_fifo() -> None:
+    """R32, pinned: the same market as the FIFO test above. Lots: 0.5 @ 100, then 0.5 @ 200
+    (sized at day 7's close, filled on day 8) and 3 x 0.25 @ 200 -- $300 over 1.75 units. The
+    account sim's realised P&L is net less the sold units at that AVERAGE (x 1.01): 1.26, where
+    the FIFO row says 4.90."""
+    market = _hourly_market({0: "100", 8: "200"}, 40)
+    rules: list[Rule] = [Dca("BTC-USD", cadence_days=7), _rev()]
+
+    [sale] = _run_account(rules, market).dca_sells
+
+    average = Decimal("300") / Decimal("1.75")
+    assert sale.qty == Decimal("10") / Decimal("0.99") / Decimal("200")
+    assert sale.realised_pnl == sale.net_usd - sale.qty * average * Decimal("1.01")
+    assert sale.realised_pnl.quantize(_CENT) == Decimal("1.26")
+    fifo = accumulation_table(
+        rules, {"BTC": {Granularity.ONE_DAY: market["BTC"][Granularity.ONE_DAY]}},
+        fee_pct=Decimal("0.01"), slippage_pct=_ZERO,
+    )["reverse_dca:BTC"]  # fmt: skip
+    assert fifo.realised_pnl.quantize(_CENT) == Decimal("4.90")
+
+
+def test_the_account_sim_skips_a_distribution_on_a_dca_day_as_live() -> None:
+    result = _run_account([Dca("BTC-USD", cadence_days=7), _rev()], _hourly_market({0: "100"}, 212))
+
+    assert [s.decision_ts // _DAY for s in result.dca_sells] == [31, 61, 91, 121, 151, 181]
+
+
+def test_the_account_sim_slices_to_the_configured_per_order_cap() -> None:
+    """Rail 2, from the sim's own config: a $50 cap (which the $50 DCA buys still clear) sells
+    one $50 leg of the ~$80 distribution -- 0.5 units at 100 -- and carries nothing over."""
+    config = _config(max_per_order_usd=Decimal("50"))
+    result = _run_account(
+        [Dca("BTC-USD", cadence_days=7), _rev(target_usd=Decimal("80"))],
+        _hourly_market({0: "100"}, 61),
+        fee=_ZERO,
+        config=config,
+    )
+
+    [sale] = result.dca_sells
+    assert sale.qty == Decimal("0.5")
+    assert sale.qty * sale.expected_price == config.caps.max_per_order_usd
+
+
+def test_the_account_sim_skips_a_distribution_that_would_breach_the_volume_cap() -> None:
+    """Issue #86's throttled run: a sale is volume, so like a DCA buy it is SKIPPED when it
+    would push the month past `monthly_volume_cap`. January buys $100 (two buys at 100; the
+    third would breach $100); on 1 February, at 300, the $10-net sale is ~$10.10 against a fresh
+    month -- but a $100-net target is ~$101, over the cap, and is skipped."""
+    market = _hourly_market({0: "100", 30: "300"}, 40)
+
+    def _sells(target: str, cap: Decimal | None) -> int:
+        rules: list[Rule] = [Dca("BTC-USD", cadence_days=7), _rev(target_usd=Decimal(target))]
+        return len(_run_account(rules, market, monthly_volume_cap=cap).dca_sells)
+
+    assert _sells("100", None) == 1, "fixture: uncapped, the day-30 distribution sells"
+    assert _sells("10", Decimal("100")) == 1, "fixture: a sale under the cap still sells"
+    assert _sells("100", Decimal("100")) == 0
