@@ -436,13 +436,16 @@ def run_simulation(
         slippage_pct=SIM_SLIPPAGE_PCT,
         slippage_by_product=slippage_by_product,
     )
-    # Accumulating rules (DCA) are not round trips: their edge pass is its own row (#821).
+    # Accumulating rules (DCA) are not round trips: their edge pass is its own row (#821). A
+    # sleeve distribution there is sliced at the same rail-2 cap the account sim and the live
+    # rails read (#857).
     accumulation = report_mod.accumulation_table(
         rules,
         candles_by_asset,
         fee_pct=fee_pct,
         slippage_pct=SIM_SLIPPAGE_PCT,
         slippage_by_product=slippage_by_product,
+        max_per_order_usd=config.caps.max_per_order_usd,
     )
 
     sim = portfolio_sim.run(
