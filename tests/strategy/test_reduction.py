@@ -42,8 +42,37 @@ def test_fifo_legs_never_exceed_what_is_held() -> None:
     assert [(lot.position_id, q) for lot, q in legs] == [(1, D("0.001"))]
 
 
+def test_fifo_legs_stop_once_the_sale_is_satisfied_inside_the_first_lot() -> None:
+    """A sale that never reaches the second lot must not add a `(lot, 0)` leg for it."""
+    first = _lot(1, "0.01", "100000", "0")
+    second = _lot(2, "0.01", "110000", "0")
+    legs = Holding("BTC-USD", (first, second)).fifo_legs(D("0.004"))
+    assert [(lot.position_id, q) for lot, q in legs] == [(1, D("0.004"))]
+
+
 def test_fifo_cost_prorates_each_consumed_lot() -> None:
     h = Holding("BTC-USD", (_lot(1, "0.001", "100000", "1.00"), _lot(2, "0.001", "110000", "1.10")))
+    assert h.fifo_cost(D("0.0015")) == D("100") + D("1.00") + D("55") + D("0.55")
+
+
+def test_a_zero_qty_lot_has_no_entry_fee_share_or_cost() -> None:
+    """`entry_fee_share`'s `original <= 0` guard: a lot with nothing held and nothing realized
+    would otherwise divide by zero."""
+    lot = _lot(1, "0", "100000", "0.50", realized="0")
+    assert lot.entry_fee_share == D("0")
+    assert lot.cost == D("0")
+
+
+def test_fifo_cost_skips_a_zero_qty_lot_before_and_between_real_lots() -> None:
+    """`fifo_cost`'s `if lot.qty > 0` filter: a zero-qty lot always takes 0, and without the
+    filter `entry_fee_share * take / lot.qty` would divide zero by zero."""
+    lots = (
+        _lot(0, "0", "0", "0"),
+        _lot(1, "0.001", "100000", "1.00"),
+        _lot(4, "0", "0", "0"),
+        _lot(2, "0.001", "110000", "1.10"),
+    )
+    h = Holding("BTC-USD", lots)
     assert h.fifo_cost(D("0.0015")) == D("100") + D("1.00") + D("55") + D("0.55")
 
 

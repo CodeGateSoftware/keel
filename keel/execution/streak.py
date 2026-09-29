@@ -212,11 +212,10 @@ def book_exit(
     §3.2, Q10; #860). It exists for a sleeve sale (`executor.reduce`, plan P7), whose FIFO walk
     can span a mixed-ownership product -- PAXG's oldest row is turtle tranche 3 -- so one flag
     for the whole call would mis-book whichever leg it does not match: a DCA leg counted toward
-    rail 16's streak, or a rule leg exempted from it. A `bool` keeps today's behaviour exactly,
-    the caller's flag on every leg, and the existing callers (`agent._close_tranches`, for
+    rail 16's streak, or a rule leg exempted from it. A `bool` keeps today's behaviour exactly, the
+    caller's flag on every leg, and the existing callers (`agent._close_tranches`, for
     `_handle_exits` and `_book_paper_exit`, and `executor.scale_out`) deliberately still pass
-    one: #860's
-    whole-position EXIT on a mixed product is a pre-existing gap this does not change.
+    one: #860's whole-position EXIT on a mixed product is a pre-existing gap this does not change.
     """
     positions = repo.get_open_positions(product_id)
     if not positions:
