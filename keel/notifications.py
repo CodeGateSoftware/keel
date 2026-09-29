@@ -58,6 +58,7 @@ from keel.execution import guards
 if TYPE_CHECKING:
     from keel.agent import LoopResult
     from keel.data.repository import Repository
+    from keel.execution.executor import ReduceResult
 
 #: Month-to-date BUY spend at (or past) this percent of the in-force rail-14 allowance fires
 #: `allowance.nearing_exhaustion`. 80 leaves roughly a fifth of the month's cap -- enough
@@ -120,6 +121,7 @@ def events_from_state(
     unplaced_setups: Sequence[UnplacedSetup],
     stale_products: Sequence[str],
     held_products: Sequence[str],
+    sleeve_proposals: Sequence[ReduceResult] = (),
 ) -> list[NotificationEvent]:
     """Derive the #444 events from doctor's findings plus the cycle facts. Pure.
 
@@ -127,6 +129,12 @@ def events_from_state(
     per-product: one event per stale product WITH a position, because that is a per-position
     fact). Numbers ride in the message (doctor's own detail strings carry the days remaining)
     and in `fields` where they are structural (`pct_used`, `count`).
+
+    `sleeve_proposals` is the cycle's `LoopResult.reduce_results` (#857, plan R19): one
+    `sleeve.proposal` per proposal the operator should look at -- `preview` or `vetoed` -- and
+    none for arbitration's `superseded` losers, whose winner is already reported. Each names its
+    proposal id and the command that shows it, and the WHOLE sale (`total_qty`, over `legs`):
+    the row's own `qty` is only rail 2's first leg.
     """
     events: list[NotificationEvent] = []
 
@@ -228,7 +236,32 @@ def events_from_state(
             )
         )
 
+    for proposal in sleeve_proposals:
+        if proposal.decision not in _NOTIFYING_PROPOSAL_DECISIONS:
+            continue
+        total = None if proposal.total_qty is None else str(proposal.total_qty)
+        legs = f"{proposal.legs} leg{'' if proposal.legs == 1 else 's'}"
+        size = "" if total is None else f" -- sell {total} over {legs}"
+        events.append(
+            notification_event(
+                "sleeve.proposal",
+                f"{proposal.product_id} {proposal.rule_kind}: proposal #{proposal.proposal_id} "
+                f"{proposal.decision}{size} -- keel dca proposals show {proposal.proposal_id}",
+                proposal_id=proposal.proposal_id,
+                product=proposal.product_id,
+                rule_kind=proposal.rule_kind,
+                decision=proposal.decision,
+                legs=proposal.legs,
+                total_qty=total,
+            )
+        )
+
     return events
+
+
+#: The proposal decisions `sleeve.proposal` reports. `superseded` is not one: its winner, in the
+#: same cycle, is.
+_NOTIFYING_PROPOSAL_DECISIONS = frozenset({"preview", "vetoed"})
 
 
 def notify_after_cycle(
@@ -304,6 +337,7 @@ def notify_after_cycle(
             unplaced_setups=_unplaced_setups(result),
             stale_products=result.stale_products,
             held_products=repo.held_products(),
+            sleeve_proposals=result.reduce_results,
         )
         # #793: an attestation alert goes out ONCE for the window it reports. Applied here and
         # not in `events_from_state`, which stays pure: the ledger is a repo read, and the

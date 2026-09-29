@@ -612,3 +612,30 @@ def test_the_reduce_scan_is_false_capable() -> None:
     """The same scan, over a `reduce` that cancels the bracket first, names it."""
     tree = ast.parse("def reduce(r):\n    _clear_resting_bracket(b, repo, 'BTC-USD', 0)\n")
     assert _calls_in(tree, "m", {"_clear_resting_bracket"}) == {("m", "reduce")}
+
+
+#: P8: the ONE function in keel that hands a `Reduction` to `executor.reduce`. A second caller
+#: is a design change, not something to absorb by editing this pin.
+REDUCE_CALLERS = {("keel.agent", "_handle_reductions")}
+
+
+def test_the_cycle_reaches_reduce_from_one_function_only() -> None:
+    """P8 (S1): `agent._handle_reductions` is `executor.reduce`'s only caller in `keel/`."""
+    assert _functions_calling_attr("executor", {"reduce"}) == REDUCE_CALLERS
+
+
+def test_handle_reductions_reaches_no_placement_cancel_or_order_writer() -> None:
+    """P8 (S1): the cycle's reduction step names nothing that places, cancels or writes an order
+    -- directly or through `executor.<name>` -- so its one venue-facing call is the preview-only
+    `executor.reduce`."""
+    with open(os.path.join(_ROOT, "keel", "agent.py"), encoding="utf-8") as fh:
+        tree = ast.parse(fh.read())
+    [step] = [
+        f
+        for f in ast.walk(tree)
+        if isinstance(f, ast.FunctionDef) and f.name == "_handle_reductions"
+    ]
+    only = ast.Module(body=[step], type_ignores=[])
+    for name in sorted(_REDUCE_FORBIDDEN_REACHES | {"roll_stop_to", "_manage_stops"}):
+        assert _calls_in(only, "keel.agent", {name}) == set(), name
+    assert _calls_via_attr(only, "keel.agent", "executor", _ORDER_REACHING_NAMES) == set()

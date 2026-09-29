@@ -83,13 +83,14 @@ from keel.config import Config
 from keel.data import freshness, market_feed
 from keel.data.repository import Repository
 from keel.execution import equity as equity_mod
-from keel.execution import executor, guards, reconcile, streak
-from keel.execution.executor import ExecutionResult, _fetch_quote_balance_pair
+from keel.execution import executor, guards, reconcile, sleeve, streak
+from keel.execution.executor import ExecutionResult, ReduceResult, _fetch_quote_balance_pair
 from keel.execution.guards import FEED_STALENESS_CYCLES
-from keel.strategy import engine
+from keel.strategy import engine, promotion
 from keel.strategy.exit_policy import EXIT_POLICY_OFF, next_stop, policy_for, trailing_atr
 from keel.strategy.paper import PaperTrader
-from keel.strategy.rules.base import Action, Rule, Setup, Signal
+from keel.strategy.reduction import Reduction
+from keel.strategy.rules.base import Action, Rule, Setup, Signal, completed_days
 from keel.strategy.rules.cusum_event import CusumEvent
 from keel.strategy.rules.dca import Dca
 from keel.strategy.rules.pullback_continuation import PullbackContinuation
@@ -235,6 +236,57 @@ def _build_rule(row: dict[str, Any]) -> Rule:
     # still builds a rule, just with `rule_id` left at its `None` default.
     rule.rule_id = row.get("id")
     return rule
+
+
+def _is_sleeve_kind(kind: str) -> bool:
+    """Whether rule kind `kind` is a sleeve-sell kind, read off its registered CLASS -- so a row
+    is sorted into the entry path or the sleeve path BEFORE it is built. An unregistered kind is
+    not a sleeve kind: it stays on the entry path, where `_build_rule` refuses it exactly as it
+    always has."""
+    return promotion.promotion_class_of(RULE_REGISTRY.get(kind)) == promotion.SLEEVE_SELL
+
+
+def _sleeve_rules(repo: Repository, config: Config) -> list[tuple[Rule, str]]:
+    """Every sleeve-sell rule this cycle asks for a `Reduction`, as `(rule, status)` pairs
+    (#857, plan R16, R31).
+
+    **Loaded apart from the entry/exit rules (R31).** `run_once`'s entry pre-pass withholds EVERY
+    entry of the cycle when any rule's bar is not ready; a sell rule on a product with a lagging
+    feed would withhold the BTC DCA buy. A sleeve rule neither enters nor exits, so it is in
+    neither pass, and it never owns a position's exit (`_handle_exits` never sees it).
+
+    **Both statuses in a live cycle (R16).** A live-mode cycle evaluates `paper` AND `live`
+    sleeve rules: for a rule that can only propose, `paper` honestly means "proposals against the
+    real book, never placed", and the status rides onto each proposal (`rule_status`). A paper
+    cycle loads `paper` only.
+
+    **A row that does not build costs that row, never the cycle.** The entry path lets
+    `_build_rule` raise; a sleeve row runs after the DCA buy has been decided, but it is loaded
+    before it, so a bad `reverse_dca` row (a missing required param) is logged and skipped here
+    rather than taking the whole cycle -- and the buy -- down with it.
+    """
+    statuses = ("paper",) if config.auto_trade.mode == "paper" else ("paper", "live")
+    loaded: list[tuple[Rule, str]] = []
+    for status in statuses:
+        for row in repo.get_rules(status):
+            if not _is_sleeve_kind(row["kind"]):
+                continue
+            try:
+                rule = _build_rule(row)
+            except Exception:  # noqa: BLE001 -- one bad sleeve row must not cost the cycle
+                log_exception(
+                    logger,
+                    "agent.sleeve_rule_build_failed",
+                    rule_id=row.get("id"),
+                    kind=row["kind"],
+                )
+                continue
+            if promotion.promotion_class_of(rule) != promotion.SLEEVE_SELL:
+                continue
+            if not getattr(rule, "product_id", None):
+                continue
+            loaded.append((rule, status))
+    return loaded
 
 
 # -- freshness -----------------------------------------------------------------------------
@@ -1069,6 +1121,243 @@ def _close_tranches(
 _WARMUP_LOGGED_PRODUCTS: set[str] = set()
 
 
+_DAY = 86_400
+
+
+def _bought_today(repo: Repository, product_id: str, now_ts: int, *, mode: str) -> bool:
+    """Whether a `mode` BUY of `product_id` FILLED on this UTC day -- the half of "DCA fires
+    today" the ledger can see once the cycle's own buy has gone out (reductions run after it)."""
+    start = now_ts - now_ts % _DAY
+    return any(
+        order["side"] == Side.BUY.value and int(order["created_at"]) >= start
+        for order in repo.get_orders(mode=mode, product_id=product_id, status="filled")
+    )
+
+
+def _dca_fires_today(
+    product_rules: list[Rule],
+    candles_by_tf: dict[Granularity, list[Any]],
+    repo: Repository,
+    product_id: str,
+    now_ts: int,
+    *,
+    mode: str,
+) -> bool:
+    """Spec §3.4's same-day-DCA exclusion: a DCA rule on this product is ON CADENCE today, or a
+    BUY of it already filled today.
+
+    Both halves, because they fail differently: the cadence answers "is this a DCA day" even when
+    the buy was vetoed or withheld (the day is still a buy day, and a sale beside it would be
+    the round trip the exclusion exists to prevent); the ledger answers it for a buy that went out
+    under a rule this cycle did not load. A DCA whose `detect` RAISES counts as firing -- the
+    refusal is the direction that costs nothing.
+    """
+    for rule in product_rules:
+        if not isinstance(rule, Dca):
+            continue
+        try:
+            if rule.detect(candles_by_tf) is not None:
+                return True
+        except Exception:  # noqa: BLE001 -- fail toward refusing the sale, never the cycle
+            log_exception(logger, "agent.dca_detect_failed", product=product_id)
+            return True
+    return _bought_today(repo, product_id, now_ts, mode=mode)
+
+
+def _handle_reductions(
+    product_id: str,
+    sleeve_rules: list[tuple[Rule, str]],
+    product_rules: list[Rule],
+    candles_by_tf: dict[Granularity, list[Any]],
+    repo: Repository,
+    broker: Any,
+    config: Config,
+    now_ts: int,
+    *,
+    offline: bool,
+) -> list[ReduceResult]:
+    """Ask every sleeve-sell rule on `product_id` for a `Reduction`, arbitrate, and hand AT MOST
+    ONE to `executor.reduce` (#857; spec §3.2, §3.6; plan R12-R16).
+
+    IN THIS BUILD EVERY RESULT IS A PROPOSAL (plan R17, S1): `executor.reduce` is preview-only --
+    it never places, cancels, or writes an `orders` row -- and it is the one venue-facing call
+    this step makes. `tests/execution/test_sell_side_invariants.py` pins the placement paths.
+
+    **It runs LAST in the cycle** (`run_once`), after the exits, the entries -- the DCA buy -- and
+    stop management. So nothing here can withhold, delay or veto a buy the same cycle places. The
+    one way a proposal reaches a later BUY is R-P7-2: a sell preview the venue refuses with
+    `TradeScopeDenied` records the refutation, and rail 20 vetoes the NEXT cycle's buys, which is
+    rail 20 doing its job on a credential the venue has just said may not trade.
+
+    In order, and each step is why the next one is reached:
+
+    1. **Nothing held, nothing asked.** The `positions` ledger is the holding (`sleeve.holding_of`,
+       every open tranche -- a sleeve rule is a policy over the holding, not its owner, so this
+       never reads `position_rule:`).
+    2. **One proposal per product per UTC day (R14).** A second run the same day -- the hourly
+       retry after a non-zero exit -- writes nothing and logs `sleeve.already_proposed_today`.
+    3. **Each rule is skipped when its bar is not ready, and the day's proposal is LOST, not
+       carried forward (#917).** A rule whose bar is not ready (`entry_bar_ready`, the gate the
+       entries use) is not asked this run: with R14 making the day's first proposal its only
+       one, asking on yesterday's bar would spend the day on a stale close, and routing the skip
+       through `blocked_entries` (as the entries do) would withhold THIS cycle's DCA buy too --
+       neither is acceptable. There is no hourly retry to catch this up the way a blocked ENTRY
+       gets one: the LaunchAgent's hourly trigger only re-runs a cycle whose exit was non-zero,
+       which this skip does not cause, and this deployment trades once per UTC day regardless.
+       So the proposal that would have fired today is simply gone -- the same accepted cost as
+       R14's one-proposal-per-day cap -- and `agent.reduction_bar_not_ready` logs it at WARNING,
+       with the bar it was missing, so an operator can see what was lost. It does NOT withhold
+       anything else on this product or any other (R31).
+    4. **A rule that raises costs that rule**, never the other kinds on this product.
+    5. **Arbitration is a fixed order** (`sleeve.ARBITRATION_ORDER`); every loser is recorded
+       `superseded`, naming the winner, and a superseded row does not reopen the day.
+    6. **The sleeve caps** (`sleeve.sleeve_refusal`: same-day DCA, `min_hold_days` on the tranches
+       the FIFO sale would consume, `cooldown_days`) refuse BEFORE an intent is built; the
+       refusal is recorded `vetoed` with `rails.sleeve`, so a skipped distribution says why and
+       is not carried forward (Review Focus 1).
+    7. `executor.reduce`, with `offline=True` and no broker on a paper cycle (R18).
+
+    The caller wraps this per product: a database error here costs this product's proposal,
+    never the cycle and never another product.
+    """
+    on_product = [(r, s) for r, s in sleeve_rules if getattr(r, "product_id", None) == product_id]
+    if not on_product:
+        return []
+    days = completed_days(candles_by_tf)
+    holding = sleeve.holding_of(repo, product_id, days[-1].close if days else None)
+    if holding.qty <= 0:
+        return []
+    if sleeve.proposed_today(repo, product_id, now_ts):
+        log_event(logger, logging.INFO, "sleeve.already_proposed_today", product=product_id)
+        return []
+
+    granularities = list(candles_by_tf)
+    ready: list[tuple[Rule, str]] = []
+    for rule, status in on_product:
+        gate = _entry_gate_granularity(rule, granularities)
+        readiness = None if gate is None else freshness.entry_bar_ready(candles_by_tf, gate, now_ts)
+        if readiness is not None and not readiness.ready:
+            # WARNING, not INFO (#917): unlike a blocked ENTRY, this proposal is not merely
+            # delayed to the hourly retry -- there isn't one. The LaunchAgent's hourly trigger
+            # only re-runs a cycle whose exit was non-zero (a blocked entry does that; this skip
+            # does not), and this deployment trades once per UTC day regardless, so a proposal
+            # skipped here is LOST for the day, not carried forward -- the same accepted cost as
+            # R14's one-proposal-per-day cap. `expected_ts`/`stored_ts` mirror the entry gate's
+            # own `agent.entry_bar_not_ready` log so an operator can see what bar was missing.
+            log_event(
+                logger,
+                logging.WARNING,
+                "agent.reduction_bar_not_ready",
+                product=product_id,
+                rule=rule.name,
+                expected_ts=readiness.expected_ts,
+                stored_ts=readiness.stored_ts,
+                reason=readiness.reason,
+            )
+            continue
+        ready.append((rule, status))
+    if not ready:
+        return []
+
+    costs = sleeve.sell_costs(repo, config, product_id)
+    order = {kind: i for i, kind in enumerate(sleeve.ARBITRATION_ORDER)}
+    fired: list[tuple[Rule, str, Reduction]] = []
+    for rule, status in sorted(ready, key=lambda rs: order.get(rs[0].name, len(order))):
+        try:
+            reduction = rule.reduce_signal(holding, candles_by_tf, costs)
+        except Exception:  # noqa: BLE001 -- one broken rule must not cost the other kinds
+            log_exception(logger, "agent.reduce_signal_failed", product=product_id, rule=rule.name)
+            continue
+        if reduction is not None:
+            fired.append((rule, status, reduction))
+    if not fired:
+        return []
+
+    winner, winner_status, winning = fired[0]
+    results: list[ReduceResult] = []
+    for rule, status, reduction in fired[1:]:
+        pid = sleeve.record_proposal(
+            repo,
+            reduction=reduction,
+            rule_id=rule.rule_id,
+            rule_status=status,
+            holding=holding,
+            costs=costs,
+            decision="superseded",
+            rails={},
+            expected_fee=reduction.qty * reduction.expected_price * costs.fee_pct,
+            fee_source=costs.fee_source,
+            legs=0,
+            now_ts=now_ts,
+            superseded_by=winner.name,
+        )
+        results.append(
+            ReduceResult(
+                product_id, rule.name, pid, "superseded", [], 0, f"superseded by {winner.name}"
+            )
+        )
+
+    refusal = sleeve.sleeve_refusal(
+        reduction=winning,
+        holding=holding,
+        rule_kind=winner.name,
+        rule_params=winner.params,
+        dca_fires_today=_dca_fires_today(
+            product_rules,
+            candles_by_tf,
+            repo,
+            product_id,
+            now_ts,
+            mode="paper" if offline else "live",
+        ),
+        last_rule_proposal_ts=sleeve.last_proposal_ts(repo, winner.rule_id),
+        now_ts=now_ts,
+    )
+    if refusal is not None:
+        pid = sleeve.record_proposal(
+            repo,
+            reduction=winning,
+            rule_id=winner.rule_id,
+            rule_status=winner_status,
+            holding=holding,
+            costs=costs,
+            decision="vetoed",
+            rails={"violations": [], "sleeve": refusal},
+            expected_fee=winning.qty * winning.expected_price * costs.fee_pct,
+            fee_source=costs.fee_source,
+            legs=0,
+            now_ts=now_ts,
+        )
+        return [
+            *results,
+            ReduceResult(
+                product_id,
+                winner.name,
+                pid,
+                "vetoed",
+                [],
+                0,
+                refusal,
+                total_qty=min(winning.qty, holding.qty),
+            ),
+        ]
+    return [
+        *results,
+        executor.reduce(
+            winning,
+            broker=None if offline else broker,
+            repo=repo,
+            config=config,
+            holding=holding,
+            costs=costs,
+            rule_id=winner.rule_id,
+            rule_status=winner_status,
+            now_ts=now_ts,
+            offline=offline,
+        ),
+    ]
+
+
 def _manage_stops(
     broker: Any,
     repo: Repository,
@@ -1617,6 +1906,10 @@ class LoopResult:
     # confirmed ready (`freshness.entry_bar_ready`, applied in `run_once` below) -- see
     # `BlockedEntry`. Defaulted so every existing `LoopResult(...)` construction stays valid.
     blocked_entries: list[BlockedEntry] = field(default_factory=list)
+    # #857 (plan P8): what `_handle_reductions` did with each sleeve-sell rule's `Reduction` this
+    # cycle -- one PROPOSAL each (preview-only in this build), including the `superseded` losers
+    # of arbitration. `notifications.events_from_state` derives `sleeve.proposal` from it (R19).
+    reduce_results: list[ReduceResult] = field(default_factory=list)
     # Paper-forward observability (P4 Task 9): the synthetic account's equity + Rail 11's
     # drawdown scalars for THIS cycle. `None` in every non-paper cycle -- there is no synthetic
     # account to report on -- so all existing `LoopResult(...)` constructions stay valid.
@@ -1669,7 +1962,22 @@ def run_once(
     interval_sec: float | None = None,
 ) -> LoopResult:
     """One agent cycle: (kill-switch / market-session gates) -> poll -> evaluate -> exits
-    -> entries.
+    -> entries -> stop management -> sleeve reductions (PROPOSALS only, #857).
+
+    The reductions are LAST, after every order this cycle places: `_handle_reductions` is
+    preview-only, wrapped per product, and cannot withhold, delay or veto the cycle's DCA buy.
+    Sleeve-sell rules are loaded apart from the entry/exit rules (`_sleeve_rules`, R31), so
+    their feeds never gate the entries and they never own an exit. Under the kill switch the
+    cycle returns before any of it, so no reduction reads the venue either.
+
+    Two more things nothing about sleeve rules may cost the DCA buy on (P8 review, held
+    question): `_sleeve_rules` itself is called wrapped -- a malformed legacy `paper` row that
+    makes `repo.get_rules("paper")` raise costs an EMPTY sleeve-rule set for this cycle, never
+    the cycle. And sleeve-ONLY products (on no entry/exit rule) are not part of the cycle's
+    `products` at all: they are polled in a SECOND, wrapped `poll_once` call inside the
+    reduction step, AFTER the entries, so a venue error or a slow poll there cannot delay or
+    abort the buy; and because they never join `products`, rail 11's equity is marked over
+    exactly the products it always was (a held sleeve-only product stays valued at cost).
 
     The venue session is read and RECORDED first, before any gate can return (FR-9) -- a
     session-bound venue's clock answer under its own namespaced keys, with the interval
@@ -1732,8 +2040,38 @@ def run_once(
         # would rehearse what is already trading and never advance a candidate, which is the
         # opposite of what the proving gate is for.
         rule_status = "paper" if config.auto_trade.mode == "paper" else "live"
-        rules = [_build_rule(row) for row in repo.get_rules(rule_status)]
+        # Sleeve-sell rules are NOT entry/exit rules (plan R31): sorted out by kind before any
+        # row is built, and loaded on their own by `_sleeve_rules` (which also reads `paper`
+        # rows in a live cycle, R16). Their products join the poll set, so the reduction step
+        # at the end of the cycle has candles to decide on.
+        rules = [
+            rule
+            for rule in (
+                _build_rule(row)
+                for row in repo.get_rules(rule_status)
+                if not _is_sleeve_kind(row["kind"])
+            )
+            if promotion.promotion_class_of(rule) != promotion.SLEEVE_SELL
+        ]
+        # `_sleeve_rules` reads `repo.get_rules("paper")` even in a LIVE cycle (R16), and a
+        # malformed legacy `paper` row raising out of that read must not cost this cycle's DCA
+        # buy -- wrapped exactly like a bad row inside `_sleeve_rules` itself is, just one layer
+        # further out (P8 review, held question).
+        try:
+            sleeve_rules = _sleeve_rules(repo, config)
+        except Exception:  # noqa: BLE001 -- a broken rules read must not cost the cycle
+            log_exception(logger, "agent.sleeve_rules_failed")
+            sleeve_rules = []
+        # `products` is the ENTRY/EXIT rules' products, exactly as before P8: it drives the poll
+        # below, the pre-pass, the main pass, the prices rail 11's equity is marked at and the
+        # paper seed. A sleeve-ONLY product (on no entry/exit rule) is deliberately not in it: it
+        # is polled and read by the reduction step at the END of the cycle (see REDUCTIONS),
+        # after the entries, so its feed can neither delay nor abort the DCA buy, and equity is
+        # marked over the same products it always was. `LoopResult.products` reports the union.
         products = sorted({p for p in (getattr(r, "product_id", None) for r in rules) if p})
+        sleeve_only_products = sorted(
+            {str(getattr(r, "product_id")) for r, _status in sleeve_rules} - set(products)
+        )
         granularities = list(config.market_data.granularities)
 
         polled = market_feed.poll_once(broker, repo, products, granularities, now_ts=now_ts)
@@ -2187,18 +2525,89 @@ def run_once(
             except Exception:  # noqa: BLE001 -- a diagnostic record must never cost a cycle
                 log_exception(logger, "agent.venue_holdings_failed")
 
+        # == REDUCTIONS: sleeve-sell PROPOSALS, the cycle's LAST step (#857, plan P8) ==========
+        #
+        # AFTER everything above, and deliberately so: the exits, the entries -- the DCA buy --
+        # and stop management have all been decided before any sleeve rule is asked, so a
+        # proposal can never withhold, delay or veto a buy this cycle places. Each product is
+        # wrapped on its own: a rule, database or venue failure costs that product's proposal,
+        # never the cycle and never another product. Preview-only: `executor.reduce` places,
+        # cancels and writes no order (S1). A stale product is skipped, as it is everywhere else
+        # in the cycle; a paper cycle runs offline with no broker (R18).
+        #
+        # Sleeve-ONLY products are polled HERE, in their own wrapped `poll_once` -- after the
+        # buy, never before it. `poll_once` has no per-product isolation (one product's 404
+        # raises out of the whole call), so a failure costs these products' proposals and
+        # nothing else: an unpolled product is then stale, and skipped like any stale product.
+        if sleeve_only_products:
+            try:
+                polled += market_feed.poll_once(
+                    broker, repo, sleeve_only_products, granularities, now_ts=now_ts
+                )
+            except Exception:  # noqa: BLE001 -- a sleeve product's feed must not cost the cycle
+                log_exception(
+                    logger, "agent.sleeve_feed_poll_failed", products=sleeve_only_products
+                )
+        reduce_results: list[ReduceResult] = []
+        for product_id in sorted({str(getattr(r, "product_id")) for r, _status in sleeve_rules}):
+            try:
+                sleeve_candles = candles_by_tf_by_product.get(product_id)
+                if product_id in sleeve_only_products:
+                    if finest is not None and not market_feed.is_fresh(
+                        repo, product_id, finest, now_ts, max_age_sec
+                    ):
+                        stale_products.append(product_id)
+                        log_event(
+                            logger,
+                            logging.INFO,
+                            "agent.feed_stale",
+                            product=product_id,
+                            finest=finest,
+                            max_age_sec=max_age_sec,
+                        )
+                        continue
+                    sleeve_candles = {g: repo.get_candles(product_id, g) for g in granularities}
+                if sleeve_candles is None:
+                    continue  # an entry product the pre-pass found stale
+                product_reductions = _handle_reductions(
+                    product_id,
+                    sleeve_rules,
+                    [r for r in rules if getattr(r, "product_id", None) == product_id],
+                    sleeve_candles,
+                    repo,
+                    broker,
+                    config,
+                    now_ts,
+                    offline=paper_trader is not None,
+                )
+            except Exception:  # noqa: BLE001 -- a proposal must never cost the cycle
+                log_exception(logger, "agent.reductions_failed", product=product_id)
+                continue
+            for reduced in product_reductions:
+                log_event(
+                    logger,
+                    logging.INFO,
+                    "agent.reduction_evaluated",
+                    product=product_id,
+                    rule=reduced.rule_kind,
+                    proposal_id=reduced.proposal_id,
+                    decision=reduced.decision,
+                )
+            reduce_results.extend(product_reductions)
+
         cycle_result = LoopResult(
             ts=now_ts,
             skipped=False,
             skip_reason=None,
             mode=reported_mode,
             polled=polled,
-            products=products,
+            products=sorted(set(products) | set(sleeve_only_products)),
             stale_products=stale_products,
             enter_signals=enter_signals,
             enter_results=enter_results,
             exit_results=exit_results,
             blocked_entries=blocked_entries,
+            reduce_results=reduce_results,
             paper_equity=result_paper_equity,
             drawdown_total_pct=result_drawdown_total_pct,
             drawdown_weekly_pct=result_drawdown_weekly_pct,

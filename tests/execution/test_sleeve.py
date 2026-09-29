@@ -356,17 +356,21 @@ def test_proposed_today_is_this_utc_day_only_and_ignores_superseded() -> None:
     assert sleeve.proposed_today(repo, "BTC-USD", now)
 
 
-def test_last_proposal_ts_is_the_rules_newest_non_superseded_row() -> None:
-    """R15's input: the pipeline enforces a rule's cooldown from the proposals table."""
+def test_last_proposal_ts_is_the_rules_newest_preview_or_placed_row() -> None:
+    """R15's input: the pipeline enforces a rule's cooldown from the proposals table -- but only
+    from a `preview` or `placed` row (#915). A `vetoed` row NEWER than the last preview (here,
+    the cooldown's own daily refusal) is ignored, or the cooldown would never expire; a
+    `superseded` row is ignored as before; a `placed` row counts, same as `preview`."""
     repo = _repo()
     assert sleeve.last_proposal_ts(repo, 7) is None
     assert sleeve.last_proposal_ts(repo, None) is None
-    sleeve.record_proposal(repo, **_proposal_kw(now_ts=10))
-    sleeve.record_proposal(repo, **_proposal_kw(now_ts=20, decision="vetoed"))
-    sleeve.record_proposal(repo, **_proposal_kw(now_ts=30, decision="superseded"))
-    sleeve.record_proposal(repo, **_proposal_kw(now_ts=40, rule_id=8))
-    assert sleeve.last_proposal_ts(repo, 7) == 20
-    assert sleeve.last_proposal_ts(repo, 8) == 40
+    sleeve.record_proposal(repo, **_proposal_kw(now_ts=10))  # preview
+    sleeve.record_proposal(repo, **_proposal_kw(now_ts=40, decision="vetoed"))  # newest, ignored
+    sleeve.record_proposal(repo, **_proposal_kw(now_ts=30, decision="superseded"))  # ignored
+    sleeve.record_proposal(repo, **_proposal_kw(now_ts=20, decision="placed"))  # counts
+    sleeve.record_proposal(repo, **_proposal_kw(now_ts=50, rule_id=8))
+    assert sleeve.last_proposal_ts(repo, 7) == 20, "the vetoed row at 40 is newer but ignored"
+    assert sleeve.last_proposal_ts(repo, 8) == 50
 
 
 def test_unverified_fill_orders_names_the_filled_buys_the_venue_never_sized() -> None:

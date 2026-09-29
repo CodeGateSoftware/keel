@@ -21,6 +21,7 @@ from typing import Any
 
 import pytest
 from keel_broker_api.orders import OrderSpec
+from keel_broker_api.port import TradeScopeDenied
 from keel_broker_api.results import (
     Balance,
     MarketSchedule,
@@ -30,6 +31,7 @@ from keel_broker_api.results import (
     SessionState,
 )
 from keel_core.telemetry import _FIELDS_ATTR
+from keel_core.trade_scope import TradeScopeState
 
 from keel import agent
 from keel.agent import LoopResult, _build_rule, loop, run_once
@@ -44,8 +46,10 @@ from keel.config import (
 )
 from keel.data.db import connect, migrate
 from keel.data.repository import Repository
-from keel.execution import executor
-from keel.strategy.rules.base import Action, Rule, Setup, Signal
+from keel.execution import executor, sleeve
+from keel.execution.guards import rail_name
+from keel.strategy.reduction import Reduction
+from keel.strategy.rules.base import Action, Rule, Setup, Signal, completed_days
 from keel.strategy.rules.dca import Dca
 from keel.strategy.rules.pullback_continuation import PullbackContinuation
 from keel.strategy.rules.turtle_breakout import TurtleBreakout
@@ -5326,3 +5330,912 @@ def test_900_held_position_counts_the_venue_filled_size(repo, held_position) -> 
     qty, _ = held_position(repo, "BTC-USD")
 
     assert qty == Decimal("0.00077099")
+
+
+# -- P8 (#857): sleeve-sell rules in the cycle ----------------------------------------------------
+#
+# A sleeve-sell rule (`promotion_class = "sleeve_sell"`) is loaded apart from the entry/exit rules
+# (plan R31) and asked for a `Reduction` by `agent._handle_reductions`, which runs AFTER the
+# cycle's exits and entries -- the DCA buy included -- and only ever PROPOSES (`executor.reduce`
+# is preview-only in this build, S1).
+
+DAY = 86_400
+
+
+class _AlwaysReduceRule(Rule):
+    """Test double: proposes selling 10% of whatever is held, every cycle."""
+
+    name = "fake_reduce"
+    promotion_class = "sleeve_sell"
+    accumulates = True
+
+    def __init__(self, product_id: str, name: str = "fake_reduce") -> None:
+        self.name, self.product_id = name, product_id
+        self.params: dict = {"product_id": product_id}
+
+    def detect(self, candles_by_tf):
+        return None
+
+    def exit_signal(self, held, candles_by_tf):
+        return False
+
+    def describe(self):
+        return {"name": self.name, "params": self.params}
+
+    def reduce_signal(self, holding, candles_by_tf, costs):
+        days = completed_days(candles_by_tf) or next(iter(candles_by_tf.values()), [])
+        if holding.qty <= 0 or not days:
+            return None
+        return Reduction(
+            self.product_id, holding.qty / 10, self.name, {}, days[-1].close, days[-1].ts
+        )
+
+
+class _ExitingReduceRule(_AlwaysReduceRule):
+    """A sleeve rule whose `exit_signal` would fire -- it must never be asked (R31)."""
+
+    def __init__(self, product_id: str) -> None:
+        super().__init__(product_id, name="fake_reduce_exit")
+
+    def exit_signal(self, held, candles_by_tf):
+        return True
+
+
+def _seed_rules(repo, monkeypatch, *rules_and_status):
+    """Seed rows, register each double's CLASS under its kind (the cycle reads the class to tell a
+    sleeve rule from an entry rule before building it), and make `_build_rule` hand back the
+    matching instance BY KIND, with the row's id threaded on as the real builder does."""
+    by_kind = {}
+    for rule, status in rules_and_status:
+        repo.insert_rule(rule.name, {"product_id": rule.product_id}, status=status)
+        by_kind[rule.name] = rule
+        if rule.name not in agent.RULE_REGISTRY:
+            monkeypatch.setitem(agent.RULE_REGISTRY, rule.name, type(rule))
+
+    def _build(row):
+        rule = by_kind[row["kind"]]
+        rule.rule_id = row.get("id")
+        return rule
+
+    monkeypatch.setattr(agent, "_build_rule", _build)
+
+
+class _HoldingBroker(FakeBroker):
+    """`FakeBroker`, plus the base currencies it holds -- `executor.reduce` clamps every SELL to
+    the venue's `Balance.total` of the base leg."""
+
+    def __init__(self, *args: Any, base: dict[str, Decimal] | None = None, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self.base = dict(base or {"BTC": Decimal("1000"), "ETH": Decimal("1000")})
+        self.balance_reads = 0
+        # Every venue ORDER call, in the order it was made, with its product and side -- so a
+        # test can pin that the cycle's BUY went out before any sleeve SELL was even quoted.
+        self.sequence: list[tuple[str, str, Side | None]] = []
+        # `(product, exception)`: a SELL preview on that product raises it.
+        self.sell_preview_raises: dict[str, Exception] = {}
+
+    def get_balances(self) -> list[Balance]:
+        self.balance_reads += 1
+        return [
+            *super().get_balances(),
+            *(Balance(currency=c, available=q, total=q) for c, q in self.base.items()),
+        ]
+
+    def get_candles(
+        self, product_id: str, granularity: Granularity, start: int, end: int
+    ) -> list[Candle]:
+        self.sequence.append(("candles", product_id, None))
+        return super().get_candles(product_id, granularity, start, end)
+
+    def preview_order(self, spec: OrderSpec) -> Preview:
+        self.sequence.append(("preview", spec.product_id, spec.side))
+        if spec.side is Side.SELL and spec.product_id in self.sell_preview_raises:
+            raise self.sell_preview_raises[spec.product_id]
+        return super().preview_order(spec)
+
+    def place_order(self, spec: OrderSpec, *, idempotency_key: str | None = None) -> PlaceResult:
+        self.sequence.append(("place", spec.product_id, spec.side))
+        return super().place_order(spec, idempotency_key=idempotency_key)
+
+    def cancel_order(self, order_id: str) -> bool:
+        self.sequence.append(("cancel", order_id, Side.SELL))
+        return super().cancel_order(order_id)
+
+
+def _lagging_config() -> Config:
+    """A polling interval long enough that a product one daily bar BEHIND is still fresh (not
+    skipped as stale) and so reaches the entry-bar readiness gate -- the case R31 is about."""
+    return _config(auto_trade=AutoTradeConfig(mode="confirm", interval_sec=100_000))
+
+
+def test_a_sleeve_rule_is_not_an_entry_rule_and_cannot_withhold_the_dca_buy(repo, monkeypatch):
+    """R31: a sleeve rule in the entry pre-pass would withhold EVERY entry of the cycle on its own
+    product's lagging bar; it must not be in that pass at all. ETH is fresh but one daily bar
+    behind; BTC is ready and its DCA is due."""
+    _seed_rules(
+        repo,
+        monkeypatch,
+        (Dca(product_id=PRODUCT, cadence_days=1), "live"),
+        (_AlwaysReduceRule("ETH-USD"), "live"),
+    )
+    # ETH's one stored bar is day 0; the venue has nothing newer, so ETH stays a bar behind.
+    _seed_history(repo, [_candle(0, "100")], product="ETH-USD")
+    broker = _HoldingBroker(
+        series={(PRODUCT, Granularity.ONE_DAY): [_candle(0, "100"), _candle(DAY, "100")]}
+    )
+
+    result = run_once(broker, repo, _lagging_config(), now_ts=2 * DAY + 3_600)
+
+    assert "ETH-USD" not in result.stale_products, "fixture: ETH must reach the readiness gate"
+    assert result.blocked_entries == []
+    assert [r.placed for r in result.enter_results] == [True]
+    assert [c["side"] for c in broker.place_calls] == [Side.BUY]
+    assert "ETH-USD" in result.products, "the sleeve rule's product is still polled"
+
+
+def test_a_paper_status_sleeve_rule_joins_a_live_cycles_poll_set(repo, monkeypatch):
+    """R16: a live cycle also evaluates `paper`-status sleeve rules, so their product is polled."""
+    _seed_rules(repo, monkeypatch, (_AlwaysReduceRule("ETH-USD"), "paper"))
+    broker = _HoldingBroker(series={("ETH-USD", Granularity.ONE_DAY): [_candle(0, "100")]})
+
+    result = run_once(broker, repo, _config(), now_ts=90_000)
+
+    assert result.products == ["ETH-USD"]
+    assert [call[0] for call in broker.get_candles_calls] == ["ETH-USD"]
+
+
+def test_sleeve_rules_are_loaded_by_class_at_both_statuses_in_a_live_cycle(repo, monkeypatch):
+    """`_sleeve_rules`: every sleeve-class row at `paper` and `live` in a live cycle, each with
+    its status; an entry rule at either status is not a sleeve rule."""
+    live, paper = _AlwaysReduceRule(PRODUCT), _AlwaysReduceRule("ETH-USD", name="fake_reduce_2")
+    _seed_rules(
+        repo,
+        monkeypatch,
+        (live, "live"),
+        (paper, "paper"),
+        (_AlwaysEnterRule(PRODUCT), "live"),
+        (_AlwaysExitRule(PRODUCT), "paper"),
+    )
+
+    loaded = agent._sleeve_rules(repo, _config())
+
+    assert sorted((rule.name, status) for rule, status in loaded) == [
+        ("fake_reduce", "live"),
+        ("fake_reduce_2", "paper"),
+    ]
+
+
+def test_a_paper_cycle_loads_only_paper_status_sleeve_rules(repo, monkeypatch):
+    """A paper cycle proves `paper` rules forward; a `live` sleeve rule is the live cycle's."""
+    _seed_rules(
+        repo,
+        monkeypatch,
+        (_AlwaysReduceRule(PRODUCT), "live"),
+        (_AlwaysReduceRule("ETH-USD", name="fake_reduce_2"), "paper"),
+    )
+
+    loaded = agent._sleeve_rules(repo, _paper_config())
+
+    assert [(rule.name, status) for rule, status in loaded] == [("fake_reduce_2", "paper")]
+
+
+def test_a_sleeve_row_that_cannot_be_built_costs_neither_the_cycle_nor_the_dca_buy(
+    repo, monkeypatch
+):
+    """A sleeve row whose params do not build (a bad `reverse_dca` row, say) is logged and
+    skipped. It must not raise out of `run_once` and take the DCA buy with it."""
+    _seed_rules(repo, monkeypatch, (Dca(product_id=PRODUCT, cadence_days=1), "live"))
+    monkeypatch.setitem(agent.RULE_REGISTRY, "fake_reduce", _AlwaysReduceRule)
+    repo.insert_rule("fake_reduce", {"product_id": PRODUCT}, status="live")
+    built = agent._build_rule
+
+    def _build(row):
+        if row["kind"] == "fake_reduce":
+            raise ValueError("reverse_dca: target_usd is required")
+        return built(row)
+
+    monkeypatch.setattr(agent, "_build_rule", _build)
+    broker = _HoldingBroker(series={(PRODUCT, Granularity.ONE_DAY): [_candle(0, "100")]})
+
+    result = run_once(broker, repo, _config(), now_ts=90_000)
+
+    assert [r.placed for r in result.enter_results] == [True]
+
+
+def test_a_sleeve_rule_does_not_own_a_positions_exit(repo, monkeypatch):
+    """Review Focus 5 at the cycle: a sleeve rule can only PROPOSE, so even when it is on record as
+    the product's `position_rule` and its `exit_signal` says yes, no EXIT is placed."""
+    rule = _ExitingReduceRule(PRODUCT)
+    _seed_rules(repo, monkeypatch, (rule, "live"))
+    _seed_open_position(repo, PRODUCT, Decimal("1"), Decimal("80"), ts=0, rule_name=rule.name)
+    repo.set_state(f"position_rule:{PRODUCT}", {"rule_name": rule.name, "opened_at": 0})
+    broker = _HoldingBroker(series={(PRODUCT, Granularity.ONE_DAY): [_candle(0, "100")]})
+
+    result = run_once(broker, repo, _config(), now_ts=90_000)
+
+    assert result.exit_results == []
+    assert [c for c in broker.place_calls if c["side"] is Side.SELL] == []
+
+
+# -- P8 Task 8.2: `_handle_reductions` ----------------------------------------------------------
+
+
+def _history(repo: Repository, days: int, product: str = PRODUCT, price: str = "100") -> int:
+    """Store daily bars for days `0 .. days-1` and return a `now_ts` one hour into day `days`,
+    at which the stored tail IS the last closed bar -- fresh and entry-ready, so the poll adds
+    nothing and the cycle decides on exactly this series."""
+    _seed_history(repo, [_candle(d * DAY, price) for d in range(days)], product=product)
+    return days * DAY + 3_600
+
+
+def _held_since_day_0(repo: Repository, product: str = PRODUCT, qty: str = "1") -> None:
+    """One DCA tranche opened at ts 0 -- older than `min_hold_days` (30) by day 41."""
+    _seed_open_position(repo, product, Decimal(qty), Decimal("80"), ts=0, rule_name="dca")
+
+
+def test_under_autonomous_mode_a_reduction_is_proposed_and_never_placed(repo, monkeypatch):
+    """S1 at the cycle level: the profile fixture is autonomous; a SELL still never goes out."""
+    _seed_rules(repo, monkeypatch, (_AlwaysReduceRule(PRODUCT), "live"))
+    _held_since_day_0(repo)
+    now = _history(repo, 41)
+    broker = _HoldingBroker()
+
+    result = run_once(broker, repo, _config(), now_ts=now)
+
+    assert result.mode == "autonomous"
+    assert [(r.product_id, r.decision) for r in result.reduce_results] == [(PRODUCT, "preview")]
+    assert broker.place_calls == [] and broker.cancel_calls == []
+    [row] = repo.get_sell_proposals()
+    assert (row["rule_status"], row["decision"], row["qty"]) == ("live", "preview", Decimal("0.1"))
+    assert row["id"] == result.reduce_results[0].proposal_id
+
+
+def test_the_reduction_step_places_cancels_and_writes_no_order(repo, monkeypatch):
+    """S1, spied: across `_handle_reductions` itself -- with a firing sell rule on a held,
+    autonomous, live book -- not one place, cancel or `orders` insert. The same cycle's DCA BUY
+    (on another product) does place, so the spies are live."""
+    _seed_rules(
+        repo,
+        monkeypatch,
+        (Dca(product_id="ETH-USD", cadence_days=1), "live"),
+        (_AlwaysReduceRule(PRODUCT), "live"),
+    )
+    _held_since_day_0(repo)
+    now = _history(repo, 41)
+    _history(repo, 41, product="ETH-USD")
+    broker = _HoldingBroker()
+    inserts: list[dict] = []
+    real_insert = repo.insert_order
+    monkeypatch.setattr(repo, "insert_order", lambda row: inserts.append(row) or real_insert(row))
+    deltas: list[tuple[int, int, int]] = []
+    returned: list[list] = []
+    real_step = agent._handle_reductions
+
+    def _spied(*args, **kwargs):
+        before = (len(broker.place_calls), len(broker.cancel_calls), len(inserts))
+        out = real_step(*args, **kwargs)
+        after = (len(broker.place_calls), len(broker.cancel_calls), len(inserts))
+        deltas.append(tuple(a - b for a, b in zip(after, before)))
+        returned.append(out)
+        return out
+
+    monkeypatch.setattr(agent, "_handle_reductions", _spied)
+
+    run_once(broker, repo, _config(), now_ts=now)
+
+    assert [[r.decision for r in out] for out in returned if out] == [["preview"]], (
+        "the sell rule must actually have reached `executor.reduce`"
+    )
+    assert set(deltas) == {(0, 0, 0)}
+    assert [(c["product_id"], c["side"]) for c in broker.place_calls] == [("ETH-USD", Side.BUY)]
+
+
+def test_a_second_run_on_the_same_utc_day_writes_no_second_proposal(repo, monkeypatch, caplog):
+    """Review Focus 2 / R14: the hourly retry after a non-zero exit re-runs the cycle; the product
+    already has today's proposal, so no rule is even asked."""
+    _seed_rules(repo, monkeypatch, (_AlwaysReduceRule(PRODUCT), "live"))
+    _held_since_day_0(repo)
+    now = _history(repo, 41)
+    broker = _HoldingBroker()
+    run_once(broker, repo, _config(), now_ts=now)
+
+    with caplog.at_level(logging.INFO):
+        again = run_once(broker, repo, _config(), now_ts=now + 3_600)
+
+    assert len(repo.get_sell_proposals()) == 1
+    assert again.reduce_results == []
+    assert [r.getMessage() for r in caplog.records].count("sleeve.already_proposed_today") == 1
+
+
+def test_a_distribution_on_a_dca_buy_day_is_recorded_vetoed_not_carried(repo, monkeypatch):
+    """Review Focus 1: day % 210 == 0 is both a 7-day DCA day and a 30-day distribution day. The
+    DCA buy goes out FIRST (reductions run after the entries), and the distribution is recorded
+    vetoed `same_day_dca`. The next day's is an ordinary proposal: nothing is carried."""
+    _seed_rules(
+        repo,
+        monkeypatch,
+        (Dca(product_id=PRODUCT, cadence_days=7), "live"),
+        (_AlwaysReduceRule(PRODUCT), "live"),
+    )
+    _held_since_day_0(repo)
+    # The fixture's day-0 cash-posture attestation lapses at day 90 (rail 22); re-attest, or
+    # rail 22 -- not the DCA cadence -- decides whether day 210 buys.
+    attest_cash_posture(repo, now_ts=200 * DAY)
+    series = [_candle(d * DAY, "100") for d in range(150, 211)]
+    _seed_history(repo, series)
+    broker = _HoldingBroker(series={(PRODUCT, Granularity.ONE_DAY): series})
+
+    first = run_once(broker, repo, _config(), now_ts=211 * DAY + 3_600)
+
+    assert [(c["side"], c["product_id"]) for c in broker.place_calls] == [(Side.BUY, PRODUCT)]
+    [row] = repo.get_sell_proposals()
+    assert row["decision"] == "vetoed" and row["rails"]["sleeve"] == "same_day_dca"
+    assert [r.decision for r in first.reduce_results] == ["vetoed"]
+    held_at_veto = sum((p["qty"] for p in repo.get_open_positions(PRODUCT)), Decimal("0"))
+    assert first.reduce_results[0].total_qty == held_at_veto / 10, (
+        "a vetoed proposal names its size too, like every other decision"
+    )
+
+    series.append(_candle(211 * DAY, "100"))  # day 211: DCA is off-cadence
+    run_once(broker, repo, _config(), now_ts=212 * DAY + 3_600)
+
+    rows = repo.get_sell_proposals()
+    assert len(rows) == 2 and rows[0]["decision"] == "preview"
+    held = sum((p["qty"] for p in repo.get_open_positions(PRODUCT)), Decimal("0"))
+    assert held > Decimal("1"), "fixture: day 210's DCA buy must be in the ledger"
+    assert rows[0]["qty"] == held / 10, "one ordinary proposal -- nothing carried forward"
+    assert [c["side"] for c in broker.place_calls] == [Side.BUY], "and still no SELL placed"
+
+
+def test_a_dca_that_fires_but_does_not_buy_still_vetoes_the_same_day_sale(repo, monkeypatch):
+    """The same-day exclusion is "DCA fires today", not only "a BUY filled today": a DCA day whose
+    buy the rails vetoed (here: withdrawals unattested, rail 17) is still a DCA day."""
+    repo.set_state("withdrawals_enabled", False)
+    _seed_rules(
+        repo,
+        monkeypatch,
+        (Dca(product_id=PRODUCT, cadence_days=1), "live"),
+        (_AlwaysReduceRule(PRODUCT), "live"),
+    )
+    _held_since_day_0(repo)
+    now = _history(repo, 41)
+    broker = _HoldingBroker()
+
+    result = run_once(broker, repo, _config(), now_ts=now)
+
+    assert [r.placed for r in result.enter_results] == [False], "fixture: the buy must be vetoed"
+    [row] = repo.get_sell_proposals()
+    assert (row["decision"], row["rails"]["sleeve"]) == ("vetoed", "same_day_dca")
+
+
+def test_a_paper_status_sleeve_rule_proposes_in_a_live_cycle_and_says_so(repo, monkeypatch):
+    """R16: preview only, and the row says the rule is `paper`."""
+    _seed_rules(repo, monkeypatch, (_AlwaysReduceRule(PRODUCT), "paper"))
+    _held_since_day_0(repo)
+    now = _history(repo, 41)
+    broker = _HoldingBroker()
+
+    run_once(broker, repo, _config(), now_ts=now)
+
+    [row] = repo.get_sell_proposals()
+    assert (row["rule_status"], row["decision"]) == ("paper", "preview")
+    assert broker.place_calls == []
+
+
+class _ReverseDouble(_AlwaysReduceRule):
+    def __init__(self, product_id: str) -> None:
+        super().__init__(product_id, name="reverse_dca")
+
+
+class _ProfitDouble(_AlwaysReduceRule):
+    def __init__(self, product_id: str) -> None:
+        super().__init__(product_id, name="profit_take")
+
+
+def test_arbitration_supersedes_the_lower_kind_and_records_it(repo, monkeypatch):
+    """Spec §3.6: `reverse_dca` outranks `profit_take`, whatever order the rows load in. The
+    loser is recorded `superseded`, and a superseded row does not reopen the day (R14)."""
+    _seed_rules(
+        repo, monkeypatch, (_ProfitDouble(PRODUCT), "live"), (_ReverseDouble(PRODUCT), "live")
+    )
+    _held_since_day_0(repo)
+    now = _history(repo, 41)
+    broker = _HoldingBroker()
+
+    result = run_once(broker, repo, _config(), now_ts=now)
+
+    rows = {r["rule_kind"]: r for r in repo.get_sell_proposals()}
+    assert rows["reverse_dca"]["decision"] == "preview"
+    assert (rows["profit_take"]["decision"], rows["profit_take"]["superseded_by"]) == (
+        "superseded",
+        "reverse_dca",
+    )
+    assert sorted((r.rule_kind, r.decision) for r in result.reduce_results) == [
+        ("profit_take", "superseded"),
+        ("reverse_dca", "preview"),
+    ]
+    assert [c for c in broker.sequence if c[2] is Side.SELL] == [("preview", PRODUCT, Side.SELL)], (
+        "only the winner is quoted"
+    )
+    run_once(broker, repo, _config(), now_ts=now + 3_600)
+    assert len(repo.get_sell_proposals()) == 2, "a superseded row does not reopen the day"
+
+
+class _RaisingReduceRule(_AlwaysReduceRule):
+    def __init__(self, product_id: str) -> None:
+        super().__init__(product_id, name="fake_reduce_raises")
+
+    def reduce_signal(self, holding, candles_by_tf, costs):
+        raise RuntimeError("rule bug")
+
+
+def _dca_and_sleeves(repo, monkeypatch, *sleeves) -> tuple[_HoldingBroker, int]:
+    """A due BTC DCA, plus sleeve rules on ETH and PAXG, each held since day 0."""
+    _seed_rules(repo, monkeypatch, (Dca(product_id=PRODUCT, cadence_days=1), "live"), *sleeves)
+    now = _history(repo, 41)
+    for product in ("ETH-USD", "PAXG-USD"):
+        _history(repo, 41, product=product)
+        _held_since_day_0(repo, product)
+    broker = _HoldingBroker(
+        base={"BTC": Decimal("1000"), "ETH": Decimal("1000"), "PAXG": Decimal("1000")}
+    )
+    return broker, now
+
+
+def test_a_raising_reduce_signal_costs_neither_the_dca_buy_nor_another_product(repo, monkeypatch):
+    broker, now = _dca_and_sleeves(
+        repo,
+        monkeypatch,
+        (_RaisingReduceRule("ETH-USD"), "live"),
+        (_AlwaysReduceRule("PAXG-USD"), "live"),
+    )
+
+    result = run_once(broker, repo, _config(), now_ts=now)
+
+    assert result.skipped is False
+    assert [(c["product_id"], c["side"]) for c in broker.place_calls] == [(PRODUCT, Side.BUY)]
+    assert [(r.product_id, r.decision) for r in result.reduce_results] == [("PAXG-USD", "preview")]
+    assert [p["product_id"] for p in repo.get_sell_proposals()] == ["PAXG-USD"]
+
+
+def test_a_raising_rule_does_not_cost_the_other_kinds_on_its_product(repo, monkeypatch):
+    _seed_rules(
+        repo,
+        monkeypatch,
+        (_RaisingReduceRule(PRODUCT), "live"),
+        (_AlwaysReduceRule(PRODUCT), "live"),
+    )
+    _held_since_day_0(repo)
+    now = _history(repo, 41)
+
+    result = run_once(_HoldingBroker(), repo, _config(), now_ts=now)
+
+    assert [(r.rule_kind, r.decision) for r in result.reduce_results] == [
+        ("fake_reduce", "preview")
+    ]
+
+
+def test_a_raising_reduce_costs_neither_the_dca_buy_nor_another_product(repo, monkeypatch):
+    """`executor.reduce` never raises for a VENUE failure, but a database error can; the step is
+    wrapped per product."""
+    broker, now = _dca_and_sleeves(
+        repo,
+        monkeypatch,
+        (_AlwaysReduceRule("ETH-USD"), "live"),
+        (_AlwaysReduceRule("PAXG-USD", name="fake_reduce_2"), "live"),
+    )
+    real_reduce = executor.reduce
+
+    def _reduce(reduction, **kwargs):
+        if reduction.product_id == "ETH-USD":
+            raise RuntimeError("database is locked")
+        return real_reduce(reduction, **kwargs)
+
+    monkeypatch.setattr(executor, "reduce", _reduce)
+
+    result = run_once(broker, repo, _config(), now_ts=now)
+
+    assert result.skipped is False
+    assert [(c["product_id"], c["side"]) for c in broker.place_calls] == [(PRODUCT, Side.BUY)]
+    assert [(r.product_id, r.decision) for r in result.reduce_results] == [("PAXG-USD", "preview")]
+
+
+def test_reductions_run_after_the_entries_so_a_denied_sell_preview_cannot_stop_todays_buy(
+    repo, monkeypatch
+):
+    """THE CYCLE ORDERING, pinned. R-P7-2: a `TradeScopeDenied` on a sell PREVIEW records the
+    venue's refutation, and rail 20 then vetoes every BUY. Because `_handle_reductions` runs after
+    the cycle's exits and entries -- for EVERY product, not interleaved per product -- today's DCA
+    BUY has already gone out when the refusal lands; it is the NEXT cycle's buy that rail 20
+    refuses, which is rail 20 doing its job on a credential the venue has just said may not trade.
+
+    The sleeve product is ADA-USD on purpose: it SORTS BEFORE BTC-USD, so a reduction step placed
+    inside the per-product main pass (after that product's exits, before the entries -- the plan's
+    original placement) would quote ADA's SELL, and record the refutation, before BTC's buy.
+    """
+    _seed_rules(
+        repo,
+        monkeypatch,
+        (Dca(product_id=PRODUCT, cadence_days=1), "live"),
+        (_AlwaysReduceRule("ADA-USD"), "live"),
+    )
+    now = _history(repo, 41)
+    # ADA's stored tail is one bar short; the venue serves day 40, so the cycle must POLL it.
+    _history(repo, 40, product="ADA-USD")
+    _held_since_day_0(repo, "ADA-USD")
+    broker = _HoldingBroker(
+        series={("ADA-USD", Granularity.ONE_DAY): [_candle(40 * DAY, "100")]},
+        base={"BTC": Decimal("1000"), "ADA": Decimal("1000")},
+    )
+    broker.sell_preview_raises["ADA-USD"] = TradeScopeDenied("403 read-only")
+    config = _config(allowlist=["ADA", "BTC", "ETH", "PAXG"])
+
+    result = run_once(broker, repo, config, now_ts=now)
+
+    assert result.products == ["ADA-USD", PRODUCT], "fixture: the sleeve product sorts first"
+    buy = broker.sequence.index(("place", PRODUCT, Side.BUY))
+    sell_quote = broker.sequence.index(("preview", "ADA-USD", Side.SELL))
+    assert buy < sell_quote, "the DCA BUY must be placed before any sleeve SELL is quoted"
+    # ADA is on no entry rule, so its feed is polled only by the reduction step -- after the buy.
+    ada_polls = [i for i, call in enumerate(broker.sequence) if call[:2] == ("candles", "ADA-USD")]
+    assert ada_polls and min(ada_polls) > buy, "a sleeve-only product is polled after the buy"
+    assert [r.placed for r in result.enter_results] == [True]
+    [row] = repo.get_sell_proposals()
+    assert row["decision"] == "preview" and "403 read-only" in row["rails"]["preview_error"]
+    scope = repo.get_venue_trade_scope("coinbase")
+    assert scope is not None and scope.state is TradeScopeState.REFUTED
+
+    _seed_history(repo, [_candle(41 * DAY, "100")])
+    _seed_history(repo, [_candle(41 * DAY, "100")], product="ADA-USD")
+    tomorrow = run_once(broker, repo, config, now_ts=now + DAY)
+
+    [vetoed] = tomorrow.enter_results
+    assert not vetoed.placed and "trade_scope" in {rail_name(v) for v in vetoed.vetoed_by}
+
+
+def test_a_kill_switch_skips_the_reductions_and_reads_no_venue_balance(repo, monkeypatch):
+    """P7's held question: a live `reduce` reads the venue's balance before the rails run. Under
+    the kill switch the cycle returns before ANY of it -- no poll, no evaluation, no proposal,
+    and no balance read."""
+    _seed_rules(repo, monkeypatch, (_AlwaysReduceRule(PRODUCT), "live"))
+    _held_since_day_0(repo)
+    now = _history(repo, 41)
+    repo.set_state("kill_switch", True)
+    broker = _HoldingBroker()
+
+    result = run_once(broker, repo, _config(), now_ts=now)
+
+    assert result.skipped and result.reduce_results == []
+    assert repo.get_sell_proposals() == []
+    assert broker.balance_reads == 0 and broker.sequence == []
+
+
+def test_a_paper_cycle_proposes_offline_and_never_touches_the_venue(repo, monkeypatch):
+    """R18: no broker, the offline rails, the fallback fee. `_MarketDataOnlyBroker` explodes on
+    any preview; the paper seed's balance read is swallowed exactly as before."""
+    _seed_rules(repo, monkeypatch, (_AlwaysReduceRule(PRODUCT), "paper"))
+    _held_since_day_0(repo)
+    now = _history(repo, 41)
+    broker = _MarketDataOnlyBroker()
+    cfg = _paper_config(paper=PaperConfig(starting_equity_usd=Decimal("100000")))
+
+    result = run_once(broker, repo, cfg, now_ts=now)
+
+    assert [r.decision for r in result.reduce_results] == ["preview"]
+    [row] = repo.get_sell_proposals()
+    assert row["fee_source"] == "fallback:config.fees.taker_pct"
+    assert row["rails"]["skipped"] != [], "the offline rails say what they skipped"
+    assert row["rule_status"] == "paper"
+
+
+def test_a_sleeve_product_a_bar_behind_is_not_proposed_on_yesterdays_bar(repo, monkeypatch):
+    """R14 makes the day's first proposal the only one: a rule asked on a lagging bar would spend
+    the day on yesterday's close. Unlike a blocked ENTRY, this is not merely delayed -- there is
+    no hourly retry that re-runs a cycle over this skip, and the deployment trades once per UTC
+    day regardless, so today's proposal is simply lost (#917, the WARNING log is pinned in
+    `test_a_bar_not_ready_reduction_skip_warns_with_the_gate_fields`). The entries are
+    unaffected either way (R31)."""
+    _seed_rules(repo, monkeypatch, (_AlwaysReduceRule("ETH-USD"), "live"))
+    _held_since_day_0(repo, "ETH-USD")
+    _seed_history(repo, [_candle(0, "100")], product="ETH-USD")
+
+    result = run_once(_HoldingBroker(), repo, _lagging_config(), now_ts=2 * DAY + 3_600)
+
+    assert "ETH-USD" not in result.stale_products, "fixture: ETH must be fresh but behind"
+    assert result.reduce_results == [] and repo.get_sell_proposals() == []
+
+
+def test_a_stale_sleeve_product_is_not_proposed(repo, monkeypatch):
+    _seed_rules(repo, monkeypatch, (_AlwaysReduceRule(PRODUCT), "live"))
+    _held_since_day_0(repo)
+
+    result = run_once(_HoldingBroker(), repo, _config(), now_ts=41 * DAY + 3_600)
+
+    assert result.stale_products == [PRODUCT]
+    assert result.reduce_results == [] and repo.get_sell_proposals() == []
+
+
+def test_nothing_held_asks_no_rule_and_records_nothing(repo, monkeypatch):
+    asked: list[str] = []
+
+    class _Counting(_AlwaysReduceRule):
+        def reduce_signal(self, holding, candles_by_tf, costs):
+            asked.append(self.product_id)
+            return super().reduce_signal(holding, candles_by_tf, costs)
+
+    _seed_rules(repo, monkeypatch, (_Counting(PRODUCT), "live"))
+    now = _history(repo, 41)
+
+    result = run_once(_HoldingBroker(), repo, _config(), now_ts=now)
+
+    assert asked == [] and result.reduce_results == [] and repo.get_sell_proposals() == []
+
+
+def test_a_buy_filled_today_outside_the_rule_set_still_vetoes_the_same_day_sale(repo, monkeypatch):
+    """The ledger half of "DCA fires today": a BUY that filled earlier this UTC day under no rule
+    this cycle loaded (a one-off `keel dca` buy, a rule since demoted) is still a buy beside
+    which a sale would be a round trip."""
+    _seed_rules(repo, monkeypatch, (_AlwaysReduceRule(PRODUCT), "live"))
+    _held_since_day_0(repo)
+    now = _history(repo, 41)
+    _seed_open_position(repo, PRODUCT, Decimal("0.5"), Decimal("100"), ts=now - 600)
+
+    run_once(_HoldingBroker(), repo, _config(), now_ts=now)
+
+    [row] = repo.get_sell_proposals()
+    assert (row["decision"], row["rails"]["sleeve"]) == ("vetoed", "same_day_dca")
+
+
+def test_yesterdays_buy_does_not_veto_todays_sale(repo, monkeypatch):
+    _seed_rules(repo, monkeypatch, (_AlwaysReduceRule(PRODUCT), "live"))
+    _held_since_day_0(repo)
+    now = _history(repo, 41)
+    _seed_open_position(repo, PRODUCT, Decimal("0.5"), Decimal("100"), ts=now - 3_600 - 60)
+
+    run_once(_HoldingBroker(), repo, _config(), now_ts=now)
+
+    [row] = repo.get_sell_proposals()
+    assert row["decision"] == "preview"
+
+
+class _CooldownReduceRule(_AlwaysReduceRule):
+    """`_AlwaysReduceRule`, with a `cooldown_days` param so R15's cooldown (#915) reaches this
+    rule's proposals."""
+
+    def __init__(self, product_id: str, cooldown_days: int = 30) -> None:
+        super().__init__(product_id)
+        self.params = {"product_id": product_id, "cooldown_days": cooldown_days}
+
+
+def test_a_vetoed_cooldown_row_does_not_re_arm_the_cooldown_forever(repo, monkeypatch):
+    """#915: `sleeve.last_proposal_ts` used to count EVERY non-superseded row, including
+    `vetoed` -- and a rule that fires every day writes a fresh `vetoed` row at `now_ts` each
+    time the cooldown itself refuses it, which re-armed the cooldown forever. Day 41: preview.
+    Days 42-70: the rule fires again every day and is vetoed `cooldown_days`, counted from day
+    41's PREVIEW, never from yesterday's own vetoed row. Day 71 -- 30 days after day 41's
+    preview -- previews again."""
+    _seed_rules(repo, monkeypatch, (_CooldownReduceRule(PRODUCT), "live"))
+    _held_since_day_0(repo)
+    now = _history(repo, 41)
+    broker = _HoldingBroker()
+
+    first = run_once(broker, repo, _config(), now_ts=now)
+    assert [r.decision for r in first.reduce_results] == ["preview"]
+
+    series = [_candle(d * DAY, "100") for d in range(41)]
+    for day in range(42, 71):
+        series.append(_candle((day - 1) * DAY, "100"))
+        _seed_history(repo, series)
+        result = run_once(broker, repo, _config(), now_ts=day * DAY + 3_600)
+        assert [r.decision for r in result.reduce_results] == ["vetoed"], day
+        [row] = [r for r in repo.get_sell_proposals() if r["ts"] == day * DAY + 3_600]
+        assert row["rails"]["sleeve"] == sleeve.COOLDOWN, day
+
+    series.append(_candle(70 * DAY, "100"))
+    _seed_history(repo, series)
+    last = run_once(broker, repo, _config(), now_ts=71 * DAY + 3_600)
+    assert [r.decision for r in last.reduce_results] == ["preview"]
+
+
+def test_a_young_tranche_is_refused_by_min_hold_days(repo, monkeypatch):
+    """#916: no cycle test used to reach `_handle_reductions`' `min_hold_days` refusal -- the
+    FIFO tranche the sale would consume is only 10 days old, younger than the default 30, so the
+    sale is vetoed `min_hold_days`."""
+    _seed_rules(repo, monkeypatch, (_AlwaysReduceRule(PRODUCT), "live"))
+    now = _history(repo, 41)
+    _seed_open_position(
+        repo, PRODUCT, Decimal("1"), Decimal("80"), ts=now - 10 * DAY, rule_name="dca"
+    )
+    broker = _HoldingBroker()
+
+    result = run_once(broker, repo, _config(), now_ts=now)
+
+    assert [r.decision for r in result.reduce_results] == ["vetoed"]
+    [row] = repo.get_sell_proposals()
+    assert row["rails"]["sleeve"] == sleeve.MIN_HOLD
+
+
+class _ShortHoldReduceRule(_AlwaysReduceRule):
+    """`_AlwaysReduceRule`, with its own `min_hold_days` param -- shorter than the default 30 --
+    so #916 can prove the rule's OWN param, not just the default, reaches the refusal."""
+
+    def __init__(self, product_id: str) -> None:
+        super().__init__(product_id)
+        self.params = {"product_id": product_id, "min_hold_days": 5}
+
+
+def test_a_rules_own_min_hold_days_reaches_the_refusal(repo, monkeypatch):
+    """#916: the tranche is 10 days old -- younger than the DEFAULT `min_hold_days` (30), but
+    older than this rule's OWN `min_hold_days` (5) -- so the sale proceeds. Proves the rule's
+    params, not merely the default, are what `_handle_reductions` passes to `sleeve_refusal`."""
+    _seed_rules(repo, monkeypatch, (_ShortHoldReduceRule(PRODUCT), "live"))
+    now = _history(repo, 41)
+    _seed_open_position(
+        repo, PRODUCT, Decimal("1"), Decimal("80"), ts=now - 10 * DAY, rule_name="dca"
+    )
+    broker = _HoldingBroker()
+
+    result = run_once(broker, repo, _config(), now_ts=now)
+
+    assert [r.decision for r in result.reduce_results] == ["preview"]
+
+
+def test_a_bar_not_ready_reduction_skip_warns_with_the_gate_fields(repo, monkeypatch, caplog):
+    """#917: the day's proposal is LOST, not merely delayed, when a sleeve product's bar is not
+    ready -- this deployment cycles once a UTC day, so there is no hourly retry to catch it up
+    the way the entry gate's rules are. `agent.reduction_bar_not_ready` is therefore WARNING, not
+    INFO, and carries the same `expected_ts`/`stored_ts` the entry gate's own not-ready log
+    does, so the operator can see what was lost."""
+    _seed_rules(repo, monkeypatch, (_AlwaysReduceRule("ETH-USD"), "live"))
+    _held_since_day_0(repo, "ETH-USD")
+    _seed_history(repo, [_candle(0, "100")], product="ETH-USD")
+
+    with caplog.at_level(logging.INFO):
+        result = run_once(_HoldingBroker(), repo, _lagging_config(), now_ts=2 * DAY + 3_600)
+
+    assert "ETH-USD" not in result.stale_products, "fixture: ETH must be fresh but behind"
+    [record] = [r for r in caplog.records if r.getMessage() == "agent.reduction_bar_not_ready"]
+    assert record.levelno == logging.WARNING
+    assert getattr(record, _FIELDS_ATTR, {}) == {
+        "product": "ETH-USD",
+        "rule": "fake_reduce",
+        "expected_ts": DAY,
+        "stored_ts": 0,
+        "reason": "behind",
+    }
+
+
+class _RaisingCandlesBroker(_HoldingBroker):
+    """`_HoldingBroker`, whose `get_candles` raises for one product -- a venue 404 for a
+    delisted id, say (P8 review, held question)."""
+
+    def __init__(self, *args: Any, raises_for: str, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self.raises_for = raises_for
+
+    def get_candles(
+        self, product_id: str, granularity: Granularity, start: int, end: int
+    ) -> list[Candle]:
+        if product_id == self.raises_for:
+            self.sequence.append(("candles", product_id, None))
+            raise RuntimeError("404 delisted")
+        return super().get_candles(product_id, granularity, start, end)
+
+
+def test_a_sleeve_only_products_feed_poll_failure_never_costs_the_dca_buy(repo, monkeypatch):
+    """P8 review, held question: `market_feed.poll_once` has no per-product isolation. A live
+    cycle's poll set now includes sleeve-only products, so a sleeve product the venue refuses
+    (a 404 for a delisted id) must not raise out of `run_once` BEFORE the entries and take the
+    DCA buy down with it. The entry-rule products are polled exactly as before, in their own
+    call; the sleeve-only products are polled in a SECOND, wrapped call."""
+    _seed_rules(
+        repo,
+        monkeypatch,
+        (Dca(product_id=PRODUCT, cadence_days=1), "live"),
+        (_AlwaysReduceRule("ETH-USD"), "live"),
+    )
+    now = _history(repo, 41)
+    broker = _RaisingCandlesBroker(raises_for="ETH-USD")
+
+    result = run_once(broker, repo, _config(), now_ts=now)
+
+    assert result.skipped is False
+    assert [c["side"] for c in broker.place_calls] == [Side.BUY]
+
+
+def test_a_broken_paper_rules_read_never_costs_the_live_dca_buy(repo, monkeypatch):
+    """P8 review, held question: `_sleeve_rules` reads `repo.get_rules('paper')` even in a LIVE
+    cycle (R16). A malformed legacy paper row that makes that read raise must not abort the
+    whole cycle -- and must not cost the same cycle's DCA buy."""
+    _seed_rules(repo, monkeypatch, (Dca(product_id=PRODUCT, cadence_days=1), "live"))
+    now = _history(repo, 41)
+    real_get_rules = repo.get_rules
+
+    def _get_rules(status: str) -> list[dict[str, Any]]:
+        if status == "paper":
+            raise RuntimeError("legacy row: malformed params")
+        return real_get_rules(status)
+
+    monkeypatch.setattr(repo, "get_rules", _get_rules)
+    broker = _HoldingBroker()
+
+    result = run_once(broker, repo, _config(), now_ts=now)
+
+    assert result.skipped is False
+    assert [c["side"] for c in broker.place_calls] == [Side.BUY]
+
+
+def test_a_dca_whose_detect_raises_counts_as_firing(repo):
+    """Fail toward refusing the SALE: a DCA rule that cannot say whether today is a buy day is
+    treated as one, so the sale is vetoed rather than risked beside a buy."""
+
+    class _BrokenDca(Dca):
+        def detect(self, candles_by_tf):
+            raise RuntimeError("rule bug")
+
+    fires = agent._dca_fires_today(
+        [_BrokenDca(product_id=PRODUCT)],
+        {Granularity.ONE_DAY: [_candle(0)]},
+        repo,
+        PRODUCT,
+        90_000,
+        mode="live",
+    )
+
+    assert fires is True
+
+
+def test_a_sleeve_only_products_poll_runs_after_the_buy_and_its_failure_costs_nothing(
+    repo, monkeypatch
+):
+    """Coordinator constraint (a): a sleeve-only product's feed is polled AFTER the entries, so a
+    venue error -- or a slow poll -- there can neither delay nor abort the day's DCA buy. The
+    failure costs that product's proposal, and the cycle still completes."""
+    _seed_rules(
+        repo,
+        monkeypatch,
+        (Dca(product_id=PRODUCT, cadence_days=1), "live"),
+        (_AlwaysReduceRule("ADA-USD"), "live"),
+    )
+    now = _history(repo, 41)
+    _held_since_day_0(repo, "ADA-USD")
+    broker = _RaisingCandlesBroker(raises_for="ADA-USD", base={"ADA": Decimal("1000")})
+    config = _config(allowlist=["ADA", "BTC", "ETH", "PAXG"])
+
+    result = run_once(broker, repo, config, now_ts=now)
+
+    buy = broker.sequence.index(("place", PRODUCT, Side.BUY))
+    ada_polls = [i for i, call in enumerate(broker.sequence) if call[:2] == ("candles", "ADA-USD")]
+    assert ada_polls and min(ada_polls) > buy
+    assert result.skipped is False and [r.placed for r in result.enter_results] == [True]
+    assert result.stale_products == ["ADA-USD"], "no series, so the reduction step skips it"
+    assert result.reduce_results == [] and repo.get_sell_proposals() == []
+
+
+def _held_paxg_equity(repo, monkeypatch, *, with_sleeve_rule: bool) -> Decimal:
+    """One live cycle: a due BTC DCA, and 1 PAXG held at a cost of 80 whose stored close is 100.
+    No entry rule polls PAXG, so equity has always valued it AT COST (`_mark_to_market_parts`)."""
+    rules: list[tuple[Rule, str]] = [(Dca(product_id=PRODUCT, cadence_days=1), "live")]
+    if with_sleeve_rule:
+        rules.append((_AlwaysReduceRule("PAXG-USD"), "live"))
+    _seed_rules(repo, monkeypatch, *rules)
+    now = _history(repo, 41)
+    _history(repo, 41, product="PAXG-USD")
+    _held_since_day_0(repo, "PAXG-USD")
+    broker = _HoldingBroker(base={"PAXG": Decimal("1")})
+
+    run_once(broker, repo, _config(), now_ts=now)
+
+    [point] = repo.get_equity_points()
+    return point.equity
+
+
+@pytest.mark.parametrize("with_sleeve_rule", [False, True], ids=["no-sleeve-rule", "sleeve-rule"])
+def test_a_sleeve_rule_does_not_move_equity(repo, monkeypatch, with_sleeve_rule):
+    """Coordinator constraint (b): rail 11's equity is byte-identical to origin/main's whether or
+    not a sleeve rule exists. Without one, it is origin/main's computation unchanged (cash plus
+    PAXG at its cost, 80); with one, the sleeve product is NOT added to the products equity is
+    marked over, so it is still 80 -- not the fresh close of 100."""
+    equity = _held_paxg_equity(repo, monkeypatch, with_sleeve_rule=with_sleeve_rule)
+
+    assert equity == Decimal("1000000") + Decimal("80")
