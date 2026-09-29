@@ -14,6 +14,8 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from decimal import Decimal
 
+import pytest
+
 from keel.commands.simulate import build_account_metrics
 from keel.config import Caps, Config, DcaConfig, MarketDataConfig, SubscriptionConfig
 from keel.sim import portfolio_sim, report
@@ -671,3 +673,127 @@ def test_the_account_sim_skips_a_distribution_that_would_breach_the_volume_cap()
     assert _sells("100", None) == 1, "fixture: uncapped, the day-30 distribution sells"
     assert _sells("10", Decimal("100")) == 1, "fixture: a sale under the cap still sells"
     assert _sells("100", Decimal("100")) == 0
+
+
+# ---------------------------------------------------------------------------
+# (i) the rendered tables carry the sell columns once anything was distributed
+# ---------------------------------------------------------------------------
+
+_SELL_HEADER = ["Distributions", "Units sold", "Distributed (net)", "Sell fees", "Realised P&L"]
+
+
+def test_render_markdown_shows_the_distribution_columns_on_both_tables() -> None:
+    market = _hourly_market({0: "100"}, 61)
+    rules: list[Rule] = [Dca("BTC-USD", cadence_days=7), _rev()]
+    result = _run_account(rules, market)
+    hourly = market["BTC"][Granularity.ONE_HOUR]
+    metrics = build_account_metrics(result, hourly[0].ts, hourly[-1].ts)
+    daily = {"BTC": {Granularity.ONE_DAY: market["BTC"][Granularity.ONE_DAY]}}
+    accumulation = accumulation_table(rules, daily, fee_pct=Decimal("0.01"), slippage_pct=_ZERO)
+    edge = report.edge_table(rules, market, fee_pct=_ZERO, slippage_pct=_ZERO)
+
+    md = report.render_markdown(
+        result,
+        edge,
+        metrics,
+        _benchmark(),
+        report.Verdict("TRAIN MORE", ["x"], True, False, False),
+        report.analyze_gaps(SimTelemetry(), {}, move_threshold_pct=Decimal("0.05")),
+        accumulation=accumulation,
+    )
+
+    base = ["Buys", "Qty", "Cost basis", "Last close", "Value", "Unrealized P&L"]
+    acc = _table_under(md, "## DCA accumulation (not round trips)")
+    assert acc[0] == ["Rule", *base, *_SELL_HEADER]
+    rev = accumulation["reverse_dca:BTC"]
+    assert acc[1:] == [
+        [key, str(r.buys), str(r.qty), str(r.cost_usd), str(r.last_close), str(r.value_usd),
+         str(r.unrealized_pnl), str(r.distributions), str(r.units_sold), str(r.distributed_usd),
+         str(r.sell_fees), str(r.realised_pnl)]
+        for key, r in accumulation.items()
+    ]  # fmt: skip
+    assert [row[0] for row in acc[1:]] == ["dca:BTC", "reverse_dca:BTC"]
+    assert rev.distributions == 1, "fixture: the edge pass distributed"
+
+    sleeve = _table_under(md, "### DCA sleeve (accumulation, marked to market)")
+    assert sleeve[0] == ["Asset", *base, *_SELL_HEADER]
+    row = metrics["dca_sleeve"]["BTC"]
+    assert row.distributions == 1, "fixture: the account sim distributed"
+    assert sleeve[1][7:] == [
+        str(row.distributions),
+        str(row.units_sold),
+        str(row.distributed_usd),
+        str(row.sell_fees),
+        str(row.realised_pnl),
+    ]
+
+
+def test_a_sleeve_with_no_distribution_renders_exactly_as_before() -> None:
+    """Nothing sold, nothing new: the seven #821 columns, byte for byte."""
+    rows = {
+        "dca:BTC": portfolio_sim.DcaSleeve.marked(1, Decimal("1"), Decimal("100"), Decimal("120"))
+    }
+
+    lines = report._render_holdings_table("Rule", rows)
+
+    assert lines == [
+        "| Rule | Buys | Qty | Cost basis | Last close | Value | Unrealized P&L |",
+        "|---|---|---|---|---|---|---|",
+        "| dca:BTC | 1 | 1 | 100 | 120 | 120 | 20 |",
+    ]
+
+
+def test_the_accumulation_paragraph_on_distributions_appears_only_when_one_was_made() -> None:
+    held = portfolio_sim.DcaSleeve.marked(1, Decimal("1"), Decimal("100"), Decimal("120"))
+    sold = portfolio_sim.DcaSleeve.marked(
+        0, _ZERO, _ZERO, Decimal("120"), distributions=1, units_sold=Decimal("0.1")
+    )
+
+    quiet = report._render_accumulation_section({"dca:BTC": held})
+    loud = report._render_accumulation_section({"dca:BTC": held, "reverse_dca:BTC": sold})
+
+    quiet_table = report._render_holdings_table("Rule", {"dca:BTC": held})
+    assert quiet == [*quiet[:4], *quiet_table] and len(quiet) == 4 + len(quiet_table)
+    loud_table = report._render_holdings_table("Rule", {"dca:BTC": held, "reverse_dca:BTC": sold})
+    assert loud[:3] == quiet[:3] and loud[3] == "" and loud[5] == ""
+    assert loud[6:] == loud_table and loud[4] not in quiet
+
+
+def test_simulate_slices_the_accumulation_row_at_the_configured_per_order_cap(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`keel simulate` hands the edge pass the config's rail-2 cap, the one the account sim and
+    `guards.check` read, so the two sim passes slice a distribution alike."""
+    from keel.commands import simulate as simulate_service
+    from keel.commands._products import _default_sim_products
+    from keel.data.db import connect, migrate
+    from keel.data.repository import Repository
+    from tests.commands.test_service_parity import NOW_TS, _seed_sim_candles
+
+    seen: list[dict] = []
+    real = report.accumulation_table
+
+    def spy(*args: object, **kwargs: object) -> dict:
+        seen.append(kwargs)
+        return real(*args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(report, "accumulation_table", spy)
+    repo = Repository(connect(":memory:"))
+    migrate(repo._conn)  # noqa: SLF001
+    _seed_sim_candles(repo, NOW_TS)
+    config = _config(max_per_order_usd=Decimal("777"))
+
+    simulate_service.run_simulation(
+        repo,
+        config,
+        None,
+        db_path=":memory:",
+        products=_default_sim_products(config),
+        years=1,
+        monthly_contribution=Decimal("500"),
+        now_ts=NOW_TS,
+        no_trial_record=True,
+        skip_within_cap=True,
+    )
+
+    assert [call["max_per_order_usd"] for call in seen] == [Decimal("777")]

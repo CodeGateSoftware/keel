@@ -1010,21 +1010,32 @@ def _render_edge_section(
 
 def _render_holdings_table(first_column: str, rows: dict[str, DcaSleeve]) -> list[str]:
     """One Markdown row per accumulated holding (`DcaSleeve`), shared by the edge pass's
-    accumulation section and the account's DCA sleeve so the two read identically."""
-    lines = [
-        f"| {first_column} | Buys | Qty | Cost basis | Last close | Value | Unrealized P&L |",
-        "|---|---|---|---|---|---|---|",
-    ]
+    accumulation section and the account's DCA sleeve so the two read identically.
+
+    The five sell columns (#857) are added only when some row distributed: a sleeve nothing sold
+    from renders exactly as it did before the reverse path existed."""
+    sold = any(row.distributions for row in rows.values())
+    header = f"| {first_column} | Buys | Qty | Cost basis | Last close | Value | Unrealized P&L |"
+    if sold:
+        header += " Distributions | Units sold | Distributed (net) | Sell fees | Realised P&L |"
+    lines = [header, "|---" * (12 if sold else 7) + "|"]
     for key, row in rows.items():
-        lines.append(
+        line = (
             f"| {key} | {row.buys} | {row.qty} | {row.cost_usd} | {row.last_close} | "
             f"{row.value_usd} | {row.unrealized_pnl} |"
         )
+        if sold:
+            line += (
+                f" {row.distributions} | {row.units_sold} | {row.distributed_usd} | "
+                f"{row.sell_fees} | {row.realised_pnl} |"
+            )
+        lines.append(line)
     return lines
 
 
 def _render_accumulation_section(accumulation: dict[str, DcaSleeve]) -> list[str]:
     """Accumulating rules' edge pass (#821), kept apart from the round-trip edge table."""
+    distributed = any(row.distributions for row in accumulation.values())
     return [
         "## DCA accumulation (not round trips)",
         "",
@@ -1032,6 +1043,16 @@ def _render_accumulation_section(accumulation: dict[str, DcaSleeve]) -> list[str
         "expectancy or R-multiples. Each row is its buys over the daily series (decided on "
         "completed days, once per day, filled at the next open), their cost including fees, and "
         f"the holding marked at the last close. Not in `{POOLED_KEY}`, not in G2.",
+        *(
+            [
+                "",
+                "A sleeve-sell rule's row (`reverse_dca`) carries its distributions instead: sold "
+                "FIFO from the rows above, which report what remains. A fidelity figure of the "
+                "harness, not a verdict about returns.",
+            ]
+            if distributed
+            else []
+        ),
         "",
         *_render_holdings_table("Rule", accumulation),
     ]
