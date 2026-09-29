@@ -103,6 +103,13 @@ def test_render_proposal_leads_with_the_line_then_the_detail() -> None:
     assert detail["order"] == "none"
 
 
+def test_render_proposal_prints_the_order_id_when_placed() -> None:
+    row = _stored(decision="placed", order_id=12)
+    lines = sleeve_report.render_proposal(row)
+    detail = dict(line.strip().split(": ", 1) for line in lines[1:])
+    assert detail["order"] == "#12"
+
+
 # -- the CLI -----------------------------------------------------------------------------------
 
 
