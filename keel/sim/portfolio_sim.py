@@ -79,12 +79,13 @@ from __future__ import annotations
 
 import bisect
 from collections import defaultdict
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from decimal import Decimal
 
 from keel.analysis import regime
 from keel.config import Config
-from keel.execution import sizing
+from keel.execution import sizing, sleeve
 from keel.execution.executor import DcaSizeInvalid, _dca_budget
 from keel.execution.guards import _asset, _utc_day_bounds, _utc_month_bounds
 from keel.sim.account import OpenIntent, OpenPosition, SimAccount
@@ -97,22 +98,37 @@ from keel.strategy.backtest import (
     _touches,
 )
 from keel.strategy.exit_policy import ExitPolicy, next_stop, policy_for, trailing_atr
+from keel.strategy.promotion import SLEEVE_SELL
+from keel.strategy.reduction import Holding, Reduction, SellCosts
 from keel.strategy.rules.base import Rule, Setup, Signal, initial_risk_of, r_multiple_of
+from keel.strategy.rules.dca import Dca
 from keel.types import Candle, Granularity
 
 __all__ = [
+    "BELOW_ONE_LEG",
     "DUST_FLOOR",
     "IDLE_SPAN_MIN_HOURS",
     "MOVE_THRESHOLD_PCT",
+    "SIM_FEE_SOURCE",
     "WINDOW_BARS",
     "DcaBuy",
+    "DcaSell",
     "DcaSleeve",
     "SimResult",
     "SimTelemetry",
     "SimTrade",
+    "SleeveSale",
+    "dca_on_cadence",
     "dca_sleeve",
+    "decide_sleeve_sale",
     "run",
+    "sleeve_sellers",
 ]
+
+#: How a simulated sale's fee is priced: the sim's own configured rate (`run`'s `fee_pct`),
+#: never a venue quote and never a literal (spec §2.2). It labels the `SellCosts` a sleeve rule
+#: sizes against, as `sleeve.FALLBACK_FEE_SOURCE` labels the live cycle's.
+SIM_FEE_SOURCE = "sim:fee_pct"
 
 # Floor for the rolling ONE_HOUR window size handed to `Rule.detect`/`engine.evaluate` -- large
 # enough for every existing rule's longest lookback (EMA-200, 90-bar-equivalent structure) even
@@ -196,12 +212,21 @@ class DcaBuy:
 
 @dataclass(frozen=True)
 class DcaSleeve:
-    """An accumulated DCA holding, marked to market (#821) -- the account sim's never-closed
-    sleeve for one asset, or the edge pass's accumulation row for one DCA rule. NOT a round
-    trip: nothing here was sold, so the P&L is unrealized.
+    """An accumulated DCA holding, marked to market (#821) -- the account sim's sleeve for one
+    asset, or the edge pass's accumulation row for one accumulating rule. NOT a round trip.
 
-    `cost_usd` is every buy's cash outlay, fees included, so `unrealized_pnl` is net of entry
-    costs; `value_usd` is `qty * last_close`."""
+    `cost_usd` is what the units STILL HELD cost, fees included, so `unrealized_pnl` is net of
+    entry costs; `value_usd` is `qty * last_close`. With no distribution that is every buy's cash
+    outlay, exactly as before #857.
+
+    **The sell columns (#857, P11)** -- `distributions`, `units_sold`, `distributed_usd` (the NET
+    cash the sales delivered, after their fee), `sell_fees` and `realised_pnl` (net proceeds less
+    the fee-inclusive basis of the units sold) -- are zero on a sleeve nothing sold from. On the
+    edge pass they sit on the SELLING rule's row (`reverse_dca`), whose own buys, qty and cost are
+    zero, and the basis is FIFO over the asset's lots (`report.accumulation_table`); on the
+    account sim they sit on the asset's row, and the basis is its one averaged lot's (plan R32,
+    `SimAccount.reduce_dca`). Either way they are a fidelity figure of the harness, not a verdict
+    about returns (spec §6, "Evidence status")."""
 
     buys: int
     qty: Decimal
@@ -209,11 +234,170 @@ class DcaSleeve:
     last_close: Decimal
     value_usd: Decimal
     unrealized_pnl: Decimal
+    distributions: int = 0
+    units_sold: Decimal = Decimal("0")
+    distributed_usd: Decimal = Decimal("0")
+    realised_pnl: Decimal = Decimal("0")
+    sell_fees: Decimal = Decimal("0")
 
     @classmethod
-    def marked(cls, buys: int, qty: Decimal, cost_usd: Decimal, last_close: Decimal) -> DcaSleeve:
+    def marked(
+        cls,
+        buys: int,
+        qty: Decimal,
+        cost_usd: Decimal,
+        last_close: Decimal,
+        *,
+        distributions: int = 0,
+        units_sold: Decimal = Decimal("0"),
+        distributed_usd: Decimal = Decimal("0"),
+        realised_pnl: Decimal = Decimal("0"),
+        sell_fees: Decimal = Decimal("0"),
+    ) -> DcaSleeve:
         value = qty * last_close
-        return cls(buys, qty, cost_usd, last_close, value, value - cost_usd)
+        return cls(
+            buys,
+            qty,
+            cost_usd,
+            last_close,
+            value,
+            value - cost_usd,
+            distributions=distributions,
+            units_sold=units_sold,
+            distributed_usd=distributed_usd,
+            realised_pnl=realised_pnl,
+            sell_fees=sell_fees,
+        )
+
+
+@dataclass(frozen=True)
+class DcaSell:
+    """One sleeve distribution the account sim filled (#857, P11) -- the reverse of `DcaBuy`.
+
+    `expected_price` is the completed daily close the rule decided on, which rail 2's slicing
+    reads (`sleeve.slice_qty`), as `executor.reduce` reads it live; `fill_price` is the next
+    hourly bar's open less slippage. `net_usd` is `gross_usd - fee_usd`, the cash credited.
+    `cost_basis` and `realised_pnl` are AVERAGE-cost, against the account's one averaged lot
+    (plan R32): the FIFO-faithful figure is `report.accumulation_table`'s."""
+
+    asset: str
+    rule_kind: str
+    decision_ts: int
+    fill_ts: int
+    qty: Decimal
+    expected_price: Decimal
+    fill_price: Decimal
+    gross_usd: Decimal
+    fee_usd: Decimal
+    net_usd: Decimal
+    cost_basis: Decimal
+    realised_pnl: Decimal
+
+
+@dataclass(frozen=True)
+class SleeveSale:
+    """A decided sleeve sale: the arbitration winner, its `Reduction`, and either the sleeve cap
+    that refused it (`refusal`, one of `sleeve_refusal`'s answers or `BELOW_ONE_LEG`) or the one
+    leg rail 2 lets it sell today (`leg_qty`, zero when refused)."""
+
+    rule: Rule
+    reduction: Reduction
+    refusal: str | None
+    leg_qty: Decimal
+
+
+#: The sim's answer when rail 2's slicer can express no leg -- `executor.reduce`'s own
+#: `rails.sleeve` word for the same case.
+BELOW_ONE_LEG = "below_one_increment"
+
+
+def sleeve_sellers(rules: list[Rule]) -> list[Rule]:
+    """The sleeve-sell rules in `rules` (`promotion_class == SLEEVE_SELL`), in spec §3.6's fixed
+    arbitration order (`sleeve.ARBITRATION_ORDER`, keyed on the kind as `agent._handle_reductions`
+    keys it), ties kept in the order given."""
+    order = {kind: i for i, kind in enumerate(sleeve.ARBITRATION_ORDER)}
+    return sorted(
+        (rule for rule in rules if rule.promotion_class == SLEEVE_SELL),
+        key=lambda rule: order.get(rule.name, len(order)),
+    )
+
+
+def dca_on_cadence(rules: list[Rule], candles_by_tf: dict[Granularity, list[Candle]]) -> bool:
+    """The cadence half of `agent._dca_fires_today`: a `Dca` rule among `rules` is on cadence on
+    this view. A `detect` that raises counts as firing -- refusing the sale is the direction that
+    costs nothing, as it is live. (The ledger half, "a buy already filled today", is the caller's:
+    the account sim reads its own buys, and the edge pass buys only on a cadence day.)"""
+    for rule in rules:
+        if not isinstance(rule, Dca):
+            continue
+        try:
+            if rule.detect(candles_by_tf) is not None:
+                return True
+        except Exception:  # noqa: BLE001 -- fail toward refusing the sale, as live does
+            return True
+    return False
+
+
+def decide_sleeve_sale(
+    sellers: list[Rule],
+    holding: Holding,
+    candles_by_tf: dict[Granularity, list[Candle]],
+    costs: SellCosts,
+    *,
+    dca_fires_today: bool,
+    last_sale_ts: Callable[[Rule], int | None],
+    now_ts: int,
+    max_per_order_usd: Decimal,
+) -> SleeveSale | None:
+    """The live pipeline's decision for one product on one day, over a sim-built `holding`
+    (#857, P11): `None` when no seller fires, else the winner and what the sleeve caps and rail 2
+    make of it. ONE definition for both sim passes -- the edge pass's FIFO lots and the account
+    sim's averaged lot -- and every step is the live one's own code, not a copy of it:
+
+    1. `sellers` (from `sleeve_sellers`) are asked in arbitration order; the first `Reduction`
+       wins (`agent._handle_reductions`), so there is at most one sale per product per day (R14).
+       A rule that raises costs that rule only.
+    2. `sleeve.sleeve_refusal` -- same-day DCA, `min_hold_days` on the lots the FIFO sale would
+       consume (R12), `cooldown_days` (R15) read from `last_sale_ts`, the sim's record of the
+       rule's last sale, as live reads its last `preview`/`placed` proposal.
+    3. The sale is capped at the holding (`executor.reduce`'s `min(qty, holding.qty)`), then
+       sliced by `sleeve.slice_qty` at the decision close with no venue increment (`None`: the
+       sim has no instrument, which is `_order_spec`'s unquantized rule for a SELL). One leg is
+       sold; the rest is not carried, because the rule is off cadence tomorrow -- live proposes
+       one leg per day the same way.
+    """
+    fired: tuple[Rule, Reduction] | None = None
+    for rule in sellers:
+        try:
+            reduction = rule.reduce_signal(holding, candles_by_tf, costs)
+        except Exception:  # noqa: BLE001 -- one broken rule must not cost the other kinds
+            continue
+        if reduction is not None:
+            fired = (rule, reduction)
+            break
+    if fired is None:
+        return None
+    rule, reduction = fired
+    refusal = sleeve.sleeve_refusal(
+        reduction=reduction,
+        holding=holding,
+        rule_kind=rule.name,
+        rule_params=rule.params,
+        dca_fires_today=dca_fires_today,
+        last_rule_proposal_ts=last_sale_ts(rule),
+        now_ts=now_ts,
+    )
+    if refusal is not None:
+        return SleeveSale(rule, reduction, refusal, Decimal("0"))
+    leg_qty, legs = sleeve.slice_qty(
+        min(reduction.qty, holding.qty),
+        reduction.expected_price,
+        max_per_order_usd=max_per_order_usd,
+        base_increment=None,
+    )
+    if legs == 0:
+        return SleeveSale(rule, reduction, BELOW_ONE_LEG, Decimal("0"))
+    return SleeveSale(rule, reduction, None, leg_qty)
 
 
 @dataclass

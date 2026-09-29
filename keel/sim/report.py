@@ -58,14 +58,22 @@ plan-prose specifics the plan leaves implicit):
 from __future__ import annotations
 
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from decimal import Decimal
 from typing import TYPE_CHECKING
 
 from keel.execution import sizing
 from keel.execution.guards import _asset
 from keel.sim.benchmark import BenchmarkResult
-from keel.sim.portfolio_sim import DcaSleeve, SimResult, SimTelemetry
+from keel.sim.portfolio_sim import (
+    SIM_FEE_SOURCE,
+    DcaSleeve,
+    SimResult,
+    SimTelemetry,
+    dca_on_cadence,
+    decide_sleeve_sale,
+    sleeve_sellers,
+)
 from keel.sim.tiers import OVER_CAP, WITHIN_CAP, TierFeeResult
 from keel.strategy.backtest import (
     SLIPPAGE_CAP_PCT,
@@ -76,7 +84,13 @@ from keel.strategy.backtest import (
     backtest,
 )
 from keel.strategy.indicators_cts import DEFAULT_WEIGHTS
-from keel.strategy.promotion import PromotionConfig, check_floors, promotion_class_of
+from keel.strategy.promotion import (
+    SLEEVE_SELL,
+    PromotionConfig,
+    check_floors,
+    promotion_class_of,
+)
+from keel.strategy.reduction import Holding, Lot, SellCosts
 from keel.strategy.rules.base import Rule, Trade
 from keel.strategy.stats import BacktestResult, summarize
 from keel.types import Candle, Granularity
@@ -253,6 +267,7 @@ def accumulation_table(
     fee_pct: Decimal,
     slippage_pct: Decimal,
     slippage_by_product: Callable[[str], Decimal] | None = None,
+    max_per_order_usd: Decimal | None = None,
 ) -> dict[str, DcaSleeve]:
     """The edge pass for ACCUMULATING rules (`Rule.accumulates` -- `Dca`), keyed like
     `edge_table` (`rule_keys`: `"{rule.name}:{asset}"`, disambiguated on collision) but never
@@ -265,48 +280,185 @@ def accumulation_table(
     the entry fee), sized `sizing.dca_size(size_usd, entry)` exactly as the account sim sizes
     it; a decision on the series' last day has no next bar and is dropped, as it is there.
 
-    The row is accumulation, not round trips: the number of buys, the cash they cost (fees
-    included), and that holding marked at the last daily close, with its unrealized P&L.
-    Nothing here is a trade, so none of it reaches `__pooled__` or G2. Risk-defined rules are
-    ignored (they are `edge_table`'s); a rule whose asset has no daily candles gets a
+    The row is accumulation, not round trips: the number of buys, what the units still held
+    cost (fees included), and that holding marked at the last daily close, with its unrealized
+    P&L. Nothing here is a trade, so none of it reaches `__pooled__` or G2. Risk-defined rules
+    are ignored (they are `edge_table`'s); a rule whose asset has no daily candles gets a
     zero-buy row rather than raising.
+
+    **The reverse path (#857, P11): a sleeve-sell rule (`reverse_dca`) sells from the asset's
+    lots, FIFO.** The accumulating rules are processed PER ASSET, over one pool of lots, oldest
+    first and, within a day, in rule order; each lot names the buying rule's key. On each
+    decided day the order is the live cycle's (`agent.run_once`, which runs
+    `_handle_reductions` LAST): the buys are decided, then the sale. Neither order changes a
+    number, because the sale is refused on any day a `Dca` is on cadence (`dca_on_cadence`,
+    the same-day-DCA cap), and a buy is only ever decided on such a day. The sale is decided by
+    `portfolio_sim.decide_sleeve_sale` -- arbitration, `sleeve.sleeve_refusal` with
+    `now_ts=fill_bar.ts`, and `sleeve.slice_qty` at `max_per_order_usd` (no cap when `None`)
+    with no venue increment -- and fills at the next day's open less slippage, paying the fee on
+    that notional. A skipped distribution is not carried forward, as live.
+
+    So each buying rule's row reports its OWN REMAINING lots (qty, and cost net of the basis
+    sold from them), and each selling rule's row has `buys=0`, `qty=0`, `cost_usd=0` and carries
+    the sell columns: `distributions`, `units_sold`, `distributed_usd` (net), `sell_fees` and a
+    FIFO-exact `realised_pnl`. The account sim books the same sale at average cost against its
+    one averaged lot (plan R32); this row is the FIFO-faithful one.
+
+    **A harness-fidelity artefact, not a verdict.** The sell columns reproduce hand computations
+    on synthetic candles (spec §6, "Evidence status"); they claim nothing about returns, and the
+    research freeze (2026-09-27) is untouched by them.
     """
+    keys = rule_keys(rules)
     rows: dict[str, DcaSleeve] = {}
-    for rule, key in zip(rules, rule_keys(rules), strict=True):
-        if not rule.accumulates:
-            continue
-        asset = _asset(rule.product_id)
+    by_asset: dict[str, list[tuple[Rule, str]]] = {}
+    for rule, key in zip(rules, keys, strict=True):
+        if rule.accumulates:
+            by_asset.setdefault(_asset(rule.product_id), []).append((rule, key))
+
+    def slip_of(product_id: str) -> Decimal:
+        return slippage_pct if slippage_by_product is None else slippage_by_product(product_id)
+
+    for asset, keyed in by_asset.items():
         daily = candles_by_asset.get(asset, {}).get(Granularity.ONE_DAY, [])
-        slip = (
-            slippage_by_product(rule.product_id)
-            if slippage_by_product is not None
-            else slippage_pct
+        rows.update(
+            _accumulate_asset(
+                keyed,
+                daily,
+                fee_pct=fee_pct,
+                slip_of=slip_of,
+                max_per_order_usd=(
+                    Decimal("Infinity") if max_per_order_usd is None else max_per_order_usd
+                ),
+            )
         )
-        decided: set[int] = set()
-        buys, qty, cost = 0, Decimal("0"), Decimal("0")
-        for i in range(len(daily) - 1):
-            fill_bar = daily[i + 1]
-            setup = rule.detect({Granularity.ONE_DAY: daily[: i + 1]})
-            if setup is None:
+    return {key: rows[key] for key in keys if key in rows}
+
+
+@dataclass
+class _SellTally:
+    """One selling rule's running sell columns over the edge pass."""
+
+    distributions: int = 0
+    units_sold: Decimal = Decimal("0")
+    distributed_usd: Decimal = Decimal("0")
+    realised_pnl: Decimal = Decimal("0")
+    sell_fees: Decimal = Decimal("0")
+
+
+def _accumulate_asset(
+    keyed: list[tuple[Rule, str]],
+    daily: list[Candle],
+    *,
+    fee_pct: Decimal,
+    slip_of: Callable[[str], Decimal],
+    max_per_order_usd: Decimal,
+) -> dict[str, DcaSleeve]:
+    """`accumulation_table` for ONE asset's accumulating rules over its daily series: one FIFO
+    pool of `Lot`s, each buying rule's remaining lots, and each selling rule's sales."""
+    sellers = sleeve_sellers([rule for rule, _ in keyed])
+    buyers = [(rule, key) for rule, key in keyed if rule.promotion_class != SLEEVE_SELL]
+    key_of = {id(rule): key for rule, key in keyed}
+    lots: list[Lot] = []
+    buys = {key: 0 for _, key in buyers}
+    cost = {key: Decimal("0") for _, key in buyers}
+    decided: dict[str, set[int]] = {key: set() for _, key in buyers}
+    sold = {key_of[id(rule)]: _SellTally() for rule in sellers}
+    last_sale: dict[str, int] = {}
+    sale_days: set[int] = set()
+    for i in range(len(daily) - 1):
+        fill_bar = daily[i + 1]
+        view = {Granularity.ONE_DAY: daily[: i + 1]}
+        # Once per decision day -- the day after the completed bar, as in the account sim. One
+        # bar per day makes this a no-op on a clean series; a duplicated daily bar would
+        # otherwise buy twice.
+        day = fill_bar.ts // 86_400
+        for rule, key in buyers:
+            setup = rule.detect(view)
+            if setup is None or day in decided[key]:
                 continue
-            # Once per decision day -- the day after the completed bar, as in the account
-            # sim. One bar per day makes this a no-op on a clean series; a duplicated daily
-            # bar would otherwise buy twice.
-            day = fill_bar.ts // 86_400
-            if day in decided:
-                continue
-            decided.add(day)
+            decided[key].add(day)
             budget = setup.context.get("size_usd")
             if budget is None or setup.entry <= 0:
                 continue
             buy_qty = sizing.dca_size(budget, setup.entry)
-            fill = fill_bar.open * (Decimal(1) + slip)
-            buys += 1
-            qty += buy_qty
-            cost += fill * buy_qty * (Decimal(1) + fee_pct)
-        last_close = daily[-1].close if daily else Decimal("0")
-        rows[key] = DcaSleeve.marked(buys, qty, cost, last_close)
-    return rows
+            fill = fill_bar.open * (Decimal(1) + slip_of(rule.product_id))
+            buys[key] += 1
+            cost[key] += fill * buy_qty * (Decimal(1) + fee_pct)
+            lots.append(
+                Lot(
+                    position_id=len(lots),
+                    rule_name=key,
+                    opened_at=fill_bar.ts,
+                    qty=buy_qty,
+                    entry_fill=fill,
+                    entry_fee=fill * buy_qty * fee_pct,
+                )
+            )
+        holding = Holding(keyed[0][0].product_id, tuple(lots))
+        if not sellers or day in sale_days or holding.qty <= 0:
+            continue
+        sale = decide_sleeve_sale(
+            sellers,
+            holding,
+            view,
+            SellCosts(fee_pct, slip_of(sellers[0].product_id), SIM_FEE_SOURCE),
+            dca_fires_today=dca_on_cadence([rule for rule, _ in buyers], view),
+            last_sale_ts=lambda rule: last_sale.get(key_of[id(rule)]),
+            now_ts=fill_bar.ts,
+            max_per_order_usd=max_per_order_usd,
+        )
+        if sale is None:
+            continue
+        sale_days.add(day)
+        if sale.refusal is not None:
+            continue
+        seller = key_of[id(sale.rule)]
+        leg = sale.leg_qty
+        gross = leg * fill_bar.open * (Decimal(1) - slip_of(sale.rule.product_id))
+        fee = gross * fee_pct
+        basis = Decimal("0")
+        remaining: list[Lot] = []
+        consumed = {lot.position_id: take for lot, take in holding.fifo_legs(leg)}
+        for lot in lots:
+            take = consumed.get(lot.position_id, Decimal("0"))
+            if take <= 0:
+                remaining.append(lot)
+                continue
+            # The basis of the units taken from THIS lot, by `Holding.fifo_cost`'s own
+            # definition, and charged to the buying rule that owns it.
+            leg_basis = Holding(holding.product_id, (lot,)).fifo_cost(take)
+            basis += leg_basis
+            cost[lot.rule_name] -= leg_basis
+            if take < lot.qty:
+                remaining.append(
+                    replace(lot, qty=lot.qty - take, realized_qty=lot.realized_qty + take)
+                )
+        lots = remaining
+        tally = sold[seller]
+        tally.distributions += 1
+        tally.units_sold += leg
+        tally.distributed_usd += gross - fee
+        tally.sell_fees += fee
+        tally.realised_pnl += gross - fee - basis
+        last_sale[seller] = fill_bar.ts
+    last_close = daily[-1].close if daily else Decimal("0")
+    out: dict[str, DcaSleeve] = {}
+    for _, key in buyers:
+        held = sum((lot.qty for lot in lots if lot.rule_name == key), Decimal("0"))
+        out[key] = DcaSleeve.marked(buys[key], held, cost[key], last_close)
+    for key, tally in sold.items():
+        out[key] = DcaSleeve.marked(
+            0,
+            Decimal("0"),
+            Decimal("0"),
+            last_close,
+            distributions=tally.distributions,
+            units_sold=tally.units_sold,
+            distributed_usd=tally.distributed_usd,
+            realised_pnl=tally.realised_pnl,
+            sell_fees=tally.sell_fees,
+        )
+    return out
 
 
 def _chronological(trades: list[Trade]) -> list[Trade]:

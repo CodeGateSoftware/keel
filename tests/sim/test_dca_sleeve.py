@@ -19,8 +19,10 @@ from keel.config import Caps, Config, DcaConfig, MarketDataConfig, SubscriptionC
 from keel.sim import portfolio_sim, report
 from keel.sim.benchmark import BenchmarkResult
 from keel.sim.portfolio_sim import SimTelemetry
+from keel.sim.report import accumulation_table, rule_keys
 from keel.strategy.rules.base import Rule, Setup
 from keel.strategy.rules.dca import Dca
+from keel.strategy.rules.reverse_dca import ReverseDca
 from keel.types import Candle, Granularity
 
 _HOUR = 3_600
@@ -339,3 +341,205 @@ def test_backtest_still_gives_dca_no_round_trips():
 
     daily = _market()["BTC"][Granularity.ONE_DAY]
     assert backtest(_dca(), daily, fee_pct=_ZERO, slippage_pct=_ZERO).n_trades == 0
+
+
+# ---------------------------------------------------------------------------
+# (g) the reverse path: `reverse_dca` distributions in the accumulation row (#857, P11)
+#
+# Fidelity checks of the harness against hand computations on synthetic, gapless candles
+# (spec §6, "Evidence status"). No real history is read, and nothing here is a verdict.
+# ---------------------------------------------------------------------------
+
+_Q8 = Decimal("0.00000001")
+_CENT = Decimal("0.01")
+
+
+def _candle(day: int, close: str) -> Candle:
+    """A daily bar for epoch day `day`, flat at `close` (so the next bar's open is its price)."""
+    c = Decimal(close)
+    return Candle(ts=day * _DAY, open=c, high=c, low=c, close=c, volume=Decimal("10"))
+
+
+def _rev(**overrides: object) -> ReverseDca:
+    kw: dict = dict(target_usd=Decimal("10"), min_price_floor=Decimal("1"))
+    kw.update(overrides)
+    return ReverseDca("BTC-USD", **kw)
+
+
+def test_the_row_keys_are_rule_keys() -> None:
+    dca, rev = Dca("BTC-USD", cadence_days=7), _rev()
+    daily = [_candle(d, "100") for d in range(61)]
+
+    rows = accumulation_table(
+        [dca, rev], {"BTC": {Granularity.ONE_DAY: daily}}, fee_pct=_ZERO, slippage_pct=_ZERO
+    )
+
+    assert list(rows) == rule_keys([dca, rev]) == ["dca:BTC", "reverse_dca:BTC"]
+
+
+def test_a_distribution_reproduces_the_hand_computation_on_gapless_candles() -> None:
+    """61 flat days at 100. DCA every 7 days, $50, fee 1%, no slippage: buys decided on days
+    0,7,...,56 (9 buys, 0.5 each, $50.50 each). reverse_dca every 30 days, $10 net: day 0 is a
+    DCA day and holds nothing; day 30 sells gross 10/0.99 at day 31's open 100, i.e. 0.10101010
+    units; its FIFO cost is 0.1010101 x 100 x 1.01; so realised = 10.00 - 10.20 = -0.20."""
+    daily = [_candle(d, "100") for d in range(61)]
+    dca = Dca("BTC-USD", cadence_days=7, budget_usd=Decimal("50"))
+    rev = _rev()
+
+    rows = accumulation_table(
+        [dca, rev],
+        {"BTC": {Granularity.ONE_DAY: daily}},
+        fee_pct=Decimal("0.01"),
+        slippage_pct=Decimal("0"),
+    )
+
+    out = rows["reverse_dca:BTC"]
+    assert out.distributions == 1
+    assert out.units_sold.quantize(_Q8) == Decimal("0.10101010")
+    assert out.distributed_usd.quantize(_CENT) == Decimal("10.00")
+    assert out.sell_fees.quantize(_CENT) == Decimal("0.10")
+    assert out.realised_pnl.quantize(_CENT) == Decimal("-0.20")
+    # The seller's row holds and bought nothing: its columns are the sale's.
+    assert (out.buys, out.qty, out.cost_usd, out.value_usd) == (0, _ZERO, _ZERO, _ZERO)
+    kept = rows["dca:BTC"]
+    assert kept.buys == 9
+    assert (kept.qty + out.units_sold) == Decimal("4.5")
+    # The buyer's row carries no sale columns: the sale is the seller's.
+    assert (kept.distributions, kept.units_sold, kept.realised_pnl) == (0, _ZERO, _ZERO)
+
+
+def test_the_buyer_row_reports_its_remaining_lots_cost_after_the_sale() -> None:
+    """The kept row's cost basis is what the REMAINING units cost, fee-inclusive: 9 x $50.50
+    bought, less the 0.10101010 units sold at $101 each (100 x 1.01)."""
+    daily = [_candle(d, "100") for d in range(61)]
+    rows = accumulation_table(
+        [Dca("BTC-USD", cadence_days=7), _rev()],
+        {"BTC": {Granularity.ONE_DAY: daily}},
+        fee_pct=Decimal("0.01"),
+        slippage_pct=_ZERO,
+    )
+
+    kept, out = rows["dca:BTC"], rows["reverse_dca:BTC"]
+    assert kept.cost_usd.quantize(_Q8) == (
+        Decimal("9") * Decimal("50.50") - out.units_sold * Decimal("101")
+    ).quantize(_Q8)
+    assert kept.value_usd == kept.qty * Decimal("100")
+
+
+def test_the_sale_consumes_the_oldest_lot_first_not_the_average() -> None:
+    """FIFO, not average cost (R32). The day-7 buy is sized at day 7's close (100, so 0.5 units)
+    and fills at day 8's open, 200; later buys are 0.25 units at 200. Day 30 sells gross
+    10/0.99 at 200 = 0.050505 units, all from the day-1 lot bought at 100: cost
+    0.050505 x 100 x 1.01 = 5.10, so realised = 10.00 - 5.10 = 4.90. An average cost (300 over
+    1.75 units, i.e. 171.43) would have said 1.26."""
+    daily = [_candle(d, "100") for d in range(8)] + [_candle(d, "200") for d in range(8, 40)]
+    rows = accumulation_table(
+        [Dca("BTC-USD", cadence_days=7), _rev()],
+        {"BTC": {Granularity.ONE_DAY: daily}},
+        fee_pct=Decimal("0.01"),
+        slippage_pct=_ZERO,
+    )
+
+    out = rows["reverse_dca:BTC"]
+    assert out.distributions == 1
+    sold = Decimal("10") / Decimal("0.99") / Decimal("200")
+    assert out.units_sold == sold
+    assert out.realised_pnl.quantize(_CENT) == Decimal("4.90")
+    assert out.realised_pnl == out.distributed_usd - sold * Decimal("100") * Decimal("1.01")
+
+
+def test_each_dca_rule_keeps_its_own_lots_and_the_oldest_rule_lot_is_sold_first() -> None:
+    """Two DCA rules on one asset buy on the same day; the lots are one FIFO pool per asset,
+    oldest first and, within a day, in rule order. The sale reaches the first rule's lot only."""
+    first = Dca("BTC-USD", cadence_days=7, budget_usd=Decimal("50"))
+    second = Dca("BTC-USD", cadence_days=7, budget_usd=Decimal("5"))
+    rules: list[Rule] = [first, second, _rev()]
+    daily = [_candle(d, "100") for d in range(33)]
+
+    rows = accumulation_table(
+        rules, {"BTC": {Granularity.ONE_DAY: daily}}, fee_pct=_ZERO, slippage_pct=_ZERO
+    )
+
+    keys = rule_keys(rules)
+    assert keys == ["dca#1:BTC", "dca#2:BTC", "reverse_dca:BTC"]
+    # Five buys each (days 0, 7, 14, 21, 28): 2.5 and 0.25 units.
+    sold = rows["reverse_dca:BTC"].units_sold
+    assert sold == Decimal("0.1")
+    assert rows["dca#1:BTC"].qty == Decimal("2.5") - sold
+    assert rows["dca#2:BTC"].qty == Decimal("0.25")
+
+
+def test_the_run_is_deterministic() -> None:
+    rules: list[Rule] = [Dca("BTC-USD", cadence_days=7), _rev()]
+    candles = {"BTC": {Granularity.ONE_DAY: [_candle(d, str(100 + d % 5)) for d in range(120)]}}
+    kw = dict(fee_pct=Decimal("0.012"), slippage_pct=Decimal("0.0005"))
+
+    first = accumulation_table(rules, candles, **kw)
+    assert first["reverse_dca:BTC"].distributions == 3, "fixture: days 30, 60 and 90 sell"
+    assert first == accumulation_table(rules, candles, **kw)
+
+
+def test_a_distribution_on_a_dca_day_is_skipped_in_the_sim_as_live() -> None:
+    daily = [_candle(d, "100") for d in range(212)]
+    rows = accumulation_table(
+        [Dca("BTC-USD", cadence_days=7), _rev()],
+        {"BTC": {Granularity.ONE_DAY: daily}},
+        fee_pct=Decimal("0.01"),
+        slippage_pct=Decimal("0"),
+    )
+    assert rows["reverse_dca:BTC"].distributions == 6, "days 30..180 sell; 210 is a DCA day"
+
+
+def test_min_hold_days_refuses_a_sale_that_would_consume_a_young_lot() -> None:
+    """The day-30 sale fills at day 31, exactly 30 days after the day-1 lot: at the default
+    30 it sells, at 31 it is refused (R12), and the refusal is not carried to day 31."""
+    daily = [_candle(d, "100") for d in range(61)]
+    candles = {"BTC": {Granularity.ONE_DAY: daily}}
+
+    def _distributions(min_hold_days: int) -> int:
+        rows = accumulation_table(
+            [Dca("BTC-USD", cadence_days=7), _rev(min_hold_days=min_hold_days)],
+            candles,
+            fee_pct=_ZERO,
+            slippage_pct=_ZERO,
+        )
+        return rows["reverse_dca:BTC"].distributions
+
+    assert _distributions(30) == 1
+    assert _distributions(31) == 0
+
+
+def test_rail_2_slices_the_distribution_to_one_leg_per_cadence_day() -> None:
+    """With a $5 per-order cap the $10 distribution is one $5 leg (0.05 units at 100); the rest
+    is not carried to the next day (`sleeve.slice_qty`, the one slicer live uses)."""
+    daily = [_candle(d, "100") for d in range(61)]
+    rows = accumulation_table(
+        [Dca("BTC-USD", cadence_days=7), _rev()],
+        {"BTC": {Granularity.ONE_DAY: daily}},
+        fee_pct=_ZERO,
+        slippage_pct=_ZERO,
+        max_per_order_usd=Decimal("5"),
+    )
+
+    out = rows["reverse_dca:BTC"]
+    assert (out.distributions, out.units_sold, out.distributed_usd) == (
+        1,
+        Decimal("0.05"),
+        Decimal("5"),
+    )
+
+
+def test_a_sale_pays_slippage_and_the_fee() -> None:
+    """The sale fills at the next open x (1 - slippage) and pays the fee on that notional."""
+    daily = [_candle(d, "100") for d in range(61)]
+    fee, slip = Decimal("0.01"), Decimal("0.002")
+    out = accumulation_table(
+        [Dca("BTC-USD", cadence_days=7), _rev()],
+        {"BTC": {Granularity.ONE_DAY: daily}},
+        fee_pct=fee,
+        slippage_pct=slip,
+    )["reverse_dca:BTC"]
+
+    gross_notional = out.units_sold * Decimal("100") * (1 - slip)
+    assert out.sell_fees == gross_notional * fee
+    assert out.distributed_usd == gross_notional - out.sell_fees
