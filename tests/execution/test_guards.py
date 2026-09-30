@@ -2581,6 +2581,73 @@ def test_a_product_closed_at_a_gain_cannot_shrink_a_sibling_product_in_its_bucke
     assert guards._open_exposure_by_asset(repo) == {"ADA": Decimal("500")}
 
 
+def test_re_entry_after_a_loss_close_counts_only_the_new_notional(repo: Repository) -> None:
+    """#943: R33 zeroed a fully closed product only while it STAYED flat -- the close's realized
+    loss came straight back with the product's next BUY, and rails 4/5/6 counted exposure nobody
+    held for as long as the product was held again. The zero must attach to the MOMENT the
+    running quantity passed through zero. Seeded so id order is NOT time order: the reset fires
+    between fills at a moment, so walking in id order instead of (created_at, id) would net the
+    re-entry against a close that happened after it and keep the phantom alive."""
+    _seed_filled_order(  # id 1, the full close at a loss -- seeded FIRST
+        repo,
+        product_id="PAXG-USD",
+        side=Side.SELL,
+        qty=Decimal("0.02"),
+        price=Decimal("4400"),
+        created_at=NOW_TS - 86_400,
+    )
+    _seed_filled_order(  # id 2, the entry that close closed
+        repo,
+        product_id="PAXG-USD",
+        side=Side.BUY,
+        qty=Decimal("0.02"),
+        price=Decimal("4673.23"),
+        created_at=NOW_TS - 2 * 86_400,
+    )
+    _seed_filled_order(  # id 3, the re-entry -- $100 bought, $100 held
+        repo,
+        product_id="PAXG-USD",
+        side=Side.BUY,
+        qty=Decimal("1"),
+        price=Decimal("100"),
+        created_at=NOW_TS,
+    )
+    # the closed pair's residual (0.02 x 4673.23 - 0.02 x 4400 = $5.46 of loss) is not exposure
+    assert guards._open_exposure_by_asset(repo) == {"PAXG": Decimal("100")}
+
+
+def test_re_entry_after_a_gain_close_is_not_hidden_by_the_gain(repo: Repository) -> None:
+    """#943's other edge: a full close at a gain leaves a NEGATIVE residual, which used to eat
+    the next position's figure -- $100 really held read as $0 once the closed pair's $200 gain
+    was netted against it. A product net long after a flat moment contributes its post-flat
+    buys and nothing else."""
+    _seed_filled_order(
+        repo,
+        product_id="ETH-USD",
+        side=Side.BUY,
+        qty=Decimal("1"),
+        price=Decimal("100"),
+        created_at=NOW_TS - 2 * 86_400,
+    )
+    _seed_filled_order(
+        repo,
+        product_id="ETH-USD",
+        side=Side.SELL,
+        qty=Decimal("1"),
+        price=Decimal("300"),
+        created_at=NOW_TS - 86_400,
+    )
+    _seed_filled_order(
+        repo,
+        product_id="ETH-USD",
+        side=Side.BUY,
+        qty=Decimal("1"),
+        price=Decimal("100"),
+        created_at=NOW_TS,
+    )
+    assert guards._open_exposure_by_asset(repo) == {"ETH": Decimal("100")}
+
+
 # -- #900: a fee-in-quote BUY counts its full quote, fee included --------------------------------
 
 

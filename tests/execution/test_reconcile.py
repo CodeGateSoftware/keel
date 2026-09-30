@@ -16,6 +16,7 @@ from typing import Any
 
 import pytest
 from keel_broker_api.orders import OrderSpec
+from keel_broker_api.port import TradeScopeDenied
 from keel_broker_api.results import Balance, OrderStatus, PlaceResult, Preview
 from keel_core.telemetry import _FIELDS_ATTR
 
@@ -1371,6 +1372,45 @@ def test_a_retry_whose_placement_state_is_unknown_is_not_retried_again(repo, cap
     assert events.count("reconcile.position_unprotected") == 1
     [escalation] = [r for r in caplog.records if r.getMessage() == "reconcile.position_unprotected"]
     assert getattr(escalation, _FIELDS_ATTR)["retry_scheduled"] is False
+
+
+class _TradeScopeDeniedRebracketBroker(_RebracketingBroker):
+    """The venue refuses the bracket's PLACEMENT outright on permissions (#945) -- definite:
+    no order rests at the exchange, whatever a raise after the row would usually imply."""
+
+    def place_order(self, spec: OrderSpec, *, idempotency_key: str | None = None) -> PlaceResult:
+        self.placed.append({"spec": spec})
+        raise TradeScopeDenied("trade scope denied")
+
+
+def test_a_permissions_refusal_is_definite_so_the_sweep_retries_and_heals(repo, caplog):
+    """#945, the mirror of the state-unknown case above: a `TradeScopeDenied` is not ambiguity
+    to park on a human. The row is `rejected` (not `pending`), the `unbracketed:` record
+    SURVIVES, the refusal gets its own CRITICAL -- and once the credential trades again, the
+    next sweep heals, because a rejected row blocks nothing."""
+    _seed_unbracketed_tranche(repo)
+    _allow_orders(repo)
+    denied = _TradeScopeDeniedRebracketBroker()
+
+    with caplog.at_level(logging.CRITICAL):
+        reconcile.reconcile_unbracketed_positions(denied, repo, _config(), now_ts=NOW)
+
+    assert len(denied.placed) == 1
+    [refused] = repo.get_orders(mode="live", product_id=PRODUCT, status="rejected")
+    assert refused["side"] == Side.SELL.value
+    assert repo.get_state(f"unbracketed:{PRODUCT}") is not None, "the retry must survive"
+    events = [r.getMessage() for r in caplog.records if r.levelno == logging.CRITICAL]
+    assert events.count("executor.bracket_refused") == 1
+    assert events.count("executor.bracket_state_unknown") == 0
+    [escalation] = [r for r in caplog.records if r.getMessage() == "reconcile.position_unprotected"]
+    assert getattr(escalation, _FIELDS_ATTR)["retry_scheduled"] is True
+
+    healed = reconcile.reconcile_unbracketed_positions(
+        _RebracketingBroker(), repo, _config(), now_ts=NOW
+    )
+
+    assert healed == [repo.get_open_positions(PRODUCT)[0]["id"]]
+    assert repo.get_state(f"unbracketed:{PRODUCT}") is None, "healed"
 
 
 def test_a_tranche_with_a_resting_bracket_is_left_alone(repo):

@@ -1305,9 +1305,10 @@ def _run_order(
         #
         # Written BEFORE the re-raise, and that ordering is the whole mechanism. NOTHING upstream
         # catches this except `place_bracket` for the bracket leg specifically (#799, R5): its
-        # broad `except Exception` around this same call swallows the re-raise on purpose,
-        # already having read this write via `_try_record_trade_scope_refuted` before doing so,
-        # so nothing is lost by the catch. Every OTHER caller is unguarded -- `agent.run_once`
+        # dedicated `TradeScopeDenied` handler (#945) and broad `Exception` handler around this
+        # same call swallow the re-raise on purpose, already having read this write via
+        # `_try_record_trade_scope_refuted` before doing so, so nothing is lost by the catch.
+        # Every OTHER caller is unguarded -- `agent.run_once`
         # does not wrap `executor.execute`, and neither does the `run_loop` above it, so the
         # exception leaves the process. (#233's design says a "cycle-survival handler" catches
         # it -- that handler is `_manage_stops`' per-tranche one, which this path does not pass
@@ -2470,6 +2471,11 @@ UNBRACKETED_PREFIX = "unbracketed:"
 #: may or may not be holding it, so nothing re-places it and the row stays `pending` for a human.
 BRACKET_STATE_UNKNOWN_EVENT = "executor.bracket_state_unknown"
 
+#: #945: the bracket leg was refused OUTRIGHT on permissions -- a DEFINITE refusal, no order at
+#: the venue. Unlike `BRACKET_STATE_UNKNOWN_EVENT` there is nothing for a human to reconcile: the
+#: row is `rejected`, the `unbracketed:` retry is armed, and the sweep retries next cycle.
+BRACKET_REFUSED_EVENT = "executor.bracket_refused"
+
 
 def place_bracket(
     broker: Any,
@@ -2507,8 +2513,14 @@ def place_bracket(
     - before the bracket's `orders` row exists (the spec cannot be built, or `_run_order` raised
       before writing one): the `unbracketed:` retry record, exactly as for a veto or a venue
       refusal;
-    - after it exists (`place_order` raised): NO retry record -- one already standing from an
-      earlier attempt is CLEARED -- the `pending` row stays, and a CRITICAL
+    - after it exists, with `TradeScopeDenied` (#945): a permissions refusal is DEFINITE -- the
+      venue did not take the order. The row is marked `rejected` (the status a broker-rejected
+      placement already takes in `_run_order`), the `unbracketed:` retry record is ARMED, and a
+      CRITICAL `executor.bracket_refused` names it: the position is unprotected, but nothing is
+      unknown, and the sweep retries next cycle instead of parking the product's exits behind a
+      pending row no venue order backs;
+    - after it exists (any other `place_order` raise): NO retry record -- one already standing
+      from an earlier attempt is CLEARED -- the `pending` row stays, and a CRITICAL
       `executor.bracket_state_unknown` names it. The venue may be holding that bracket, so a
       retry could double-commit the base; exits on the product fail closed on the row until a
       human reconciles it.
@@ -2595,6 +2607,57 @@ def place_bracket(
             now_ts,
             spec=spec,
         )
+    except TradeScopeDenied as exc:
+        # #945: a permissions refusal is DEFINITE -- the venue did not take the order, so there
+        # is nothing at the exchange and no unknown to reconcile. The generic handler below books
+        # ambiguity (a raise after the row was written MIGHT mean the venue is holding it); this
+        # exception says it is not. `_run_order` has already written the trade-scope refutation
+        # before re-raising, so nothing is lost by catching it here.
+        written = [
+            o
+            for o in repo.get_orders(mode="live", product_id=product_id)
+            if o["id"] not in before and o["side"] == Side.SELL.value
+        ]
+        if not written:
+            # Refused at the PREVIEW, before any row existed: the pre-row refusal of the
+            # docstring's first bullet, whatever the exception -- nothing to reject.
+            repo.set_state(
+                f"{UNBRACKETED_PREFIX}{product_id}",
+                {"stop": stop, "target": target, "qty": qty},
+            )
+            log_event(
+                logger,
+                logging.WARNING,
+                "executor.bracket_not_placed",
+                product=product_id,
+                reason=f"the venue refused the bracket leg on permissions before it was "
+                f"placed: {exc!r}",
+                vetoed_by=[],
+            )
+        else:
+            # The row this wrote is `pending`; the venue refused it outright, so `rejected` is
+            # the fact (the same status a broker-rejected placement takes). ARM the retry -- the
+            # sweep is driven from the ledger and `unbracketed:`, and a `rejected` row is not a
+            # resting one, so nothing blocks it from re-placing next cycle.
+            repo.update_order(written[-1]["id"], status="rejected", updated_at=now_ts)
+            repo.set_state(
+                f"{UNBRACKETED_PREFIX}{product_id}",
+                {"stop": stop, "target": target, "qty": qty},
+            )
+            log_event(
+                logger,
+                logging.CRITICAL,
+                BRACKET_REFUSED_EVENT,
+                product=product_id,
+                order_id=written[-1]["id"],
+                reason=repr(exc),
+                detail=(
+                    "the venue refused the bracket leg outright on permissions: no order "
+                    "rests at the exchange. The row is rejected and the sweep retries next "
+                    "cycle; until one is accepted, the position has no stop"
+                ),
+            )
+        return None
     except Exception as exc:  # noqa: BLE001 -- see the comment above
         written = [
             o
@@ -3039,13 +3102,15 @@ def reduce(
     **Never raises for a venue failure (Review Focus 4).** A preview that throws is recorded
     with the fallback fee and `rails.preview_error`, because a cycle must not die on a proposal
     -- the DCA buy after it in the same cycle is the operator's plan. A `TradeScopeDenied` is
-    ALSO recorded against the venue's trade scope, exactly as `_run_order` records a denied
-    preview (#233): the venue has falsified the credential, and rail 20 then vetoes the next
-    BUY cleanly rather than that BUY's own preview raising out of the cycle. A venue answer
-    whose fee is not a fact -- zero, a synthetic estimate, or one carrying errors -- also falls
-    back, and says why in `rails.fee_fallback_reason`.
+    recorded the same way and nowhere else (R79, #944): writing the trade-scope refutation here,
+    as R-P7-2 first had it, let a rule that can place nothing halt the next day's DCA buys over a
+    fee quote; if the scope is really gone, the next BUY's own preview refuses on its own, and
+    #233's refutation stays what it was -- a placement-path fact. A venue answer whose fee is
+    not a fact -- zero, a synthetic estimate, or one carrying errors -- also falls back, and
+    says why in `rails.fee_fallback_reason`.
 
-    `offline=True` (paper, R18) touches no broker: the offline rails run, their skipped list is
+    `offline=True` (a paper cycle, R18, or a paper-STATUS rule on a live one, R78) touches no
+    broker: the offline rails run, their skipped list is
     recorded, and the fee is the fallback. `broker=None` with `offline=False` is a DIFFERENT
     case -- every rail still runs (nothing is skipped) -- and is recorded with
     `rails.fee_fallback_reason` set to say the venue was never asked, so the row cannot be read
@@ -3160,8 +3225,21 @@ def reduce(
         try:
             preview = broker.preview_order(_order_spec(intent))
         except TradeScopeDenied as exc:
-            _try_record_trade_scope_refuted(repo, str(exc), now_ts, intent, None)
-            _log_trade_scope_refusal(intent, None)
+            # R79 (#944): the refusal stays on THIS row. R-P7-2's refutation write here let a
+            # rule that can place nothing -- a preview is a fee quote, not an order -- refute
+            # the credential rail 20 reads and halt the next day's DCA buys. If the trade scope
+            # is really gone, the next BUY's own preview refuses on its own, exactly as it did
+            # before any sleeve rule existed; #233's refutation stays a placement-path fact.
+            # Logged at WARNING, not through `_log_trade_scope_refusal`: that event is ERROR
+            # because it is the one an operator greps for when entries STOP, and a proposal's
+            # refusal must not file itself among causes of that.
+            log_event(
+                logger,
+                logging.WARNING,
+                "executor.reduce_preview_denied",
+                product=product_id,
+                reason=repr(exc),
+            )
             rails["preview_error"] = repr(exc)
         except Exception as exc:  # noqa: BLE001 -- see the docstring: never die on a proposal
             log_venue_failure(logger, "executor.reduce_preview_failed", product=product_id)
