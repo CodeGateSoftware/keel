@@ -18,6 +18,7 @@ from decimal import Decimal
 from keel.strategy.reduction import Holding, Lot
 from keel.strategy.rules.base import Rule
 from keel.strategy.rules.dca import Dca
+from keel.strategy.rules.profit_take import ProfitTake
 from keel.strategy.rules.reverse_dca import ReverseDca
 from keel.types import Candle, Granularity
 from tests.strategy.rule_conformance import ReductionConformanceTests, RuleConformanceTests
@@ -77,3 +78,19 @@ class TestReverseDcaConformance(ReductionConformanceTests):
         # Day 60 is a 30-day cadence boundary; one bar at 100000 is its own lookback high, so
         # the drawdown gate passes and the floor of 1 is far below.
         return {Granularity.ONE_DAY: [_dca_candle(day=60, price="100000")]}
+
+
+class TestProfitTakeConformance(ReductionConformanceTests):
+    def rule(self) -> Rule:
+        return ProfitTake("BTC-USD")
+
+    def holding(self) -> Holding:
+        # vwae = (0.01 x 100000 + 0.45) / 0.01 = 100045 (`test_profit_take._held`).
+        return Holding(
+            "BTC-USD", (Lot(1, "dca", 0, Decimal("0.01"), Decimal("100000"), Decimal("0.45")),)
+        )
+
+    def firing_candles(self) -> dict[Granularity, list[Candle]]:
+        # 200000 is ~100% over the average entry, far past the 25% trigger, and a 15% trim of
+        # 0.01 nets ~$148 at the conformance costs -- far past the $5 fee gate.
+        return {Granularity.ONE_DAY: [_dca_candle(day=60, price="200000")]}

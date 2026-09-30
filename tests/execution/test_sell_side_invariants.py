@@ -663,6 +663,7 @@ def test_every_sleeve_sell_kind_is_preview_only() -> None:
 
     kinds = _sleeve_sell_kinds()
     assert "reverse_dca" in kinds, "vacuous until the first kind ships -- P9 ships it"
+    assert "profit_take" in kinds, "P14 ships the second sleeve-sell kind"
     for kind, cls in kinds.items():
         hint = get_type_hints(cls.__init__)["execution"]
         assert get_origin(hint) is Literal, kind

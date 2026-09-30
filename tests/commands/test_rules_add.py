@@ -17,6 +17,7 @@ import inspect
 import json
 from decimal import Decimal
 
+import pytest
 from click.testing import CliRunner
 
 from keel import agent
@@ -1395,6 +1396,54 @@ def test_rules_add_refuses_a_non_positive_target(tmp_path, valid_config_path):
     )
     assert result.exit_code == 1 and "target_usd" in result.output
     assert "unknown rule kind" not in result.output
+    assert _repo(tmp_path).get_rules() == []
+
+
+# -- profit_take (#857, plan P14 Task 14.1): registered for `rules add`, preview-only (S2) -------
+
+
+def test_rules_add_writes_a_profit_take_candidate_at_its_spec_defaults(
+    tmp_path, valid_config_path
+):
+    result = _add(tmp_path, valid_config_path, "--kind", "profit_take", "--product", "BTC-USD")
+    assert result.exit_code == 0, result.output
+    [row] = _repo(tmp_path).get_rules()
+    assert (row["kind"], row["status"]) == ("profit_take", "candidate")
+    rule = _build_rule(row)
+    assert (
+        rule.params["gain_pct"],
+        rule.params["trim_pct"],
+        rule.params["min_net_usd"],
+        rule.params["cooldown_days"],
+        rule.params["min_hold_days"],
+        rule.params["execution"],
+    ) == (Decimal("25"), Decimal("15"), Decimal("5"), 30, 30, "preview")
+
+
+@pytest.mark.parametrize(
+    ("params", "named"),
+    [
+        ('{"execution": "auto"}', "execution"),
+        ('{"trim_pct": "25"}', "trim_pct"),
+        ('{"gain_pct": "0"}', "gain_pct"),
+    ],
+)
+def test_rules_add_refuses_a_bad_profit_take_and_writes_nothing(
+    tmp_path, valid_config_path, params, named
+):
+    result = _add(
+        tmp_path,
+        valid_config_path,
+        "--kind",
+        "profit_take",
+        "--product",
+        "BTC-USD",
+        "--params",
+        params,
+    )
+    assert result.exit_code == 1
+    assert "unknown rule kind" not in result.output
+    assert named in result.output
     assert _repo(tmp_path).get_rules() == []
 
 
