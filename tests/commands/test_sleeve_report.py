@@ -630,13 +630,23 @@ def test_a_raising_dca_detect_counts_as_firing_not_a_crash() -> None:
 
 @pytest.fixture
 def live_config_path(write_config: Any) -> Any:
-    """The same valid config, `auto_trade.mode: live` -- for the half of R40's reading
-    (`run_proposal_replay`'s `dca_status`) `valid_config_path` (paper) cannot exercise."""
+    """The same valid config on a LIVE profile -- `auto_trade.mode: confirm`, the only non-paper
+    mode (`mode: live` is refused by `load_config`: autonomy is a profile choice) -- for the half
+    of R40's reading (`run_proposal_replay`'s `dca_status`) `valid_config_path` (paper) cannot
+    exercise.
+
+    It used to write `mode: live`, which `load_config` refuses, so `rules backtest`'s
+    `_optional_cfg` fell back to NO config and the live-profile test below ran the `config=None`
+    path instead (P14, found by applying R54 there). It now loads, and the test pins that it
+    does."""
+    from keel.config import load_config
     from tests.conftest import VALID_CONFIG_YAML
 
-    text = VALID_CONFIG_YAML.replace("mode: paper", "mode: live")
-    assert "mode: live" in text and "mode: paper" not in text
-    return write_config(text)
+    text = VALID_CONFIG_YAML.replace("mode: paper", "mode: confirm")
+    assert "mode: confirm" in text and "mode: paper" not in text
+    path = write_config(text)
+    assert load_config(path).auto_trade.mode == "confirm"
+    return path
 
 
 def test_a_paper_dca_on_the_same_product_vetoes_every_distribution_bar(
@@ -711,6 +721,8 @@ def test_a_live_dca_on_the_same_product_vetoes_under_a_live_profile(
     result = _backtest(tmp_path, live_config_path, rid)
     assert result.exit_code == 0, result.output
     lines = result.output.splitlines()
+    # The config reached the replay: its fee line is the config's, not the no-config default.
+    assert _fee_lines(result.output) == ["fee line: 1.2000% (fallback:config.fees.taker_pct)"]
     [head] = [line for line in lines if line.startswith("  same-day dca:")]
     assert head == (
         f"  same-day dca: 1 dca rule(s) at status live on BTC-USD replayed (ids {dca_id})"
@@ -722,8 +734,8 @@ def test_a_live_dca_on_the_same_product_vetoes_under_a_live_profile(
 
 def test_the_no_config_replay_uses_the_library_default_fee_and_leaves_legs_unsliced(repo) -> None:
     """The no-config branch (`config is None`): the headline fee is `backtest.TAKER_FEE_PCT`
-    labelled as the library default, `dca_status` defaults to `live`, and with no
-    `max_per_order_usd` every sale row carries `legs unsliced` (no cap to slice against)."""
+    labelled as the library default, and with no `max_per_order_usd` every sale row carries
+    `legs unsliced` (no cap to slice against). Its dca reading is R54's, pinned below."""
     from keel.commands.rules import run_proposal_replay
 
     repo.upsert_candles("BTC-USD", Granularity.ONE_DAY, _rising(91))
@@ -740,6 +752,57 @@ def test_the_no_config_replay_uses_the_library_default_fee_and_leaves_legs_unsli
     sales = [line for line in out if " bar: sell " in line]
     assert len(sales) == 3
     assert all(line.endswith("legs unsliced") for line in sales)
+
+
+@pytest.mark.parametrize("dca_status", ["candidate", "paper", "live"])
+def test_the_no_config_replay_counts_any_non_disabled_dca_as_the_gate_does(
+    repo, dca_status: str
+) -> None:
+    """R54 on the replay (carried from P13's held question b): with no config no status is the
+    cycle's, so ANY non-disabled dca on the product is replayed -- the reading the sleeve gate's
+    own `config=None` path takes (`_cycle_dca_on`). It used to read `live` alone, so a paper
+    dca on a paper profile's database replayed no collision at all."""
+    from keel.commands.rules import ANY_ACTIVE_DCA, run_proposal_replay
+    from keel.execution.sleeve import SAME_DAY_DCA
+
+    repo.upsert_candles("BTC-USD", Granularity.ONE_DAY, _rising(91))
+    rid = repo.insert_rule(
+        "reverse_dca",
+        {"product_id": "BTC-USD", "target_usd": "10", "min_price_floor": "1"},
+        status="candidate",
+    )
+    dca_id = repo.insert_rule(
+        "dca", {"product_id": "BTC-USD", "cadence_days": 30}, status=dca_status
+    )
+    out: list[str] = []
+    run_proposal_replay(repo, None, rid, echo=out.append)
+    [head] = [line for line in out if line.startswith("  same-day dca:")]
+    assert head == (
+        f"  same-day dca: 1 dca rule(s) at status {ANY_ACTIVE_DCA} on BTC-USD replayed "
+        f"(ids {dca_id})"
+    )
+    vetoed = [line for line in out if f"bar: vetoed ({SAME_DAY_DCA})" in line]
+    sold = [line for line in out if " bar: sell " in line]
+    assert (len(vetoed), len(sold)) == (4, 0)
+
+
+def test_the_no_config_replay_ignores_a_disabled_dca(repo) -> None:
+    """The other half of R54: a disabled dca buys nothing on any profile, so it is not replayed
+    and vetoes nothing -- the three cadence bars past min_hold sell."""
+    from keel.commands.rules import ANY_ACTIVE_DCA, run_proposal_replay
+
+    repo.upsert_candles("BTC-USD", Granularity.ONE_DAY, _rising(91))
+    rid = repo.insert_rule(
+        "reverse_dca",
+        {"product_id": "BTC-USD", "target_usd": "10", "min_price_floor": "1"},
+        status="candidate",
+    )
+    repo.insert_rule("dca", {"product_id": "BTC-USD", "cadence_days": 30}, status="disabled")
+    out: list[str] = []
+    run_proposal_replay(repo, None, rid, echo=out.append)
+    [head] = [line for line in out if line.startswith("  same-day dca:")]
+    assert head == f"  same-day dca: no dca rule at status {ANY_ACTIVE_DCA} on BTC-USD"
+    assert sum(1 for line in out if " bar: sell " in line) == 3
 
 
 def test_an_hour_granularity_is_refused_and_a_day_is_accepted(tmp_path, valid_config_path) -> None:

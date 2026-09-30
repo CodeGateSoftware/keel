@@ -1402,9 +1402,7 @@ def test_rules_add_refuses_a_non_positive_target(tmp_path, valid_config_path):
 # -- profit_take (#857, plan P14 Task 14.1): registered for `rules add`, preview-only (S2) -------
 
 
-def test_rules_add_writes_a_profit_take_candidate_at_its_spec_defaults(
-    tmp_path, valid_config_path
-):
+def test_rules_add_writes_a_profit_take_candidate_at_its_spec_defaults(tmp_path, valid_config_path):
     result = _add(tmp_path, valid_config_path, "--kind", "profit_take", "--product", "BTC-USD")
     assert result.exit_code == 0, result.output
     [row] = _repo(tmp_path).get_rules()

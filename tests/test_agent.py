@@ -6235,9 +6235,7 @@ def test_the_next_days_trim_is_vetoed_by_the_rules_own_cooldown(repo):
 
     result = run_once(_HoldingBroker(), repo, _config(), now_ts=now + DAY)
 
-    assert [(r.rule_kind, r.decision) for r in result.reduce_results] == [
-        ("profit_take", "vetoed")
-    ]
+    assert [(r.rule_kind, r.decision) for r in result.reduce_results] == [("profit_take", "vetoed")]
     newest = repo.get_sell_proposals()[0]
     assert (newest["decision"], newest["rails"]["sleeve"]) == ("vetoed", sleeve.COOLDOWN)
 
