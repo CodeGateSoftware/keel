@@ -59,6 +59,7 @@ if TYPE_CHECKING:
     from keel.agent import LoopResult
     from keel.data.repository import Repository
     from keel.execution.executor import ReduceResult
+    from keel.execution.sleeve_exit import ExitWatch
 
 #: Month-to-date BUY spend at (or past) this percent of the in-force rail-14 allowance fires
 #: `allowance.nearing_exhaustion`. 80 leaves roughly a fifth of the month's cap -- enough
@@ -123,6 +124,7 @@ def events_from_state(
     held_products: Sequence[str],
     sleeve_proposals: Sequence[ReduceResult] = (),
     sleeve_only_products: Sequence[str] = (),
+    exit_watch_transitions: Sequence[ExitWatch] = (),
 ) -> list[NotificationEvent]:
     """Derive the #444 events from doctor's findings plus the cycle facts. Pure.
 
@@ -143,6 +145,12 @@ def events_from_state(
     cooldown vetoing daily is one alert at its first veto, not one per day. Each names its
     proposal id and the command that shows it, and the WHOLE sale (`total_qty`, over `legs`):
     the row's own `qty` is only rail 2's first leg.
+
+    `exit_watch_transitions` is the cycle's `LoopResult.exit_watch_transitions` (#857, P15): one
+    `sleeve.exit_watch` per level CHANGE the sleeve exit monitor recorded -- a steady level is not
+    in it, so nothing repeats per cycle. Worded by the level (`_exit_watch_message`): `near` and
+    `breached` as warnings, `clear` after one of them as a recovery (plan OQ10). Every one ends
+    by saying nothing is sold.
     """
     events: list[NotificationEvent] = []
 
@@ -281,7 +289,62 @@ def events_from_state(
             )
         )
 
+    for watch in exit_watch_transitions:
+        events.append(
+            notification_event(
+                "sleeve.exit_watch",
+                _exit_watch_message(watch),
+                product=watch.product_id,
+                level=watch.level,
+                previous=watch.previous,
+                close=None if watch.close is None else str(watch.close),
+                dd_level=None if watch.dd_level is None else str(watch.dd_level),
+                sma=None if watch.sma is None else str(watch.sma),
+                breached_arms=list(watch.breached_arms),
+            )
+        )
+
     return events
+
+
+#: The tail every `sleeve.exit_watch` message ends on: what the monitor did (nothing) and where
+#: the operator looks next.
+EXIT_WATCH_TAIL = "alert only: nothing is sold -- keel dca exit --preview shows the levels"
+
+
+def _exit_watch_message(watch: ExitWatch) -> str:
+    """One `sleeve.exit_watch` message, worded by the level the product moved to."""
+    product = watch.product_id
+    close = "none" if watch.close is None else format(watch.close, "f")
+    levels = ", ".join(
+        part
+        for part in (
+            None if watch.dd_level is None else f"drawdown level {_level(watch.dd_level)}",
+            None if watch.sma is None else f"SMA {_level(watch.sma)}",
+        )
+        if part
+    )
+    against = f"close {close} against {levels or 'no level'}"
+    if watch.level == "breached":
+        head = f"{product} breached its sleeve exit level ({', '.join(watch.breached_arms)})"
+    elif watch.level == "near":
+        head = f"{product} is near its sleeve exit level"
+    elif watch.level == "clear":
+        was_flagged = watch.previous in ("near", "breached")
+        head = (
+            f"{product} recovered: clear of its sleeve exit levels"
+            if was_flagged
+            else f"{product} is now watched: clear of its sleeve exit levels"
+        )
+    else:
+        head = f"{product} is not judged: too few cached daily bars for its sleeve exit levels"
+    return f"{head}: {against} -- {EXIT_WATCH_TAIL}"
+
+
+def _level(value: Decimal) -> str:
+    """A computed level (an SMA, a drawdown line) to the cent -- a quotient's 28 digits say
+    nothing an operator reads."""
+    return format(value.quantize(Decimal("0.01")), "f")
 
 
 #: The proposal decisions `sleeve.proposal` reports. `superseded` is not one: its winner, in the
@@ -364,6 +427,7 @@ def notify_after_cycle(
             held_products=repo.held_products(),
             sleeve_proposals=result.reduce_results,
             sleeve_only_products=result.sleeve_only_products,
+            exit_watch_transitions=result.exit_watch_transitions,
         )
         # #793: an attestation alert goes out ONCE for the window it reports. Applied here and
         # not in `events_from_state`, which stays pure: the ledger is a repo read, and the

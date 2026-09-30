@@ -2081,6 +2081,98 @@ def sleeve_rule_findings(
     return [same, floor_finding]
 
 
+#: `exit_watch_findings`' OK headline for a product the monitor could not judge yet.
+EXIT_WATCH_NOT_JUDGED = "{product}: not judged -- too few cached daily bars for its exit levels"
+
+_EXIT_WATCH_FIX = (
+    "`keel dca exit --preview` shows both levels; the monitor sells nothing -- any sale is the "
+    "operator's decision"
+)
+
+
+def _level_text(value: Any) -> str:
+    """A recorded level to the cent, or `none` -- an SMA is a quotient, and its 28 stored digits
+    say nothing an operator reads. Unparseable text is shown as recorded."""
+    if value is None:
+        return "none"
+    try:
+        return format(Decimal(str(value)).quantize(Decimal("0.01")), "f")
+    except InvalidOperation, ValueError:
+        return str(value)
+
+
+def exit_watch_findings(records: dict[str, dict[str, Any]]) -> list[Finding]:
+    """The sleeve exit monitor's last recorded level per watched product (#857, spec §7 "Doctor:
+    the `sleeve_exit:<product>` state is rendered"; plan P15 Task 15.3).
+
+    `records` maps each product to the `sleeve_exit:<product>` record the cycle wrote
+    (`agent._watch_sleeve_exits`). One `sleeve.exit_watch` Finding per product, in product order:
+    WARN for `near` and `breached` -- the product is at or past a structural exit level the
+    operator may want to act on -- and OK for `clear` and `insufficient_history`, which is not
+    judged rather than guessed (spec §7 failure mode b). With no record at all (nothing watched
+    yet), ONE OK sentinel, the shape `ledger_drift_findings` uses, so the name never vanishes
+    from a deployment's findings (PR #888).
+
+    WARN, never FAIL: the monitor is an alert, and holding a product through its level -- PAXG
+    tranche 3, held without a stop by the 2026-09-22 decision -- is a choice, not a fault. The
+    level is the cycle's, as of the bar it names; doctor recomputes nothing.
+    """
+    if not records:
+        return [
+            Finding(
+                "sleeve.exit_watch",
+                OK,
+                "no held product is on the exit watch",
+                "-",
+                "-",
+            )
+        ]
+    findings: list[Finding] = []
+    for product in sorted(records):
+        record = records[product]
+        level = str(record.get("level"))
+        bar = "an unrecorded bar" if record.get("ts") is None else _utc_date(int(record["ts"]))
+        against = (
+            f"close {_level_text(record.get('close'))} on {bar}, "
+            f"drawdown level {_level_text(record.get('dd_level'))}, "
+            f"SMA {_level_text(record.get('sma'))}"
+        )
+        if level in ("near", "breached"):
+            arms = ", ".join(record.get("breached_arms") or [])
+            findings.append(
+                Finding(
+                    "sleeve.exit_watch",
+                    WARN,
+                    f"{product} is {level} its sleeve exit level"
+                    + (f" ({arms})" if level == "breached" and arms else ""),
+                    against,
+                    _EXIT_WATCH_FIX,
+                    products=(product,),
+                )
+            )
+        elif level == "insufficient_history":
+            findings.append(
+                Finding(
+                    "sleeve.exit_watch",
+                    OK,
+                    EXIT_WATCH_NOT_JUDGED.format(product=product),
+                    against,
+                    "-",
+                )
+            )
+        else:
+            findings.append(
+                Finding(
+                    "sleeve.exit_watch",
+                    OK,
+                    f"{product} is clear of its sleeve exit levels",
+                    against,
+                    "-",
+                )
+            )
+    return findings
+
+
 def doctor_exit_code(findings: list[Finding]) -> int:
     """Faults fail the run; deliberate halts and warnings do not."""
     return 1 if any(f.status == FAIL for f in findings) else 0
@@ -2386,6 +2478,18 @@ def gather_findings(repo: Any, config: Any, log_lines: Iterable[str], now_ts: in
         all_rules,
         sleeve_closes,
         managed_status="paper" if config.auto_trade.mode == "paper" else "live",
+    )
+
+    # #857 (plan P15): the sleeve exit monitor's last level per watched product, as the cycle
+    # recorded it. A record the cycle cleared (a product no longer watched) is skipped.
+    from keel.execution.sleeve_exit import STATE_PREFIX as EXIT_WATCH_PREFIX
+
+    findings += exit_watch_findings(
+        {
+            key[len(EXIT_WATCH_PREFIX) :]: record
+            for key in repo.get_state_keys(EXIT_WATCH_PREFIX)
+            if (record := repo.get_state(key))
+        }
     )
 
     from keel.data import freshness as freshness_mod

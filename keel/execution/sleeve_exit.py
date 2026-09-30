@@ -185,11 +185,12 @@ _PARAM_TYPES: dict[str, Any] = {
 _STATUS_RANK = {"live": 0, "paper": 1}
 
 
-def monitor_params(sleeve_rules: Iterable[tuple[Any, str]], product_id: str) -> dict[str, Any]:
-    """The `classify` keyword arguments a `sleeve_exit` rule on `product_id` sets, or `{}` -- the
-    R26 defaults -- with none. `sleeve_rules` is the cycle's `(rule, status)` pairs
-    (`agent._sleeve_rules`); a `live` rule wins over a `paper` one, then the lowest rule id. Only
-    the params the rule actually sets are returned, so an unset one keeps its default."""
+def monitor_rule(
+    sleeve_rules: Iterable[tuple[Any, str]], product_id: str
+) -> tuple[Any, str] | None:
+    """The `(rule, status)` of the `sleeve_exit` rule whose params set `product_id`'s levels, or
+    `None` -- R26's defaults. `sleeve_rules` is the cycle's `(rule, status)` pairs
+    (`agent._sleeve_rules`); a `live` rule wins over a `paper` one, then the lowest rule id."""
     candidates = [
         (rule, status)
         for rule, status in sleeve_rules
@@ -197,10 +198,19 @@ def monitor_params(sleeve_rules: Iterable[tuple[Any, str]], product_id: str) -> 
         and getattr(rule, "product_id", None) == product_id
     ]
     if not candidates:
-        return {}
-    rule, _status = min(
+        return None
+    return min(
         candidates,
         key=lambda pair: (_STATUS_RANK.get(pair[1], 2), getattr(pair[0], "rule_id", None) or 0),
     )
-    params = getattr(rule, "params", None) or {}
+
+
+def monitor_params(sleeve_rules: Iterable[tuple[Any, str]], product_id: str) -> dict[str, Any]:
+    """The `classify` keyword arguments `monitor_rule`'s rule sets for `product_id`, or `{}` --
+    the R26 defaults -- with none. Only the params the rule actually sets are returned, so an
+    unset one keeps its default."""
+    chosen = monitor_rule(sleeve_rules, product_id)
+    if chosen is None:
+        return {}
+    params = getattr(chosen[0], "params", None) or {}
     return {name: cast(params[name]) for name, cast in _PARAM_TYPES.items() if name in params}

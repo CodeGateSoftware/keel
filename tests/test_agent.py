@@ -6609,6 +6609,10 @@ def test_a_transition_fires_once_and_a_steady_level_fires_nothing(repo):
     assert (breach.product_id, breach.level, breach.previous) == (_PAXG, "breached", "clear")
     assert breach.breached_arms == ("drawdown",)
     assert repo.get_state("sleeve_exit:PAXG-USD")["level"] == "breached"
+    # ALERT ONLY: a breach under an autonomous live profile places, cancels and writes nothing.
+    assert third.mode == "autonomous"
+    assert broker.place_calls == [] and broker.cancel_calls == []
+    assert repo.get_orders() == [] and repo.get_sell_proposals() == []
 
 
 def test_clearing_the_retry_record_changes_nothing(repo):

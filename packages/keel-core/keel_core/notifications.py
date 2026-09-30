@@ -91,6 +91,13 @@ class EventSpec:
 #:   `vetoed`; arbitration's `superseded` losers are silent). The taxonomy's first `info` event:
 #:   in this build a proposal is PREVIEW-ONLY and places nothing, so it is a report, not a
 #:   warning. It rides the cycle's result (`LoopResult.reduce_results`), not a repo key.
+#: * `sleeve.exit_watch` (#857, plan P15) -- the sleeve exit monitor recorded a new LEVEL for a
+#:   held product with no resting bracket: `near` or `breached` its structural exit (a trailing
+#:   drawdown, a confirmed close under the 200-day SMA), `clear` again, or not judged
+#:   (`insufficient_history`). On transition only, never per cycle (spec §7): an alert repeated
+#:   every day trains the operator to ignore it. WARN, because a breach is a decision about the
+#:   sleeve the operator may have to make -- the monitor itself sells nothing. It rides the
+#:   cycle's result (`LoopResult.exit_watch_transitions`).
 EVENTS: tuple[EventSpec, ...] = (
     EventSpec("attestation.expiring", "attestation", WARN),
     EventSpec("rail.armed", "rail", WARN),
@@ -98,6 +105,7 @@ EVENTS: tuple[EventSpec, ...] = (
     EventSpec("allowance.nearing_exhaustion", "allowance", WARN),
     EventSpec("feed.stale_open_position", "data", WARN),
     EventSpec("sleeve.proposal", "execution", INFO),
+    EventSpec("sleeve.exit_watch", "execution", WARN),
 )
 
 EVENTS_BY_KEY: dict[str, EventSpec] = {spec.key: spec for spec in EVENTS}

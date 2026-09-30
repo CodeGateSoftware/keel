@@ -221,3 +221,11 @@ def test_sleeve_proposal_is_an_info_execution_event():
     so it is the taxonomy's first `info` event, routed with the other execution facts."""
     spec = EVENTS_BY_KEY["sleeve.proposal"]
     assert (spec.category, spec.severity) == ("execution", "info")
+
+
+def test_sleeve_exit_watch_is_a_warn_execution_event():
+    """#857 (plan P15): a level change on a held product's structural exit -- a breach above
+    all -- gates money the operator may act on, so it is a WARN, routed with the execution
+    facts. Nothing is sold: the monitor is an alert."""
+    spec = EVENTS_BY_KEY["sleeve.exit_watch"]
+    assert (spec.category, spec.severity) == ("execution", "warn")

@@ -304,3 +304,26 @@ def test_colliding_target_weights_are_a_clean_error_not_a_traceback(
         line.startswith("Error: target_weights has keys that collide")
         for line in result.output.splitlines()
     )
+
+
+def test_a_profit_take_row_that_does_not_build_is_named_not_a_traceback(
+    deployment,  # noqa: F811
+) -> None:
+    """P14's held item: a `profit_take` row with bad stored params crashed the whole gain view.
+    It is skipped and named on one line; every held product is still reported."""
+    db, _config_path = deployment
+    _seed(db)
+    bad = _repo(db).insert_rule(
+        "profit_take", {"product_id": "BTC-USD", "trim_pct": "90"}, status="paper"
+    )
+
+    result = _trim(deployment, "--preview")
+
+    assert result.exit_code == 0, result.output
+    lines = result.output.splitlines()
+    skipped = [line for line in lines if line.startswith("SKIPPED rule ")]
+    assert len(skipped) == 1 and skipped[0].startswith(f"SKIPPED rule {bad} (profit_take, paper)")
+    assert sorted(line.split()[0] for line in lines if line.startswith("  ")) == [
+        "BTC-USD",
+        "PAXG-USD",
+    ]

@@ -42,6 +42,12 @@ untested and no `profit_take` rule is promoted. `--view bands` is a DISPLAY: ban
 tested and not adopted (#831), no `band_rebalance` rule exists, and the report says so every
 run. A flag that does not apply to the chosen view is a usage error, never silently ignored.
 
+**`keel dca exit --preview` opens read-only ALWAYS, too** (#857, P15; spec §7): the sleeve exit
+monitor's levels for every held product with no resting bracket -- clear, near, breached or not
+judged, on the cached daily bars, beside the level the cycle last recorded. It writes nothing
+(the `sleeve_exit:` record is the cycle's), builds no broker, and builds no sale: the monitor is
+an alert, and its footer says an automatic sale is not built.
+
 **`keel dca distribute --preview` opens read-only ALWAYS, too** (#857, P10): what each
 `reverse_dca` rule's next cadence day would do, on today's cached close. It writes nothing -- no
 proposal row, no state -- and builds no broker, so its fee is the `config.fees.taker_pct` fallback,
@@ -79,6 +85,12 @@ from keel.commands.dca_plan import (
 #: The last line every sleeve preview (`distribute`, `trim`) prints: in this build no sleeve sale
 #: is placed, by any path (S1, S2).
 PREVIEW_FOOTER = "preview only: nothing is placed."
+
+#: The last line `keel dca exit --preview` prints: the monitor alerts, and in this build no
+#: automatic sleeve sale exists to build (S1, S2) -- `sleeve_exit`'s proposal is preview-only too.
+EXIT_PREVIEW_FOOTER = (
+    "preview only: an automatic sale is not built -- the monitor alerts, and nothing is placed."
+)
 
 #: The `[Y]/[E]/[N]` prompt's per-choice label, keyed by letter. One table, so the loop's prompt
 #: line and its retry message cannot disagree about what each letter means.
@@ -294,10 +306,37 @@ def distribute_cmd(ctx: click.Context, preview: bool) -> None:
         raise click.UsageError("pass --preview: it is the only mode in this build.")
     config = _load_cfg(ctx)
     repo = _common._open_repo_ro(ctx)
-    rows = sleeve_report.distribution_rows(repo, config, now_ts=int(time.time()))
-    for line in sleeve_report.render_distribution(rows):
+    skipped: list[sleeve_report.SkippedRule] = []
+    rows = sleeve_report.distribution_rows(repo, config, now_ts=int(time.time()), skipped=skipped)
+    for line in sleeve_report.render_distribution(rows, skipped=skipped):
         click.echo(line)
     click.echo(PREVIEW_FOOTER)
+
+
+@dca_group.command("exit")
+@click.option(
+    "--preview",
+    is_flag=True,
+    default=False,
+    help="Show the sleeve exit monitor's levels per watched product. Required: it is the only "
+    "mode in this build.",
+)
+@click.pass_context
+@with_disclaimer
+def exit_cmd(ctx: click.Context, preview: bool) -> None:
+    """Where each held product with no resting bracket stands against its structural exit
+    levels (spec §7): a trailing drawdown from the lookback high and a confirmed close under the
+    SMA, as clear, near, breached or not judged -- the monitor's own classification on the cached
+    daily bars, beside the level the cycle last recorded. Writes nothing and asks no venue."""
+    if not preview:
+        raise click.UsageError("pass --preview: it is the only mode in this build.")
+    config = _load_cfg(ctx)
+    repo = _common._open_repo_ro(ctx)
+    skipped: list[sleeve_report.SkippedRule] = []
+    rows = sleeve_report.exit_watch_view(repo, config, now_ts=int(time.time()), skipped=skipped)
+    for line in sleeve_report.render_exit_watch(rows, skipped=skipped):
+        click.echo(line)
+    click.echo(EXIT_PREVIEW_FOOTER)
 
 
 def _require_preview(_ctx: click.Context, _param: click.Parameter, value: bool) -> bool:
@@ -400,6 +439,7 @@ def trim_cmd(
     repo = _common._open_repo_ro(ctx)
     now_ts = int(time.time())
     if view == "gain":
+        skipped: list[sleeve_report.SkippedRule] = []
         rows = sleeve_report.gain_view(
             repo,
             config,
@@ -407,8 +447,9 @@ def trim_cmd(
             trim_pct=trim_pct,
             product_id=product_id,
             now_ts=now_ts,
+            skipped=skipped,
         )
-        lines = sleeve_report.render_gain(rows)
+        lines = sleeve_report.render_gain(rows, skipped=skipped)
     elif view == "lots":
         lines = sleeve_report.render_lots(
             sleeve_report.lots_view(repo, config, product_id, now_ts=now_ts)

@@ -179,6 +179,41 @@ def _now(now_ts: int | None) -> int:
     return int(time.time()) if now_ts is None else now_ts
 
 
+# -- a rule row that does not build (P14's held item, in P15) ----------------------------------
+
+
+@dataclass(frozen=True)
+class SkippedRule:
+    """A stored rule row a view could not build (`rule_id`, its `kind` and `status`) and the
+    error its constructor raised (`<ExceptionType>: <message>`). The view skips the row, as
+    `run_once` does (`agent._load_sleeve_rules`), and prints `skipped_rule_line` for it."""
+
+    rule_id: int | None
+    kind: str
+    status: str
+    error: str
+
+    @classmethod
+    def of(cls, row: dict[str, Any], exc: Exception) -> SkippedRule:
+        rule_id = row.get("id")
+        return cls(
+            None if rule_id is None else int(rule_id),
+            str(row["kind"]),
+            str(row.get("status")),
+            f"{type(exc).__name__}: {exc}",
+        )
+
+
+def skipped_rule_line(skipped: SkippedRule) -> str:
+    """The one line a view prints for a rule row it skipped -- which row, why, and the fix."""
+    rid = _UNRECORDED if skipped.rule_id is None else str(skipped.rule_id)
+    return (
+        f"SKIPPED rule {rid} ({skipped.kind}, {skipped.status}): its stored params do not build "
+        f"({skipped.error}) -- it is not in this report; "
+        f"`keel rules disable {rid}` and `keel rules add` a corrected one"
+    )
+
+
 def render_proposal_line(row: dict[str, Any]) -> str:
     """The one-line summary of a `sell_proposals` row (as `Repository.get_sell_proposal` returns
     it): the module docstring's format."""
@@ -285,7 +320,9 @@ def next_cadence_day(today: int, cadence_days: int) -> int:
     return anchor + (-anchor) % cadence_days
 
 
-def distribution_rows(repo: Any, config: Any, now_ts: int) -> list[DistributionRow]:
+def distribution_rows(
+    repo: Any, config: Any, now_ts: int, *, skipped: list[SkippedRule] | None = None
+) -> list[DistributionRow]:
     """One `DistributionRow` per `reverse_dca` rule this profile's cycle would ask (#857, spec §6
     "CLI"). READ-ONLY: it writes nothing and builds no broker (R25).
 
@@ -313,6 +350,10 @@ def distribution_rows(repo: Any, config: Any, now_ts: int) -> list[DistributionR
     also falls on the cadence BAR day (the same day `_dca_fires_today`'s `Dca.detect` would see,
     since both rules read the same restamped bar). The pipeline records that day's proposal
     `vetoed` (`same_day_dca`) and does not carry it forward.
+
+    **A `reverse_dca` row that does not build is skipped, as the cycle skips it** -- and, unlike
+    the cycle, which only logs it, appended to `skipped` when the caller passes a list, so the
+    report names it (`skipped_rule_line`) instead of silently lacking a rule.
     """
     # Lazy: the agent imports this package's siblings, and a report must not pull the cycle's
     # whole import graph in at module load.
@@ -331,8 +372,13 @@ def distribution_rows(repo: Any, config: Any, now_ts: int) -> list[DistributionR
                 int(params.get("cadence_days", 7))
             )
 
+    loaded, failed = agent._load_sleeve_rules(repo, config)
+    if skipped is not None:
+        skipped.extend(
+            SkippedRule.of(row, exc) for row, exc in failed if row["kind"] == "reverse_dca"
+        )
     rows: list[DistributionRow] = []
-    for rule, status in agent._sleeve_rules(repo, config):
+    for rule, status in loaded:
         if not isinstance(rule, ReverseDca):
             continue
         product_id = rule.product_id
@@ -403,7 +449,9 @@ def distribution_rows(repo: Any, config: Any, now_ts: int) -> list[DistributionR
     return rows
 
 
-def render_distribution(rows: list[DistributionRow]) -> list[str]:
+def render_distribution(
+    rows: list[DistributionRow], *, skipped: Sequence[SkippedRule] = ()
+) -> list[str]:
     """One line per row -- the module docstring's distribution format -- and, under a SALE whose
     bar is also a dca buy day, one indented line saying the pipeline will veto it. A row with a
     closed gate gets no such line: the rule proposes nothing, so there is nothing to veto.
@@ -412,12 +460,13 @@ def render_distribution(rows: list[DistributionRow]) -> list[str]:
     what the rule judges, the proposal day is when a cycle judging it actually records something,
     and a line naming only one of the two reads as a promise for the wrong day. It also names the
     daily bar the gates were judged on (`mark bar`), with a `STALE mark:` line under a row whose
-    bar a cycle would not decide on (`MarkBar`)."""
+    bar a cycle would not decide on (`MarkBar`). A `reverse_dca` row that did not build comes
+    first, one `skipped_rule_line` each."""
+    lines: list[str] = [skipped_rule_line(entry) for entry in skipped]
     if not rows:
-        return [NO_DISTRIBUTION_RULES]
+        return [*lines, NO_DISTRIBUTION_RULES]
     from keel.execution.sleeve import FALLBACK_FEE_SOURCE, SAME_DAY_DCA
 
-    lines: list[str] = []
     for row in rows:
         rule = _UNRECORDED if row.rule_id is None else str(row.rule_id)
         proposed_ts = row.next_cadence_ts + _DAY
@@ -1171,25 +1220,35 @@ def profit_take_params(
     return ProfitTake(product_id or getattr(rule, "product_id", "") or "-", **params)
 
 
-def _profit_take_rule_on(repo: Any, product_id: str) -> tuple[Any | None, str]:
-    """The product's most advanced non-disabled `profit_take` rule, built from its row, and the
-    label naming it -- or `(None, "spec defaults")`. Most advanced is `live`, then `paper`, then
-    `candidate`; the lowest id breaks a tie."""
+def _profit_take_rule_on(
+    repo: Any, product_id: str, skipped: list[SkippedRule] | None = None
+) -> tuple[Any | None, str]:
+    """The product's most advanced non-disabled `profit_take` rule that BUILDS, and the label
+    naming it -- or `(None, "spec defaults")`. Most advanced is `live`, then `paper`, then
+    `candidate`; the lowest id breaks a tie. A row whose stored params do not build is skipped
+    -- appended to `skipped` -- and the next one is tried, so one bad row costs that row, never
+    the report (P14's held item)."""
     from keel import agent
 
-    rows = [
-        r
-        for r in repo.get_rules()
-        if r["kind"] == "profit_take"
-        and r["status"] in _STATUS_RANK
-        and (r["params"] or {}).get("product_id") == product_id
-    ]
-    if not rows:
-        return None, "spec defaults"
-    row = min(rows, key=lambda r: (_STATUS_RANK[r["status"]], int(r["id"])))
-    return agent.build_rule_from_params("profit_take", row["params"]), (
-        f"rule {row['id']} ({row['status']})"
+    rows = sorted(
+        (
+            r
+            for r in repo.get_rules()
+            if r["kind"] == "profit_take"
+            and r["status"] in _STATUS_RANK
+            and (r["params"] or {}).get("product_id") == product_id
+        ),
+        key=lambda r: (_STATUS_RANK[r["status"]], int(r["id"])),
     )
+    for row in rows:
+        try:
+            rule = agent.build_rule_from_params("profit_take", row["params"])
+        except Exception as exc:  # noqa: BLE001 -- one bad row must not sink the view
+            if skipped is not None:
+                skipped.append(SkippedRule.of(row, exc))
+            continue
+        return rule, f"rule {row['id']} ({row['status']})"
+    return None, "spec defaults"
 
 
 def gain_view(
@@ -1200,13 +1259,16 @@ def gain_view(
     trim_pct: Decimal | None = None,
     product_id: str | None = None,
     now_ts: int | None = None,
+    skipped: list[SkippedRule] | None = None,
 ) -> list[GainRow]:
     """One `GainRow` per held product, in product-id order (spec §4's trim report; `product_id`
     narrows to one). READ-ONLY: it writes nothing, builds no broker, and proposes nothing (R25).
 
     **The params**, per product, each one separately: `gain_pct`/`trim_pct` when given (the
     `--gain-pct`/`--trim-pct` flags); otherwise the product's most advanced non-disabled
-    `profit_take` rule (`_profit_take_rule_on`); otherwise the spec defaults (25, 15, $5).
+    `profit_take` rule (`_profit_take_rule_on`); otherwise the spec defaults (25, 15, $5). A
+    `profit_take` row whose stored params do not build is skipped -- appended to `skipped` when
+    the caller passes a list, for `render_gain` to name -- and the next row is used.
 
     **The verdict is the rule's own, not a copy of it** (plan Task 14.2): a `ProfitTake` built
     from those params is asked `reduce_signal` over the product's `Holding` (`sleeve.holding_of`)
@@ -1226,7 +1288,7 @@ def gain_view(
     products = sorted({str(p["product_id"]) for p in repo.get_open_positions(product_id)})
     rows: list[GainRow] = []
     for product in products:
-        stored, source = _profit_take_rule_on(repo, product)
+        stored, source = _profit_take_rule_on(repo, product, skipped)
         flags = [
             name
             for name, value in (("--gain-pct", gain_pct), ("--trim-pct", trim_pct))
@@ -1328,7 +1390,7 @@ def _price(value: Decimal | None) -> str:
     return format(Decimal(f"{value:.10g}").normalize(), "f")
 
 
-def render_gain(rows: Sequence[GainRow]) -> list[str]:
+def render_gain(rows: Sequence[GainRow], *, skipped: Sequence[SkippedRule] = ()) -> list[str]:
     """The gain report: a head naming the fee source and the mark bar, a `STALE mark:` line per
     product marked at a stale bar, `GAIN_NOT_EVIDENCE`, one line per held product --
 
@@ -1338,7 +1400,8 @@ def render_gain(rows: Sequence[GainRow]) -> list[str]:
 
     (one line; wrapped here; the sale part only when the trigger is met, its legs only when the
     trim clears the fee gate) -- or `mark none` and the params before the verdict when there is
-    no daily close -- then `GAIN_PIPELINE_NOTE` and `NOT_TAX_ADVICE`, on every run."""
+    no daily close -- then `GAIN_PIPELINE_NOTE` and `NOT_TAX_ADVICE`, on every run. A
+    `profit_take` row that did not build is named under the head (`skipped_rule_line`)."""
     from keel.execution.sleeve import FALLBACK_FEE_SOURCE
 
     lines = [
@@ -1346,6 +1409,7 @@ def render_gain(rows: Sequence[GainRow]) -> list[str]:
         f"fallback rate ({FALLBACK_FEE_SOURCE}); no venue asked; "
         f"{mark_bar_head(row.mark_bar for row in rows)}",
         *_stale_lines((row.product_id, row.mark_bar) for row in rows),
+        *(skipped_rule_line(entry) for entry in skipped),
         GAIN_NOT_EVIDENCE,
     ]
     if not rows:
@@ -1374,4 +1438,165 @@ def render_gain(rows: Sequence[GainRow]) -> list[str]:
         lines.append(line + f"  -> {row.verdict}")
     lines.append(GAIN_PIPELINE_NOTE)
     lines.append(NOT_TAX_ADVICE)
+    return lines
+
+
+# -- keel dca exit --preview (P15, spec §7) --------------------------------------------------
+
+#: `ExitWatchRow.params_source` when no `sleeve_exit` rule sets the product's levels.
+EXIT_DEFAULTS_SOURCE = "spec defaults, R26"
+#: Printed once on every exit report, under its head.
+EXIT_NOT_EVIDENCE = (
+    "an alert, not a tested edge: the levels are spec §7's (R26) and nothing was tuned; a "
+    "breach proposes no sale here -- selling is the operator's decision"
+)
+NO_EXIT_WATCH = "no held product without a resting bracket: nothing is on the exit watch."
+
+
+@dataclass(frozen=True)
+class ExitWatchRow:
+    """One watched product (an open tranche with no resting bracket, `agent.exit_watched_products`)
+    under the sleeve exit monitor.
+
+    `watch` is the monitor's own `sleeve_exit.classify` on the cached completed daily bars (`bars`
+    of them), with the level the cycle last recorded as its `previous`, so the view and the next
+    cycle agree on the `near` band's hysteresis. `dd_pct` .. `arms` are the levels it was judged
+    at and `params_source` where they came from (`rule <id> (<status>)` or
+    `EXIT_DEFAULTS_SOURCE`). `recorded_level`/`recorded_at` are the cycle's own last record
+    (`sleeve_exit:<product>`), `None` when no cycle has recorded one."""
+
+    watch: Any
+    dd_pct: Decimal
+    lookback_days: int
+    sma_period: int
+    confirm_days: int
+    warn_pct: Decimal
+    arms: tuple[str, ...]
+    params_source: str
+    recorded_level: str | None
+    recorded_at: int | None
+    mark_bar: MarkBar | None
+    bars: int
+
+
+def exit_watch_view(
+    repo: Any,
+    config: Any,
+    *,
+    now_ts: int | None = None,
+    skipped: list[SkippedRule] | None = None,
+) -> list[ExitWatchRow]:
+    """One `ExitWatchRow` per product the monitor watches, in product order (spec §7). READ-ONLY:
+    it writes nothing -- the `sleeve_exit:` record is the cycle's -- and builds no broker (R25).
+
+    The levels are the monitor's, not a copy of it: `sleeve_exit.classify` over the product's
+    completed cached daily bars, at the params of a `sleeve_exit` rule the cycle would load for it
+    (`sleeve_exit.monitor_rule`), else R26's defaults. A `sleeve_exit` row that does not build is
+    skipped, as the cycle skips it, and appended to `skipped` for the report to name."""
+    from keel import agent
+    from keel.execution import sleeve_exit
+    from keel.strategy.rules.base import completed_days
+    from keel.types import Granularity
+
+    now = _now(now_ts)
+    loaded, failed = agent._load_sleeve_rules(repo, config)
+    if skipped is not None:
+        skipped.extend(
+            SkippedRule.of(row, exc) for row, exc in failed if row["kind"] == sleeve_exit.RULE_KIND
+        )
+    rows: list[ExitWatchRow] = []
+    for product in agent.exit_watched_products(repo):
+        cached = repo.get_candles(product, Granularity.ONE_DAY)
+        daily = completed_days({Granularity.ONE_DAY: cached})
+        record = repo.get_state(f"{sleeve_exit.STATE_PREFIX}{product}") or {}
+        chosen = sleeve_exit.monitor_rule(loaded, product)
+        overrides = sleeve_exit.monitor_params(loaded, product)
+        watch = sleeve_exit.classify(product, daily, previous=record.get("level"), **overrides)
+        rows.append(
+            ExitWatchRow(
+                watch=watch,
+                dd_pct=overrides.get("dd_pct", sleeve_exit.DEFAULT_DD_PCT),
+                lookback_days=overrides.get("lookback_days", sleeve_exit.DEFAULT_LOOKBACK_DAYS),
+                sma_period=overrides.get("sma_period", sleeve_exit.DEFAULT_SMA_PERIOD),
+                confirm_days=overrides.get("confirm_days", sleeve_exit.DEFAULT_CONFIRM_DAYS),
+                warn_pct=overrides.get("warn_pct", sleeve_exit.DEFAULT_WARN_PCT),
+                arms=tuple(overrides.get("arms", sleeve_exit.ARMS)),
+                params_source=(
+                    EXIT_DEFAULTS_SOURCE
+                    if chosen is None
+                    else f"rule {getattr(chosen[0], 'rule_id', None)} ({chosen[1]})"
+                ),
+                recorded_level=record.get("level"),
+                recorded_at=record.get("observed_at"),
+                mark_bar=mark_bar(daily, now),
+                bars=len(daily),
+            )
+        )
+    return rows
+
+
+def _cents(value: Decimal) -> str:
+    return format(value.quantize(Decimal("0.01")), "f")
+
+
+def render_exit_watch(
+    rows: Sequence[ExitWatchRow], *, skipped: Sequence[SkippedRule] = ()
+) -> list[str]:
+    """The exit report: a head naming the mark bar, a `STALE mark:` line per product marked at a
+    stale bar, a `skipped_rule_line` per `sleeve_exit` row that did not build,
+    `EXIT_NOT_EVIDENCE`, then one line per watched product --
+
+        <product> <level>[ (<arms>)]  close <c> on <YYYY-MM-DD>
+        drawdown <dd>% under the <n>-day high: level <l>
+        sma<period> <sma> (<k> closes under it confirm) | sma<period> not judged (<m> of <n> bars)
+        near within <w>%  (<params source>)  last recorded <level> on <YYYY-MM-DD> | never recorded
+
+    (one line; wrapped here; an arm the params leave out prints `<arm> off`) -- or
+    `NO_EXIT_WATCH` when nothing is watched."""
+    lines = [
+        "exit watch -- the sleeve exit monitor's levels per held product with no resting "
+        "bracket, on the cached daily bars; no venue asked; "
+        f"{mark_bar_head(row.mark_bar for row in rows)}",
+        *_stale_lines((row.watch.product_id, row.mark_bar) for row in rows),
+        *(skipped_rule_line(entry) for entry in skipped),
+        EXIT_NOT_EVIDENCE,
+    ]
+    if not rows:
+        lines.append(NO_EXIT_WATCH)
+    for row in rows:
+        watch = row.watch
+        level = watch.level
+        if watch.breached_arms:
+            level += f" ({', '.join(watch.breached_arms)})"
+        close = "close none" if watch.close is None else f"close {_plain(watch.close)}"
+        if watch.ts is not None:
+            close += f" on {_day(watch.ts)}"
+        if "drawdown" not in row.arms:
+            drawdown = "drawdown off"
+        else:
+            level_text = "not judged" if watch.dd_level is None else _cents(watch.dd_level)
+            drawdown = (
+                f"drawdown {_plain(row.dd_pct)}% under the {row.lookback_days}-day high: "
+                f"level {level_text}"
+            )
+        need = row.sma_period + row.confirm_days - 1
+        if "sma" not in row.arms:
+            sma = "sma off"
+        elif watch.sma is None:
+            sma = f"sma{row.sma_period} not judged ({row.bars} of {need} bars)"
+        else:
+            sma = (
+                f"sma{row.sma_period} {_cents(watch.sma)} "
+                f"({row.confirm_days} closes under it confirm)"
+            )
+        recorded = (
+            "never recorded"
+            if row.recorded_level is None
+            else f"last recorded {row.recorded_level}"
+            + ("" if row.recorded_at is None else f" on {_day(row.recorded_at)}")
+        )
+        lines.append(
+            f"  {watch.product_id} {level}  {close}  {drawdown}  {sma}"
+            f"  near within {_plain(row.warn_pct)}%  ({row.params_source})  {recorded}"
+        )
     return lines

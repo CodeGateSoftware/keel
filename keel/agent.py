@@ -275,8 +275,17 @@ def _is_sleeve_kind(kind: str) -> bool:
 
 
 def _sleeve_rules(repo: Repository, config: Config) -> list[tuple[Rule, str]]:
+    """Every sleeve-sell rule this cycle asks for a `Reduction`, as `(rule, status)` pairs -- the
+    loaded half of `_load_sleeve_rules`, which says why each rule is or is not here."""
+    return _load_sleeve_rules(repo, config)[0]
+
+
+def _load_sleeve_rules(
+    repo: Repository, config: Config
+) -> tuple[list[tuple[Rule, str]], list[tuple[dict[str, Any], Exception]]]:
     """Every sleeve-sell rule this cycle asks for a `Reduction`, as `(rule, status)` pairs
-    (#857, plan R16, R31).
+    (#857, plan R16, R31) -- and, second, every sleeve row that did NOT build, with the exception
+    it raised, so a read-only view (`sleeve_report`) can name what the cycle skips.
 
     **Loaded apart from the entry/exit rules (R31).** `run_once`'s entry pre-pass withholds EVERY
     entry of the cycle when any rule's bar is not ready; a sell rule on a product with a lagging
@@ -291,30 +300,34 @@ def _sleeve_rules(repo: Repository, config: Config) -> list[tuple[Rule, str]]:
     **A row that does not build costs that row, never the cycle.** The entry path lets
     `_build_rule` raise; a sleeve row runs after the DCA buy has been decided, but it is loaded
     before it, so a bad `reverse_dca` row (a missing required param) is logged and skipped here
-    rather than taking the whole cycle -- and the buy -- down with it.
+    rather than taking the whole cycle -- and the buy -- down with it. The cycle only logs it;
+    the failures are returned so every sleeve view prints one line naming the row (P14's held
+    item), rather than showing a report that silently lacks a rule.
     """
     statuses = ("paper",) if config.auto_trade.mode == "paper" else ("paper", "live")
     loaded: list[tuple[Rule, str]] = []
+    failed: list[tuple[dict[str, Any], Exception]] = []
     for status in statuses:
         for row in repo.get_rules(status):
             if not _is_sleeve_kind(row["kind"]):
                 continue
             try:
                 rule = _build_rule(row)
-            except Exception:  # noqa: BLE001 -- one bad sleeve row must not cost the cycle
+            except Exception as exc:  # noqa: BLE001 -- one bad sleeve row must not cost the cycle
                 log_exception(
                     logger,
                     "agent.sleeve_rule_build_failed",
                     rule_id=row.get("id"),
                     kind=row["kind"],
                 )
+                failed.append(({**row, "status": row.get("status", status)}, exc))
                 continue
             if promotion.promotion_class_of(rule) != promotion.SLEEVE_SELL:
                 continue
             if not getattr(rule, "product_id", None):
                 continue
             loaded.append((rule, status))
-    return loaded
+    return loaded, failed
 
 
 # -- freshness -----------------------------------------------------------------------------
@@ -1430,6 +1443,19 @@ def _flag_repeat(repo: Repository, result: ReduceResult) -> ReduceResult:
     return replace(result, repeats_previous=repeats) if repeats else result
 
 
+def exit_watched_products(repo: Repository) -> list[str]:
+    """The products the sleeve exit monitor watches, ascending: each holds an open tranche with
+    no resting bracket (`reconcile._has_resting_bracket`), read off the `positions` ledger. The
+    cycle's watch and `keel dca exit --preview` share this one definition. A read."""
+    return sorted(
+        {
+            str(position["product_id"])
+            for position in repo.get_open_positions()
+            if not reconcile._has_resting_bracket(repo, position)
+        }
+    )
+
+
 def _watch_sleeve_exits(
     broker: Any,
     repo: Repository,
@@ -1469,13 +1495,7 @@ def _watch_sleeve_exits(
     time included. A steady level returns nothing, so the alert fires once per change and never
     per cycle (spec §7). Each product is wrapped on its own.
     """
-    watched = sorted(
-        {
-            str(position["product_id"])
-            for position in repo.get_open_positions()
-            if not reconcile._has_resting_bracket(repo, position)
-        }
-    )
+    watched = exit_watched_products(repo)
     for key in repo.get_state_keys(sleeve_exit.STATE_PREFIX):
         if key[len(sleeve_exit.STATE_PREFIX) :] not in watched and repo.get_state(key):
             repo.set_state(key, None)

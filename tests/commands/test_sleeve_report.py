@@ -1821,3 +1821,211 @@ def test_two_rules_at_one_status_break_the_tie_on_the_lowest_id(repo) -> None:
     repo.insert_rule("profit_take", {"product_id": "BTC-USD", "gain_pct": "45"}, status="paper")
     [row] = sleeve_report.gain_view(repo, _config(), now_ts=_NOW_100)
     assert (row.gain_pct_used, row.params_source) == (D("30"), f"rule {first} (paper)")
+
+
+# -- one rule row that does not build costs that row, never the view (P14's held item, in P15) ---
+#
+# `run_once` classifies sleeve rows so one bad row cannot sink the cycle (`agent._sleeve_rules`);
+# every sleeve view that builds a rule from a stored row now does the same, and prints one line
+# naming each row it skipped instead of a traceback.
+
+
+def test_a_profit_take_row_that_does_not_build_is_skipped_and_the_next_one_used(repo) -> None:
+    _hold(repo, "BTC-USD", qty="0.01", mark="200000")
+    bad = repo.insert_rule(
+        "profit_take", {"product_id": "BTC-USD", "trim_pct": "90"}, status="paper"
+    )
+    good = repo.insert_rule(
+        "profit_take", {"product_id": "BTC-USD", "gain_pct": "40"}, status="candidate"
+    )
+    skipped: list[sleeve_report.SkippedRule] = []
+
+    [row] = sleeve_report.gain_view(repo, _config(), now_ts=_NOW_100, skipped=skipped)
+
+    assert (row.gain_pct_used, row.params_source) == (D("40"), f"rule {good} (candidate)")
+    assert [(s.rule_id, s.kind, s.status) for s in skipped] == [(bad, "profit_take", "paper")]
+    assert skipped[0].error.startswith("ValueError: ")
+
+
+def test_a_products_only_profit_take_row_failing_leaves_the_spec_defaults_and_says_so(
+    repo,
+) -> None:
+    _hold(repo, "BTC-USD", qty="0.01", mark="200000")
+    bad = repo.insert_rule(
+        "profit_take", {"product_id": "BTC-USD", "trim_pct": "90"}, status="live"
+    )
+    skipped: list[sleeve_report.SkippedRule] = []
+
+    [row] = sleeve_report.gain_view(repo, _config(), now_ts=_NOW_100, skipped=skipped)
+    lines = render_gain_with(row, skipped)
+
+    assert row.params_source == "spec defaults"
+    [line] = [text for text in lines if text.startswith("SKIPPED rule ")]
+    assert line == sleeve_report.skipped_rule_line(skipped[0])
+    assert skipped[0].rule_id == bad
+    assert lines.index(line) < next(i for i, t in enumerate(lines) if t.startswith("  BTC-USD "))
+
+
+def render_gain_with(row: Any, skipped: list[Any]) -> list[str]:
+    return sleeve_report.render_gain([row], skipped=skipped)
+
+
+def test_a_skipped_rule_line_names_the_row_its_kind_status_and_error() -> None:
+    line = sleeve_report.skipped_rule_line(
+        sleeve_report.SkippedRule(12, "profit_take", "paper", "ValueError: trim_pct out of range")
+    )
+    assert line == (
+        "SKIPPED rule 12 (profit_take, paper): its stored params do not build "
+        "(ValueError: trim_pct out of range) -- it is not in this report; "
+        "`keel rules disable 12` and `keel rules add` a corrected one"
+    )
+
+
+def test_a_reverse_dca_row_that_does_not_build_is_skipped_and_named(repo) -> None:
+    good = _seed(repo)
+    bad = repo.insert_rule("reverse_dca", {"product_id": "BTC-USD"}, status="paper")
+    # Another sleeve kind's bad row is the gain view's to name, not this one's.
+    repo.insert_rule("profit_take", {"product_id": "BTC-USD", "trim_pct": "90"}, status="paper")
+    skipped: list[sleeve_report.SkippedRule] = []
+
+    rows = distribution_rows(repo, _config(), now_ts=201 * DAY, skipped=skipped)
+
+    assert [r.rule_id for r in rows] == [good]
+    assert [(s.rule_id, s.kind, s.status) for s in skipped] == [(bad, "reverse_dca", "paper")]
+    lines = render_distribution(rows, skipped=skipped)
+    assert lines[0] == sleeve_report.skipped_rule_line(skipped[0])
+    assert sum(line.startswith("SKIPPED rule ") for line in lines) == 1
+
+
+# -- keel dca exit --preview (P15 Task 15.3, spec §7) --------------------------------------------
+#
+# The monitor's own `classify` on the cached daily bars, for the products the cycle watches (an
+# open tranche with no resting bracket), beside the level the cycle last recorded.
+
+
+def _bracketed(repo: Repository, product: str) -> None:
+    bracket = repo.insert_order(
+        dict(
+            mode="live",
+            product_id=product,
+            side="SELL",
+            order_type="bracket",
+            qty=D("1"),
+            limit_price=D("1"),
+            status="pending",
+            fee=D("0"),
+            expected_fill=D("1"),
+        )
+    )
+    repo.open_position(
+        product_id=product,
+        rule_name="turtle_breakout",
+        opened_at=1,
+        qty=D("1"),
+        entry_fill=D("1"),
+        entry_fee=D("0"),
+        bracket_order_id=bracket,
+    )
+
+
+def test_the_exit_view_is_the_monitors_own_level_for_each_watched_product(repo) -> None:
+    from keel.execution import sleeve_exit
+
+    _hold(repo, "BTC-USD", qty="0.01", mark=None)
+    daily = [_candle(d, "100000") for d in range(70, 100)]
+    repo.upsert_candles("BTC-USD", Granularity.ONE_DAY, daily)
+    _bracketed(repo, "ETH-USD")
+    repo.upsert_candles("ETH-USD", Granularity.ONE_DAY, daily)
+
+    [row] = sleeve_report.exit_watch_view(repo, _config(), now_ts=_NOW_100)
+
+    assert row.watch == sleeve_exit.classify("BTC-USD", daily)
+    assert (row.recorded_level, row.recorded_at, row.params_source) == (
+        None,
+        None,
+        sleeve_report.EXIT_DEFAULTS_SOURCE,
+    )
+    assert row.mark_bar == sleeve_report.MarkBar(99 * DAY, 99 * DAY, 0)
+
+
+def test_the_exit_view_reads_the_recorded_level_as_the_previous_one(repo) -> None:
+    """Hysteresis: 70 is 7.7% over the drawdown level 65 -- `near` for a product the cycle last
+    recorded `near`, `clear` for one it did not. The view agrees with the next cycle."""
+    _hold(repo, "BTC-USD", qty="0.01", mark=None)
+    repo.upsert_candles(
+        "BTC-USD",
+        Granularity.ONE_DAY,
+        [*[_candle(d, "100") for d in range(89, 99)], _candle(99, "70")],
+    )
+    [fresh] = sleeve_report.exit_watch_view(repo, _config(), now_ts=_NOW_100)
+    repo.set_state("sleeve_exit:BTC-USD", {"level": "near", "observed_at": 99 * DAY})
+    [held] = sleeve_report.exit_watch_view(repo, _config(), now_ts=_NOW_100)
+
+    assert (fresh.watch.level, held.watch.level) == ("clear", "near")
+    assert (held.recorded_level, held.recorded_at) == ("near", 99 * DAY)
+
+
+def test_a_rendered_exit_row_prints_each_level_in_its_own_slot() -> None:
+    from keel.execution.sleeve_exit import ExitWatch
+
+    row = sleeve_report.ExitWatchRow(
+        watch=ExitWatch(
+            "PAXG-USD", "breached", D("2800"), D("3055"), None, ("drawdown",), 99 * DAY
+        ),
+        dd_pct=D("35"),
+        lookback_days=200,
+        sma_period=200,
+        confirm_days=3,
+        warn_pct=D("5"),
+        arms=("drawdown", "sma"),
+        params_source=sleeve_report.EXIT_DEFAULTS_SOURCE,
+        recorded_level="near",
+        recorded_at=98 * DAY + 3_600,
+        mark_bar=sleeve_report.MarkBar(99 * DAY, 99 * DAY, 0),
+        bars=41,
+    )
+    lines = sleeve_report.render_exit_watch([row])
+
+    assert lines[0].startswith("exit watch -- ")
+    assert lines[0].endswith(f"mark bar {_dated(99)}")
+    assert lines[1] == sleeve_report.EXIT_NOT_EVIDENCE
+    assert lines[2] == (
+        f"  PAXG-USD breached (drawdown)  close 2800 on {_dated(99)}"
+        "  drawdown 35% under the 200-day high: level 3055.00"
+        "  sma200 not judged (41 of 202 bars)"
+        "  near within 5%  (spec defaults, R26)"
+        f"  last recorded near on {_dated(98)}"
+    )
+    assert len(lines) == 3
+
+
+def test_an_empty_exit_watch_says_nothing_is_watched() -> None:
+    lines = sleeve_report.render_exit_watch([])
+    assert lines[-1] == sleeve_report.NO_EXIT_WATCH
+    assert lines[1] == sleeve_report.EXIT_NOT_EVIDENCE
+
+
+def test_a_sleeve_exit_row_that_does_not_build_is_named_and_others_are_not(
+    repo, monkeypatch
+) -> None:
+    """P16 registers `sleeve_exit`; until then a double stands in. A bad `sleeve_exit` row is
+    named by the exit view -- and a bad row of ANOTHER sleeve kind is left to its own view."""
+    from keel import agent
+    from keel.strategy.rules.reverse_dca import ReverseDca
+
+    class _BrokenSleeveExit(ReverseDca):
+        def __init__(self, **_params: Any) -> None:
+            raise ValueError("dd_pct must be in (0, 100)")
+
+    monkeypatch.setitem(agent.RULE_REGISTRY, "sleeve_exit", _BrokenSleeveExit)
+    _hold(repo, "BTC-USD", qty="0.01", mark="100")
+    bad = repo.insert_rule("sleeve_exit", {"product_id": "BTC-USD", "dd_pct": "0"}, status="paper")
+    repo.insert_rule("reverse_dca", {"product_id": "BTC-USD"}, status="paper")
+    skipped: list[sleeve_report.SkippedRule] = []
+
+    [row] = sleeve_report.exit_watch_view(repo, _config(), now_ts=_NOW_100, skipped=skipped)
+
+    assert row.params_source == sleeve_report.EXIT_DEFAULTS_SOURCE
+    assert [(s.rule_id, s.kind) for s in skipped] == [(bad, "sleeve_exit")]
+    lines = sleeve_report.render_exit_watch([row], skipped=skipped)
+    assert lines.count(sleeve_report.skipped_rule_line(skipped[0])) == 1

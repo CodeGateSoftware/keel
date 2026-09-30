@@ -162,3 +162,20 @@ def test_it_really_reads_the_clock(deployment, monkeypatch) -> None:  # noqa: F8
     monkeypatch.setattr(dca_cli.time, "time", lambda: calls.append(1) or float(_NOW))
     _invoke(deployment, "--preview")
     assert calls
+
+
+def test_a_reverse_dca_row_that_does_not_build_is_named_not_hidden(
+    deployment,  # noqa: F811
+    frozen_now,
+) -> None:
+    """The cycle skips a sleeve row that does not build and only logs it; the preview an
+    operator reads names it, so a rule that silently proposes nothing is visible."""
+    db, _config_path = deployment
+    _seed(db)
+    bad = _repo(db).insert_rule("reverse_dca", {"product_id": "BTC-USD"}, status="paper")
+
+    result = _invoke(deployment, "--preview")
+
+    assert result.exit_code == 0, result.output
+    skipped = [line for line in result.output.splitlines() if line.startswith("SKIPPED rule ")]
+    assert len(skipped) == 1 and skipped[0].startswith(f"SKIPPED rule {bad} (reverse_dca, paper)")
