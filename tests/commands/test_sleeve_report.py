@@ -138,8 +138,14 @@ def test_todays_own_cadence_bar_is_next_and_is_proposed_tomorrow(repo) -> None:
     _seed(repo)
     [row] = distribution_rows(repo, _config(), now_ts=210 * DAY + 3_600)
     assert row.next_cadence_ts == 210 * DAY
-    [line, _collision] = render_distribution([row])
-    assert line.startswith("rule 1 (paper) BTC-USD cadence bar 1970-07-30, proposed 1970-07-31: ")
+    [line, stale, _collision] = render_distribution([row])
+    assert line.startswith(
+        "rule 1 (paper) BTC-USD cadence bar 1970-07-30, proposed 1970-07-31, mark bar 1970-07-20: "
+    )
+    # The fixture's newest bar is day 200, ten days before today: flagged, not silently used.
+    assert row.mark_bar is not None and stale == sleeve_report.stale_mark_line(
+        "BTC-USD", row.mark_bar
+    )
 
 
 def test_a_cadence_bar_several_days_out_is_named_ahead_of_time(repo) -> None:
@@ -929,6 +935,7 @@ def _lot_row(**overrides: Any) -> LotRow:
         mark=D("4300"),
         unrealised=D("-5.658636"),
         realised_if_sold=D("-6.907236"),
+        mark_bar=sleeve_report.MarkBar(19_675 * DAY, 19_675 * DAY, 0),  # 2023-11-14, fresh
     )
     base.update(overrides)
     return LotRow(**base)
@@ -950,7 +957,9 @@ def test_a_rendered_lot_names_its_tranche_its_rule_and_the_fallback_fee() -> Non
     lines = render_lots([_lot_row(), _lot_row(position_id=4, rule_name="dca")])
     head, *rest = lines
     source = sleeve.FALLBACK_FEE_SOURCE
-    assert head == f"lots -- fees at the fallback rate ({source}); no venue asked"
+    assert (
+        head == f"lots -- fees at the fallback rate ({source}); no venue asked; mark bar 2023-11-14"
+    )
     lot_lines = [line for line in rest if line.startswith("  #")]
     assert [line.split()[0:2] for line in lot_lines] == [["#3", "turtle_breakout"], ["#4", "dca"]]
     assert lines.count("PAXG-USD") == 1, "one product heading over its lots"
@@ -1228,3 +1237,137 @@ def test_a_target_asset_held_in_another_quote_is_named_not_dropped(repo) -> None
     report = bands_view(repo, _config(target_weights=_HALVES))
     assert report.untargeted == ("BTC-USDC",)
     assert [(r.asset, r.weight) for r in report.rows] == [("BTC", D("0.5")), ("ETH", D("0.5"))]
+
+
+# -- carried from P13's held question (a): every view names the daily bar it marks at, and says
+# -- when that bar is older than the one a cycle would judge a sleeve rule on ----------------------
+
+#: One hour into UTC day 100: the newest COMPLETED daily bar is day 99's.
+_NOW_100 = 100 * DAY + 3_600
+
+
+def _dated(day: int) -> str:
+    return sleeve_report._day(day * DAY)
+
+
+@pytest.mark.parametrize(("last_day", "behind"), [(99, 0), (98, 1), (90, 9)])
+def test_the_mark_bar_is_judged_by_the_cycles_own_daily_readiness_gate(
+    last_day: int, behind: int
+) -> None:
+    """`MarkBar.stale` is exactly `freshness.entry_bar_ready`'s verdict on a daily-only series --
+    the gate `agent._handle_reductions` skips a sleeve rule on (#917) -- not a new threshold."""
+    from keel.data import freshness
+
+    daily = [_candle(d, "100") for d in range(last_day - 2, last_day + 1)]
+    bar = sleeve_report.mark_bar(daily, _NOW_100)
+    readiness = freshness.entry_bar_ready(
+        {Granularity.ONE_DAY: daily}, Granularity.ONE_DAY, _NOW_100
+    )
+    assert bar is not None
+    assert (bar.ts, bar.expected_ts, bar.bars_behind) == (last_day * DAY, 99 * DAY, behind)
+    assert bar.stale is (not readiness.ready) is (behind > 0)
+
+
+def test_no_daily_bar_is_no_mark_bar() -> None:
+    assert sleeve_report.mark_bar([], _NOW_100) is None
+
+
+def test_the_mark_bar_head_names_one_date_a_range_or_none() -> None:
+    fresh = sleeve_report.MarkBar(99 * DAY, 99 * DAY, 0)
+    old = sleeve_report.MarkBar(90 * DAY, 99 * DAY, 9)
+    assert sleeve_report.mark_bar_head([fresh, fresh, None]) == f"mark bar {_dated(99)}"
+    assert sleeve_report.mark_bar_head([fresh, old]) == (f"mark bars {_dated(90)}..{_dated(99)}")
+    assert sleeve_report.mark_bar_head([None]) == "mark bar none"
+
+
+def test_a_stale_line_names_the_product_its_bar_and_the_bar_the_cycle_expects() -> None:
+    old = sleeve_report.MarkBar(90 * DAY, 99 * DAY, 9)
+    assert sleeve_report.stale_mark_line("PAXG-USD", old) == (
+        f"STALE mark: PAXG-USD's latest cached daily bar is {_dated(90)}, 9 bar(s) behind "
+        f"{_dated(99)}, the newest completed one -- a cycle would not judge a sleeve rule on it "
+        "(freshness.entry_bar_ready), so every PAXG-USD figure here is priced at an old close"
+    )
+
+
+def _two_products(repo: Repository) -> None:
+    """BTC fresh (its newest bar is day 99's), PAXG stale (day 90)."""
+    for product, opened_at in (("BTC-USD", 1), ("PAXG-USD", 2)):
+        repo.open_position(
+            product_id=product,
+            rule_name="dca",
+            opened_at=opened_at,
+            qty=D("0.01"),
+            entry_fill=D("100"),
+            entry_fee=D("0"),
+        )
+    repo.upsert_candles("BTC-USD", Granularity.ONE_DAY, [_candle(98, "110"), _candle(99, "120")])
+    repo.upsert_candles("PAXG-USD", Granularity.ONE_DAY, [_candle(90, "130")])
+
+
+def test_the_lots_view_carries_each_products_mark_bar(repo) -> None:
+    _two_products(repo)
+    rows = lots_view(repo, _config(), now_ts=_NOW_100)
+    assert [(r.product_id, r.mark_bar) for r in rows] == [
+        ("BTC-USD", sleeve_report.MarkBar(99 * DAY, 99 * DAY, 0)),
+        ("PAXG-USD", sleeve_report.MarkBar(90 * DAY, 99 * DAY, 9)),
+    ]
+
+
+def test_the_lots_head_names_the_mark_bar_and_a_stale_product_is_flagged_once(repo) -> None:
+    _two_products(repo)
+    rows = lots_view(repo, _config(), now_ts=_NOW_100)
+    lines = render_lots(rows)
+    assert lines[0] == (
+        f"lots -- fees at the fallback rate ({sleeve.FALLBACK_FEE_SOURCE}); no venue asked; "
+        f"mark bars {_dated(90)}..{_dated(99)}"
+    )
+    stale = [line for line in lines if line.startswith("STALE mark: ")]
+    assert stale == [sleeve_report.stale_mark_line("PAXG-USD", rows[1].mark_bar)]
+    assert lines[1] == stale[0], "the flag sits directly under the head it qualifies"
+
+
+def test_a_fresh_lots_report_has_one_date_and_no_flag(repo) -> None:
+    _two_products(repo)
+    lines = render_lots(lots_view(repo, _config(), product_id="BTC-USD", now_ts=_NOW_100))
+    assert lines[0].endswith(f"; mark bar {_dated(99)}")
+    assert not any(line.startswith("STALE mark: ") for line in lines)
+
+
+def test_the_bands_view_carries_the_mark_bar_of_every_weighed_holding(repo) -> None:
+    _two_products(repo)
+    report = bands_view(
+        repo, _config(target_weights={"BTC": D("0.5"), "PAXG": D("0.5")}), now_ts=_NOW_100
+    )
+    assert report.marks == (
+        ("BTC-USD", sleeve_report.MarkBar(99 * DAY, 99 * DAY, 0)),
+        ("PAXG-USD", sleeve_report.MarkBar(90 * DAY, 99 * DAY, 9)),
+    )
+    lines = render_bands(report)
+    assert lines[0].endswith(f"; mark bars {_dated(90)}..{_dated(99)}")
+    assert [line for line in lines if line.startswith("STALE mark: ")] == [
+        sleeve_report.stale_mark_line("PAXG-USD", report.marks[1][1])
+    ]
+    assert lines[1].startswith("STALE mark: PAXG-USD")
+
+
+def test_a_distribution_row_names_its_mark_bar_and_flags_a_stale_one(repo) -> None:
+    repo.insert_rule(
+        "reverse_dca",
+        {"product_id": "BTC-USD", "target_usd": "10", "min_price_floor": "1"},
+        status="live",
+    )
+    repo.open_position(
+        product_id="BTC-USD",
+        rule_name="dca",
+        opened_at=1,
+        qty=D("0.01"),
+        entry_fill=D("100"),
+        entry_fee=D("0"),
+    )
+    repo.upsert_candles("BTC-USD", Granularity.ONE_DAY, [_candle(90, "100000")])
+    [row] = distribution_rows(repo, _config(), now_ts=_NOW_100)
+    assert row.mark_bar == sleeve_report.MarkBar(90 * DAY, 99 * DAY, 9)
+    first, *rest = render_distribution([row])
+    assert f"proposed {_dated(121)}, mark bar {_dated(90)}: " in first
+    assert first.startswith("rule ")
+    assert rest[0] == sleeve_report.stale_mark_line("BTC-USD", row.mark_bar)

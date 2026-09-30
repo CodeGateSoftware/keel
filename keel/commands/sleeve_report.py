@@ -56,6 +56,17 @@ band, and says on every run that band trimming was tested and not adopted (#831)
 never a proposal (spec §5). Both mark at the latest cached daily close and print `mark none`,
 never a zero, without one.
 
+**Every view names the daily bar it marks at, and flags one that is behind** (`MarkBar`; P14,
+carried from P13's held question a). A report priced "if sold now" off a cache that stopped
+updating would otherwise read as today's numbers. Each view's head line names the bar
+(`mark_bar_head`: `mark bar <YYYY-MM-DD>`, or `mark bars <oldest>..<newest>` when products
+differ), and a product whose bar is older than the newest COMPLETED daily bar gets one
+`STALE mark:` line directly under it (`stale_mark_line`). "Older" is not a new threshold: it is
+`freshness.entry_bar_ready` on the daily series, the very gate `agent._handle_reductions` skips a
+sleeve rule on (#917), so the report is stale exactly when the cycle would refuse to decide on
+the same bar. A fresh bar is always that newest completed one, so every fresh product shares one
+date and any other date on the head belongs to a flagged product.
+
 **The fee source is always printed beside the fee.** A venue-previewed commission and the
 `config.fees.taker_pct` fallback are different kinds of number (the plan's Global Constraints:
 "every fallback records its source"), and a fee shown without its source reads as the venue's.
@@ -64,6 +75,7 @@ never a zero, without one.
 from __future__ import annotations
 
 import json
+import time
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from decimal import Decimal
@@ -72,7 +84,7 @@ from typing import TYPE_CHECKING, Any, Literal
 from keel.commands.doctor import _money
 
 if TYPE_CHECKING:
-    from collections.abc import Sequence
+    from collections.abc import Iterable, Sequence
 
     from keel.strategy.rules.base import Rule
     from keel.types import Candle
@@ -91,6 +103,80 @@ def _plain(value: Decimal | None) -> str:
 
 def _usd(value: Decimal | None) -> str:
     return _UNRECORDED if value is None else _money(value)
+
+
+# -- the mark bar: which daily close a view prices at, and whether a cycle would use it -------
+
+
+@dataclass(frozen=True)
+class MarkBar:
+    """The cached daily bar a view marks a product at (`ts`), the newest daily bar that could be
+    complete at the time of the report (`expected_ts`, `freshness.expected_last_ts`), and how
+    many bars the first is behind the second -- `freshness.entry_bar_ready`'s own count."""
+
+    ts: int
+    expected_ts: int
+    bars_behind: int
+
+    @property
+    def stale(self) -> bool:
+        """The cycle's own verdict: `_handle_reductions` does not ask a sleeve rule to decide on
+        a daily bar that is behind (#917), so a report marked at one is not today's picture."""
+        return self.bars_behind > 0
+
+
+def mark_bar(daily: Sequence[Candle], now_ts: int) -> MarkBar | None:
+    """The `MarkBar` of `daily`'s newest bar at `now_ts`, or `None` with no bar at all.
+
+    Judged by `freshness.entry_bar_ready` over the daily series ALONE: with no finer series it
+    answers only "missing" or "behind", which is the question here -- a view's mark is the
+    latest cached close, not a bar an entry needs confirmed."""
+    from keel.data import freshness
+    from keel.types import Granularity
+
+    if not daily:
+        return None
+    readiness = freshness.entry_bar_ready(
+        {Granularity.ONE_DAY: list(daily)}, Granularity.ONE_DAY, now_ts
+    )
+    return MarkBar(daily[-1].ts, readiness.expected_ts, readiness.bars_behind)
+
+
+def mark_bar_head(bars: Iterable[MarkBar | None]) -> str:
+    """What a view's head line says about its marks: one date, the oldest..newest range, or
+    `none` when nothing is marked."""
+    days = sorted({bar.ts for bar in bars if bar is not None})
+    if not days:
+        return "mark bar none"
+    if len(days) == 1:
+        return f"mark bar {_day(days[0])}"
+    return f"mark bars {_day(days[0])}..{_day(days[-1])}"
+
+
+def stale_mark_line(product_id: str, bar: MarkBar) -> str:
+    """The one flag a view prints under its head for a product marked at a stale bar."""
+    return (
+        f"STALE mark: {product_id}'s latest cached daily bar is {_day(bar.ts)}, "
+        f"{bar.bars_behind} bar(s) behind {_day(bar.expected_ts)}, the newest completed one -- "
+        "a cycle would not judge a sleeve rule on it (freshness.entry_bar_ready), so every "
+        f"{product_id} figure here is priced at an old close"
+    )
+
+
+def _stale_lines(marks: Iterable[tuple[str, MarkBar | None]]) -> list[str]:
+    """One `stale_mark_line` per stale product, in first-seen order, never twice."""
+    seen: set[str] = set()
+    lines: list[str] = []
+    for product_id, bar in marks:
+        if bar is not None and bar.stale and product_id not in seen:
+            seen.add(product_id)
+            lines.append(stale_mark_line(product_id, bar))
+    return lines
+
+
+def _now(now_ts: int | None) -> int:
+    """A view's clock: the caller's, or the wall clock when it passes none (the CLI's case)."""
+    return int(time.time()) if now_ts is None else now_ts
 
 
 def render_proposal_line(row: dict[str, Any]) -> str:
@@ -176,6 +262,8 @@ class DistributionRow:
     fee_usd: Decimal | None
     legs: int
     dca_collision: bool
+    #: The daily bar the gates were judged on (`MarkBar`); `None` with no cached daily close.
+    mark_bar: MarkBar | None = None
 
 
 def next_cadence_day(today: int, cadence_days: int) -> int:
@@ -258,6 +346,7 @@ def distribution_rows(repo: Any, config: Any, now_ts: int) -> list[DistributionR
                 )
             )
             continue
+        bar = mark_bar(daily, now_ts)
         restamped = [*daily[:-1], replace(daily[-1], ts=day * _DAY)]
         holding = sleeve.holding_of(repo, product_id, daily[-1].close)
         costs = sleeve.sell_costs(repo, config, product_id)
@@ -284,6 +373,7 @@ def distribution_rows(repo: Any, config: Any, now_ts: int) -> list[DistributionR
                     None,
                     0,
                     collision,
+                    bar,
                 )
             )
             continue
@@ -307,6 +397,7 @@ def distribution_rows(repo: Any, config: Any, now_ts: int) -> list[DistributionR
                 fee_usd=qty * price * costs.fee_pct,
                 legs=legs,
                 dca_collision=collision,
+                mark_bar=bar,
             )
         )
     return rows
@@ -319,7 +410,9 @@ def render_distribution(rows: list[DistributionRow]) -> list[str]:
 
     The head names the cadence BAR and the day it is proposed on (bar + 1 day, #921): the bar is
     what the rule judges, the proposal day is when a cycle judging it actually records something,
-    and a line naming only one of the two reads as a promise for the wrong day."""
+    and a line naming only one of the two reads as a promise for the wrong day. It also names the
+    daily bar the gates were judged on (`mark bar`), with a `STALE mark:` line under a row whose
+    bar a cycle would not decide on (`MarkBar`)."""
     if not rows:
         return [NO_DISTRIBUTION_RULES]
     from keel.execution.sleeve import FALLBACK_FEE_SOURCE, SAME_DAY_DCA
@@ -328,9 +421,10 @@ def render_distribution(rows: list[DistributionRow]) -> list[str]:
     for row in rows:
         rule = _UNRECORDED if row.rule_id is None else str(row.rule_id)
         proposed_ts = row.next_cadence_ts + _DAY
+        marked = "" if row.mark_bar is None else f", mark bar {_day(row.mark_bar.ts)}"
         head = (
             f"rule {rule} ({row.status}) {row.product_id} "
-            f"cadence bar {_day(row.next_cadence_ts)}, proposed {_day(proposed_ts)}: "
+            f"cadence bar {_day(row.next_cadence_ts)}, proposed {_day(proposed_ts)}{marked}: "
         )
         gates = "  gates " + " ".join(
             f"{name}={'open' if ok else 'closed'}" for name, ok in row.gates.items()
@@ -348,6 +442,7 @@ def render_distribution(rows: list[DistributionRow]) -> list[str]:
                 + f"  fee {_usd(row.fee_usd)} ({FALLBACK_FEE_SOURCE})"
                 + gates
             )
+        lines.extend(_stale_lines([(row.product_id, row.mark_bar)]))
         if row.dca_collision and row.qty is not None:
             lines.append(
                 f"  a dca buy falls on the same day: the pipeline records it vetoed "
@@ -664,17 +759,22 @@ class LotRow:
     mark: Decimal | None
     unrealised: Decimal | None
     realised_if_sold: Decimal | None
+    #: The daily bar `mark` is that bar's close (`MarkBar`); `None` exactly when `mark` is.
+    mark_bar: MarkBar | None = None
 
 
-def _daily_mark(repo: Any, product_id: str) -> Decimal | None:
-    """The latest cached ONE_DAY close, or `None`: the bar the sleeve-sell rules decide on."""
+def _daily_mark(repo: Any, product_id: str, now_ts: int) -> tuple[Decimal | None, MarkBar | None]:
+    """The latest cached ONE_DAY close and its `MarkBar`, or `(None, None)`: the bar the
+    sleeve-sell rules decide on."""
     from keel.types import Granularity
 
     daily = repo.get_candles(product_id, Granularity.ONE_DAY)
-    return daily[-1].close if daily else None
+    return (daily[-1].close, mark_bar(daily, now_ts)) if daily else (None, None)
 
 
-def lots_view(repo: Any, config: Any, product_id: str | None = None) -> list[LotRow]:
+def lots_view(
+    repo: Any, config: Any, product_id: str | None = None, *, now_ts: int | None = None
+) -> list[LotRow]:
     """Every open tranche, one `LotRow` each (spec §8.1). READ-ONLY: it writes nothing and builds
     no broker (R25).
 
@@ -689,10 +789,11 @@ def lots_view(repo: Any, config: Any, product_id: str | None = None) -> list[Lot
     """
     from keel.execution import sleeve
 
+    now = _now(now_ts)
     products = sorted({str(p["product_id"]) for p in repo.get_open_positions(product_id)})
     rows: list[LotRow] = []
     for product in products:
-        mark = _daily_mark(repo, product)
+        mark, bar = _daily_mark(repo, product, now)
         costs = sleeve.sell_costs(repo, config, product)
         for lot in sleeve.holding_of(repo, product, mark).lots:
             cost = lot.cost
@@ -719,13 +820,15 @@ def lots_view(repo: Any, config: Any, product_id: str | None = None) -> list[Lot
                     mark=mark,
                     unrealised=unrealised,
                     realised_if_sold=realised,
+                    mark_bar=bar,
                 )
             )
     return rows
 
 
 def render_lots(rows: Sequence[LotRow]) -> list[str]:
-    """The lots report: a head naming the fee source, `LOTS_FIFO_NOTE`, one heading per product
+    """The lots report: a head naming the fee source and the mark bar, a `STALE mark:` line per
+    product marked at a stale bar, `LOTS_FIFO_NOTE`, one heading per product
     over its tranches, and `NOT_TAX_ADVICE` last. One line per tranche:
 
         #<id> <rule> opened <YYYY-MM-DD> qty <q> @ <fill>  fee share $<f>  cost $<c>
@@ -736,7 +839,9 @@ def render_lots(rows: Sequence[LotRow]) -> list[str]:
     from keel.execution.sleeve import FALLBACK_FEE_SOURCE
 
     lines = [
-        f"lots -- fees at the fallback rate ({FALLBACK_FEE_SOURCE}); no venue asked",
+        f"lots -- fees at the fallback rate ({FALLBACK_FEE_SOURCE}); no venue asked; "
+        f"{mark_bar_head(row.mark_bar for row in rows)}",
+        *_stale_lines((row.product_id, row.mark_bar) for row in rows),
         LOTS_FIFO_NOTE,
     ]
     if not rows:
@@ -848,9 +953,12 @@ class BandsReport:
     rows: tuple[BandRow, ...]
     incomplete: tuple[str, ...]
     untargeted: tuple[str, ...]
+    #: `(product, MarkBar)` for every held target product that has a daily close, in target
+    #: order: the bars the weights were marked at.
+    marks: tuple[tuple[str, MarkBar], ...] = ()
 
 
-def bands_view(repo: Any, config: Any) -> BandsReport:
+def bands_view(repo: Any, config: Any, *, now_ts: int | None = None) -> BandsReport:
     """Each target asset's weight against `config.target_weights`, its band, and -- when over
     -- the size back to target and its two-leg fee drag (spec §5). READ-ONLY: it writes
     nothing, builds no broker and proposes nothing (R25).
@@ -881,9 +989,11 @@ def bands_view(repo: Any, config: Any) -> BandsReport:
     held_products = sorted({str(p["product_id"]) for p in repo.get_open_positions()})
     untargeted = tuple(p for p in held_products if p not in weighed)
 
+    now = _now(now_ts)
     values: dict[str, Decimal] = {}
     products: dict[str, str] = {}
     incomplete: list[str] = []
+    marks: list[tuple[str, MarkBar]] = []
     for asset in targets:
         product = _history_product(asset, quote)
         products[asset] = product
@@ -891,14 +1001,15 @@ def bands_view(repo: Any, config: Any) -> BandsReport:
         if holding.qty <= 0:
             values[asset] = Decimal("0")
             continue
-        mark = _daily_mark(repo, product)
-        if mark is None:
+        mark, bar = _daily_mark(repo, product, now)
+        if mark is None or bar is None:
             incomplete.append(asset)
             continue
+        marks.append((product, bar))
         values[asset] = holding.qty * mark
     total = sum(values.values(), Decimal("0"))
     if incomplete or total <= 0:
-        return BandsReport((), tuple(incomplete), untargeted)
+        return BandsReport((), tuple(incomplete), untargeted, tuple(marks))
 
     weights = {asset: values[asset] / total for asset in targets}
     slippage = {
@@ -928,12 +1039,13 @@ def bands_view(repo: Any, config: Any) -> BandsReport:
         else:
             status = "within"
         rows.append(BandRow(asset, target, weight, band, status, values[asset], candidate, drag))
-    return BandsReport(tuple(rows), (), untargeted)
+    return BandsReport(tuple(rows), (), untargeted, tuple(marks))
 
 
 def render_bands(report: BandsReport) -> list[str]:
-    """The bands report: a head naming the band and the fee source,
-    `BANDS_NOT_A_RECOMMENDATION`, one line per target asset --
+    """The bands report: a head naming the band, the fee source and the mark bar, a `STALE
+    mark:` line per product marked at a stale bar, `BANDS_NOT_A_RECOMMENDATION`, one line per
+    target asset --
 
         <asset> target <t>%  weight <w>%  band ±<b>%  <status>  value $<v>
         [size to target $<c>  two-leg fee drag $<d>]
@@ -946,7 +1058,9 @@ def render_bands(report: BandsReport) -> list[str]:
     lines = [
         f"bands -- weights against config target_weights, band = max({_weight_pct(BAND_REL)} x "
         f"target, {_weight_pct(BAND_ABS_FLOOR)}); fees at the fallback rate "
-        f"({FALLBACK_FEE_SOURCE}), per-product slippage; no venue asked",
+        f"({FALLBACK_FEE_SOURCE}), per-product slippage; no venue asked; "
+        f"{mark_bar_head(bar for _product, bar in report.marks)}",
+        *_stale_lines(report.marks),
         BANDS_NOT_A_RECOMMENDATION,
     ]
     if report.incomplete:
