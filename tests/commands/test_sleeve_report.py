@@ -1566,6 +1566,8 @@ def test_below_the_fee_gate_is_triggered_with_the_rules_own_figures(repo) -> Non
     rejection = rule.last_rejection
     assert rejection is not None and rejection["gate"] == "fee_gate"
     assert (row.verdict, row.triggered, row.legs) == ("below fee gate", True, 0)
+    # The trigger price is the rule's own too (review round 1, #936): never recomputed here.
+    assert row.trigger_price == rejection["trigger_price"]
     assert (row.qty_to_sell, row.fee_usd, row.net_usd) == (
         rejection["qty"],
         rejection["fee_usd"],
@@ -1786,3 +1788,36 @@ def test_a_computed_price_prints_ten_significant_digits_and_no_trailing_zeros() 
     assert sleeve_report._price(D("101200.00") * D("1.25")) == "126500"
     assert sleeve_report._price(D("4604.1653451327433628318584")) == "4604.165345"
     assert sleeve_report._price(None) == "unrecorded"
+
+
+# -- review round 1 (#936): the dedupe, the tie-break and the non-finite flag, pinned -------------
+
+
+def test_a_stale_product_with_several_tranches_is_flagged_once_not_per_tranche(repo) -> None:
+    """`_stale_lines` names a product once however many rows carry its bar: PAXG has two lots,
+    both marked at the same stale bar, and the report says so on exactly one line."""
+    for opened_at in (1, 2):
+        repo.open_position(
+            product_id="PAXG-USD",
+            rule_name="dca",
+            opened_at=opened_at,
+            qty=D("0.01"),
+            entry_fill=D("100"),
+            entry_fee=D("0"),
+        )
+    repo.upsert_candles("PAXG-USD", Granularity.ONE_DAY, [_candle(90, "130")])
+    rows = lots_view(repo, _config(), now_ts=_NOW_100)
+    assert len(rows) == 2 and all(r.mark_bar is not None and r.mark_bar.stale for r in rows)
+    stale = [line for line in render_lots(rows) if line.startswith("STALE mark: ")]
+    assert stale == [sleeve_report.stale_mark_line("PAXG-USD", rows[0].mark_bar)]
+
+
+def test_two_rules_at_one_status_break_the_tie_on_the_lowest_id(repo) -> None:
+    """R56: the most advanced status wins, and between two rows at that status the lower id."""
+    _hold(repo, "BTC-USD", qty="0.01", mark="200000")
+    first = repo.insert_rule(
+        "profit_take", {"product_id": "BTC-USD", "gain_pct": "30"}, status="paper"
+    )
+    repo.insert_rule("profit_take", {"product_id": "BTC-USD", "gain_pct": "45"}, status="paper")
+    [row] = sleeve_report.gain_view(repo, _config(), now_ts=_NOW_100)
+    assert (row.gain_pct_used, row.params_source) == (D("30"), f"rule {first} (paper)")

@@ -1277,16 +1277,11 @@ def gain_view(
             continue
         rejection = rule.last_rejection or {}
         gate = rejection.get("gate")
-        trigger_price = (
-            None
-            if vwae is None or mark is None
-            else (vwae * (Decimal("1") + p["gain_pct"] / Decimal("100")))
-        )
         if gate == "fee_gate":
             rows.append(
                 GainRow(
                     **base,
-                    trigger_price=trigger_price,
+                    trigger_price=rejection["trigger_price"],
                     triggered=True,
                     qty_to_sell=rejection["qty"],
                     fee_usd=rejection["fee_usd"],

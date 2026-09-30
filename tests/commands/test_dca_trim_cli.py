@@ -214,6 +214,11 @@ def test_the_gain_flags_reach_the_view(deployment) -> None:  # noqa: F811
         (("--trim-pct", "9"), "--trim-pct"),
         (("--gain-pct", "0"), "--gain-pct"),
         (("--gain-pct", "abc"), "--gain-pct"),
+        # Review round 1 (#936): not a traceback -- `Decimal("NaN") <= 0` raises rather than
+        # answering, and Infinity would pass the rule's range check.
+        (("--gain-pct", "NaN"), "--gain-pct"),
+        (("--trim-pct", "Infinity"), "--trim-pct"),
+        (("--gain-pct", "-Infinity"), "--gain-pct"),
     ],
 )
 def test_a_flag_the_rule_would_refuse_is_a_usage_error(deployment, args, named) -> None:  # noqa: F811

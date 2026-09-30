@@ -80,6 +80,7 @@ def test_the_fee_gate_at_its_boundary() -> None:
     assert rule.reduce_signal(held, _day(str(close)), COSTS) is None
     assert rule.last_rejection == {
         "gate": "fee_gate",
+        "trigger_price": held.vwae * D("1.25"),
         "qty": qty,
         "fee_usd": qty * close * COSTS.fee_pct,
         "net_usd": net,

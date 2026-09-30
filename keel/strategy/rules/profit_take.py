@@ -180,6 +180,7 @@ class ProfitTake(Rule):
         if net_usd < p["min_net_usd"]:
             self.last_rejection = {
                 "gate": "fee_gate",
+                "trigger_price": trigger_price,
                 "qty": qty,
                 "fee_usd": fee_usd,
                 "net_usd": net_usd,
