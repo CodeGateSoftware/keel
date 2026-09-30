@@ -2581,7 +2581,7 @@ def test_a_product_closed_at_a_gain_cannot_shrink_a_sibling_product_in_its_bucke
     assert guards._open_exposure_by_asset(repo) == {"ADA": Decimal("500")}
 
 
-def test_a_re_entry_after_a_full_close_at_a_loss_carries_only_its_own_notional(repo: Repository) -> None:
+def test_re_entry_after_a_loss_close_counts_only_the_new_notional(repo: Repository) -> None:
     """#943: R33 zeroed a fully closed product only while it STAYED flat -- the close's realized
     loss came straight back with the product's next BUY, and rails 4/5/6 counted exposure nobody
     held for as long as the product was held again. The zero must attach to the MOMENT the
@@ -2616,7 +2616,7 @@ def test_a_re_entry_after_a_full_close_at_a_loss_carries_only_its_own_notional(r
     assert guards._open_exposure_by_asset(repo) == {"PAXG": Decimal("100")}
 
 
-def test_a_re_entry_after_a_full_close_at_a_gain_is_not_hidden_by_the_gain(repo: Repository) -> None:
+def test_re_entry_after_a_gain_close_is_not_hidden_by_the_gain(repo: Repository) -> None:
     """#943's other edge: a full close at a gain leaves a NEGATIVE residual, which used to eat
     the next position's figure -- $100 really held read as $0 once the closed pair's $200 gain
     was netted against it. A product net long after a flat moment contributes its post-flat
