@@ -6591,7 +6591,8 @@ def test_the_watch_poll_runs_after_the_buy_and_its_failure_costs_nothing(repo, m
 
 def _paxg_book(repo: Repository, days: int = 41, price: str = "4700") -> int:
     """PAXG's tranche and `days` cached daily bars, no rules at all -- `now_ts` an hour into day
-    `days`, so the cached tail is the last closed bar and the watch's poll fetches nothing."""
+    `days`, so the cached tail is the last closed bar. The watch's backfill asks the venue only
+    for the earlier days its window lacks, and `_HoldingBroker` has none to give."""
     _paxg_tranche(repo)
     return _history(repo, days, product=_PAXG, price=price)
 
@@ -6810,3 +6811,30 @@ def test_a_watch_that_raises_before_any_product_costs_nothing(repo, monkeypatch)
     assert result.skipped is False
     assert [c["side"] for c in broker.place_calls] == [Side.BUY]
     assert result.exit_watch_transitions == []
+
+
+def test_a_sleeve_exit_rules_longer_window_sizes_the_backfill_on_a_sleeve_only_product(
+    repo, monkeypatch
+):
+    """Review round 2: a product under a sleeve rule is polled by the reduction step, whose
+    `poll_once` cold-starts it with ONE bar. The watch still fills its daily history -- sized by
+    the product's own `sleeve_exit` rule (a 300-day lookback here), not only by the defaults."""
+
+    class _LongWindowExit(_AlwaysReduceRule):
+        def __init__(self, product_id: str) -> None:
+            super().__init__(product_id, name="sleeve_exit")
+            self.params = {"product_id": product_id, "lookback_days": 300}
+
+        def reduce_signal(self, holding, candles_by_tf, costs):
+            return None
+
+    _seed_rules(repo, monkeypatch, (_LongWindowExit(_PAXG), "live"))
+    _paxg_tranche(repo)
+    series = [_candle(d * DAY, "4700") for d in range(400)]
+    broker = _HoldingBroker(series={(_PAXG, Granularity.ONE_DAY): series})
+
+    result = run_once(broker, repo, _config(), now_ts=400 * DAY + 3_600)
+
+    assert result.sleeve_only_products == [_PAXG], "fixture: PAXG is a sleeve-only product"
+    cached = repo.get_candles(_PAXG, Granularity.ONE_DAY)
+    assert (len(cached), cached[-1].ts) == (300, 399 * DAY)

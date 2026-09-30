@@ -1477,10 +1477,12 @@ def _watch_sleeve_exits(
     not being told where it is (Q7). A product that is no longer watched has its record cleared,
     so doctor does not keep reporting a level nothing watches; that is not a transition.
 
-    **R27's poll.** In a LIVE cycle, a watched product outside `products` (the products this
-    cycle already polled) gets its `ONE_DAY` candles fetched here -- daily only, whatever the
-    config's granularities, one product at a time and each wrapped: a failure costs that
-    product's fresh bars (it is judged on whatever is cached, `insufficient_history` with
+    **R27's poll.** In a LIVE cycle, a watched product outside `products` -- the ENTRY rules'
+    products, whose series the entry poll owns -- gets its `ONE_DAY` candles fetched here. That
+    includes a sleeve-only product (review round 2): the reduction step's `poll_once` cold-starts
+    it with one bar, and its `sleeve_exit` rule's own windows size the fill. Daily only,
+    whatever the config's granularities, one product at a time and each wrapped: a failure
+    costs that product's fresh bars (it is judged on whatever is cached, `insufficient_history` with
     nothing), never the cycle or another product. It is a `market_feed.backfill` over
     `sleeve_exit.history_days` (R70, #938), not a `poll_once`: `poll_once` cold-starts an empty
     series with ONE bar, which judged PAXG's "200-day high" on the high since deploy and left
@@ -2829,7 +2831,7 @@ def run_once(
             exit_watch_transitions = _watch_sleeve_exits(
                 broker,
                 repo,
-                sorted(set(products) | set(sleeve_only_products)),
+                products,
                 sleeve_rules,
                 now_ts,
                 live=paper_trader is None,
