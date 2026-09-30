@@ -666,19 +666,26 @@ def test_an_entry_rule_or_an_unknown_id_still_starts_the_promotion_job(
     assert started == ["rule_promoted"]
 
 
+@pytest.mark.parametrize("state", ["missing", "empty"])
 def test_an_unreadable_database_refuses_rather_than_starting_the_job(
-    fresh: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    fresh: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch, tmp_path: Path, state: str
 ) -> None:
-    """Review round 2 (#935): the class check fails CLOSED. If the rule's kind cannot be read,
-    the browser cannot tell a sleeve-sell rule from an entry rule, so it starts nothing."""
+    """Review rounds 2 and 3 (#935): the class check fails CLOSED. If the rule's kind cannot be
+    read -- the file will not open (`missing`), or it opens and the read fails (`empty`: no
+    `rules` table) -- the browser cannot tell a sleeve-sell rule from an entry rule, so it
+    starts nothing."""
     from keel.commands.setup import ActionResult, promote_rule, unreadable_rule_refusal
 
     config_path, _db_path = fresh
     started = _spy_jobs(monkeypatch)
-    missing = tmp_path / "absent.db"
+    db = tmp_path / f"{state}.db"
+    if state == "empty":
+        db.write_bytes(b"")
 
-    result = promote_rule(config_path, missing, {"rule_id": "1"})
+    result = promote_rule(config_path, db, {"rule_id": "1"})
 
     assert result == ActionResult("rule_promoted", False, unreadable_rule_refusal(1))
     assert started == []
-    assert not missing.exists()
+    assert db.exists() is (state == "empty")
+    if state == "empty":
+        assert db.read_bytes() == b""
