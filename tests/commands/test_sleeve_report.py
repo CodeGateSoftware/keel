@@ -2090,6 +2090,11 @@ def test_a_sleeve_exit_row_that_does_not_build_is_named_and_others_are_not(repo)
             {"level": "near", "observed_at": "yesterday"},
             "ValueError: its recorded observed_at is not an epoch second: 'yesterday'",
         ),
+        (
+            # #941: an int, but milliseconds -- past any date the report can print.
+            {"level": "near", "observed_at": 1_759_000_000_000},
+            "ValueError: its recorded observed_at is not an epoch second: 1759000000000",
+        ),
     ],
 )
 def test_a_malformed_record_skips_that_product_and_reports_the_others(

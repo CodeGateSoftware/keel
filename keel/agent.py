@@ -1242,6 +1242,8 @@ def _handle_reductions(
 
     In order, and each step is why the next one is reached:
 
+    0. **One `sleeve_exit` rule per product** (#940): only `sleeve_exit_rule.monitor_rule`'s pick
+       is asked, so a proposal is judged at the same levels as the watch and the preview.
     1. **Nothing held, nothing asked.** The `positions` ledger is the holding (`sleeve.holding_of`,
        every open tranche -- a sleeve rule is a policy over the holding, not its owner, so this
        never reads `position_rule:`).
@@ -1281,6 +1283,16 @@ def _handle_reductions(
     never the cycle and never another product.
     """
     on_product = [(r, s) for r, s in sleeve_rules if getattr(r, "product_id", None) == product_id]
+    # #940: of the `sleeve_exit` rules on this product, only the one that sets its monitor
+    # levels (`monitor_rule`: live first, then the lowest id) may propose. The watch and the
+    # preview judge the product at that rule's levels; a second rule proposing at its own would
+    # sell the sleeve on a breach the alert says has not happened.
+    selected = sleeve_exit_rule.monitor_rule(on_product, product_id)
+    on_product = [
+        (r, s)
+        for r, s in on_product
+        if not isinstance(r, SleeveExit) or (selected is not None and r is selected[0])
+    ]
     if not on_product:
         return []
     days = completed_days(candles_by_tf)
@@ -1538,6 +1550,16 @@ def _watch_sleeve_exits(
         try:
             key = f"{sleeve_exit.STATE_PREFIX}{product_id}"
             record = repo.get_state(key) or {}
+            if not isinstance(record, dict):
+                # Unreadable: read as no record, so it is judged and REWRITTEN below -- raising
+                # here would skip the rewrite and leave the product unjudged for good.
+                log_event(
+                    logger,
+                    logging.WARNING,
+                    "agent.exit_watch_record_unreadable",
+                    product=product_id,
+                )
+                record = {}
             previous = record.get("level")
             daily = completed_days(
                 {Granularity.ONE_DAY: repo.get_candles(product_id, Granularity.ONE_DAY)}

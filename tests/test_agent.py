@@ -6379,6 +6379,46 @@ def test_a_repeated_same_day_dca_veto_is_recorded_but_not_re_announced(repo):
     ]
 
 
+def test_only_the_sleeve_exit_rule_that_sets_the_levels_may_propose(repo):
+    """#940: with two `sleeve_exit` rules on one product -- live at 35%, paper at 20% -- the
+    watch and the preview judge the product at the LIVE rule's levels (`monitor_rule`). A close
+    25% under the high is `clear` there, so the paper rule must not propose the whole sleeve on
+    levels the watch says are not breached: one product, one definition of a breach."""
+    repo.insert_rule("sleeve_exit", {"product_id": PRODUCT, "arms": ["drawdown"]}, status="live")
+    paper = repo.insert_rule(
+        "sleeve_exit",
+        {"product_id": PRODUCT, "arms": ["drawdown"], "dd_pct": "20"},
+        status="paper",
+    )
+    now = 30 * DAY + 3_600
+    _seed_open_position(repo, PRODUCT, Decimal("0.5"), Decimal("100"), ts=0, rule_name="dca")
+    _seed_history(repo, [*(_candle(d * DAY, "100") for d in range(29)), _candle(29 * DAY, "75")])
+    loaded = agent._sleeve_rules(repo, _config())
+    assert sorted(rule.rule_id for rule, _status in loaded) == [paper - 1, paper], "fixture"
+
+    result = run_once(_HoldingBroker(), repo, _config(), now_ts=now)
+
+    assert result.reduce_results == [] and repo.get_sell_proposals() == []
+    assert _watched(result) == [(PRODUCT, "clear")]
+
+
+def test_a_malformed_exit_record_is_overwritten_not_stuck(repo):
+    """Held item 5 of #939's review (pre-existing from P15): a `sleeve_exit:` record that is not
+    a mapping made the watch raise before it rewrote the record, so the product was never judged
+    or alerted again. It is now read as no record: judged, recorded, and reported as a first
+    look."""
+    now = _paxg_book(repo)
+    repo.set_state("sleeve_exit:PAXG-USD", "breached")
+
+    result = run_once(_HoldingBroker(), repo, _config(), now_ts=now)
+
+    assert [(t.product_id, t.level, t.previous) for t in result.exit_watch_transitions] == [
+        (_PAXG, "clear", None)
+    ]
+    record = repo.get_state("sleeve_exit:PAXG-USD")
+    assert isinstance(record, dict) and record["level"] == "clear"
+
+
 def test_a_young_tranche_is_refused_by_min_hold_days(repo, monkeypatch):
     """#916: no cycle test used to reach `_handle_reductions`' `min_hold_days` refusal -- the
     FIFO tranche the sale would consume is only 10 days old, younger than the default 30, so the

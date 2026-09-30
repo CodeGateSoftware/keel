@@ -2104,7 +2104,7 @@ def _level_text(value: Any) -> str:
         return str(value)
 
 
-def exit_watch_findings(records: dict[str, dict[str, Any]]) -> list[Finding]:
+def exit_watch_findings(records: dict[str, Any]) -> list[Finding]:
     """The sleeve exit monitor's last recorded level per watched product (#857, spec §7 "Doctor:
     the `sleeve_exit:<product>` state is rendered"; plan P15 Task 15.3).
 
@@ -2113,7 +2113,9 @@ def exit_watch_findings(records: dict[str, dict[str, Any]]) -> list[Finding]:
     WARN for `near` and `breached` -- the product is at or past a structural exit level the
     operator may want to act on -- and OK for `clear` and `insufficient_history`, which is not
     judged rather than guessed (spec §7 failure mode b). A record whose level is none of the
-    four is WARN, never read as `clear`. With no record at all (nothing watched
+    four is WARN, never read as `clear`, and so is one that cannot be read at all -- not a
+    mapping, or a field that does not render -- which is ONE WARN for that product rather than a
+    crash of `gather_findings` (#942). With no record at all (nothing watched
     yet), ONE OK sentinel, the shape `ledger_drift_findings` uses, so the name never vanishes
     from a deployment's findings (PR #888).
 
@@ -2133,61 +2135,69 @@ def exit_watch_findings(records: dict[str, dict[str, Any]]) -> list[Finding]:
         ]
     findings: list[Finding] = []
     for product in sorted(records):
-        record = records[product]
-        level = str(record.get("level"))
-        bar = "an unrecorded bar" if record.get("ts") is None else _utc_date(int(record["ts"]))
-        against = (
-            f"close {_level_text(record.get('close'))} on {bar}, "
-            f"drawdown level {_level_text(record.get('dd_level'))}, "
-            f"SMA {_level_text(record.get('sma'))}"
-        )
-        if level in ("near", "breached"):
-            arms = ", ".join(record.get("breached_arms") or [])
-            findings.append(
-                Finding(
-                    "sleeve.exit_watch",
-                    WARN,
-                    f"{product} is {level} its sleeve exit level"
-                    + (f" ({arms})" if level == "breached" and arms else ""),
-                    against,
-                    _EXIT_WATCH_FIX,
-                    products=(product,),
-                )
-            )
-        elif level == "insufficient_history":
-            findings.append(
-                Finding(
-                    "sleeve.exit_watch",
-                    OK,
-                    EXIT_WATCH_NOT_JUDGED.format(product=product),
-                    against,
-                    "-",
-                )
-            )
-        elif level == "clear":
-            findings.append(
-                Finding(
-                    "sleeve.exit_watch",
-                    OK,
-                    f"{product} is clear of its sleeve exit levels",
-                    against,
-                    "-",
-                )
-            )
-        else:
-            # A record with no level this knows is not `clear`: fail toward telling.
+        try:
+            findings.append(_exit_watch_finding(product, records[product]))
+        except Exception as exc:  # noqa: BLE001 -- one record costs its own finding (#942)
             findings.append(
                 Finding(
                     "sleeve.exit_watch",
                     WARN,
                     EXIT_WATCH_UNREADABLE.format(product=product),
-                    f"recorded level {record.get('level')!r}; {against}",
-                    "the next live cycle rewrites the record; `keel dca exit --preview` shows "
-                    "the levels now",
+                    f"the record cannot be read ({type(exc).__name__}: {exc})",
+                    _EXIT_WATCH_REWRITE_FIX,
                     products=(product,),
                 )
             )
     return findings
+
+
+#: What an unreadable `sleeve_exit:` record's finding tells the operator to do.
+_EXIT_WATCH_REWRITE_FIX = (
+    "the next live cycle rewrites the record; `keel dca exit --preview` shows the levels now"
+)
+
+
+def _exit_watch_finding(product: str, record: Any) -> Finding:
+    """One product's `sleeve.exit_watch` Finding (`exit_watch_findings`). Raises on a record it
+    cannot read -- not a mapping, or a field that does not render -- so the caller reports it as
+    unreadable rather than crash `gather_findings` (#942)."""
+    if not isinstance(record, dict):
+        raise TypeError(f"not a mapping: {record!r}")
+    level = str(record.get("level"))
+    bar = "an unrecorded bar" if record.get("ts") is None else _utc_date(int(record["ts"]))
+    against = (
+        f"close {_level_text(record.get('close'))} on {bar}, "
+        f"drawdown level {_level_text(record.get('dd_level'))}, "
+        f"SMA {_level_text(record.get('sma'))}"
+    )
+    if level in ("near", "breached"):
+        arms = ", ".join(record.get("breached_arms") or [])
+        return Finding(
+            "sleeve.exit_watch",
+            WARN,
+            f"{product} is {level} its sleeve exit level"
+            + (f" ({arms})" if level == "breached" and arms else ""),
+            against,
+            _EXIT_WATCH_FIX,
+            products=(product,),
+        )
+    if level == "insufficient_history":
+        return Finding(
+            "sleeve.exit_watch", OK, EXIT_WATCH_NOT_JUDGED.format(product=product), against, "-"
+        )
+    if level == "clear":
+        return Finding(
+            "sleeve.exit_watch", OK, f"{product} is clear of its sleeve exit levels", against, "-"
+        )
+    # A record with no level this knows is not `clear`: fail toward telling.
+    return Finding(
+        "sleeve.exit_watch",
+        WARN,
+        EXIT_WATCH_UNREADABLE.format(product=product),
+        f"recorded level {record.get('level')!r}; {against}",
+        _EXIT_WATCH_REWRITE_FIX,
+        products=(product,),
+    )
 
 
 def doctor_exit_code(findings: list[Finding]) -> int:

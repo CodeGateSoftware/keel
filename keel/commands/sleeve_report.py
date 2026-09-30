@@ -1558,10 +1558,17 @@ def _exit_watch_row(repo: Any, loaded: Any, product: str, now: int) -> ExitWatch
     if recorded_level is not None and not isinstance(recorded_level, str):
         raise ValueError(f"its recorded level is not a level name: {recorded_level!r}")
     recorded_at = record.get("observed_at")
-    if recorded_at is not None and (
-        isinstance(recorded_at, bool) or not isinstance(recorded_at, int)
-    ):
-        raise ValueError(f"its recorded observed_at is not an epoch second: {recorded_at!r}")
+    if recorded_at is not None:
+        # An int the report cannot print as a date (a millisecond epoch, #941) is as unreadable
+        # as a string: refuse it here, inside the per-product wrap, not in the renderer.
+        try:
+            if isinstance(recorded_at, bool) or not isinstance(recorded_at, int):
+                raise TypeError
+            _day(recorded_at)
+        except TypeError, ValueError, OverflowError, OSError:
+            raise ValueError(
+                f"its recorded observed_at is not an epoch second: {recorded_at!r}"
+            ) from None
     chosen = sleeve_exit_rule.monitor_rule(loaded, product)
     overrides = sleeve_exit_rule.monitor_params(loaded, product)
     # A recorded level outside the four is shown as it is (R71) and moves no hysteresis band.
