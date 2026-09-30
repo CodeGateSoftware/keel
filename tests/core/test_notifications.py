@@ -22,6 +22,8 @@ import pytest
 from keel_core.notifications import (
     EVENTS,
     EVENTS_BY_KEY,
+    INFO,
+    WARN,
     NotificationSettings,
     notification_event,
     send_event,
@@ -229,3 +231,27 @@ def test_sleeve_exit_watch_is_a_warn_execution_event():
     facts. Nothing is sold: the monitor is an alert."""
     spec = EVENTS_BY_KEY["sleeve.exit_watch"]
     assert (spec.category, spec.severity) == ("execution", "warn")
+
+
+def test_an_event_may_be_sent_below_its_keys_severity_never_above():
+    """P16 (P15's held item c): the taxonomy's severity is a key's CEILING. A caller may send one
+    occurrence at `info` -- `sleeve.exit_watch`'s first look or recovery -- but never raise an
+    `info` key to `warn`, and never name a severity outside the vocabulary. Delivery routes on
+    the KEY (`NotificationSettings.opted_in`), so a lowered severity is still delivered."""
+    lowered = notification_event("sleeve.exit_watch", "m", severity=INFO, product="X")
+    assert (lowered.key, lowered.category, lowered.severity, dict(lowered.fields)) == (
+        "sleeve.exit_watch",
+        "execution",
+        "info",
+        {"product": "X"},
+    )
+    assert notification_event("sleeve.exit_watch", "m").severity == "warn"
+    assert notification_event("sleeve.exit_watch", "m", severity=WARN).severity == "warn"
+    with pytest.raises(ValueError):
+        notification_event("sleeve.proposal", "m", severity=WARN)
+    with pytest.raises(ValueError):
+        notification_event("sleeve.exit_watch", "m", severity="critical")
+    sent: list[bytes] = []
+    settings = NotificationSettings(events=frozenset({"sleeve.exit_watch"}))
+    assert send_event("http://hook", lowered, settings, transport=lambda _u, b: sent.append(b))
+    assert [json.loads(body)["severity"] for body in sent] == ["info"]

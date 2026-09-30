@@ -20,7 +20,13 @@ import json
 from decimal import Decimal
 
 import pytest
-from keel_core.notifications import EVENTS_BY_KEY, WARN, NotificationSettings, send_event
+from keel_core.notifications import (
+    EVENTS_BY_KEY,
+    WARN,
+    NotificationSettings,
+    format_plain,
+    send_event,
+)
 
 from keel import notifications
 from keel.commands.doctor import attestation_findings, rail_state_findings
@@ -848,3 +854,38 @@ def test_the_wiring_derives_exit_watch_events_from_the_cycle_result():
         "near",
     )
     assert repo.state_writes == []
+
+
+# -- P15's held item c: a report is INFO, a level the operator may act on is WARN ---------------
+
+
+@pytest.mark.parametrize(
+    ("level", "previous", "severity"),
+    [
+        ("breached", None, "warn"),
+        ("breached", "near", "warn"),
+        ("near", None, "warn"),
+        ("near", "clear", "warn"),
+        ("near", "breached", "warn"),
+        ("clear", None, "info"),  # "now watched": the first observation
+        ("clear", "insufficient_history", "info"),  # judged at last: also a first look
+        ("clear", "near", "info"),  # "recovered"
+        ("clear", "breached", "info"),  # "recovered"
+        ("insufficient_history", None, "info"),
+        ("insufficient_history", "clear", "info"),
+    ],
+)
+def test_an_exit_watch_event_is_warn_only_when_near_or_breached(level, previous, severity):
+    """The ruling on P15's held item c: `near` and `breached` are the levels an operator may have
+    to decide on, so they stay WARN; a first observation, a recovery and a product not yet
+    judged describe the watch and are INFO -- a WARN on every first look trains the operator to
+    skim the channel the breach will arrive on."""
+    [event] = [
+        e for e in _state(watch=(_watch(level, previous=previous),)) if e.key == "sleeve.exit_watch"
+    ]
+    assert (event.fields["level"], event.fields["previous"], event.severity) == (
+        level,
+        previous,
+        severity,
+    )
+    assert format_plain(event)["severity"] == severity

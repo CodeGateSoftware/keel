@@ -43,6 +43,8 @@ from typing import TYPE_CHECKING, Any
 
 from keel_core.alerting import resolve_webhook_url
 from keel_core.notifications import (
+    INFO,
+    WARN,
     NotificationEvent,
     Transport,
     notification_event,
@@ -150,7 +152,8 @@ def events_from_state(
     `sleeve.exit_watch` per level CHANGE the sleeve exit monitor recorded -- a steady level is not
     in it, so nothing repeats per cycle. Worded by the level (`_exit_watch_message`): `near` and
     `breached` as warnings, `clear` after one of them as a recovery (plan OQ10). Every one ends
-    by saying nothing is sold.
+    by saying nothing is sold. Only `near` and `breached` are sent at WARN; the rest at INFO
+    (`_exit_watch_severity`, P16).
     """
     events: list[NotificationEvent] = []
 
@@ -294,6 +297,7 @@ def events_from_state(
             notification_event(
                 "sleeve.exit_watch",
                 _exit_watch_message(watch),
+                severity=_exit_watch_severity(watch),
                 product=watch.product_id,
                 level=watch.level,
                 previous=watch.previous,
@@ -310,6 +314,19 @@ def events_from_state(
 #: The tail every `sleeve.exit_watch` message ends on: what the monitor did (nothing) and where
 #: the operator looks next.
 EXIT_WATCH_TAIL = "alert only: nothing is sold -- keel dca exit --preview shows the levels"
+
+
+#: The exit-watch levels an operator may have to act on -- the only ones sent at WARN.
+_EXIT_WATCH_WARN_LEVELS = frozenset({"near", "breached"})
+
+
+def _exit_watch_severity(watch: ExitWatch) -> str:
+    """WARN for `near` and `breached`; INFO for everything else -- the first observation ("now
+    watched"), a recovery (back to `clear`) and `insufficient_history` (the ruling on P15's held
+    item c). Those describe the watch rather than ask for a decision, and a WARN on each first
+    look would teach the operator to skim the channel a breach arrives on. The agent's own
+    `agent.exit_watch_transition` log already splits the levels the same way."""
+    return WARN if watch.level in _EXIT_WATCH_WARN_LEVELS else INFO
 
 
 def _exit_watch_message(watch: ExitWatch) -> str:
