@@ -479,15 +479,33 @@ def test_a_preview_that_raises_records_the_proposal_on_the_fallback_fee(
     assert row["rails"]["preview_error"] == repr(exc)
 
 
-def test_a_denied_preview_records_the_venues_refusal_as_every_preview_does(
+def test_a_denied_sell_preview_stays_on_the_row_and_leaves_the_credential_alone(
     repo: Repository,
 ) -> None:
-    """#233: a preview is a trade-scoped venue call, and `_run_order` records a denied one. So
-    does `reduce` -- the venue has falsified the attestation, and rail 20 then vetoes the next
-    BUY cleanly instead of that BUY's own preview raising out of the cycle."""
-    _run(repo, _PreviewRefusingBroker(TradeScopeDenied("403 read-only")))
+    """R79 (#944): a sell PREVIEW is a fee quote for a proposal that places nothing, so its
+    refusal is the row's fact, not the credential's. R-P7-2's refutation write here let a
+    watching rule halt the next day's DCA buys over a fee quote; if the trade scope is really
+    gone, the BUY's own preview refuses on its own (#233 stays a placement-path fact)."""
+    result = _run(repo, _PreviewRefusingBroker(TradeScopeDenied("403 read-only")))
+
+    row = _proposal(repo, result)
+    assert row["decision"] == "preview"
+    assert "403 read-only" in row["rails"]["preview_error"]
     scope = repo.get_venue_trade_scope("coinbase")
-    assert scope is not None and scope.state is TradeScopeState.REFUTED
+    assert scope is None or scope.state is not TradeScopeState.REFUTED
+    dca_buy = OrderIntent(
+        product_id="BTC-USD",
+        side=Side.BUY,
+        qty=D("0.0005"),
+        entry=D("100000"),
+        stop=None,
+        notional=D("50"),
+        is_dca=True,
+        rule_kind="dca",
+        available_quote=D("1000"),
+        withdrawals_enabled=True,
+    )
+    assert guards.check(dca_buy, repo, _config(), NOW_TS).violations == []
 
 
 def test_a_preview_that_times_out_leaves_the_next_buy_unblocked(repo: Repository) -> None:
