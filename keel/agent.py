@@ -2198,9 +2198,10 @@ def run_once(
     exactly the products it always was (a held sleeve-only product stays valued at cost).
 
     The exit watch (`_watch_sleeve_exits`, plan P15) comes after the reductions and keeps the
-    same two promises: the daily poll it makes for a held product no rule polls (R27) is made
-    after the buy and wrapped, and that product never joins `products` either, so a close the
-    poll caches does not move rail 11 -- the product is still valued at cost.
+    same two promises: the daily history it fetches for a watched product outside the entry
+    rules' products (R27, R70) is fetched after the buy and wrapped, and that product never
+    joins `products` either, so a close it caches does not move rail 11 -- the product is still
+    valued at cost.
 
     The venue session is read and RECORDED first, before any gate can return (FR-9) -- a
     session-bound venue's clock answer under its own namespaced keys, with the interval
@@ -2821,9 +2822,10 @@ def run_once(
         # == THE EXIT WATCH: the sleeve exit monitor, AFTER the reductions (#857, plan P15) =====
         #
         # Last of all, for the reductions' reason: the exits, the entries -- the DCA buy -- and
-        # stop management are decided before it runs, and its one venue call (R27's daily poll
-        # for a watched product no rule polls, PAXG tranche 3 today) is made only after them, so
-        # a slow or failing poll can neither delay nor abort the buy. It writes only its own
+        # stop management are decided before it runs, and its venue calls (R27/R70's daily
+        # backfill for each watched product outside the entry rules' products -- PAXG tranche 3
+        # today) are made only after them, so a slow or failing fetch can neither delay nor
+        # abort the buy. It writes only its own
         # `sleeve_exit:` records and places nothing. Wrapped, although it wraps itself: an alert
         # must never cost the cycle.
         exit_watch_transitions: list[ExitWatch] = []
