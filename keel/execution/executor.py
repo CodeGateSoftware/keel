@@ -3102,13 +3102,15 @@ def reduce(
     **Never raises for a venue failure (Review Focus 4).** A preview that throws is recorded
     with the fallback fee and `rails.preview_error`, because a cycle must not die on a proposal
     -- the DCA buy after it in the same cycle is the operator's plan. A `TradeScopeDenied` is
-    ALSO recorded against the venue's trade scope, exactly as `_run_order` records a denied
-    preview (#233): the venue has falsified the credential, and rail 20 then vetoes the next
-    BUY cleanly rather than that BUY's own preview raising out of the cycle. A venue answer
-    whose fee is not a fact -- zero, a synthetic estimate, or one carrying errors -- also falls
-    back, and says why in `rails.fee_fallback_reason`.
+    recorded the same way and nowhere else (R79, #944): writing the trade-scope refutation here,
+    as R-P7-2 first had it, let a rule that can place nothing halt the next day's DCA buys over a
+    fee quote; if the scope is really gone, the next BUY's own preview refuses on its own, and
+    #233's refutation stays what it was -- a placement-path fact. A venue answer whose fee is
+    not a fact -- zero, a synthetic estimate, or one carrying errors -- also falls back, and
+    says why in `rails.fee_fallback_reason`.
 
-    `offline=True` (paper, R18) touches no broker: the offline rails run, their skipped list is
+    `offline=True` (a paper cycle, R18, or a paper-STATUS rule on a live one, R78) touches no
+    broker: the offline rails run, their skipped list is
     recorded, and the fee is the fallback. `broker=None` with `offline=False` is a DIFFERENT
     case -- every rail still runs (nothing is skipped) -- and is recorded with
     `rails.fee_fallback_reason` set to say the venue was never asked, so the row cannot be read
@@ -3223,8 +3225,21 @@ def reduce(
         try:
             preview = broker.preview_order(_order_spec(intent))
         except TradeScopeDenied as exc:
-            _try_record_trade_scope_refuted(repo, str(exc), now_ts, intent, None)
-            _log_trade_scope_refusal(intent, None)
+            # R79 (#944): the refusal stays on THIS row. R-P7-2's refutation write here let a
+            # rule that can place nothing -- a preview is a fee quote, not an order -- refute
+            # the credential rail 20 reads and halt the next day's DCA buys. If the trade scope
+            # is really gone, the next BUY's own preview refuses on its own, exactly as it did
+            # before any sleeve rule existed; #233's refutation stays a placement-path fact.
+            # Logged at WARNING, not through `_log_trade_scope_refusal`: that event is ERROR
+            # because it is the one an operator greps for when entries STOP, and a proposal's
+            # refusal must not file itself among causes of that.
+            log_event(
+                logger,
+                logging.WARNING,
+                "executor.reduce_preview_denied",
+                product=product_id,
+                reason=repr(exc),
+            )
             rails["preview_error"] = repr(exc)
         except Exception as exc:  # noqa: BLE001 -- see the docstring: never die on a proposal
             log_venue_failure(logger, "executor.reduce_preview_failed", product=product_id)
