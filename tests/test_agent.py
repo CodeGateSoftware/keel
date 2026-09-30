@@ -6463,3 +6463,378 @@ def test_a_sleeve_rule_does_not_move_equity(repo, monkeypatch, with_sleeve_rule)
     equity = _held_paxg_equity(repo, monkeypatch, with_sleeve_rule=with_sleeve_rule)
 
     assert equity == Decimal("1000000") + Decimal("80")
+
+
+# -- the sleeve exit monitor's per-cycle watch (#857, plan P15 Task 15.2; R27, Q7, #811) --------
+
+_PAXG = "PAXG-USD"
+
+
+def _paxg_tranche(repo: Repository, *, bracket_order_id: int | None = None) -> None:
+    """#811's PAXG tranche 3: a rule tranche with a recorded stop, held with NO resting bracket
+    (the 2026-09-22 decision), on a product no live rule polls."""
+    repo.open_position(
+        product_id=_PAXG,
+        rule_name="turtle_breakout",
+        opened_at=0,
+        qty=Decimal("0.0132"),
+        entry_fill=Decimal("4673.23"),
+        entry_fee=Decimal("0.73"),
+        initial_stop=Decimal("4521.76"),
+        bracket_order_id=bracket_order_id,
+    )
+
+
+class _GranularityBroker(_HoldingBroker):
+    """`_HoldingBroker` that also records WHICH granularity each candle request asked for."""
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self.candle_requests: list[tuple[str, Granularity]] = []
+
+    def get_candles(
+        self, product_id: str, granularity: Granularity, start: int, end: int
+    ) -> list[Candle]:
+        self.candle_requests.append((product_id, granularity))
+        return super().get_candles(product_id, granularity, start, end)
+
+
+class _RefusesSellsBroker(_HoldingBroker):
+    """Refuses every SELL placement, so the unbracketed sweep cannot re-bracket the tranche from
+    its retry record -- the point under test is the record, not the bracket."""
+
+    def place_order(self, spec: OrderSpec, *, idempotency_key: str | None = None) -> PlaceResult:
+        if spec.side is Side.SELL:
+            self.sequence.append(("place", spec.product_id, spec.side))
+            return PlaceResult(success=False, broker_order_id=None, reason="refused by the test")
+        return super().place_order(spec, idempotency_key=idempotency_key)
+
+
+def _watched(result: LoopResult) -> list[tuple[str, str]]:
+    return [(t.product_id, t.level) for t in result.exit_watch_transitions]
+
+
+def test_paxg_tranche_3_is_watched_although_no_live_rule_polls_paxg(repo, monkeypatch):
+    """Q7 + R27: the only live rule is BTC's dca; PAXG's DAILY series is polled for the monitor
+    alone -- daily only, whatever the config's granularities -- and the level recorded."""
+    _seed_rules(repo, monkeypatch, (Dca(product_id=PRODUCT, cadence_days=1), "live"))
+    now = _history(repo, 41)
+    _paxg_tranche(repo)
+    paxg = [_candle(d * DAY, "4700") for d in range(41)]
+    broker = _GranularityBroker(
+        series={(_PAXG, Granularity.ONE_DAY): paxg, (_PAXG, Granularity.ONE_HOUR): paxg}
+    )
+    config = _config(
+        market_data=MarketDataConfig(
+            granularities=[Granularity.ONE_HOUR, Granularity.ONE_DAY], history_days=365
+        )
+    )
+
+    result = run_once(broker, repo, config, now_ts=now)
+
+    assert {g for p, g in broker.candle_requests if p == _PAXG} == {Granularity.ONE_DAY}
+    # #938: a cold cache is filled with the history the arms need, not one bar -- here all 41
+    # bars the venue has.
+    assert [c.ts for c in repo.get_candles(_PAXG, Granularity.ONE_DAY)] == [
+        d * DAY for d in range(41)
+    ]
+    record = repo.get_state("sleeve_exit:PAXG-USD")
+    assert (record["level"], record["close"], record["ts"]) == ("clear", "4700", 40 * DAY)
+    assert (_PAXG, "clear") in _watched(result)
+    assert _PAXG not in result.products, "the watch's poll is not a rule product"
+
+
+def test_the_watch_poll_never_writes_the_rail_12_heartbeat(repo, monkeypatch):
+    """R27: `last_feed_ts` is the entry poll's heartbeat (rail 12). The monitor's extra poll
+    writes it NOT AT ALL -- counted, because a second write of the same `now_ts` would be
+    invisible to a read of the value."""
+    _seed_rules(repo, monkeypatch, (Dca(product_id=PRODUCT, cadence_days=1), "live"))
+    now = _history(repo, 41)
+    _paxg_tranche(repo)
+    broker = _HoldingBroker(
+        series={(_PAXG, Granularity.ONE_DAY): [_candle(d * DAY, "4700") for d in range(41)]}
+    )
+    writes: list[Any] = []
+    real_set_state = repo.set_state
+
+    def _spy(key: str, value: Any) -> None:
+        if key == "last_feed_ts":
+            writes.append(value)
+        real_set_state(key, value)
+
+    monkeypatch.setattr(repo, "set_state", _spy)
+
+    run_once(broker, repo, _config(), now_ts=now)
+
+    assert writes == [now]
+    assert repo.get_candles(_PAXG, Granularity.ONE_DAY), "fixture: the watch did poll PAXG"
+
+
+def test_the_watch_poll_runs_after_the_buy_and_its_failure_costs_nothing(repo, monkeypatch):
+    """The ordering constraint, as P8 pinned its own sleeve poll: PAXG's candles are requested
+    only AFTER the day's DCA buy is placed, and a venue error there costs the level (it reads
+    `insufficient_history`: nothing is cached), never the buy or the cycle."""
+    _seed_rules(repo, monkeypatch, (Dca(product_id=PRODUCT, cadence_days=1), "live"))
+    now = _history(repo, 41)
+    _paxg_tranche(repo)
+    broker = _RaisingCandlesBroker(raises_for=_PAXG)
+
+    result = run_once(broker, repo, _config(), now_ts=now)
+
+    buy = broker.sequence.index(("place", PRODUCT, Side.BUY))
+    paxg_polls = [i for i, call in enumerate(broker.sequence) if call[:2] == ("candles", _PAXG)]
+    assert paxg_polls and min(paxg_polls) > buy
+    assert result.skipped is False and [r.placed for r in result.enter_results] == [True]
+    assert repo.get_state("sleeve_exit:PAXG-USD")["level"] == "insufficient_history"
+    assert (_PAXG, "insufficient_history") in _watched(result)
+
+
+def _paxg_book(repo: Repository, days: int = 41, price: str = "4700") -> int:
+    """PAXG's tranche and `days` cached daily bars, no rules at all -- `now_ts` an hour into day
+    `days`, so the cached tail is the last closed bar. The watch's backfill asks the venue only
+    for the earlier days its window lacks, and `_HoldingBroker` has none to give."""
+    _paxg_tranche(repo)
+    return _history(repo, days, product=_PAXG, price=price)
+
+
+def test_a_transition_fires_once_and_a_steady_level_fires_nothing(repo):
+    now = _paxg_book(repo)
+    broker = _HoldingBroker()
+
+    first = run_once(broker, repo, _config(), now_ts=now)
+    second = run_once(broker, repo, _config(), now_ts=now + 3_600)
+    assert (
+        _watched(first) == [(_PAXG, "clear")] and first.exit_watch_transitions[0].previous is None
+    )
+    assert second.exit_watch_transitions == []
+
+    _seed_history(repo, [_candle(41 * DAY, "2800")], product=_PAXG)  # 40% under the 4700 high
+    third = run_once(broker, repo, _config(), now_ts=now + DAY)
+    [breach] = third.exit_watch_transitions
+    assert (breach.product_id, breach.level, breach.previous) == (_PAXG, "breached", "clear")
+    assert breach.breached_arms == ("drawdown",)
+    assert repo.get_state("sleeve_exit:PAXG-USD")["level"] == "breached"
+    # ALERT ONLY: a breach under an autonomous live profile places, cancels and writes nothing.
+    assert third.mode == "autonomous"
+    assert broker.place_calls == [] and broker.cancel_calls == []
+    assert repo.get_orders() == [] and repo.get_sell_proposals() == []
+
+
+def test_clearing_the_retry_record_changes_nothing(repo):
+    """#811 as a test: the monitor reads the positions ledger, never `unbracketed:`. The retry
+    record's only alert went silent when it was cleared; the monitor's level must not."""
+    now = _paxg_book(repo)
+    broker = _RefusesSellsBroker()
+    repo.set_state("unbracketed:PAXG-USD", {"stop": "4521.76", "target": "5000", "qty": "0.0132"})
+    run_once(broker, repo, _config(), now_ts=now)
+    before = repo.get_state("sleeve_exit:PAXG-USD")
+    assert before is not None, "fixture: the tranche must be watched on the first run"
+
+    repo.set_state("unbracketed:PAXG-USD", None)
+    after_run = run_once(broker, repo, _config(), now_ts=now + 3_600)
+
+    assert repo.get_state("sleeve_exit:PAXG-USD")["level"] == before["level"]
+    assert after_run.exit_watch_transitions == []
+
+
+def test_a_tranche_with_a_resting_bracket_is_not_watched(repo):
+    """Spec §7: the monitor is for tranches WITHOUT a resting bracket
+    (`reconcile._has_resting_bracket`) -- a bracketed tranche has its stop at the venue."""
+    bracket = repo.insert_order(
+        dict(
+            mode="live",
+            product_id=_PAXG,
+            side=Side.SELL.value,
+            order_type="bracket",
+            qty=Decimal("0.0132"),
+            limit_price=Decimal("5000"),
+            status="pending",
+            fee=Decimal("0"),
+            expected_fill=Decimal("5000"),
+        )
+    )
+    _paxg_tranche(repo, bracket_order_id=bracket)
+    now = _history(repo, 41, product=_PAXG, price="4700")
+
+    result = run_once(_HoldingBroker(), repo, _config(), now_ts=now)
+
+    assert result.exit_watch_transitions == []
+    assert repo.get_state("sleeve_exit:PAXG-USD") is None
+
+
+def test_a_product_that_leaves_the_watch_has_its_record_cleared(repo):
+    """A record for a product no longer watched (sold, or bracketed) would keep doctor warning
+    about a level nothing watches; the cycle clears it, and says nothing -- it is not a level."""
+    now = _paxg_book(repo)
+    run_once(_HoldingBroker(), repo, _config(), now_ts=now)
+    [tranche] = repo.get_open_positions(_PAXG)
+    repo.close_position(tranche["id"], closed_at=now)
+
+    result = run_once(_HoldingBroker(), repo, _config(), now_ts=now + 3_600)
+
+    assert repo.get_state("sleeve_exit:PAXG-USD") is None
+    assert result.exit_watch_transitions == []
+
+
+def test_a_paper_cycle_watches_from_the_cache_and_polls_nothing_for_it(repo):
+    """`live=False`: a paper cycle asks no venue on the monitor's behalf; it classifies what is
+    cached. The cache is a bar behind, so a live cycle WOULD request PAXG's candles here (the
+    control run below) -- a paper cycle does not."""
+    now = _paxg_book(repo) + DAY
+    paper_broker = _GranularityBroker()
+
+    result = run_once(paper_broker, repo, _paper_config(), now_ts=now)
+
+    assert [p for p, _g in paper_broker.candle_requests if p == _PAXG] == []
+    assert _watched(result) == [(_PAXG, "clear")]
+
+    live_broker = _GranularityBroker()
+    run_once(live_broker, repo, _config(), now_ts=now)
+    assert (_PAXG, Granularity.ONE_DAY) in live_broker.candle_requests, "control: live polls"
+
+
+def test_a_sleeve_exit_rules_params_override_the_default_levels(repo, monkeypatch):
+    """R26: a `sleeve_exit` rule's params override the module constants for its product. A 20%
+    fall is `clear` against the default 35% drawdown and `breached` against the rule's 10%."""
+
+    class _SleeveExitDouble(_AlwaysReduceRule):
+        def __init__(self, product_id: str) -> None:
+            super().__init__(product_id, name="sleeve_exit")
+            self.params = {"product_id": product_id, "dd_pct": "10", "arms": ["drawdown"]}
+
+        def reduce_signal(self, holding, candles_by_tf, costs):
+            return None
+
+    now = _paxg_book(repo, price="100")
+    _seed_history(repo, [_candle(41 * DAY, "80")], product=_PAXG)
+    later = now + DAY
+    default = run_once(_HoldingBroker(), repo, _config(), now_ts=later)
+    assert _watched(default) == [(_PAXG, "clear")]
+
+    _seed_rules(repo, monkeypatch, (_SleeveExitDouble(_PAXG), "live"))
+    overridden = run_once(_HoldingBroker(), repo, _config(), now_ts=later + 3_600)
+    assert _watched(overridden) == [(_PAXG, "breached")]
+
+
+def test_a_monitor_that_raises_costs_neither_the_cycle_nor_the_dca_buy(repo, monkeypatch):
+    _seed_rules(repo, monkeypatch, (Dca(product_id=PRODUCT, cadence_days=1), "live"))
+    now = _history(repo, 41)
+    _paxg_tranche(repo)
+
+    def _boom(*_a: Any, **_k: Any) -> Any:
+        raise RuntimeError("monitor bug")
+
+    monkeypatch.setattr(agent.sleeve_exit, "classify", _boom)
+    broker = _HoldingBroker()
+
+    result = run_once(broker, repo, _config(), now_ts=now)
+
+    assert result.skipped is False
+    assert [c["side"] for c in broker.place_calls] == [Side.BUY]
+    assert result.exit_watch_transitions == []
+
+
+def test_a_held_product_the_watch_polls_does_not_move_equity(repo):
+    """Rail 11 on the live profile, which has no sleeve rule: PAXG is held at a cost of 80 and no
+    rule polls it. The watch's poll caches a PAXG close of 100, and equity -- this cycle's AND
+    the next one's, which runs with that close already cached -- still values PAXG at cost. No
+    other rule runs, so nothing else can move the number."""
+    _held_since_day_0(repo, _PAXG)
+    now = 41 * DAY + 3_600
+    broker = _HoldingBroker(
+        base={"PAXG": Decimal("1")},
+        series={(_PAXG, Granularity.ONE_DAY): [_candle(d * DAY, "100") for d in range(42)]},
+    )
+
+    run_once(broker, repo, _config(), now_ts=now)
+    first = repo.get_candles(_PAXG, Granularity.ONE_DAY)
+    assert (len(first), first[-1].close) == (41, Decimal("100")), "fixture: the watch cached PAXG"
+    run_once(broker, repo, _config(), now_ts=now + DAY)
+
+    assert len(repo.get_candles(_PAXG, Granularity.ONE_DAY)) == 42, "fixture: and again"
+    assert [p.equity for p in repo.get_equity_points()] == [Decimal("1000080")] * 2
+
+
+def test_a_cold_cache_is_filled_with_the_history_the_arms_need(repo):
+    """#938: `poll_once` cold-starts an empty table with ONE bar, so PAXG was judged on the high
+    "since deploy" and its SMA arm stayed unjudged for ~200 days. The watch fills the daily
+    history both arms need (`sleeve_exit.history_days`: 202 bars for the SMA's 200 + 3 - 1) in
+    one pass, and three closes under the 200-day SMA confirm a break the same cycle."""
+    _paxg_tranche(repo)
+    series = [
+        *[_candle(d * DAY, "100") for d in range(257)],
+        *[_candle(d * DAY, "90") for d in range(257, 260)],
+    ]
+    broker = _GranularityBroker(series={(_PAXG, Granularity.ONE_DAY): series})
+    now = 260 * DAY + 3_600
+
+    result = run_once(broker, repo, _config(), now_ts=now)
+
+    cached = repo.get_candles(_PAXG, Granularity.ONE_DAY)
+    assert len(cached) == 202 and cached[-1].ts == 259 * DAY
+    [watch] = result.exit_watch_transitions
+    assert (watch.level, watch.breached_arms) == ("breached", ("sma",))
+
+    # Steady state: the next day asks only for what is missing -- the one new bar.
+    series.append(_candle(260 * DAY, "90"))
+    broker.candle_requests.clear()
+    requested: list[tuple[int, int]] = []
+    real_get = broker.get_candles
+
+    def _spy(product_id, granularity, start, end):
+        requested.append((start, end))
+        return real_get(product_id, granularity, start, end)
+
+    broker.get_candles = _spy  # type: ignore[method-assign]
+    run_once(broker, repo, _config(), now_ts=now + DAY)
+    assert requested == [(260 * DAY, 260 * DAY)]
+
+
+def test_a_watch_that_raises_before_any_product_costs_nothing(repo, monkeypatch):
+    """The OUTER wrap in `run_once`: a failure before the per-product loop (here, reading which
+    products are watched) costs the watch this cycle, never the cycle or the DCA buy."""
+    _seed_rules(repo, monkeypatch, (Dca(product_id=PRODUCT, cadence_days=1), "live"))
+    now = _history(repo, 41)
+    _paxg_tranche(repo)
+    calls: list[int] = []
+
+    def _boom(_repo: Any) -> list[str]:
+        calls.append(1)
+        raise RuntimeError("positions read failed")
+
+    monkeypatch.setattr(agent, "exit_watched_products", _boom)
+    broker = _HoldingBroker()
+
+    result = run_once(broker, repo, _config(), now_ts=now)
+
+    assert calls == [1], "fixture: the failure must be reached"
+    assert result.skipped is False
+    assert [c["side"] for c in broker.place_calls] == [Side.BUY]
+    assert result.exit_watch_transitions == []
+
+
+def test_a_sleeve_exit_rules_longer_window_sizes_the_backfill_on_a_sleeve_only_product(
+    repo, monkeypatch
+):
+    """Review round 2: a product under a sleeve rule is polled by the reduction step, whose
+    `poll_once` cold-starts it with ONE bar. The watch still fills its daily history -- sized by
+    the product's own `sleeve_exit` rule (a 300-day lookback here), not only by the defaults."""
+
+    class _LongWindowExit(_AlwaysReduceRule):
+        def __init__(self, product_id: str) -> None:
+            super().__init__(product_id, name="sleeve_exit")
+            self.params = {"product_id": product_id, "lookback_days": 300}
+
+        def reduce_signal(self, holding, candles_by_tf, costs):
+            return None
+
+    _seed_rules(repo, monkeypatch, (_LongWindowExit(_PAXG), "live"))
+    _paxg_tranche(repo)
+    series = [_candle(d * DAY, "4700") for d in range(400)]
+    broker = _HoldingBroker(series={(_PAXG, Granularity.ONE_DAY): series})
+
+    result = run_once(broker, repo, _config(), now_ts=400 * DAY + 3_600)
+
+    assert result.sleeve_only_products == [_PAXG], "fixture: PAXG is a sleeve-only product"
+    cached = repo.get_candles(_PAXG, Granularity.ONE_DAY)
+    assert (len(cached), cached[-1].ts) == (300, 399 * DAY)

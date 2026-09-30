@@ -625,6 +625,7 @@ def test_gather_findings_covers_every_check_over_a_seeded_db(tmp_path, valid_con
         "ledger.venue_drift",
         "sleeve.buy_and_sell_same_asset",
         "sleeve.price_floor_stale",
+        "sleeve.exit_watch",
         "data.missing",
         "data.stale",
         "data.gaps",

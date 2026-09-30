@@ -83,9 +83,10 @@ from keel.config import Config
 from keel.data import freshness, market_feed
 from keel.data.repository import Repository
 from keel.execution import equity as equity_mod
-from keel.execution import executor, guards, reconcile, sleeve, streak
+from keel.execution import executor, guards, reconcile, sleeve, sleeve_exit, streak
 from keel.execution.executor import ExecutionResult, ReduceResult, _fetch_quote_balance_pair
 from keel.execution.guards import FEED_STALENESS_CYCLES
+from keel.execution.sleeve_exit import ExitWatch
 from keel.strategy import engine, promotion
 from keel.strategy.exit_policy import EXIT_POLICY_OFF, next_stop, policy_for, trailing_atr
 from keel.strategy.paper import PaperTrader
@@ -274,8 +275,17 @@ def _is_sleeve_kind(kind: str) -> bool:
 
 
 def _sleeve_rules(repo: Repository, config: Config) -> list[tuple[Rule, str]]:
+    """Every sleeve-sell rule this cycle asks for a `Reduction`, as `(rule, status)` pairs -- the
+    loaded half of `_load_sleeve_rules`, which says why each rule is or is not here."""
+    return _load_sleeve_rules(repo, config)[0]
+
+
+def _load_sleeve_rules(
+    repo: Repository, config: Config
+) -> tuple[list[tuple[Rule, str]], list[tuple[dict[str, Any], Exception]]]:
     """Every sleeve-sell rule this cycle asks for a `Reduction`, as `(rule, status)` pairs
-    (#857, plan R16, R31).
+    (#857, plan R16, R31) -- and, second, every sleeve row that did NOT build, with the exception
+    it raised, so a read-only view (`sleeve_report`) can name what the cycle skips.
 
     **Loaded apart from the entry/exit rules (R31).** `run_once`'s entry pre-pass withholds EVERY
     entry of the cycle when any rule's bar is not ready; a sell rule on a product with a lagging
@@ -290,30 +300,34 @@ def _sleeve_rules(repo: Repository, config: Config) -> list[tuple[Rule, str]]:
     **A row that does not build costs that row, never the cycle.** The entry path lets
     `_build_rule` raise; a sleeve row runs after the DCA buy has been decided, but it is loaded
     before it, so a bad `reverse_dca` row (a missing required param) is logged and skipped here
-    rather than taking the whole cycle -- and the buy -- down with it.
+    rather than taking the whole cycle -- and the buy -- down with it. The cycle only logs it;
+    the failures are returned so every sleeve view prints one line naming the row (P14's held
+    item), rather than showing a report that silently lacks a rule.
     """
     statuses = ("paper",) if config.auto_trade.mode == "paper" else ("paper", "live")
     loaded: list[tuple[Rule, str]] = []
+    failed: list[tuple[dict[str, Any], Exception]] = []
     for status in statuses:
         for row in repo.get_rules(status):
             if not _is_sleeve_kind(row["kind"]):
                 continue
             try:
                 rule = _build_rule(row)
-            except Exception:  # noqa: BLE001 -- one bad sleeve row must not cost the cycle
+            except Exception as exc:  # noqa: BLE001 -- one bad sleeve row must not cost the cycle
                 log_exception(
                     logger,
                     "agent.sleeve_rule_build_failed",
                     rule_id=row.get("id"),
                     kind=row["kind"],
                 )
+                failed.append(({**row, "status": row.get("status", status)}, exc))
                 continue
             if promotion.promotion_class_of(rule) != promotion.SLEEVE_SELL:
                 continue
             if not getattr(rule, "product_id", None):
                 continue
             loaded.append((rule, status))
-    return loaded
+    return loaded, failed
 
 
 # -- freshness -----------------------------------------------------------------------------
@@ -1429,6 +1443,129 @@ def _flag_repeat(repo: Repository, result: ReduceResult) -> ReduceResult:
     return replace(result, repeats_previous=repeats) if repeats else result
 
 
+def exit_watched_products(repo: Repository) -> list[str]:
+    """The products the sleeve exit monitor watches, ascending: each holds an open tranche with
+    no resting bracket (`reconcile._has_resting_bracket`), read off the `positions` ledger. The
+    cycle's watch and `keel dca exit --preview` share this one definition. A read."""
+    return sorted(
+        {
+            str(position["product_id"])
+            for position in repo.get_open_positions()
+            if not reconcile._has_resting_bracket(repo, position)
+        }
+    )
+
+
+def _watch_sleeve_exits(
+    broker: Any,
+    repo: Repository,
+    products: list[str],
+    sleeve_rules: list[tuple[Rule, str]],
+    now_ts: int,
+    *,
+    live: bool,
+) -> list[ExitWatch]:
+    """Classify every watched product and record it; return the level CHANGES only (#857, spec
+    §7, plan P15 Task 15.2; R26, R27, Q7). ALERT ONLY: it places, cancels and writes no order,
+    and it never builds an intent -- `sleeve_exit`'s proposal is P16's rule, not this.
+
+    **Watched** is a product holding an open tranche with no resting bracket
+    (`reconcile._has_resting_bracket`), read off the `positions` ledger -- never off an
+    `unbracketed:` retry record, which is what #811's only alert keyed on and why clearing that
+    record silenced it. A DCA tranche is watched (it has no bracket by design), and so is PAXG
+    tranche 3, held without a stop by the 2026-09-22 decision: holding it is not the same as
+    not being told where it is (Q7). A product that is no longer watched has its record cleared,
+    so doctor does not keep reporting a level nothing watches; that is not a transition.
+
+    **R27's poll.** In a LIVE cycle, a watched product outside `products` -- the ENTRY rules'
+    products, whose series the entry poll owns -- gets its `ONE_DAY` candles fetched here. That
+    includes a sleeve-only product (review round 2): the reduction step's `poll_once` cold-starts
+    it with one bar, and its `sleeve_exit` rule's own windows size the fill. Daily only,
+    whatever the config's granularities, one product at a time and each wrapped: a failure
+    costs that product's fresh bars (it is judged on whatever is cached, `insufficient_history` with
+    nothing), never the cycle or another product. It is a `market_feed.backfill` over
+    `sleeve_exit.history_days` (R70, #938), not a `poll_once`: `poll_once` cold-starts an empty
+    series with ONE bar, which judged PAXG's "200-day high" on the high since deploy and left
+    its SMA arm unjudged for 200 days. `backfill` requests only the missing bars, so once the
+    window is full it asks for the newest bar alone -- the same one request a poll makes. It
+    does NOT write `last_feed_ts`, rail 12's heartbeat, which belongs to the entry poll. A
+    paper cycle (`live=False`) asks no venue on the monitor's behalf and judges the cache.
+
+    **The levels** are `sleeve_exit.classify` on the product's completed daily bars, at the
+    params of a `sleeve_exit` rule on the product when there is one, else R26's module
+    constants (`sleeve_exit.monitor_params`). The record, `sleeve_exit:<product>`, holds
+    `level`, the bar `ts` it was judged on, `close`, `dd_level` and `sma` (money as `str`),
+    `breached_arms`, and `observed_at`, this cycle's clock.
+
+    **A transition** is a level different from the recorded one -- a product seen for the first
+    time included. A steady level returns nothing, so the alert fires once per change and never
+    per cycle (spec §7). Each product is wrapped on its own.
+    """
+    watched = exit_watched_products(repo)
+    for key in repo.get_state_keys(sleeve_exit.STATE_PREFIX):
+        if key[len(sleeve_exit.STATE_PREFIX) :] not in watched and repo.get_state(key):
+            repo.set_state(key, None)
+
+    if live:
+        for product_id in (product for product in watched if product not in products):
+            try:
+                market_feed.backfill(
+                    broker,
+                    repo,
+                    [product_id],
+                    [Granularity.ONE_DAY],
+                    sleeve_exit.history_days(
+                        **sleeve_exit.monitor_params(sleeve_rules, product_id)
+                    ),
+                    now_ts=now_ts,
+                )
+            except Exception:  # noqa: BLE001 -- a watched product's feed must not cost the cycle
+                log_exception(logger, "agent.exit_watch_poll_failed", product=product_id)
+
+    transitions: list[ExitWatch] = []
+    for product_id in watched:
+        try:
+            key = f"{sleeve_exit.STATE_PREFIX}{product_id}"
+            record = repo.get_state(key) or {}
+            previous = record.get("level")
+            daily = completed_days(
+                {Granularity.ONE_DAY: repo.get_candles(product_id, Granularity.ONE_DAY)}
+            )
+            watch = sleeve_exit.classify(
+                product_id,
+                daily,
+                previous=previous,
+                **sleeve_exit.monitor_params(sleeve_rules, product_id),
+            )
+            repo.set_state(
+                key,
+                {
+                    "level": watch.level,
+                    "ts": watch.ts,
+                    "close": None if watch.close is None else str(watch.close),
+                    "dd_level": None if watch.dd_level is None else str(watch.dd_level),
+                    "sma": None if watch.sma is None else str(watch.sma),
+                    "breached_arms": list(watch.breached_arms),
+                    "observed_at": now_ts,
+                },
+            )
+        except Exception:  # noqa: BLE001 -- one product's level must not cost another's
+            log_exception(logger, "agent.exit_watch_failed", product=product_id)
+            continue
+        if watch.level != previous:
+            log_event(
+                logger,
+                logging.WARNING if watch.level in ("near", "breached") else logging.INFO,
+                "agent.exit_watch_transition",
+                product=product_id,
+                level=watch.level,
+                previous=previous,
+                breached_arms=list(watch.breached_arms),
+            )
+            transitions.append(watch)
+    return transitions
+
+
 def _manage_stops(
     broker: Any,
     repo: Repository,
@@ -1986,6 +2123,10 @@ class LoopResult:
     # them by what a stale feed actually stops there (the rule's proposals), not by the exits no
     # rule of theirs can take.
     sleeve_only_products: list[str] = field(default_factory=list)
+    # #857 (plan P15): the sleeve exit monitor's level CHANGES this cycle (`_watch_sleeve_exits`),
+    # one per watched product whose level differs from the one last recorded. A steady level is
+    # not here. `notifications.events_from_state` derives `sleeve.exit_watch` from it.
+    exit_watch_transitions: list[ExitWatch] = field(default_factory=list)
     # Paper-forward observability (P4 Task 9): the synthetic account's equity + Rail 11's
     # drawdown scalars for THIS cycle. `None` in every non-paper cycle -- there is no synthetic
     # account to report on -- so all existing `LoopResult(...)` constructions stay valid.
@@ -2038,7 +2179,8 @@ def run_once(
     interval_sec: float | None = None,
 ) -> LoopResult:
     """One agent cycle: (kill-switch / market-session gates) -> poll -> evaluate -> exits
-    -> entries -> stop management -> sleeve reductions (PROPOSALS only, #857).
+    -> entries -> stop management -> sleeve reductions (PROPOSALS only, #857) -> the sleeve
+    exit watch (ALERTS only, #857 P15).
 
     The reductions are LAST, after every order this cycle places: `_handle_reductions` is
     preview-only, wrapped per product, and cannot withhold, delay or veto the cycle's DCA buy.
@@ -2054,6 +2196,12 @@ def run_once(
     reduction step, AFTER the entries, so a venue error or a slow poll there cannot delay or
     abort the buy; and because they never join `products`, rail 11's equity is marked over
     exactly the products it always was (a held sleeve-only product stays valued at cost).
+
+    The exit watch (`_watch_sleeve_exits`, plan P15) comes after the reductions and keeps the
+    same two promises: the daily history it fetches for a watched product outside the entry
+    rules' products (R27, R70) is fetched after the buy and wrapped, and that product never
+    joins `products` either, so a close it caches does not move rail 11 -- the product is still
+    valued at cost.
 
     The venue session is read and RECORDED first, before any gate can return (FR-9) -- a
     session-bound venue's clock answer under its own namespaced keys, with the interval
@@ -2671,6 +2819,28 @@ def run_once(
                 )
             reduce_results.extend(product_reductions)
 
+        # == THE EXIT WATCH: the sleeve exit monitor, AFTER the reductions (#857, plan P15) =====
+        #
+        # Last of all, for the reductions' reason: the exits, the entries -- the DCA buy -- and
+        # stop management are decided before it runs, and its venue calls (R27/R70's daily
+        # backfill for each watched product outside the entry rules' products -- PAXG tranche 3
+        # today) are made only after them, so a slow or failing fetch can neither delay nor
+        # abort the buy. It writes only its own
+        # `sleeve_exit:` records and places nothing. Wrapped, although it wraps itself: an alert
+        # must never cost the cycle.
+        exit_watch_transitions: list[ExitWatch] = []
+        try:
+            exit_watch_transitions = _watch_sleeve_exits(
+                broker,
+                repo,
+                products,
+                sleeve_rules,
+                now_ts,
+                live=paper_trader is None,
+            )
+        except Exception:  # noqa: BLE001 -- the monitor must never cost the cycle
+            log_exception(logger, "agent.exit_watch_failed")
+
         cycle_result = LoopResult(
             ts=now_ts,
             skipped=False,
@@ -2685,6 +2855,7 @@ def run_once(
             blocked_entries=blocked_entries,
             reduce_results=reduce_results,
             sleeve_only_products=list(sleeve_only_products),
+            exit_watch_transitions=exit_watch_transitions,
             paper_equity=result_paper_equity,
             drawdown_total_pct=result_drawdown_total_pct,
             drawdown_weekly_pct=result_drawdown_weekly_pct,

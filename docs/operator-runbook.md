@@ -1057,6 +1057,7 @@ notifications:
     allowance.nearing_exhaustion: true
     feed.stale_open_position: true
     sleeve.proposal: true
+    sleeve.exit_watch: true
 ```
 
 The taxonomy (thresholds are the ones `keel doctor` computes — the notification layer reads
@@ -1070,6 +1071,7 @@ doctor's own findings, so the alert and the diagnostic can never disagree):
 | `allowance.nearing_exhaustion` | month-to-date BUY spend reaches 80% of the in-force rail-14 allowance — or there is spend against an allowance of 0 (no subscription in force: lapsed or never attested) | rail 14 only speaks when it vetoes, which is too late to re-tier |
 | `feed.stale_open_position` | a product's feed is stale while a position is open in it | the stale product is skipped at INFO; an open position's exits ride on that stopped data |
 | `sleeve.proposal` (`info`) | a cycle recorded a sleeve-sell proposal, `preview` or `vetoed` (never an arbitration `superseded` loser); the message names the proposal, the whole sale and its legs, and `keel dca proposals show <id>` | nothing is wrong and nothing was sold: sleeve sales are preview-only proposals in this build |
+| `sleeve.exit_watch` | the sleeve exit monitor recorded a new level for a held product with no resting bracket (PAXG tranche 3 and every DCA tranche): `near` or `breached` its structural exit (35% under the 200-day high, or three closes under the 200-day SMA), `clear` again (worded as a recovery), or not judged (too little history). Once per change, never per cycle; `keel dca exit --preview` and `keel doctor`'s `sleeve.exit_watch` show the levels | it is an alert, not a fault: the monitor sells nothing, and holding PAXG without a stop is a decision (2026-09-22), not an error |
 
 Payloads: `plain` is a flat JSON object (`event`, `severity`, `category`, `message`, plus the
 numbers — `pct_used`, days remaining in the message); `slack` is Slack-compatible

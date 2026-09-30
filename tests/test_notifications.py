@@ -26,6 +26,7 @@ from keel import notifications
 from keel.commands.doctor import attestation_findings, rail_state_findings
 from keel.config import AutoTradeConfig, Caps, Config, MarketDataConfig
 from keel.execution.executor import ReduceResult
+from keel.execution.sleeve_exit import ExitWatch
 from keel.notifications import (
     _ATTESTATION_FINDINGS,
     ALLOWANCE_NEARING_USED_PCT,
@@ -84,6 +85,7 @@ def _state(
     held: tuple[str, ...] = (),
     sleeve: tuple[ReduceResult, ...] = (),
     sleeve_only: tuple[str, ...] = (),
+    watch: tuple[ExitWatch, ...] = (),
 ):
     return events_from_state(
         attestation_findings=attestation if attestation is not None else _attestation(NOW),
@@ -95,6 +97,7 @@ def _state(
         held_products=held,
         sleeve_proposals=sleeve,
         sleeve_only_products=sleeve_only,
+        exit_watch_transitions=watch,
     )
 
 
@@ -331,12 +334,14 @@ class _LoopResult:
         stale_products=(),
         reduce_results=(),
         sleeve_only_products=(),
+        exit_watch_transitions=(),
     ) -> None:
         self.enter_signals = list(enter_signals)
         self.enter_results = list(enter_results)
         self.stale_products = list(stale_products)
         self.reduce_results = list(reduce_results)
         self.sleeve_only_products = list(sleeve_only_products)
+        self.exit_watch_transitions = list(exit_watch_transitions)
 
 
 def _recording_transport(calls: list[tuple[str, str]]):
@@ -458,6 +463,7 @@ class TestEveryTaxonomyEventSurvivesDelivery:
         "allowance.nearing_exhaustion",
         "feed.stale_open_position",
         "sleeve.proposal",
+        "sleeve.exit_watch",
     }
 
     @staticmethod
@@ -478,6 +484,8 @@ class TestEveryTaxonomyEventSurvivesDelivery:
                     "BTC-USD", "reverse_dca", 4, "preview", [], 4, "", total_qty=Decimal("0.0015")
                 ),
             ),
+            # #857 P15: a breach carries Decimal levels -- the same trap again.
+            watch=(_watch("breached", arms=("drawdown",)),),
         )
 
     @pytest.mark.parametrize("fmt", ["plain", "slack"])
@@ -764,3 +772,79 @@ def test_the_wiring_reads_which_stale_products_only_a_sleeve_rule_watches():
         ("feed.stale_open_position", "BTC-USD", "rules"),
         ("feed.stale_open_position", "PAXG-USD", "sleeve"),
     ]
+
+
+# -- sleeve.exit_watch (#857, plan P15 Task 15.3; spec §7, plan OQ10) ---------------------------
+
+
+def _watch(level, *, previous=None, arms=(), sma=None) -> ExitWatch:
+    return ExitWatch("PAXG-USD", level, Decimal("4300"), Decimal("3055"), sma, arms, 1, previous)
+
+
+@pytest.mark.parametrize("level", ["near", "breached", "clear", "insufficient_history"])
+def test_every_exit_watch_transition_is_one_event(level):
+    [event] = [e for e in _state(watch=(_watch(level),)) if e.key == "sleeve.exit_watch"]
+    assert (event.fields["product"], event.fields["level"]) == ("PAXG-USD", level)
+    assert event.fields["previous"] is None
+    assert (event.fields["close"], event.fields["dd_level"]) == ("4300", "3055")
+
+
+def test_one_event_per_transition_in_the_cycle():
+    events = _state(watch=(_watch("near"), dataclasses.replace(_watch("clear"), product_id="X")))
+    assert [(e.fields["product"], e.fields["level"]) for e in events] == [
+        ("PAXG-USD", "near"),
+        ("X", "clear"),
+    ]
+
+
+def test_no_transition_no_event():
+    assert [e for e in _state() if e.key == "sleeve.exit_watch"] == []
+
+
+def test_a_breach_names_its_arms_and_says_nothing_is_sold():
+    [event] = _state(watch=(_watch("breached", previous="near", arms=("drawdown", "sma")),))
+    assert event.fields["breached_arms"] == ["drawdown", "sma"]
+    assert event.fields["previous"] == "near"
+    assert event.message.startswith("PAXG-USD breached its sleeve exit level (drawdown, sma)")
+    assert event.message.endswith(notifications.EXIT_WATCH_TAIL)
+
+
+def test_a_return_to_clear_is_worded_as_a_recovery_not_a_first_look():
+    """Plan OQ10: a transition back to `clear` notifies, worded as a recovery. A product seen
+    for the first time at `clear` is not a recovery -- nothing was wrong before."""
+    [recovered] = _state(watch=(_watch("clear", previous="breached"),))
+    [eased] = _state(watch=(_watch("clear", previous="near"),))
+    [first] = _state(watch=(_watch("clear"),))
+    [judged] = _state(watch=(_watch("clear", previous="insufficient_history"),))
+    assert recovered.message.startswith("PAXG-USD recovered: clear of its sleeve exit levels")
+    assert eased.message.startswith("PAXG-USD recovered: clear of its sleeve exit levels")
+    assert first.message.startswith("PAXG-USD is now watched: clear of its sleeve exit levels")
+    assert judged.message.startswith("PAXG-USD is now watched: clear of its sleeve exit levels")
+
+
+def test_the_wiring_derives_exit_watch_events_from_the_cycle_result():
+    """`notify_after_cycle` reads `result.exit_watch_transitions` and writes nothing new: the
+    write list is still exactly the #793 ledger key, and here not even that."""
+    calls: list[tuple[str, str]] = []
+    repo = _Repo(withdrawals_attested_at=NOW)
+    repo.cash_posture = _healthy_posture()
+    config = _config_with(NotificationSettings(events=frozenset({"sleeve.exit_watch"})))
+
+    sent = notify_after_cycle(
+        repo,
+        config,
+        _LoopResult(exit_watch_transitions=[_watch("near")]),
+        NOW,
+        url="https://alerts.example/hook",
+        transport=_recording_transport(calls),
+    )
+
+    assert sent == 1
+    [(_url, body)] = calls
+    payload = json.loads(body)
+    assert (payload["event"], payload["product"], payload["level"]) == (
+        "sleeve.exit_watch",
+        "PAXG-USD",
+        "near",
+    )
+    assert repo.state_writes == []
