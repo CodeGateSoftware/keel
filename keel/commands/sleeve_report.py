@@ -840,9 +840,10 @@ class BandRow:
 class BandsReport:
     """`bands_view`'s result. `incomplete` names the held target assets with no cached daily
     close; when it is non-empty `rows` is empty, because every weight's denominator would be
-    wrong. `untargeted` names held products whose asset has no positive target weight: they
-    are not in the sleeve the weights are taken over, and the report says so rather than
-    dropping them silently."""
+    wrong. `untargeted` names every held product that is not weighed -- its asset has no
+    positive target weight, or it is a target asset in another quote than the settlement
+    currency: they are not in the sleeve the weights are taken over, and the report says so
+    rather than dropping them silently."""
 
     rows: tuple[BandRow, ...]
     incomplete: tuple[str, ...]
@@ -867,7 +868,6 @@ def bands_view(repo: Any, config: Any) -> BandsReport:
     from keel.commands._products import _history_product
     from keel.commands.dca_plan import _weights_by_asset
     from keel.execution import sleeve
-    from keel.execution.guards import _asset
 
     weights_raw = _weights_by_asset(config.target_weights, "target_weights")
     positive = {asset: w for asset, w in weights_raw.items() if w > 0}
@@ -875,8 +875,11 @@ def bands_view(repo: Any, config: Any) -> BandsReport:
     targets = {asset: w / total_weight for asset, w in positive.items()}
     quote = config.quote_currency
 
+    # Untargeted = every held product that is not the ONE product weighed for its asset -- a
+    # non-target asset, or a target asset held in another quote (BTC-USDC on a USD profile).
+    weighed = {_history_product(asset, quote) for asset in targets}
     held_products = sorted({str(p["product_id"]) for p in repo.get_open_positions()})
-    untargeted = tuple(p for p in held_products if _asset(p).upper() not in targets)
+    untargeted = tuple(p for p in held_products if p not in weighed)
 
     values: dict[str, Decimal] = {}
     products: dict[str, str] = {}

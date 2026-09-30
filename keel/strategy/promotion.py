@@ -798,6 +798,15 @@ def transition(
 #: Spec §3.7's `min_paper_days`: two monthly cadence checks in `paper` before `live`.
 SLEEVE_SELL_MIN_PAPER_DAYS = 60
 
+#: `sleeve_sell_gate`'s Q2 refusal. Neutral about WHICH dca counts: the caller decides (a dca the
+#: profile's cycle runs, or any non-disabled one when there is no config, R54), and a reason
+#: that said "this profile's cycle runs" would be false for a candidate dca in the second case.
+CONCURRENT_DCA_REASON = (
+    "a dca rule buys this product (one this profile's cycle runs, or with no config any "
+    "non-disabled one): distributing beside it is a round trip at two fees -- pass "
+    "--allow-concurrent-dca to promote anyway (spec Q2)"
+)
+
 _SECONDS_PER_DAY = 86_400
 
 
@@ -835,7 +844,9 @@ def sleeve_sell_gate(
       two fees, and the operator says so on the record. The caller decides what counts as
       concurrent (`concurrent_live_dca`, named for the spec's live case): a `reverse_dca` beside
       a `dca` the profile's cycle runs -- `live` on a live profile, `paper` on a paper one (plan
-      R40; spec §6 failure mode a).
+      R40; spec §6 failure mode a) -- or, when the caller has no config to say which status that
+      is, any non-disabled `dca` on the product (R54, the stricter reading). The refusal's text
+      (`CONCURRENT_DCA_REASON`) is worded for both readings.
 
     **`live` means preview in this build (S2).** Every sleeve-sell kind declares `execution:
     Literal["preview"]`, so a rule this gate promotes to `live` still only records proposals;
@@ -875,9 +886,5 @@ def sleeve_sell_gate(
                 "silence -- mark one with `keel dca proposals review <id>`"
             )
         if concurrent_live_dca and not allow_concurrent_dca:
-            reasons.append(
-                "a dca rule this profile's cycle runs buys this product: distributing beside it "
-                "is a round trip at two fees -- pass --allow-concurrent-dca to promote anyway "
-                "(spec Q2)"
-            )
+            reasons.append(CONCURRENT_DCA_REASON)
     return (not reasons, reasons)

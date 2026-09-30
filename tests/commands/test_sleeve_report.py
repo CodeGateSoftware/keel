@@ -1159,3 +1159,72 @@ def test_a_rendered_row_prints_the_candidate_only_when_over() -> None:
         (False, False),
     ]
     assert sleeve_report.bands_untargeted_line(("DOGE-USD",)) in lines
+
+
+# -- review round 1 (#935): the rendered figures and R52's weighting, pinned exactly ----------
+
+
+def test_a_rendered_lot_line_prints_each_figure_in_its_own_slot() -> None:
+    [line] = [text for text in render_lots([_lot_row()]) if text.startswith("  #")]
+    assert line == (
+        "  #3 turtle_breakout opened 2023-11-14 qty 0.0132 @ 4673.23  fee share $0.73"
+        "  cost $62.42  mark 4300  unrealised $-5.66  if sold now $-6.91"
+        " (fee 1.2000%, slippage 1.0000%)"
+    )
+
+
+def test_a_rendered_lot_line_without_a_mark_stops_at_the_cost() -> None:
+    [line] = [
+        text
+        for text in render_lots([_lot_row(mark=None, unrealised=None, realised_if_sold=None)])
+        if text.startswith("  #")
+    ]
+    assert line == (
+        "  #3 turtle_breakout opened 2023-11-14 qty 0.0132 @ 4673.23  fee share $0.73"
+        "  cost $62.42  mark none (no cached daily close)"
+    )
+
+
+def test_a_rendered_band_line_prints_each_figure_in_its_own_slot() -> None:
+    under = _band_row(
+        asset="ETH",
+        weight=D("0.4"),
+        status="under",
+        value_usd=D("400"),
+        candidate_sell_usd=None,
+        fee_drag_usd=None,
+    )
+    lines = render_bands(BandsReport(rows=(_band_row(), under), incomplete=(), untargeted=()))
+    assert [line for line in lines if line.startswith("  ")] == [
+        "  BTC target 50.00%  weight 60.00%  band ±7.50%  over  value $600.00"
+        "  size to target $100.00  two-leg fee drag $2.51",
+        "  ETH target 50.00%  weight 40.00%  band ±7.50%  under  value $400.00",
+    ]
+
+
+def test_the_redeploy_legs_slippage_is_weighted_by_each_underweights_shortfall(repo) -> None:
+    """R52 with TWO underweights: ETH is .10 short, SOL .20, so the buy leg's slippage is
+    (ETH x .1 + SOL x .2) / .3 -- not either one alone, not their max, not a plain mean."""
+    _hold(repo, "BTC-USD", qty="0.008", mark="100000")  # $800 -> .80 of a .50 target
+    _hold(repo, "ETH-USD", qty="0.0375", mark="4000")  # $150 -> .15 of .25
+    _hold(repo, "SOL-USD", qty="0.001", mark="50000")  # $50 -> .05 of .25
+    weights = {"BTC": D("0.5"), "ETH": D("0.25"), "SOL": D("0.25")}
+    report = bands_view(repo, _config(target_weights=weights))
+    slip = {p: backtest_slippage(repo, f"{p}-USD")[0] for p in ("BTC", "ETH", "SOL")}
+    assert slip["ETH"] != slip["SOL"], "the fixture must tell the weightings apart"
+    fee = _config().fees.taker_pct
+    buy = (slip["ETH"] * D("0.1") + slip["SOL"] * D("0.2")) / D("0.3")
+    btc = next(r for r in report.rows if r.asset == "BTC")
+    assert btc.candidate_sell_usd == D("300")
+    assert btc.fee_drag_usd == D("300") * (fee + slip["BTC"]) + D("300") * (fee + buy)
+
+
+def test_a_target_asset_held_in_another_quote_is_named_not_dropped(repo) -> None:
+    """R51: only the settlement-currency product is weighed; a BTC-USDC holding on a USD profile
+    is listed as untargeted rather than silently missing from the report."""
+    _hold(repo, "BTC-USD", qty="0.005", mark="100000")
+    _hold(repo, "ETH-USD", qty="0.125", mark="4000")
+    _hold(repo, "BTC-USDC", qty="0.001", mark="100000")
+    report = bands_view(repo, _config(target_weights=_HALVES))
+    assert report.untargeted == ("BTC-USDC",)
+    assert [(r.asset, r.weight) for r in report.rows] == [("BTC", D("0.5")), ("ETH", D("0.5"))]

@@ -50,6 +50,7 @@ from keel.data.db import connect, migrate
 from keel.data.repository import Repository
 from keel.research import bias
 from keel.strategy import backtest as backtest_mod
+from keel.strategy import promotion as promotion_mod
 from keel.strategy.reduction import Reduction
 from keel.strategy.rules.reverse_dca import ReverseDca
 from keel.types import Candle, Granularity
@@ -1171,6 +1172,8 @@ def test_the_promote_path_accepts_a_missing_config_for_a_sleeve_rule(btc_book, d
         )
     assert _status(btc_book, rid) == "paper"
     assert sum(1 for line in err if "--allow-concurrent-dca" in line) == 1
+    # The reason must not claim a cycle runs a dca no cycle may run (review round 1, #935).
+    assert f"  - {promotion_mod.CONCURRENT_DCA_REASON}" in err
     [gate] = [line for line in out if "sleeve_sell gate" in line]
     assert gate.endswith("non-disabled dca on BTC-USD: yes")
 

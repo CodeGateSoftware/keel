@@ -608,7 +608,7 @@ def _statuses(db_path: Path) -> dict[int, str]:
         conn.close()
 
 
-@pytest.mark.parametrize("status", ["candidate", "paper"])
+@pytest.mark.parametrize("status", ["candidate", "paper", "live", "disabled"])
 def test_the_web_promotion_refuses_a_sleeve_sell_rule_and_names_the_cli(
     fresh: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch, status: str
 ) -> None:
