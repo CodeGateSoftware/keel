@@ -31,6 +31,13 @@ the proposal and `not a terminal: nothing written.`, and exits 0. A `superseded`
 its rule's decision and cannot be reviewed (exit 1); an already-reviewed one keeps its FIRST review
 time -- the gate reads whether a review happened, and the audit chain already holds when.
 
+**`keel dca trim --preview --view {lots,bands}` opens read-only ALWAYS, too** (#857, P13): the
+per-tranche lots report (spec §8.1, "not tax advice") or the weights-against-targets drift
+display (spec §5). Neither writes, proposes or builds a broker; every fee is the fallback rate
+(R25). `--view bands` is a DISPLAY: band trimming was tested and not adopted (#831), no
+`band_rebalance` rule exists, and the report says so every run. `--view gain` arrives in P14
+(R24), where it becomes the default; until then it is a usage error.
+
 **`keel dca distribute --preview` opens read-only ALWAYS, too** (#857, P10): what each
 `reverse_dca` rule's next cadence day would do, on today's cached close. It writes nothing -- no
 proposal row, no state -- and builds no broker, so its fee is the `config.fees.taker_pct` fallback,
@@ -65,9 +72,9 @@ from keel.commands.dca_plan import (
     render_dca_plan,
 )
 
-#: The last line `keel dca distribute --preview` prints: in this build no sleeve sale is placed,
-#: by any path (S1, S2).
-DISTRIBUTE_PREVIEW_FOOTER = "preview only: nothing is placed."
+#: The last line every sleeve preview (`distribute`, `trim`) prints: in this build no sleeve sale
+#: is placed, by any path (S1, S2).
+PREVIEW_FOOTER = "preview only: nothing is placed."
 
 #: The `[Y]/[E]/[N]` prompt's per-choice label, keyed by letter. One table, so the loop's prompt
 #: line and its retry message cannot disagree about what each letter means.
@@ -286,4 +293,50 @@ def distribute_cmd(ctx: click.Context, preview: bool) -> None:
     rows = sleeve_report.distribution_rows(repo, config, now_ts=int(time.time()))
     for line in sleeve_report.render_distribution(rows):
         click.echo(line)
-    click.echo(DISTRIBUTE_PREVIEW_FOOTER)
+    click.echo(PREVIEW_FOOTER)
+
+
+def _require_preview(_ctx: click.Context, _param: click.Parameter, value: bool) -> bool:
+    """`--preview` is refused as absent BEFORE `--view` is parsed (the option is eager), so the
+    usage error names the missing mode first -- the only mode in this build."""
+    if not value:
+        raise click.UsageError("pass --preview: it is the only mode in this build.")
+    return value
+
+
+@dca_group.command("trim")
+@click.option(
+    "--preview",
+    is_flag=True,
+    default=False,
+    is_eager=True,
+    callback=_require_preview,
+    help="Show the report. Required: it is the only mode in this build.",
+)
+@click.option(
+    "--view",
+    type=click.Choice(["lots", "bands"]),
+    required=True,
+    help="lots: every open tranche in FIFO order, with its unrealised and if-sold-now P&L (not "
+    "tax advice). bands: sleeve weights against target_weights (a display; band trimming was "
+    "tested and not adopted, #831).",
+)
+@click.pass_context
+@with_disclaimer
+def trim_cmd(ctx: click.Context, preview: bool, view: str) -> None:
+    """A read-only report over the positions ledger: per-tranche P&L (`--view lots`) or weights
+    against targets (`--view bands`). Fees at the fallback rate. Writes nothing, asks no venue,
+    and proposes nothing."""
+    config = _load_cfg(ctx)
+    repo = _common._open_repo_ro(ctx)
+    if view == "lots":
+        lines = sleeve_report.render_lots(sleeve_report.lots_view(repo, config))
+    else:
+        try:
+            report = sleeve_report.bands_view(repo, config)
+        except DcaPlanError as exc:  # a config-level refusal (#848), shown verbatim
+            raise click.ClickException(str(exc)) from exc
+        lines = sleeve_report.render_bands(report)
+    for line in lines:
+        click.echo(line)
+    click.echo(PREVIEW_FOOTER)

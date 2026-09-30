@@ -101,8 +101,8 @@ def test_preview_prints_the_rows_and_writes_nothing(
     assert "(fallback:config.fees.taker_pct)" in expected[0]
     # The footer follows the rows directly, once (the disclaimer `with_disclaimer` prints comes
     # after it).
-    assert lines.count(dca_cli.DISTRIBUTE_PREVIEW_FOOTER) == 1
-    assert lines.index(dca_cli.DISTRIBUTE_PREVIEW_FOOTER) == lines.index(expected[-1]) + 1
+    assert lines.count(dca_cli.PREVIEW_FOOTER) == 1
+    assert lines.index(dca_cli.PREVIEW_FOOTER) == lines.index(expected[-1]) + 1
     assert watcher.execute("PRAGMA data_version").fetchone()[0] == before
     assert {
         t: watcher.execute(f'SELECT COUNT(*) FROM "{t}"').fetchone()[0] for t in tables
@@ -114,7 +114,7 @@ def test_preview_prints_the_rows_and_writes_nothing(
 
 
 def test_the_footer_says_nothing_is_placed() -> None:
-    assert dca_cli.DISTRIBUTE_PREVIEW_FOOTER == "preview only: nothing is placed."
+    assert dca_cli.PREVIEW_FOOTER == "preview only: nothing is placed."
 
 
 def test_without_preview_it_is_a_usage_error(deployment) -> None:  # noqa: F811

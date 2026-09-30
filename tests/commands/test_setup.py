@@ -576,3 +576,116 @@ def test_bare_setup_invocation_is_unchanged_by_becoming_a_group(fresh: tuple[Pat
     from keel.commands.setup import _state_as_json
 
     assert json_mod.loads(json_result.output) == _state_as_json(inspect(config_path, db_path))
+
+
+# -- the web promotion refuses a sleeve-sell rule (#857, P12's held question, carried to P13) ---
+
+
+def _spy_jobs(monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    from keel.commands import jobs
+
+    started: list[str] = []
+    monkeypatch.setattr(jobs, "is_running", lambda: False)
+    monkeypatch.setattr(jobs, "start", lambda key, _run: started.append(key) or True)
+    return started
+
+
+def _rule(db_path: Path, kind: str, params: dict[str, str], status: str) -> int:
+    conn = connect(str(db_path))
+    try:
+        rule_id = Repository(conn).insert_rule(kind, params, status=status)
+        conn.commit()
+    finally:
+        conn.close()
+    return rule_id
+
+
+def _statuses(db_path: Path) -> dict[int, str]:
+    conn = connect(str(db_path))
+    try:
+        return {r["id"]: r["status"] for r in Repository(conn).get_rules()}
+    finally:
+        conn.close()
+
+
+@pytest.mark.parametrize("status", ["candidate", "paper", "live", "disabled"])
+def test_the_web_promotion_refuses_a_sleeve_sell_rule_and_names_the_cli(
+    fresh: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch, status: str
+) -> None:
+    """The browser cannot carry `--allow-concurrent-dca` or the operator's review flow, and a
+    sleeve-sell rule's paper -> live step is the one that decides whether it may ever sell. So
+    the web action refuses it outright, starts no job, and names the terminal command."""
+    from keel.commands.setup import ActionResult, promote_rule, sleeve_sell_web_refusal
+
+    config_path, db_path = fresh
+    started = _spy_jobs(monkeypatch)
+    rid = _rule(
+        db_path,
+        "reverse_dca",
+        {"product_id": "BTC-USD", "target_usd": "10", "min_price_floor": "1"},
+        status,
+    )
+    watcher = sqlite3.connect(str(db_path))
+    before = watcher.execute("PRAGMA data_version").fetchone()[0]
+
+    result = promote_rule(config_path, db_path, {"rule_id": str(rid)})
+
+    assert result == ActionResult(
+        "rule_promoted", False, sleeve_sell_web_refusal(rid, "reverse_dca")
+    )
+    assert started == []
+    assert _statuses(db_path) == {rid: status}
+    assert watcher.execute("PRAGMA data_version").fetchone()[0] == before
+    watcher.close()
+
+
+def test_the_refusal_names_the_terminal_command() -> None:
+    from keel.commands.setup import sleeve_sell_web_refusal
+
+    text = sleeve_sell_web_refusal(7, "reverse_dca")
+    assert "`keel rules promote 7`" in text
+    assert "--allow-concurrent-dca" in text
+
+
+@pytest.mark.parametrize("rule_id", ["known", "999"])
+def test_an_entry_rule_or_an_unknown_id_still_starts_the_promotion_job(
+    fresh: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch, rule_id: str
+) -> None:
+    """The positive control: only a sleeve-sell rule is refused. An entry rule reaches the job,
+    and so does an unknown id -- `attempt_promotion`'s own refusal names that one."""
+    from keel.commands.setup import promote_rule
+
+    config_path, db_path = fresh
+    started = _spy_jobs(monkeypatch)
+    if rule_id == "known":
+        rule_id = str(_rule(db_path, "dca", {"product_id": "BTC-USD"}, "candidate"))
+
+    result = promote_rule(config_path, db_path, {"rule_id": rule_id})
+
+    assert result.changed is True
+    assert started == ["rule_promoted"]
+
+
+@pytest.mark.parametrize("state", ["missing", "empty"])
+def test_an_unreadable_database_refuses_rather_than_starting_the_job(
+    fresh: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch, tmp_path: Path, state: str
+) -> None:
+    """Review rounds 2 and 3 (#935): the class check fails CLOSED. If the rule's kind cannot be
+    read -- the file will not open (`missing`), or it opens and the read fails (`empty`: no
+    `rules` table) -- the browser cannot tell a sleeve-sell rule from an entry rule, so it
+    starts nothing."""
+    from keel.commands.setup import ActionResult, promote_rule, unreadable_rule_refusal
+
+    config_path, _db_path = fresh
+    started = _spy_jobs(monkeypatch)
+    db = tmp_path / f"{state}.db"
+    if state == "empty":
+        db.write_bytes(b"")
+
+    result = promote_rule(config_path, db, {"rule_id": "1"})
+
+    assert result == ActionResult("rule_promoted", False, unreadable_rule_refusal(1))
+    assert started == []
+    assert db.exists() is (state == "empty")
+    if state == "empty":
+        assert db.read_bytes() == b""

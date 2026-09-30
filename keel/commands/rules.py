@@ -1109,9 +1109,11 @@ def attempt_promotion(
             repo,
             row,
             rule,
-            # R40; with no config the conservative reading is `live` (never a quieter one).
+            # R40. With no config, no status is the cycle's: `None` counts ANY non-disabled dca
+            # on the product (`_cycle_dca_on`) -- the stricter reading, which a paper dca on a
+            # paper profile cannot slip past the way it would past `live` alone.
             dca_status=(
-                "paper" if config is not None and config.auto_trade.mode == "paper" else "live"
+                None if config is None else "paper" if config.auto_trade.mode == "paper" else "live"
             ),
             allow_concurrent_dca=allow_concurrent_dca,
             now_ts=int(time.time()) if now_ts is None else now_ts,
@@ -1421,17 +1423,30 @@ def _reviewed_paper_proposals(repo: Repository, rule_id: int) -> int:
     )
 
 
-def _cycle_dca_on(repo: Repository, product_id: str, dca_status: str) -> bool:
+#: `_promote_sleeve_sell`'s `dca_status` label when no config says which status the cycle runs.
+ANY_ACTIVE_DCA = "non-disabled"
+
+
+def _cycle_dca_on(repo: Repository, product_id: str, dca_status: str | None) -> bool:
     """Spec Q2 / §6 failure mode (a): a `dca` rule at `dca_status` buys `product_id`.
 
     `dca_status` is the status this profile's cycle RUNS (R40, the reading
     `DistributionRow.dca_collision` and doctor's `sleeve.buy_and_sell_same_asset` share): `paper`
     on a paper profile, `live` otherwise. A dca the cycle does not load buys nothing, so it makes
     no round trip; a `paper` dca on a paper profile does, exactly as a `live` one does on a live
-    profile."""
+    profile.
+
+    `None` means no config says which status that is, and then ANY non-disabled dca on the
+    product counts (P13, P12's held question): the stricter reading. `live` alone would miss a
+    paper dca on a paper profile; counting every active status can only refuse more, and the
+    operator's answer to a refusal is the explicit `--allow-concurrent-dca`."""
+    rows = (
+        [r for r in repo.get_rules() if r["status"] != "disabled"]
+        if dca_status is None
+        else repo.get_rules(dca_status)
+    )
     return any(
-        r["kind"] == "dca" and (r["params"] or {}).get("product_id") == product_id
-        for r in repo.get_rules(dca_status)
+        r["kind"] == "dca" and (r["params"] or {}).get("product_id") == product_id for r in rows
     )
 
 
@@ -1440,7 +1455,7 @@ def _promote_sleeve_sell(
     row: dict[str, Any],
     rule: Rule,
     *,
-    dca_status: str,
+    dca_status: str | None,
     allow_concurrent_dca: bool,
     now_ts: int,
     sink: Callable[[str], None],
@@ -1466,7 +1481,8 @@ def _promote_sleeve_sell(
 
     **Concurrency (Q2) is read for `reverse_dca` only**: it is the kind whose monthly sale beside
     a weekly buy the spec names (§6 failure mode a). The dca that counts is one at `dca_status`,
-    the status this profile's cycle runs (R40, `_cycle_dca_on`). **`--allow-concurrent-dca` is a
+    the status this profile's cycle runs (R40, `_cycle_dca_on`), or any non-disabled dca when
+    `dca_status` is `None` (no config). **`--allow-concurrent-dca` is a
     paper -> live condition only** (Q2); passed at any other step it has no effect, and this
     prints one line saying so rather than silently accepting a flag that does nothing.
     """
@@ -1514,6 +1530,7 @@ def _promote_sleeve_sell(
 
     reviewed = _reviewed_paper_proposals(repo, rule_id)
     concurrent = kind == "reverse_dca" and _cycle_dca_on(repo, product_id, dca_status)
+    dca_label = ANY_ACTIVE_DCA if dca_status is None else dca_status
     promoted_at = row.get("promoted_at")
     ok, reasons = promotion_mod.sleeve_sell_gate(
         status=row["status"],
@@ -1533,7 +1550,7 @@ def _promote_sleeve_sell(
         f"rule {rule_id} ({kind}): sleeve_sell gate -- lookahead {report.verdict} over "
         f"{report.n_bars_checked} daily bars ({n_compared} compared); days in paper {in_paper} "
         f"(need {promotion_mod.SLEEVE_SELL_MIN_PAPER_DAYS}); reviewed paper proposals {reviewed}; "
-        f"{dca_status} dca on {product_id}: {'yes' if concurrent else 'no'}"
+        f"{dca_label} dca on {product_id}: {'yes' if concurrent else 'no'}"
     )
     if not ok:
         for reason in reasons:
@@ -1558,7 +1575,7 @@ def _promote_sleeve_sell(
     )
     if concurrent and allow_concurrent_dca:
         sink(
-            f"  --allow-concurrent-dca: a {dca_status} dca buys {product_id} beside this rule's "
+            f"  --allow-concurrent-dca: a {dca_label} dca buys {product_id} beside this rule's "
             "sales -- "
             "a round trip at two fees, promoted on the operator's record (spec Q2)"
         )
