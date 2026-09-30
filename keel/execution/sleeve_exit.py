@@ -48,10 +48,10 @@ tested edge: nothing here was tuned (the research freeze, 2026-09-27).
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from decimal import Decimal
-from typing import Literal
+from typing import Any, Literal
 
 from keel.types import Candle
 
@@ -166,3 +166,41 @@ def classify(
     return ExitWatch(
         product_id, level, close, dd_level, sma, tuple(breached), daily[-1].ts, previous
     )
+
+
+#: The rule kind whose params override the defaults for its product (P16's `sleeve_exit`).
+RULE_KIND = "sleeve_exit"
+
+#: Each overridable param and the type `classify` takes it as. A rule's params come back from
+#: the database JSON-plain (strings and lists), so they are coerced here, once.
+_PARAM_TYPES: dict[str, Any] = {
+    "dd_pct": lambda v: Decimal(str(v)),
+    "lookback_days": int,
+    "sma_period": int,
+    "confirm_days": int,
+    "warn_pct": lambda v: Decimal(str(v)),
+    "arms": tuple,
+}
+
+_STATUS_RANK = {"live": 0, "paper": 1}
+
+
+def monitor_params(sleeve_rules: Iterable[tuple[Any, str]], product_id: str) -> dict[str, Any]:
+    """The `classify` keyword arguments a `sleeve_exit` rule on `product_id` sets, or `{}` -- the
+    R26 defaults -- with none. `sleeve_rules` is the cycle's `(rule, status)` pairs
+    (`agent._sleeve_rules`); a `live` rule wins over a `paper` one, then the lowest rule id. Only
+    the params the rule actually sets are returned, so an unset one keeps its default."""
+    candidates = [
+        (rule, status)
+        for rule, status in sleeve_rules
+        if getattr(rule, "name", None) == RULE_KIND
+        and getattr(rule, "product_id", None) == product_id
+    ]
+    if not candidates:
+        return {}
+    rule, _status = min(
+        candidates,
+        key=lambda pair: (_STATUS_RANK.get(pair[1], 2), getattr(pair[0], "rule_id", None) or 0),
+    )
+    params = getattr(rule, "params", None) or {}
+    return {name: cast(params[name]) for name, cast in _PARAM_TYPES.items() if name in params}
