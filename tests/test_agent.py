@@ -5847,9 +5847,7 @@ def test_a_raising_reduce_costs_neither_the_dca_buy_nor_another_product(repo, mo
     assert [(r.product_id, r.decision) for r in result.reduce_results] == [("PAXG-USD", "preview")]
 
 
-def test_reductions_run_after_the_entries_and_a_denied_sell_preview_stops_no_buy(
-    repo, monkeypatch
-):
+def test_reductions_run_after_the_entries_and_a_denied_sell_preview_stops_no_buy(repo, monkeypatch):
     """THE CYCLE ORDERING, pinned. R79 (#944): a `TradeScopeDenied` on a sell PREVIEW stays on
     the proposal row -- no refutation is written, so neither TODAY's buy (ordering) nor
     TOMORROW's (rail 20's input is untouched) can be stopped by a watching rule's fee quote.
