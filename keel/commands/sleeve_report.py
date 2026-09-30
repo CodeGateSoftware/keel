@@ -1547,11 +1547,12 @@ def render_exit_watch(
     `EXIT_NOT_EVIDENCE`, then one line per watched product --
 
         <product> <level>[ (<arms>)]  close <c> on <YYYY-MM-DD>
-        drawdown <dd>% under the <n>-day high: level <l>
+        drawdown <dd>% under the <n>-day high: level <l> | drawdown not judged (no cached daily bar)
         sma<period> <sma> (<k> closes under it confirm) | sma<period> not judged (<m> of <n> bars)
         near within <w>%  (<params source>)  last recorded <level> on <YYYY-MM-DD> | never recorded
 
-    (one line; wrapped here; an arm the params leave out prints `<arm> off`) -- or
+    (one line; wrapped here; `<n>` is the bars cached, up to the lookback; an arm the params
+    leave out prints `<arm> off`) -- or
     `NO_EXIT_WATCH` when nothing is watched."""
     lines = [
         "exit watch -- the sleeve exit monitor's levels per held product with no resting "
@@ -1573,11 +1574,15 @@ def render_exit_watch(
             close += f" on {_day(watch.ts)}"
         if "drawdown" not in row.arms:
             drawdown = "drawdown off"
+        elif watch.dd_level is None:
+            drawdown = "drawdown not judged (no cached daily bar)"
         else:
-            level_text = "not judged" if watch.dd_level is None else _cents(watch.dd_level)
+            # The high is over the bars actually cached, up to the lookback: say how many days
+            # that is, not the lookback a short cache has not reached (review round 1).
+            window = min(row.bars, row.lookback_days)
             drawdown = (
-                f"drawdown {_plain(row.dd_pct)}% under the {row.lookback_days}-day high: "
-                f"level {level_text}"
+                f"drawdown {_plain(row.dd_pct)}% under the {window}-day high: "
+                f"level {_cents(watch.dd_level)}"
             )
         need = row.sma_period + row.confirm_days - 1
         if "sma" not in row.arms:

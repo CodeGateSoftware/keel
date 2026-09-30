@@ -247,3 +247,12 @@ def test_gather_findings_renders_the_cycles_exit_watch_records(
     assert conn.total_changes == before, "gather_findings wrote to the database"
     watch = [f for f in findings if f.name == "sleeve.exit_watch"]
     assert [(f.status, f.products) for f in watch] == [(WARN, ("PAXG-USD",))]
+
+
+@pytest.mark.parametrize("record", [{}, {"level": None}, {"level": "flat"}])
+def test_an_unreadable_exit_watch_record_warns_rather_than_reading_clear(record) -> None:
+    """Review round 1 (held, fixed): a record with no recognisable level is not `clear` -- it
+    fails toward telling the operator, WARN, naming the product."""
+    [finding] = doctor.exit_watch_findings({"PAXG-USD": record})
+    assert (finding.status, finding.products) == (WARN, ("PAXG-USD",))
+    assert finding.headline == doctor.EXIT_WATCH_UNREADABLE.format(product="PAXG-USD")

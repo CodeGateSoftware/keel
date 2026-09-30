@@ -381,6 +381,12 @@ Each ruling is stated as `what — why — cost if wrong`.
 - **R69** (added in P15). Before P16 registers `sleeve_exit`, the override is read duck-typed. `sleeve_exit.monitor_rule` picks the loaded sleeve rule named `sleeve_exit` on the product (`live` before `paper`, then the lowest id), and `monitor_params` coerces only the params it sets. The tests use a double registered under that kind.
   - Why: Task 15.2 names the override. P16 then only has to register the class.
   - Cost if wrong: P16 adjusts one selector if its class names itself differently.
+- **R70** (added in P15 review round 1, #938). R27's extra fetch is a `market_feed.backfill` of `ONE_DAY` over `sleeve_exit.history_days(...)`, not a `poll_once`. The window is the longer arm's need plus one day: 203 days at the defaults, the SMA's `200 + 3 - 1` bars. It runs one product at a time, each wrapped, and is still after the buy and still off `last_feed_ts`. The watch function takes no `config`.
+  - Why: `poll_once` cold-starts an empty series with ONE bar. PAXG tranche 3 has no cache, so its "200-day high" was the high since deploy and its SMA arm stayed unjudged for about 200 days. `backfill` requests only the missing bars, so once the window is full it asks for the newest bar alone, the same one request a poll makes.
+  - Cost if wrong: one larger request the first cycle a product is watched, a single page under the venue's candle cap. A venue gap inside the window is re-requested each cycle.
+- **R71** (added in P15 review round 1). `keel dca exit --preview` names the drawdown window it actually judged, `min(cached bars, lookback_days)`. A product with no cached bar reads `drawdown not judged`. Doctor WARNs on a `sleeve_exit:` record whose level is none of the four; it never reads it as `clear`.
+  - Why: "under the 200-day high" over 30 cached bars claims a window that was not judged. A malformed record read as `clear` is the silent direction.
+  - Cost if wrong: none. Both are display.
 
 ---
 

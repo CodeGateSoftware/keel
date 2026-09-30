@@ -1991,12 +1991,63 @@ def test_a_rendered_exit_row_prints_each_level_in_its_own_slot() -> None:
     assert lines[1] == sleeve_report.EXIT_NOT_EVIDENCE
     assert lines[2] == (
         f"  PAXG-USD breached (drawdown)  close 2800 on {_dated(99)}"
-        "  drawdown 35% under the 200-day high: level 3055.00"
+        "  drawdown 35% under the 41-day high: level 3055.00"
         "  sma200 not judged (41 of 202 bars)"
         "  near within 5%  (spec defaults, R26)"
         f"  last recorded near on {_dated(98)}"
     )
     assert len(lines) == 3
+
+
+def test_the_drawdown_window_printed_is_the_bars_it_was_judged_over() -> None:
+    """Review round 1: with fewer cached bars than `lookback_days`, the trailing high is the
+    high of what is cached, and the line says how many days that is -- a full window prints
+    the lookback."""
+    from keel.execution.sleeve_exit import ExitWatch
+
+    def line(bars: int) -> str:
+        row = sleeve_report.ExitWatchRow(
+            watch=ExitWatch("BTC-USD", "clear", D("100"), D("65"), None, (), 99 * DAY),
+            dd_pct=D("35"),
+            lookback_days=200,
+            sma_period=200,
+            confirm_days=3,
+            warn_pct=D("5"),
+            arms=("drawdown",),
+            params_source=sleeve_report.EXIT_DEFAULTS_SOURCE,
+            recorded_level=None,
+            recorded_at=None,
+            mark_bar=None,
+            bars=bars,
+        )
+        [text] = [t for t in sleeve_report.render_exit_watch([row]) if t.startswith("  BTC-USD")]
+        return text
+
+    assert "  drawdown 35% under the 30-day high: level 65.00  " in line(30)
+    assert "  drawdown 35% under the 200-day high: level 65.00  " in line(450)
+
+
+def test_a_product_with_no_bar_says_its_drawdown_is_not_judged() -> None:
+    from keel.execution.sleeve_exit import ExitWatch
+
+    row = sleeve_report.ExitWatchRow(
+        watch=ExitWatch("PAXG-USD", "insufficient_history", None, None, None, (), None),
+        dd_pct=D("35"),
+        lookback_days=200,
+        sma_period=200,
+        confirm_days=3,
+        warn_pct=D("5"),
+        arms=("drawdown", "sma"),
+        params_source=sleeve_report.EXIT_DEFAULTS_SOURCE,
+        recorded_level=None,
+        recorded_at=None,
+        mark_bar=None,
+        bars=0,
+    )
+    assert sleeve_report.render_exit_watch([row])[2] == (
+        "  PAXG-USD insufficient_history  close none  drawdown not judged (no cached daily bar)"
+        "  sma200 not judged (0 of 202 bars)  near within 5%  (spec defaults, R26)  never recorded"
+    )
 
 
 def test_an_empty_exit_watch_says_nothing_is_watched() -> None:

@@ -2081,6 +2081,9 @@ def sleeve_rule_findings(
     return [same, floor_finding]
 
 
+#: `exit_watch_findings`' WARN headline for a record with no level it recognises.
+EXIT_WATCH_UNREADABLE = "{product}: its exit-watch record carries no recognisable level"
+
 #: `exit_watch_findings`' OK headline for a product the monitor could not judge yet.
 EXIT_WATCH_NOT_JUDGED = "{product}: not judged -- too few cached daily bars for its exit levels"
 
@@ -2109,7 +2112,8 @@ def exit_watch_findings(records: dict[str, dict[str, Any]]) -> list[Finding]:
     (`agent._watch_sleeve_exits`). One `sleeve.exit_watch` Finding per product, in product order:
     WARN for `near` and `breached` -- the product is at or past a structural exit level the
     operator may want to act on -- and OK for `clear` and `insufficient_history`, which is not
-    judged rather than guessed (spec §7 failure mode b). With no record at all (nothing watched
+    judged rather than guessed (spec §7 failure mode b). A record whose level is none of the
+    four is WARN, never read as `clear`. With no record at all (nothing watched
     yet), ONE OK sentinel, the shape `ledger_drift_findings` uses, so the name never vanishes
     from a deployment's findings (PR #888).
 
@@ -2160,7 +2164,7 @@ def exit_watch_findings(records: dict[str, dict[str, Any]]) -> list[Finding]:
                     "-",
                 )
             )
-        else:
+        elif level == "clear":
             findings.append(
                 Finding(
                     "sleeve.exit_watch",
@@ -2168,6 +2172,19 @@ def exit_watch_findings(records: dict[str, dict[str, Any]]) -> list[Finding]:
                     f"{product} is clear of its sleeve exit levels",
                     against,
                     "-",
+                )
+            )
+        else:
+            # A record with no level this knows is not `clear`: fail toward telling.
+            findings.append(
+                Finding(
+                    "sleeve.exit_watch",
+                    WARN,
+                    EXIT_WATCH_UNREADABLE.format(product=product),
+                    f"recorded level {record.get('level')!r}; {against}",
+                    "the next live cycle rewrites the record; `keel dca exit --preview` shows "
+                    "the levels now",
+                    products=(product,),
                 )
             )
     return findings

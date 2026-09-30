@@ -6533,7 +6533,11 @@ def test_paxg_tranche_3_is_watched_although_no_live_rule_polls_paxg(repo, monkey
     result = run_once(broker, repo, config, now_ts=now)
 
     assert {g for p, g in broker.candle_requests if p == _PAXG} == {Granularity.ONE_DAY}
-    assert [c.ts for c in repo.get_candles(_PAXG, Granularity.ONE_DAY)] == [40 * DAY]
+    # #938: a cold cache is filled with the history the arms need, not one bar -- here all 41
+    # bars the venue has.
+    assert [c.ts for c in repo.get_candles(_PAXG, Granularity.ONE_DAY)] == [
+        d * DAY for d in range(41)
+    ]
     record = repo.get_state("sleeve_exit:PAXG-USD")
     assert (record["level"], record["close"], record["ts"]) == ("clear", "4700", 40 * DAY)
     assert (_PAXG, "clear") in _watched(result)
@@ -6742,8 +6746,67 @@ def test_a_held_product_the_watch_polls_does_not_move_equity(repo):
     )
 
     run_once(broker, repo, _config(), now_ts=now)
-    assert [c.close for c in repo.get_candles(_PAXG, Granularity.ONE_DAY)] == [Decimal("100")]
+    first = repo.get_candles(_PAXG, Granularity.ONE_DAY)
+    assert (len(first), first[-1].close) == (41, Decimal("100")), "fixture: the watch cached PAXG"
     run_once(broker, repo, _config(), now_ts=now + DAY)
 
-    assert len(repo.get_candles(_PAXG, Granularity.ONE_DAY)) == 2, "fixture: polled twice"
+    assert len(repo.get_candles(_PAXG, Granularity.ONE_DAY)) == 42, "fixture: and again"
     assert [p.equity for p in repo.get_equity_points()] == [Decimal("1000080")] * 2
+
+
+def test_a_cold_cache_is_filled_with_the_history_the_arms_need(repo):
+    """#938: `poll_once` cold-starts an empty table with ONE bar, so PAXG was judged on the high
+    "since deploy" and its SMA arm stayed unjudged for ~200 days. The watch fills the daily
+    history both arms need (`sleeve_exit.history_days`: 202 bars for the SMA's 200 + 3 - 1) in
+    one pass, and three closes under the 200-day SMA confirm a break the same cycle."""
+    _paxg_tranche(repo)
+    series = [
+        *[_candle(d * DAY, "100") for d in range(257)],
+        *[_candle(d * DAY, "90") for d in range(257, 260)],
+    ]
+    broker = _GranularityBroker(series={(_PAXG, Granularity.ONE_DAY): series})
+    now = 260 * DAY + 3_600
+
+    result = run_once(broker, repo, _config(), now_ts=now)
+
+    cached = repo.get_candles(_PAXG, Granularity.ONE_DAY)
+    assert len(cached) == 202 and cached[-1].ts == 259 * DAY
+    [watch] = result.exit_watch_transitions
+    assert (watch.level, watch.breached_arms) == ("breached", ("sma",))
+
+    # Steady state: the next day asks only for what is missing -- the one new bar.
+    series.append(_candle(260 * DAY, "90"))
+    broker.candle_requests.clear()
+    requested: list[tuple[int, int]] = []
+    real_get = broker.get_candles
+
+    def _spy(product_id, granularity, start, end):
+        requested.append((start, end))
+        return real_get(product_id, granularity, start, end)
+
+    broker.get_candles = _spy  # type: ignore[method-assign]
+    run_once(broker, repo, _config(), now_ts=now + DAY)
+    assert requested == [(260 * DAY, 260 * DAY)]
+
+
+def test_a_watch_that_raises_before_any_product_costs_nothing(repo, monkeypatch):
+    """The OUTER wrap in `run_once`: a failure before the per-product loop (here, reading which
+    products are watched) costs the watch this cycle, never the cycle or the DCA buy."""
+    _seed_rules(repo, monkeypatch, (Dca(product_id=PRODUCT, cadence_days=1), "live"))
+    now = _history(repo, 41)
+    _paxg_tranche(repo)
+    calls: list[int] = []
+
+    def _boom(_repo: Any) -> list[str]:
+        calls.append(1)
+        raise RuntimeError("positions read failed")
+
+    monkeypatch.setattr(agent, "exit_watched_products", _boom)
+    broker = _HoldingBroker()
+
+    result = run_once(broker, repo, _config(), now_ts=now)
+
+    assert calls == [1], "fixture: the failure must be reached"
+    assert result.skipped is False
+    assert [c["side"] for c in broker.place_calls] == [Side.BUY]
+    assert result.exit_watch_transitions == []

@@ -218,3 +218,13 @@ def test_monitor_params_read_the_products_sleeve_exit_rule_live_first() -> None:
         "X-USD",
     )
     assert both == {"sma_period": 50, "warn_pct": D("2.5"), "lookback_days": 10}
+
+
+def test_the_history_the_arms_need_is_the_longer_arm_plus_one_day() -> None:
+    """#938: what the watch fills a cold cache to -- the SMA's `sma_period + confirm_days - 1`
+    bars or the drawdown's `lookback_days`, whichever is longer, plus the day the window's
+    start is aligned up by."""
+    assert sleeve_exit.history_days() == 203
+    assert sleeve_exit.history_days(lookback_days=300) == 301
+    assert sleeve_exit.history_days(sma_period=50, confirm_days=2, lookback_days=20) == 52
+    assert sleeve_exit.history_days(arms=("drawdown",), lookback_days=90) == 91

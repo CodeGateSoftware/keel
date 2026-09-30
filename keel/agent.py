@@ -1459,7 +1459,6 @@ def exit_watched_products(repo: Repository) -> list[str]:
 def _watch_sleeve_exits(
     broker: Any,
     repo: Repository,
-    config: Config,
     products: list[str],
     sleeve_rules: list[tuple[Rule, str]],
     now_ts: int,
@@ -1479,10 +1478,15 @@ def _watch_sleeve_exits(
     so doctor does not keep reporting a level nothing watches; that is not a transition.
 
     **R27's poll.** In a LIVE cycle, a watched product outside `products` (the products this
-    cycle already polled) gets its `ONE_DAY` candles from a second `market_feed.poll_once` --
-    daily only, whatever the config's granularities, and wrapped: a failure costs that level
-    (it is judged on whatever is cached, `insufficient_history` with nothing), never the cycle.
-    It does NOT write `last_feed_ts`, rail 12's heartbeat, which belongs to the entry poll. A
+    cycle already polled) gets its `ONE_DAY` candles fetched here -- daily only, whatever the
+    config's granularities, one product at a time and each wrapped: a failure costs that
+    product's fresh bars (it is judged on whatever is cached, `insufficient_history` with
+    nothing), never the cycle or another product. It is a `market_feed.backfill` over
+    `sleeve_exit.history_days` (R70, #938), not a `poll_once`: `poll_once` cold-starts an empty
+    series with ONE bar, which judged PAXG's "200-day high" on the high since deploy and left
+    its SMA arm unjudged for 200 days. `backfill` requests only the missing bars, so once the
+    window is full it asks for the newest bar alone -- the same one request a poll makes. It
+    does NOT write `last_feed_ts`, rail 12's heartbeat, which belongs to the entry poll. A
     paper cycle (`live=False`) asks no venue on the monitor's behalf and judges the cache.
 
     **The levels** are `sleeve_exit.classify` on the product's completed daily bars, at the
@@ -1500,12 +1504,21 @@ def _watch_sleeve_exits(
         if key[len(sleeve_exit.STATE_PREFIX) :] not in watched and repo.get_state(key):
             repo.set_state(key, None)
 
-    unpolled = [product for product in watched if product not in products]
-    if live and unpolled:
-        try:
-            market_feed.poll_once(broker, repo, unpolled, [Granularity.ONE_DAY], now_ts=now_ts)
-        except Exception:  # noqa: BLE001 -- a watched product's feed must not cost the cycle
-            log_exception(logger, "agent.exit_watch_poll_failed", products=unpolled)
+    if live:
+        for product_id in (product for product in watched if product not in products):
+            try:
+                market_feed.backfill(
+                    broker,
+                    repo,
+                    [product_id],
+                    [Granularity.ONE_DAY],
+                    sleeve_exit.history_days(
+                        **sleeve_exit.monitor_params(sleeve_rules, product_id)
+                    ),
+                    now_ts=now_ts,
+                )
+            except Exception:  # noqa: BLE001 -- a watched product's feed must not cost the cycle
+                log_exception(logger, "agent.exit_watch_poll_failed", product=product_id)
 
     transitions: list[ExitWatch] = []
     for product_id in watched:
@@ -2816,7 +2829,6 @@ def run_once(
             exit_watch_transitions = _watch_sleeve_exits(
                 broker,
                 repo,
-                config,
                 sorted(set(products) | set(sleeve_only_products)),
                 sleeve_rules,
                 now_ts,

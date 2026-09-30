@@ -168,6 +168,29 @@ def classify(
     )
 
 
+def history_days(
+    *,
+    dd_pct: Decimal = DEFAULT_DD_PCT,
+    lookback_days: int = DEFAULT_LOOKBACK_DAYS,
+    sma_period: int = DEFAULT_SMA_PERIOD,
+    confirm_days: int = DEFAULT_CONFIRM_DAYS,
+    warn_pct: Decimal = DEFAULT_WARN_PCT,
+    arms: Sequence[str] = ARMS,
+) -> int:
+    """How many days of daily history `classify` needs to judge every requested arm in full: the
+    drawdown's `lookback_days` or the SMA's `sma_period + confirm_days - 1` bars, whichever is
+    longer, plus one day -- a history window's start is aligned UP to the next bar, which costs
+    one. Takes `classify`'s keywords (so `monitor_params` splats into both); only the arms and
+    their windows matter. The cycle fills a watched product's cache to this (#938)."""
+    del dd_pct, warn_pct  # levels, not windows
+    needs = [0]
+    if "drawdown" in arms:
+        needs.append(lookback_days)
+    if "sma" in arms:
+        needs.append(sma_period + confirm_days - 1)
+    return max(needs) + 1
+
+
 #: The rule kind whose params override the defaults for its product (P16's `sleeve_exit`).
 RULE_KIND = "sleeve_exit"
 
