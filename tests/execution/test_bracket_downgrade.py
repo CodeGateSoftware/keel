@@ -4,7 +4,8 @@ The ENTRY has already filled when `place_bracket` runs, so nothing its bracket l
 escape `executor.execute`. The stage decides the recovery: a throw BEFORE the bracket's `orders`
 row exists (the preview) writes the `unbracketed:` retry record; a throw AFTER it exists
 (`place_order`) leaves the `pending` row for a human and writes no retry, because the venue may be
-holding the bracket.
+holding the bracket -- EXCEPT a permissions refusal (#945), which is definite: the venue did not
+take the order, so the row is `rejected`, the retry is armed, and the sweep re-places next cycle.
 """
 
 from __future__ import annotations
@@ -91,17 +92,15 @@ def test_a_bracket_preview_that_throws_after_a_filled_entry_downgrades(
     assert _events(caplog, executor.BRACKET_STATE_UNKNOWN_EVENT) == []
 
 
-@pytest.mark.parametrize(
-    "exc",
-    [TimeoutError("read timed out"), TradeScopeDenied("trade scope denied")],
-    ids=["timeout", "trade_scope_denied"],
-)
 def test_a_bracket_place_that_throws_downgrades_without_a_retry(
     repo,  # noqa: F811
     caplog: pytest.LogCaptureFixture,
-    exc: Exception,
 ) -> None:
-    broker = _SellPlaceRaises(exc)
+    """An AMBIGUOUS raise (a timeout: the request may have landed) keeps the state-unknown
+    booking -- the venue may hold a resting bracket, so a retry could double-commit the base and
+    the pending row waits for a human. `TradeScopeDenied` is split out below (#945): it is not
+    ambiguous."""
+    broker = _SellPlaceRaises(TimeoutError("read timed out"))
 
     with caplog.at_level(logging.WARNING, logger="keel.execution.executor"):
         result = executor.execute(
@@ -123,6 +122,73 @@ def test_a_bracket_place_that_throws_downgrades_without_a_retry(
     assert (fields["product"], fields["order_id"]) == ("BTC-USD", pending_sell["id"])
     assert _events(caplog, "executor.bracket_not_placed") == []
     assert repo.get_state("open_stop:BTC-USD") is None, "no stop is asserted for an unknown row"
+
+
+def test_a_permissions_refusal_on_the_bracket_leg_is_definite_rejected_and_retried(
+    repo,  # noqa: F811
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """#945: `TradeScopeDenied` is a DEFINITE answer -- the venue did not take the order, so
+    nothing rests at the exchange and there is no unknown to reconcile. The row takes the status
+    a broker-rejected placement already takes (`rejected`), the `unbracketed:` retry is ARMED
+    rather than cleared, and the next cycle's sweep heals with a working credential instead of
+    parking the product's exits behind a phantom pending row."""
+    broker = _SellPlaceRaises(TradeScopeDenied("trade scope denied"))
+
+    with caplog.at_level(logging.WARNING, logger="keel.execution.executor"):
+        result = executor.execute(
+            _enter_signal(), broker, repo, _config(), "autonomous", now_ts=NOW_TS
+        )
+
+    assert broker.sell_places == 1, "the bracket leg must actually have reached place_order"
+    assert result.placed is True
+    assert result.bracket_order_id is None
+    [refused_sell] = [o for o in repo.get_orders(mode="live") if o["side"] == "SELL"]
+    assert refused_sell["status"] == "rejected", "the refusal is definite, not unknown"
+    retry = repo.get_state(f"{executor.UNBRACKETED_PREFIX}BTC-USD")
+    assert retry is not None, "the sweep must be able to retry next cycle"
+    assert _events(caplog, executor.BRACKET_STATE_UNKNOWN_EVENT) == []
+    [critical] = _events(caplog, executor.BRACKET_REFUSED_EVENT)
+    assert critical.levelno == logging.CRITICAL
+    fields = getattr(critical, _FIELDS_ATTR)
+    assert (fields["product"], fields["order_id"]) == ("BTC-USD", refused_sell["id"])
+    assert repo.get_state("open_stop:BTC-USD") is None, "no stop rests anywhere yet"
+
+
+def test_a_permissions_refusal_before_the_row_exists_arms_the_retry(
+    repo,  # noqa: F811
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The other stage: refused at the PREVIEW, before any row was written. That case was
+    already correct (the retry record, like any pre-row refusal); it stays correct under the
+    dedicated handler, and no row is written to reject."""
+
+    class _SellPreviewDenied(FakeBroker):
+        def __init__(self) -> None:
+            super().__init__()
+            self.sell_previews = 0
+
+        def preview_order(self, spec: OrderSpec) -> Preview:
+            if spec.side is Side.SELL:
+                self.sell_previews += 1
+                raise TradeScopeDenied("trade scope denied")
+            return super().preview_order(spec)
+
+    broker = _SellPreviewDenied()
+
+    with caplog.at_level(logging.WARNING, logger="keel.execution.executor"):
+        result = executor.execute(
+            _enter_signal(), broker, repo, _config(), "autonomous", now_ts=NOW_TS
+        )
+
+    assert broker.sell_previews == 1
+    assert result.placed is True
+    assert [(o["side"], o["status"]) for o in repo.get_orders(mode="live")] == [
+        ("BUY", "filled")
+    ], "a preview-stage refusal writes no bracket row"
+    assert repo.get_state(f"{executor.UNBRACKETED_PREFIX}BTC-USD") is not None
+    assert _events(caplog, executor.BRACKET_STATE_UNKNOWN_EVENT) == []
+    assert _events(caplog, executor.BRACKET_REFUSED_EVENT) == []
 
 
 def test_a_bracket_that_places_still_returns_its_order_id(repo) -> None:  # noqa: F811
