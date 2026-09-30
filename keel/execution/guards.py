@@ -427,12 +427,28 @@ def _open_exposure_by_asset(repo: Repository) -> dict[str, Decimal]:
     leaves a positive residual, and a gain no longer leaves a NEGATIVE one that ate into a
     sibling product's figure in the same bucket. A product still net-long nets by notional
     exactly as before; grouping by product first changes nothing there.
+
+    **The zero attaches to the MOMENT the product goes flat, not only to the end state (#943).**
+    Testing `qty > 0` once after netting the whole history only hid the residual while the
+    product STAYED flat: the next BUY on the same product brought the closed round-trip's
+    residual straight back -- a $6.36 phantom on PAXG's next DCA buy after a declared close at a
+    loss, counted by rails 4/5/6 for as long as the product was held again. So the walk is
+    chronological, in `(created_at, id)` order, and the bucket's notional AND quantity reset to
+    zero the moment its running quantity passes through zero. A product that is still net long
+    and never went flat nets exactly as it did before; one that went flat starts its next
+    position from zero, which is R33's own rule ("a fully closed product contributes zero")
+    applied at the only moment it can mean anything.
     """
     exposure: dict[str, Decimal] = {}
     per_product: dict[str, dict[str, Any]] = {}
     rows: list[dict[str, Any]] = []
     for status in _OBSERVED_FILL_STATUSES:
         rows.extend(repo.get_orders(mode="live", status=status))
+    # #943: the walk below is CHRONOLOGICAL, because the reset fires at a MOMENT -- "the product
+    # went flat" -- and `get_orders` returns each status group in id order, not the groups in
+    # time order. Netting a later fill before an earlier one would fire the reset between the
+    # wrong pair of rows and change the figure.
+    rows.sort(key=lambda order: (order.get("created_at") or 0, order.get("id") or 0))
     for order in rows:
         product_id = order["product_id"]
         side = order["side"]
@@ -463,6 +479,16 @@ def _open_exposure_by_asset(repo: Repository) -> dict[str, Decimal]:
         elif side == Side.SELL.value:
             bucket["notional"] -= amount
             bucket["qty"] -= qty
+        if bucket["qty"] <= 0:
+            # #943: the zero above attaches to the MOMENT the running quantity passes through
+            # zero, not only to the end state. Netting the whole history and testing `qty > 0`
+            # once at the end let a closed round-trip's residual -- a real gain or loss, which
+            # is not exposure in either direction -- come straight back with the product's next
+            # BUY, and PAXG's next DCA buy then carried phantom exposure for as long as it was
+            # held. Resetting here means a product still net long that NEVER went flat nets
+            # exactly as it did before; one that did go flat starts its next position from zero.
+            bucket["notional"] = Decimal("0")
+            bucket["qty"] = Decimal("0")
     for bucket in per_product.values():
         if bucket["qty"] > 0:
             asset = bucket["asset"]
