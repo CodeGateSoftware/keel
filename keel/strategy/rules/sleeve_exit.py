@@ -49,7 +49,7 @@ seeded seller is what no one should get by accident, even one whose params all d
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable
 from decimal import Decimal
 from typing import Any, Literal
 
@@ -146,7 +146,7 @@ class SleeveExit(Rule):
         sma_period: int = monitor.DEFAULT_SMA_PERIOD,
         confirm_days: int = monitor.DEFAULT_CONFIRM_DAYS,
         warn_pct: Decimal = monitor.DEFAULT_WARN_PCT,
-        arms: Sequence[str] = monitor.ARMS,
+        arms: tuple[str, ...] = monitor.ARMS,
         execution: Execution = "preview",
         name: str = KIND,
     ) -> None:
