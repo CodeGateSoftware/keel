@@ -47,7 +47,6 @@ from keel.config import (
 from keel.data.db import connect, migrate
 from keel.data.repository import Repository
 from keel.execution import executor, sleeve
-from keel.execution.guards import rail_name
 from keel.strategy.reduction import Reduction
 from keel.strategy.rules.base import Action, Rule, Setup, Signal, completed_days
 from keel.strategy.rules.dca import Dca
@@ -5710,7 +5709,10 @@ def test_a_dca_that_fires_but_does_not_buy_still_vetoes_the_same_day_sale(repo, 
 
 
 def test_a_paper_status_sleeve_rule_proposes_in_a_live_cycle_and_says_so(repo, monkeypatch):
-    """R16: preview only, and the row says the rule is `paper`."""
+    """R16/R78 (#944): preview only, and the row says the rule is `paper` -- and since R78 a
+    paper rule is a rehearsal that touches no venue: no SELL quote, no placement, the fallback
+    fee. R16's first wording handed the paper rule the live broker, so a watching rule asked
+    the venue for a fee quote it did not need."""
     _seed_rules(repo, monkeypatch, (_AlwaysReduceRule(PRODUCT), "paper"))
     _held_since_day_0(repo)
     now = _history(repo, 41)
@@ -5720,7 +5722,11 @@ def test_a_paper_status_sleeve_rule_proposes_in_a_live_cycle_and_says_so(repo, m
 
     [row] = repo.get_sell_proposals()
     assert (row["rule_status"], row["decision"]) == ("paper", "preview")
+    assert row["fee_source"] == sleeve.FALLBACK_FEE_SOURCE
     assert broker.place_calls == []
+    assert not [c for c in broker.sequence if c[2] is Side.SELL], (
+        "R78: the venue is never asked for a paper rule's fee"
+    )
 
 
 class _ReverseDouble(_AlwaysReduceRule):
@@ -5841,18 +5847,18 @@ def test_a_raising_reduce_costs_neither_the_dca_buy_nor_another_product(repo, mo
     assert [(r.product_id, r.decision) for r in result.reduce_results] == [("PAXG-USD", "preview")]
 
 
-def test_reductions_run_after_the_entries_so_a_denied_sell_preview_cannot_stop_todays_buy(
+def test_reductions_run_after_the_entries_and_a_denied_sell_preview_stops_no_buy(
     repo, monkeypatch
 ):
-    """THE CYCLE ORDERING, pinned. R-P7-2: a `TradeScopeDenied` on a sell PREVIEW records the
-    venue's refutation, and rail 20 then vetoes every BUY. Because `_handle_reductions` runs after
-    the cycle's exits and entries -- for EVERY product, not interleaved per product -- today's DCA
-    BUY has already gone out when the refusal lands; it is the NEXT cycle's buy that rail 20
-    refuses, which is rail 20 doing its job on a credential the venue has just said may not trade.
+    """THE CYCLE ORDERING, pinned. R79 (#944): a `TradeScopeDenied` on a sell PREVIEW stays on
+    the proposal row -- no refutation is written, so neither TODAY's buy (ordering) nor
+    TOMORROW's (rail 20's input is untouched) can be stopped by a watching rule's fee quote.
+    R-P7-2 first had the refutation recorded here, which halted the next day's DCA buys over a
+    proposal that places nothing.
 
     The sleeve product is ADA-USD on purpose: it SORTS BEFORE BTC-USD, so a reduction step placed
     inside the per-product main pass (after that product's exits, before the entries -- the plan's
-    original placement) would quote ADA's SELL, and record the refutation, before BTC's buy.
+    original placement) would quote ADA's SELL before BTC's buy.
     """
     _seed_rules(
         repo,
@@ -5884,14 +5890,16 @@ def test_reductions_run_after_the_entries_so_a_denied_sell_preview_cannot_stop_t
     [row] = repo.get_sell_proposals()
     assert row["decision"] == "preview" and "403 read-only" in row["rails"]["preview_error"]
     scope = repo.get_venue_trade_scope("coinbase")
-    assert scope is not None and scope.state is TradeScopeState.REFUTED
+    assert scope is None or scope.state is not TradeScopeState.REFUTED, (
+        "R79: a sell preview's refusal must not refute the credential rail 20 reads"
+    )
 
     _seed_history(repo, [_candle(41 * DAY, "100")])
     _seed_history(repo, [_candle(41 * DAY, "100")], product="ADA-USD")
     tomorrow = run_once(broker, repo, config, now_ts=now + DAY)
 
-    [vetoed] = tomorrow.enter_results
-    assert not vetoed.placed and "trade_scope" in {rail_name(v) for v in vetoed.vetoed_by}
+    [tomorrows_buy] = tomorrow.enter_results
+    assert tomorrows_buy.placed, "R79: tomorrow's DCA buy is untouched by the refusal"
 
 
 def test_a_kill_switch_skips_the_reductions_and_reads_no_venue_balance(repo, monkeypatch):

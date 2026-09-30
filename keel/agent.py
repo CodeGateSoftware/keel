@@ -302,10 +302,13 @@ def _load_sleeve_rules(
     feed would withhold the BTC DCA buy. A sleeve rule neither enters nor exits, so it is in
     neither pass, and it never owns a position's exit (`_handle_exits` never sees it).
 
-    **Both statuses in a live cycle (R16).** A live-mode cycle evaluates `paper` AND `live`
-    sleeve rules: for a rule that can only propose, `paper` honestly means "proposals against the
-    real book, never placed", and the status rides onto each proposal (`rule_status`). A paper
-    cycle loads `paper` only.
+    **Both statuses in a live cycle (R16, R78).** A live-mode cycle evaluates `paper` AND `live`
+    sleeve rules, and the status rides onto each proposal (`rule_status`). `paper` means a
+    rehearsal that touches no venue: since R78 (#944) a paper-status rule proposes OFFLINE --
+    fallback fee, offline rails -- even on a live cycle. R16's first wording, "proposals against
+    the real book", handed it the live broker, so a rule that only watches asked the venue for a
+    fee quote, and a key whose permissions refused that request could halt the next day's DCA
+    buys. A paper cycle loads `paper` only.
 
     **A row that does not build costs that row, never the cycle.** The entry path lets
     `_build_rule` raise; a sleeve row runs after the DCA buy has been decided, but it is loaded
@@ -1235,10 +1238,10 @@ def _handle_reductions(
     this step makes. `tests/execution/test_sell_side_invariants.py` pins the placement paths.
 
     **It runs LAST in the cycle** (`run_once`), after the exits, the entries -- the DCA buy -- and
-    stop management. So nothing here can withhold, delay or veto a buy the same cycle places. The
-    one way a proposal reaches a later BUY is R-P7-2: a sell preview the venue refuses with
-    `TradeScopeDenied` records the refutation, and rail 20 vetoes the NEXT cycle's buys, which is
-    rail 20 doing its job on a credential the venue has just said may not trade.
+    stop management. So nothing here can withhold, delay or veto a buy the same cycle places,
+    and nothing a proposal DISCOVERS reaches a later buy either (R79, #944): a venue refusal on
+    a sell preview stays on the proposal's own row -- if the trade scope is really gone, it is
+    the next BUY's own preview that says so, not a watching rule's fee quote.
 
     In order, and each step is why the next one is reached:
 
@@ -1271,7 +1274,9 @@ def _handle_reductions(
        the FIFO sale would consume, `cooldown_days`) refuse BEFORE an intent is built; the
        refusal is recorded `vetoed` with `rails.sleeve`, so a skipped distribution says why and
        is not carried forward (Review Focus 1).
-    7. `executor.reduce`, with `offline=True` and no broker on a paper cycle (R18).
+    7. `executor.reduce`, with `offline=True` and no broker on a paper cycle (R18) and for a
+       paper-STATUS rule on a live one (R78) -- only a LIVE rule's proposal is quoted at the
+       venue, and whatever the venue answers, refusal included, stays on the row (R79).
     8. **A repeated refusal is recorded, not re-announced** (`_flag_repeat`, P9): the winner's
        result carries `repeats_previous` when its row is the same refusal as the product's
        previous proposal MADE ON THE IMMEDIATELY PRECEDING UTC DAY (#919 -- a cadence rule like
@@ -1434,7 +1439,15 @@ def _handle_reductions(
             repo,
             executor.reduce(
                 winning,
-                broker=None if offline else broker,
+                # R78 (#944): a paper-STATUS rule proposes OFFLINE even on a live cycle. R16's
+                # first wording -- "proposals against the real book" -- handed it the live
+                # broker, so a rule that only watches asked the venue for a fee quote, and a key
+                # whose permissions refused that request could halt the next day's DCA buys
+                # (R79). A paper rule is a rehearsal: the fallback fee, the offline rails, no
+                # venue call. The sleeve caps above still judge it against the cycle's LIVE
+                # DCA (`dca_fires_today` keeps the cycle's mode), so a paper proposal cannot
+                # propose selling base the live DCA bought today.
+                broker=None if offline or winner_status != "live" else broker,
                 repo=repo,
                 config=config,
                 holding=holding,
@@ -1442,7 +1455,7 @@ def _handle_reductions(
                 rule_id=winner.rule_id,
                 rule_status=winner_status,
                 now_ts=now_ts,
-                offline=offline,
+                offline=offline or winner_status != "live",
             ),
         ),
     ]
