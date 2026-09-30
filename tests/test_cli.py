@@ -18,6 +18,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
+import pytest
 from click.testing import CliRunner
 from keel_broker_api.orders import OrderSpec
 from keel_broker_api.results import PlaceResult, Preview, SessionState
@@ -1259,7 +1260,8 @@ def test_rules_seed_populates_products_times_kinds(tmp_path, valid_config_path):
     assert len(rows) == 3 * len(seedable)
     assert f"seeded={3 * len(seedable)} skipped=0" in result.output
     assert {row["kind"] for row in rows} == set(seedable)
-    assert "reverse_dca" in RULE_REGISTRY and "reverse_dca" not in seedable
+    for sleeve_kind in ("reverse_dca", "profit_take"):
+        assert sleeve_kind in RULE_REGISTRY and sleeve_kind not in seedable
 
 
 def test_rules_seed_is_idempotent(tmp_path, valid_config_path):
@@ -1294,11 +1296,14 @@ def test_rules_seed_force_reseeds_even_when_present(tmp_path, valid_config_path)
     assert len(repo.get_rules()) == 2 * 3 * len(agent.seedable_kinds())
 
 
+@pytest.mark.parametrize("sleeve_kind", ["reverse_dca", "profit_take"])
 def test_rules_seed_refuses_a_sleeve_sell_kind_by_name_and_writes_nothing(
-    tmp_path, valid_config_path
+    tmp_path, valid_config_path, sleeve_kind
 ):
     """R20: `--kinds reverse_dca` is refused, naming the kind and `rules add`, not built from
-    `{"product_id": p}` alone (which its required `target_usd` makes a crash)."""
+    `{"product_id": p}` alone (which its required `target_usd` makes a crash). `profit_take`
+    (P14) is refused too although every param it has defaults: the refusal is by CLASS, not by
+    whether the constructor happens to fail."""
     db_path = tmp_path / "test.db"
     repo = _repo_at(db_path)
     result = CliRunner().invoke(
@@ -1311,11 +1316,11 @@ def test_rules_seed_refuses_a_sleeve_sell_kind_by_name_and_writes_nothing(
             "rules",
             "seed",
             "--kinds",
-            "dca,reverse_dca",
+            f"dca,{sleeve_kind}",
         ],
     )
     assert result.exit_code == 1
-    assert "reverse_dca" in result.output and "rules add" in result.output
+    assert sleeve_kind in result.output and "rules add" in result.output
     assert repo.get_rules() == []
 
 

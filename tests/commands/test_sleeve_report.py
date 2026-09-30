@@ -14,7 +14,7 @@ from decimal import Decimal
 from typing import Any
 
 import pytest
-from keel_core.config import AutoTradeConfig, FeesConfig
+from keel_core.config import AutoTradeConfig, Caps, FeesConfig
 
 from keel.commands import sleeve_report
 from keel.commands.rules import backtest_slippage
@@ -138,8 +138,14 @@ def test_todays_own_cadence_bar_is_next_and_is_proposed_tomorrow(repo) -> None:
     _seed(repo)
     [row] = distribution_rows(repo, _config(), now_ts=210 * DAY + 3_600)
     assert row.next_cadence_ts == 210 * DAY
-    [line, _collision] = render_distribution([row])
-    assert line.startswith("rule 1 (paper) BTC-USD cadence bar 1970-07-30, proposed 1970-07-31: ")
+    [line, stale, _collision] = render_distribution([row])
+    assert line.startswith(
+        "rule 1 (paper) BTC-USD cadence bar 1970-07-30, proposed 1970-07-31, mark bar 1970-07-20: "
+    )
+    # The fixture's newest bar is day 200, ten days before today: flagged, not silently used.
+    assert row.mark_bar is not None and stale == sleeve_report.stale_mark_line(
+        "BTC-USD", row.mark_bar
+    )
 
 
 def test_a_cadence_bar_several_days_out_is_named_ahead_of_time(repo) -> None:
@@ -624,13 +630,23 @@ def test_a_raising_dca_detect_counts_as_firing_not_a_crash() -> None:
 
 @pytest.fixture
 def live_config_path(write_config: Any) -> Any:
-    """The same valid config, `auto_trade.mode: live` -- for the half of R40's reading
-    (`run_proposal_replay`'s `dca_status`) `valid_config_path` (paper) cannot exercise."""
+    """The same valid config on a LIVE profile -- `auto_trade.mode: confirm`, the only non-paper
+    mode (`mode: live` is refused by `load_config`: autonomy is a profile choice) -- for the half
+    of R40's reading (`run_proposal_replay`'s `dca_status`) `valid_config_path` (paper) cannot
+    exercise.
+
+    It used to write `mode: live`, which `load_config` refuses, so `rules backtest`'s
+    `_optional_cfg` fell back to NO config and the live-profile test below ran the `config=None`
+    path instead (P14, found by applying R54 there). It now loads, and the test pins that it
+    does."""
+    from keel.config import load_config
     from tests.conftest import VALID_CONFIG_YAML
 
-    text = VALID_CONFIG_YAML.replace("mode: paper", "mode: live")
-    assert "mode: live" in text and "mode: paper" not in text
-    return write_config(text)
+    text = VALID_CONFIG_YAML.replace("mode: paper", "mode: confirm")
+    assert "mode: confirm" in text and "mode: paper" not in text
+    path = write_config(text)
+    assert load_config(path).auto_trade.mode == "confirm"
+    return path
 
 
 def test_a_paper_dca_on_the_same_product_vetoes_every_distribution_bar(
@@ -705,6 +721,8 @@ def test_a_live_dca_on_the_same_product_vetoes_under_a_live_profile(
     result = _backtest(tmp_path, live_config_path, rid)
     assert result.exit_code == 0, result.output
     lines = result.output.splitlines()
+    # The config reached the replay: its fee line is the config's, not the no-config default.
+    assert _fee_lines(result.output) == ["fee line: 1.2000% (fallback:config.fees.taker_pct)"]
     [head] = [line for line in lines if line.startswith("  same-day dca:")]
     assert head == (
         f"  same-day dca: 1 dca rule(s) at status live on BTC-USD replayed (ids {dca_id})"
@@ -716,8 +734,8 @@ def test_a_live_dca_on_the_same_product_vetoes_under_a_live_profile(
 
 def test_the_no_config_replay_uses_the_library_default_fee_and_leaves_legs_unsliced(repo) -> None:
     """The no-config branch (`config is None`): the headline fee is `backtest.TAKER_FEE_PCT`
-    labelled as the library default, `dca_status` defaults to `live`, and with no
-    `max_per_order_usd` every sale row carries `legs unsliced` (no cap to slice against)."""
+    labelled as the library default, and with no `max_per_order_usd` every sale row carries
+    `legs unsliced` (no cap to slice against). Its dca reading is R54's, pinned below."""
     from keel.commands.rules import run_proposal_replay
 
     repo.upsert_candles("BTC-USD", Granularity.ONE_DAY, _rising(91))
@@ -734,6 +752,57 @@ def test_the_no_config_replay_uses_the_library_default_fee_and_leaves_legs_unsli
     sales = [line for line in out if " bar: sell " in line]
     assert len(sales) == 3
     assert all(line.endswith("legs unsliced") for line in sales)
+
+
+@pytest.mark.parametrize("dca_status", ["candidate", "paper", "live"])
+def test_the_no_config_replay_counts_any_non_disabled_dca_as_the_gate_does(
+    repo, dca_status: str
+) -> None:
+    """R54 on the replay (carried from P13's held question b): with no config no status is the
+    cycle's, so ANY non-disabled dca on the product is replayed -- the reading the sleeve gate's
+    own `config=None` path takes (`_cycle_dca_on`). It used to read `live` alone, so a paper
+    dca on a paper profile's database replayed no collision at all."""
+    from keel.commands.rules import ANY_ACTIVE_DCA, run_proposal_replay
+    from keel.execution.sleeve import SAME_DAY_DCA
+
+    repo.upsert_candles("BTC-USD", Granularity.ONE_DAY, _rising(91))
+    rid = repo.insert_rule(
+        "reverse_dca",
+        {"product_id": "BTC-USD", "target_usd": "10", "min_price_floor": "1"},
+        status="candidate",
+    )
+    dca_id = repo.insert_rule(
+        "dca", {"product_id": "BTC-USD", "cadence_days": 30}, status=dca_status
+    )
+    out: list[str] = []
+    run_proposal_replay(repo, None, rid, echo=out.append)
+    [head] = [line for line in out if line.startswith("  same-day dca:")]
+    assert head == (
+        f"  same-day dca: 1 dca rule(s) at status {ANY_ACTIVE_DCA} on BTC-USD replayed "
+        f"(ids {dca_id})"
+    )
+    vetoed = [line for line in out if f"bar: vetoed ({SAME_DAY_DCA})" in line]
+    sold = [line for line in out if " bar: sell " in line]
+    assert (len(vetoed), len(sold)) == (4, 0)
+
+
+def test_the_no_config_replay_ignores_a_disabled_dca(repo) -> None:
+    """The other half of R54: a disabled dca buys nothing on any profile, so it is not replayed
+    and vetoes nothing -- the three cadence bars past min_hold sell."""
+    from keel.commands.rules import ANY_ACTIVE_DCA, run_proposal_replay
+
+    repo.upsert_candles("BTC-USD", Granularity.ONE_DAY, _rising(91))
+    rid = repo.insert_rule(
+        "reverse_dca",
+        {"product_id": "BTC-USD", "target_usd": "10", "min_price_floor": "1"},
+        status="candidate",
+    )
+    repo.insert_rule("dca", {"product_id": "BTC-USD", "cadence_days": 30}, status="disabled")
+    out: list[str] = []
+    run_proposal_replay(repo, None, rid, echo=out.append)
+    [head] = [line for line in out if line.startswith("  same-day dca:")]
+    assert head == f"  same-day dca: no dca rule at status {ANY_ACTIVE_DCA} on BTC-USD"
+    assert sum(1 for line in out if " bar: sell " in line) == 3
 
 
 def test_an_hour_granularity_is_refused_and_a_day_is_accepted(tmp_path, valid_config_path) -> None:
@@ -929,6 +998,7 @@ def _lot_row(**overrides: Any) -> LotRow:
         mark=D("4300"),
         unrealised=D("-5.658636"),
         realised_if_sold=D("-6.907236"),
+        mark_bar=sleeve_report.MarkBar(19_675 * DAY, 19_675 * DAY, 0),  # 2023-11-14, fresh
     )
     base.update(overrides)
     return LotRow(**base)
@@ -950,7 +1020,9 @@ def test_a_rendered_lot_names_its_tranche_its_rule_and_the_fallback_fee() -> Non
     lines = render_lots([_lot_row(), _lot_row(position_id=4, rule_name="dca")])
     head, *rest = lines
     source = sleeve.FALLBACK_FEE_SOURCE
-    assert head == f"lots -- fees at the fallback rate ({source}); no venue asked"
+    assert (
+        head == f"lots -- fees at the fallback rate ({source}); no venue asked; mark bar 2023-11-14"
+    )
     lot_lines = [line for line in rest if line.startswith("  #")]
     assert [line.split()[0:2] for line in lot_lines] == [["#3", "turtle_breakout"], ["#4", "dca"]]
     assert lines.count("PAXG-USD") == 1, "one product heading over its lots"
@@ -1228,3 +1300,524 @@ def test_a_target_asset_held_in_another_quote_is_named_not_dropped(repo) -> None
     report = bands_view(repo, _config(target_weights=_HALVES))
     assert report.untargeted == ("BTC-USDC",)
     assert [(r.asset, r.weight) for r in report.rows] == [("BTC", D("0.5")), ("ETH", D("0.5"))]
+
+
+# -- carried from P13's held question (a): every view names the daily bar it marks at, and says
+# -- when that bar is older than the one a cycle would judge a sleeve rule on ----------------------
+
+#: One hour into UTC day 100: the newest COMPLETED daily bar is day 99's.
+_NOW_100 = 100 * DAY + 3_600
+
+
+def _dated(day: int) -> str:
+    return sleeve_report._day(day * DAY)
+
+
+@pytest.mark.parametrize(("last_day", "behind"), [(99, 0), (98, 1), (90, 9)])
+def test_the_mark_bar_is_judged_by_the_cycles_own_daily_readiness_gate(
+    last_day: int, behind: int
+) -> None:
+    """`MarkBar.stale` is exactly `freshness.entry_bar_ready`'s verdict on a daily-only series --
+    the gate `agent._handle_reductions` skips a sleeve rule on (#917) -- not a new threshold."""
+    from keel.data import freshness
+
+    daily = [_candle(d, "100") for d in range(last_day - 2, last_day + 1)]
+    bar = sleeve_report.mark_bar(daily, _NOW_100)
+    readiness = freshness.entry_bar_ready(
+        {Granularity.ONE_DAY: daily}, Granularity.ONE_DAY, _NOW_100
+    )
+    assert bar is not None
+    assert (bar.ts, bar.expected_ts, bar.bars_behind) == (last_day * DAY, 99 * DAY, behind)
+    assert bar.stale is (not readiness.ready) is (behind > 0)
+
+
+def test_no_daily_bar_is_no_mark_bar() -> None:
+    assert sleeve_report.mark_bar([], _NOW_100) is None
+
+
+def test_the_mark_bar_head_names_one_date_a_range_or_none() -> None:
+    fresh = sleeve_report.MarkBar(99 * DAY, 99 * DAY, 0)
+    old = sleeve_report.MarkBar(90 * DAY, 99 * DAY, 9)
+    assert sleeve_report.mark_bar_head([fresh, fresh, None]) == f"mark bar {_dated(99)}"
+    assert sleeve_report.mark_bar_head([fresh, old]) == (f"mark bars {_dated(90)}..{_dated(99)}")
+    assert sleeve_report.mark_bar_head([None]) == "mark bar none"
+
+
+def test_a_stale_line_names_the_product_its_bar_and_the_bar_the_cycle_expects() -> None:
+    old = sleeve_report.MarkBar(90 * DAY, 99 * DAY, 9)
+    assert sleeve_report.stale_mark_line("PAXG-USD", old) == (
+        f"STALE mark: PAXG-USD's latest cached daily bar is {_dated(90)}, 9 bar(s) behind "
+        f"{_dated(99)}, the newest completed one -- a cycle would not judge a sleeve rule on it "
+        "(freshness.entry_bar_ready), so every PAXG-USD figure here is priced at an old close"
+    )
+
+
+def _two_products(repo: Repository) -> None:
+    """BTC fresh (its newest bar is day 99's), PAXG stale (day 90)."""
+    for product, opened_at in (("BTC-USD", 1), ("PAXG-USD", 2)):
+        repo.open_position(
+            product_id=product,
+            rule_name="dca",
+            opened_at=opened_at,
+            qty=D("0.01"),
+            entry_fill=D("100"),
+            entry_fee=D("0"),
+        )
+    repo.upsert_candles("BTC-USD", Granularity.ONE_DAY, [_candle(98, "110"), _candle(99, "120")])
+    repo.upsert_candles("PAXG-USD", Granularity.ONE_DAY, [_candle(90, "130")])
+
+
+def test_the_lots_view_carries_each_products_mark_bar(repo) -> None:
+    _two_products(repo)
+    rows = lots_view(repo, _config(), now_ts=_NOW_100)
+    assert [(r.product_id, r.mark_bar) for r in rows] == [
+        ("BTC-USD", sleeve_report.MarkBar(99 * DAY, 99 * DAY, 0)),
+        ("PAXG-USD", sleeve_report.MarkBar(90 * DAY, 99 * DAY, 9)),
+    ]
+
+
+def test_the_lots_head_names_the_mark_bar_and_a_stale_product_is_flagged_once(repo) -> None:
+    _two_products(repo)
+    rows = lots_view(repo, _config(), now_ts=_NOW_100)
+    lines = render_lots(rows)
+    assert lines[0] == (
+        f"lots -- fees at the fallback rate ({sleeve.FALLBACK_FEE_SOURCE}); no venue asked; "
+        f"mark bars {_dated(90)}..{_dated(99)}"
+    )
+    stale = [line for line in lines if line.startswith("STALE mark: ")]
+    assert stale == [sleeve_report.stale_mark_line("PAXG-USD", rows[1].mark_bar)]
+    assert lines[1] == stale[0], "the flag sits directly under the head it qualifies"
+
+
+def test_a_fresh_lots_report_has_one_date_and_no_flag(repo) -> None:
+    _two_products(repo)
+    lines = render_lots(lots_view(repo, _config(), product_id="BTC-USD", now_ts=_NOW_100))
+    assert lines[0].endswith(f"; mark bar {_dated(99)}")
+    assert not any(line.startswith("STALE mark: ") for line in lines)
+
+
+def test_the_bands_view_carries_the_mark_bar_of_every_weighed_holding(repo) -> None:
+    _two_products(repo)
+    report = bands_view(
+        repo, _config(target_weights={"BTC": D("0.5"), "PAXG": D("0.5")}), now_ts=_NOW_100
+    )
+    assert report.marks == (
+        ("BTC-USD", sleeve_report.MarkBar(99 * DAY, 99 * DAY, 0)),
+        ("PAXG-USD", sleeve_report.MarkBar(90 * DAY, 99 * DAY, 9)),
+    )
+    lines = render_bands(report)
+    assert lines[0].endswith(f"; mark bars {_dated(90)}..{_dated(99)}")
+    assert [line for line in lines if line.startswith("STALE mark: ")] == [
+        sleeve_report.stale_mark_line("PAXG-USD", report.marks[1][1])
+    ]
+    assert lines[1].startswith("STALE mark: PAXG-USD")
+
+
+def test_a_distribution_row_names_its_mark_bar_and_flags_a_stale_one(repo) -> None:
+    repo.insert_rule(
+        "reverse_dca",
+        {"product_id": "BTC-USD", "target_usd": "10", "min_price_floor": "1"},
+        status="live",
+    )
+    repo.open_position(
+        product_id="BTC-USD",
+        rule_name="dca",
+        opened_at=1,
+        qty=D("0.01"),
+        entry_fill=D("100"),
+        entry_fee=D("0"),
+    )
+    repo.upsert_candles("BTC-USD", Granularity.ONE_DAY, [_candle(90, "100000")])
+    [row] = distribution_rows(repo, _config(), now_ts=_NOW_100)
+    assert row.mark_bar == sleeve_report.MarkBar(90 * DAY, 99 * DAY, 9)
+    first, *rest = render_distribution([row])
+    assert f"proposed {_dated(121)}, mark bar {_dated(90)}: " in first
+    assert first.startswith("rule ")
+    assert rest[0] == sleeve_report.stale_mark_line("BTC-USD", row.mark_bar)
+
+
+# -- keel dca trim --preview --view gain (P14 Task 14.2, spec §4) -------------------------------
+#
+# Every verdict and figure is the `profit_take` rule's own `reduce_signal` on the cached daily close
+# (the plan: "it invents none of the arithmetic"); the view only chooses the params and prints.
+
+
+def _btc_dca(repo: Repository, *, qty: str = "0.01", fill: str = "100000", fee: str = "0.45"):
+    return repo.open_position(
+        product_id="BTC-USD",
+        rule_name="dca",
+        opened_at=1,
+        qty=D(qty),
+        entry_fill=D(fill),
+        entry_fee=D(fee),
+    )
+
+
+def _mark(repo: Repository, product: str, close: str, day: int = 99) -> None:
+    repo.upsert_candles(product, Granularity.ONE_DAY, [_candle(day, close)])
+
+
+def _profit_take_rule(**params: Any) -> Any:
+    from keel.strategy.rules.profit_take import ProfitTake
+
+    return ProfitTake("BTC-USD", **params)
+
+
+def test_gain_view_uses_the_products_profit_take_rule_params_when_there_is_one(repo) -> None:
+    _hold(repo, "BTC-USD", qty="0.01", mark="200000")
+    rid = repo.insert_rule(
+        "profit_take",
+        {"product_id": "BTC-USD", "gain_pct": "40", "trim_pct": "10"},
+        status="candidate",
+    )
+    [row] = sleeve_report.gain_view(repo, _config(), now_ts=_NOW_100)
+    assert (row.gain_pct_used, row.trim_pct_used) == (D("40"), D("10"))
+    assert row.params_source == f"rule {rid} (candidate)"
+    assert row.triggered and row.fifo_first_tranche is not None
+    assert row.verdict in {"would trim", "below fee gate"}
+
+
+def test_the_flags_override_the_rule(repo) -> None:
+    # Bought at 100000 and marked at 200000: ~100% up, well short of a 500% trigger. (`_hold`
+    # books its tranche at 1, which a 500% trigger would still clear.)
+    _btc_dca(repo)
+    _mark(repo, "BTC-USD", "200000")
+    [row] = sleeve_report.gain_view(repo, _config(), gain_pct=D("500"), now_ts=_NOW_100)
+    assert row.triggered is False and row.verdict == "below trigger"
+    assert (row.gain_pct_used, row.trim_pct_used) == (D("500"), D("15"))
+    assert row.params_source == "spec defaults, --gain-pct"
+
+
+def test_each_flag_overrides_only_its_own_param(repo) -> None:
+    _hold(repo, "BTC-USD", qty="0.01", mark="200000")
+    rid = repo.insert_rule(
+        "profit_take",
+        {"product_id": "BTC-USD", "gain_pct": "40", "trim_pct": "10", "min_net_usd": "7"},
+        status="paper",
+    )
+    [row] = sleeve_report.gain_view(repo, _config(), trim_pct=D("20"), now_ts=_NOW_100)
+    assert (row.gain_pct_used, row.trim_pct_used, row.min_net_usd_used) == (
+        D("40"),
+        D("20"),
+        D("7"),
+    )
+    assert row.params_source == f"rule {rid} (paper), --trim-pct"
+
+
+def test_a_disabled_rule_is_not_read_and_the_most_advanced_status_wins(repo) -> None:
+    _hold(repo, "BTC-USD", qty="0.01", mark="200000")
+    repo.insert_rule("profit_take", {"product_id": "BTC-USD", "gain_pct": "90"}, status="disabled")
+    repo.insert_rule("profit_take", {"product_id": "BTC-USD", "gain_pct": "60"}, status="candidate")
+    live = repo.insert_rule(
+        "profit_take", {"product_id": "BTC-USD", "gain_pct": "30"}, status="live"
+    )
+    repo.insert_rule("profit_take", {"product_id": "ETH-USD", "gain_pct": "70"}, status="live")
+    [row] = sleeve_report.gain_view(repo, _config(), now_ts=_NOW_100)
+    assert (row.gain_pct_used, row.params_source) == (D("30"), f"rule {live} (live)")
+
+
+def test_no_rule_and_no_flag_is_the_spec_defaults(repo) -> None:
+    _hold(repo, "BTC-USD", qty="0.01", mark="200000")
+    [row] = sleeve_report.gain_view(repo, _config(), now_ts=_NOW_100)
+    assert (row.gain_pct_used, row.trim_pct_used, row.min_net_usd_used, row.params_source) == (
+        D("25"),
+        D("15"),
+        D("5"),
+        "spec defaults",
+    )
+
+
+def test_a_would_trim_row_is_the_rules_own_reduction(repo) -> None:
+    """The figures are the `Reduction`'s: qty, and the fee and net its trigger carries."""
+    first = _btc_dca(repo)
+    _mark(repo, "BTC-USD", "200000")
+    [row] = sleeve_report.gain_view(repo, _config(), now_ts=_NOW_100)
+    held = sleeve.holding_of(repo, "BTC-USD", D("200000"))
+    costs = sleeve.sell_costs(repo, _config(), "BTC-USD")
+    red = _profit_take_rule().reduce_signal(
+        held, {Granularity.ONE_DAY: [_candle(99, "200000")]}, costs
+    )
+    assert red is not None
+    assert (row.verdict, row.triggered) == ("would trim", True)
+    assert (row.qty_to_sell, row.fee_usd, row.net_usd) == (
+        red.qty,
+        D(red.trigger["fee_usd"]),
+        D(red.trigger["net_usd"]),
+    )
+    assert (row.qty, row.vwae, row.cost_basis, row.mark) == (
+        held.qty,
+        held.vwae,
+        held.cost_basis,
+        D("200000"),
+    )
+    assert row.unrealised == held.qty * D("200000") - held.cost_basis
+    assert row.trigger_price == D(red.trigger["trigger_price"])
+    assert (row.fifo_first_tranche, row.legs) == (first, 1)
+
+
+def test_below_the_fee_gate_is_triggered_with_the_rules_own_figures(repo) -> None:
+    _btc_dca(repo, qty="0.0001")  # a trim of 0.000015 BTC nets cents, under the $5 gate
+    _mark(repo, "BTC-USD", "200000")
+    [row] = sleeve_report.gain_view(repo, _config(), now_ts=_NOW_100)
+    rule = _profit_take_rule()
+    held = sleeve.holding_of(repo, "BTC-USD", D("200000"))
+    costs = sleeve.sell_costs(repo, _config(), "BTC-USD")
+    assert rule.reduce_signal(held, {Granularity.ONE_DAY: [_candle(99, "200000")]}, costs) is None
+    rejection = rule.last_rejection
+    assert rejection is not None and rejection["gate"] == "fee_gate"
+    assert (row.verdict, row.triggered, row.legs) == ("below fee gate", True, 0)
+    # The trigger price is the rule's own too (review round 1, #936): never recomputed here.
+    assert row.trigger_price == rejection["trigger_price"]
+    assert (row.qty_to_sell, row.fee_usd, row.net_usd) == (
+        rejection["qty"],
+        rejection["fee_usd"],
+        rejection["net_usd"],
+    )
+
+
+def test_below_the_trigger_prints_no_sale(repo) -> None:
+    _btc_dca(repo)
+    _mark(repo, "BTC-USD", "110000")
+    [row] = sleeve_report.gain_view(repo, _config(), now_ts=_NOW_100)
+    assert (row.verdict, row.triggered, row.legs) == ("below trigger", False, 0)
+    assert (row.qty_to_sell, row.fee_usd, row.net_usd) == (None, None, None)
+    assert row.trigger_price == D("100045") * D("1.25")
+
+
+def test_no_mark_is_no_verdict_rather_than_a_total_loss(repo) -> None:
+    _btc_dca(repo)
+    [row] = sleeve_report.gain_view(repo, _config(), now_ts=_NOW_100)
+    assert (row.verdict, row.triggered, row.mark, row.unrealised, row.mark_bar) == (
+        "no cached daily close",
+        False,
+        None,
+        None,
+        None,
+    )
+    assert (row.trigger_price, row.qty_to_sell, row.net_usd) == (None, None, None)
+
+
+def test_the_first_tranche_is_the_fifo_one_on_a_mixed_product(repo) -> None:
+    """Review Focus 3: on PAXG the oldest tranche is the turtle one, so a trim hits it first."""
+    turtle = repo.open_position(
+        product_id="PAXG-USD",
+        rule_name="turtle_breakout",
+        opened_at=1,
+        qty=D("0.0132"),
+        entry_fill=D("2000"),
+        entry_fee=D("0.73"),
+    )
+    repo.open_position(
+        product_id="PAXG-USD",
+        rule_name="dca",
+        opened_at=2,
+        qty=D("0.5"),
+        entry_fill=D("2000"),
+        entry_fee=D("0.40"),
+    )
+    _mark(repo, "PAXG-USD", "4300")
+    [row] = sleeve_report.gain_view(repo, _config(), now_ts=_NOW_100)
+    assert (row.product_id, row.fifo_first_tranche, row.verdict) == (
+        "PAXG-USD",
+        turtle,
+        "would trim",
+    )
+
+
+def test_a_trim_above_the_per_order_cap_needs_several_legs(repo) -> None:
+    """`legs` is `sleeve.slice_qty`'s: 0.15 BTC at 200000 is $30000, over a $1000 cap."""
+    _btc_dca(repo, qty="1")
+    _mark(repo, "BTC-USD", "200000")
+    config = _config(
+        caps=Caps(
+            max_per_order_usd=D("1000"),
+            max_per_day_usd=D("300000"),
+            max_exposure_usd=D("1000000"),
+            max_per_asset_pct=D("1"),
+        )
+    )
+    [row] = sleeve_report.gain_view(repo, config, now_ts=_NOW_100)
+    assert row.qty_to_sell == D("0.15")
+    _leg, legs = sleeve.slice_qty(
+        D("0.15"),
+        D("200000"),
+        max_per_order_usd=config.caps.max_per_order_usd,
+        base_increment=None,
+    )
+    assert legs > 1, "the fixture must need slicing"
+    assert row.legs == legs
+
+
+def test_products_list_in_order_and_a_product_filter_narrows(repo) -> None:
+    _hold(repo, "PAXG-USD", qty="0.01", mark="4000")
+    _hold(repo, "BTC-USD", qty="0.01", mark="200000")
+    assert [r.product_id for r in sleeve_report.gain_view(repo, _config(), now_ts=_NOW_100)] == [
+        "BTC-USD",
+        "PAXG-USD",
+    ]
+    [only] = sleeve_report.gain_view(repo, _config(), product_id="PAXG-USD", now_ts=_NOW_100)
+    assert only.product_id == "PAXG-USD"
+
+
+def test_a_bad_flag_is_the_rules_own_refusal() -> None:
+    """The view builds the rule from the chosen params, so an out-of-range flag is refused by
+    the constructor's own check, never re-implemented here."""
+    with pytest.raises(ValueError, match="trim_pct"):
+        sleeve_report.profit_take_params(None, trim_pct=D("25"))
+
+
+def test_the_gain_view_carries_its_mark_bar(repo) -> None:
+    _hold(repo, "BTC-USD", qty="0.01", mark="200000")  # the bar is day 10: stale at day 100
+    [row] = sleeve_report.gain_view(repo, _config(), now_ts=_NOW_100)
+    assert row.mark_bar == sleeve_report.MarkBar(10 * DAY, 99 * DAY, 89)
+
+
+# -- render_gain --------------------------------------------------------------------------------
+
+
+def _gain_row(**overrides: Any) -> Any:
+    base: dict[str, Any] = dict(
+        product_id="BTC-USD",
+        qty=D("0.01"),
+        vwae=D("100045"),
+        cost_basis=D("1000.45"),
+        mark=D("200000"),
+        unrealised=D("999.55"),
+        gain_pct_used=D("25"),
+        trim_pct_used=D("15"),
+        min_net_usd_used=D("5"),
+        params_source="spec defaults",
+        trigger_price=D("125056.25"),
+        triggered=True,
+        fifo_first_tranche=1,
+        qty_to_sell=D("0.0015"),
+        fee_usd=D("3.6"),
+        net_usd=D("146.28"),
+        verdict="would trim",
+        legs=1,
+        mark_bar=sleeve_report.MarkBar(99 * DAY, 99 * DAY, 0),
+    )
+    base.update(overrides)
+    return sleeve_report.GainRow(**base)
+
+
+def test_a_rendered_gain_line_prints_each_figure_in_its_own_slot() -> None:
+    lines = sleeve_report.render_gain([_gain_row()])
+    assert [line for line in lines if line.startswith("  ")] == [
+        "  BTC-USD qty 0.01  vwae 100045  cost $1000.45  mark 200000  unrealised $999.55"
+        "  gain 25% trim 15% min net $5.00 (spec defaults)  trigger 125056.25 met"
+        "  first tranche #1  sell 0.0015 over 1 leg  fee $3.60  net $146.28  -> would trim",
+    ]
+
+
+def test_a_rendered_row_below_its_trigger_prints_no_sale() -> None:
+    row = _gain_row(
+        triggered=False,
+        qty_to_sell=None,
+        fee_usd=None,
+        net_usd=None,
+        verdict="below trigger",
+        legs=0,
+    )
+    [line] = [text for text in sleeve_report.render_gain([row]) if text.startswith("  ")]
+    assert line.endswith("  trigger 125056.25 not met  first tranche #1  -> below trigger")
+
+
+def test_a_rendered_row_below_the_fee_gate_prints_its_figures_and_no_legs() -> None:
+    row = _gain_row(net_usd=D("0.42"), verdict="below fee gate", legs=0)
+    [line] = [text for text in sleeve_report.render_gain([row]) if text.startswith("  ")]
+    assert line.endswith(
+        "  trigger 125056.25 met  first tranche #1  sell 0.0015  fee $3.60  net $0.42"
+        "  -> below fee gate"
+    )
+
+
+def test_a_rendered_row_without_a_mark_stops_at_the_cost() -> None:
+    row = _gain_row(
+        mark=None,
+        unrealised=None,
+        trigger_price=None,
+        triggered=False,
+        qty_to_sell=None,
+        fee_usd=None,
+        net_usd=None,
+        verdict="no cached daily close",
+        legs=0,
+        mark_bar=None,
+    )
+    [line] = [text for text in sleeve_report.render_gain([row]) if text.startswith("  ")]
+    assert line == (
+        "  BTC-USD qty 0.01  vwae 100045  cost $1000.45  mark none"
+        "  gain 25% trim 15% min net $5.00 (spec defaults)  -> no cached daily close"
+    )
+
+
+def test_the_gain_report_names_its_fee_source_mark_bar_and_what_it_is_not() -> None:
+    lines = sleeve_report.render_gain([_gain_row()])
+    assert lines[0] == (
+        "gain -- profit_take's trigger per held product, over the positions ledger; fees at the "
+        f"fallback rate ({sleeve.FALLBACK_FEE_SOURCE}); no venue asked; mark bar {_dated(99)}"
+    )
+    assert lines.count(sleeve_report.GAIN_NOT_EVIDENCE) == 1
+    assert lines.count(sleeve_report.GAIN_PIPELINE_NOTE) == 1
+    assert lines[-1] == sleeve_report.NOT_TAX_ADVICE
+
+
+def test_the_gain_notes_claim_no_edge_and_name_the_caps_not_applied() -> None:
+    assert "untested" in sleeve_report.GAIN_NOT_EVIDENCE
+    assert "no profit_take rule is promoted" in sleeve_report.GAIN_NOT_EVIDENCE
+    for cap in ("min_hold_days", "cooldown_days", "same-day dca"):
+        assert cap in sleeve_report.GAIN_PIPELINE_NOTE
+
+
+def test_a_stale_gain_row_is_flagged_under_the_head() -> None:
+    old = sleeve_report.MarkBar(90 * DAY, 99 * DAY, 9)
+    lines = sleeve_report.render_gain([_gain_row(mark_bar=old)])
+    assert lines[1] == sleeve_report.stale_mark_line("BTC-USD", old)
+    assert sum(1 for line in lines if line.startswith("STALE mark: ")) == 1
+
+
+def test_nothing_held_is_one_line_and_the_notes() -> None:
+    lines = sleeve_report.render_gain([])
+    assert sleeve_report.NO_OPEN_LOTS in lines
+    assert not any(line.startswith("  ") for line in lines)
+
+
+def test_a_computed_price_prints_ten_significant_digits_and_no_trailing_zeros() -> None:
+    assert sleeve_report._price(D("100045") * D("1.25")) == "125056.25"
+    assert sleeve_report._price(D("101200.00") * D("1.25")) == "126500"
+    assert sleeve_report._price(D("4604.1653451327433628318584")) == "4604.165345"
+    assert sleeve_report._price(None) == "unrecorded"
+
+
+# -- review round 1 (#936): the dedupe, the tie-break and the non-finite flag, pinned -------------
+
+
+def test_a_stale_product_with_several_tranches_is_flagged_once_not_per_tranche(repo) -> None:
+    """`_stale_lines` names a product once however many rows carry its bar: PAXG has two lots,
+    both marked at the same stale bar, and the report says so on exactly one line."""
+    for opened_at in (1, 2):
+        repo.open_position(
+            product_id="PAXG-USD",
+            rule_name="dca",
+            opened_at=opened_at,
+            qty=D("0.01"),
+            entry_fill=D("100"),
+            entry_fee=D("0"),
+        )
+    repo.upsert_candles("PAXG-USD", Granularity.ONE_DAY, [_candle(90, "130")])
+    rows = lots_view(repo, _config(), now_ts=_NOW_100)
+    assert len(rows) == 2 and all(r.mark_bar is not None and r.mark_bar.stale for r in rows)
+    stale = [line for line in render_lots(rows) if line.startswith("STALE mark: ")]
+    assert stale == [sleeve_report.stale_mark_line("PAXG-USD", rows[0].mark_bar)]
+
+
+def test_two_rules_at_one_status_break_the_tie_on_the_lowest_id(repo) -> None:
+    """R56: the most advanced status wins, and between two rows at that status the lower id."""
+    _hold(repo, "BTC-USD", qty="0.01", mark="200000")
+    first = repo.insert_rule(
+        "profit_take", {"product_id": "BTC-USD", "gain_pct": "30"}, status="paper"
+    )
+    repo.insert_rule("profit_take", {"product_id": "BTC-USD", "gain_pct": "45"}, status="paper")
+    [row] = sleeve_report.gain_view(repo, _config(), now_ts=_NOW_100)
+    assert (row.gain_pct_used, row.params_source) == (D("30"), f"rule {first} (paper)")

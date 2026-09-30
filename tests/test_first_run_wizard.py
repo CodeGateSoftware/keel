@@ -553,4 +553,5 @@ def test_the_wizard_seeds_every_seedable_kind_and_no_sleeve_sell_kind(tmp_path: 
     finally:
         conn.close()
     assert kinds == set(agent.seedable_kinds())
-    assert "reverse_dca" in agent.RULE_REGISTRY and "reverse_dca" not in kinds
+    for sleeve_kind in ("reverse_dca", "profit_take"):
+        assert sleeve_kind in agent.RULE_REGISTRY and sleeve_kind not in kinds

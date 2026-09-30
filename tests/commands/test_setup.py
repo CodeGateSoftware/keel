@@ -608,9 +608,22 @@ def _statuses(db_path: Path) -> dict[int, str]:
         conn.close()
 
 
+_SLEEVE_KINDS = [
+    ("reverse_dca", {"product_id": "BTC-USD", "target_usd": "10", "min_price_floor": "1"}),
+    # P14: the second sleeve-sell kind is refused by its registered class, with no change to
+    # the web action -- R53 reads the class, never a list of kind names.
+    ("profit_take", {"product_id": "BTC-USD"}),
+]
+
+
+@pytest.mark.parametrize(("kind", "params"), _SLEEVE_KINDS)
 @pytest.mark.parametrize("status", ["candidate", "paper", "live", "disabled"])
 def test_the_web_promotion_refuses_a_sleeve_sell_rule_and_names_the_cli(
-    fresh: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch, status: str
+    fresh: tuple[Path, Path],
+    monkeypatch: pytest.MonkeyPatch,
+    status: str,
+    kind: str,
+    params: dict[str, str],
 ) -> None:
     """The browser cannot carry `--allow-concurrent-dca` or the operator's review flow, and a
     sleeve-sell rule's paper -> live step is the one that decides whether it may ever sell. So
@@ -619,20 +632,13 @@ def test_the_web_promotion_refuses_a_sleeve_sell_rule_and_names_the_cli(
 
     config_path, db_path = fresh
     started = _spy_jobs(monkeypatch)
-    rid = _rule(
-        db_path,
-        "reverse_dca",
-        {"product_id": "BTC-USD", "target_usd": "10", "min_price_floor": "1"},
-        status,
-    )
+    rid = _rule(db_path, kind, params, status)
     watcher = sqlite3.connect(str(db_path))
     before = watcher.execute("PRAGMA data_version").fetchone()[0]
 
     result = promote_rule(config_path, db_path, {"rule_id": str(rid)})
 
-    assert result == ActionResult(
-        "rule_promoted", False, sleeve_sell_web_refusal(rid, "reverse_dca")
-    )
+    assert result == ActionResult("rule_promoted", False, sleeve_sell_web_refusal(rid, kind))
     assert started == []
     assert _statuses(db_path) == {rid: status}
     assert watcher.execute("PRAGMA data_version").fetchone()[0] == before

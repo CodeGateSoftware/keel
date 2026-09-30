@@ -6194,6 +6194,73 @@ def test_a_stored_reverse_dca_row_proposes_its_distribution_through_the_real_bui
     assert broker.place_calls == [] and broker.cancel_calls == []
 
 
+def _profit_take_row(repo: Repository, price: str = "100000") -> int:
+    """A stored `profit_take` row at its spec defaults (as `rules add` stores it), over one dca
+    tranche of 0.01 bought at 50000 on day 0, and 61 days of flat daily closes at `price`."""
+    repo.insert_rule("profit_take", {"product_id": PRODUCT}, status="live")
+    _seed_open_position(repo, PRODUCT, Decimal("0.01"), Decimal("50000"), ts=0, rule_name="dca")
+    return _history(repo, 61, price=price)
+
+
+def test_a_stored_profit_take_row_proposes_its_trim_through_the_real_builder(repo):
+    """P14 end to end, with NO `_build_rule` patch: the close (100000) is 100% over the average
+    entry (50000), past the 25% trigger, so a 15% trim of 0.01 reaches `executor.reduce` as one
+    preview. Nothing is placed."""
+    now = _profit_take_row(repo)
+    broker = _HoldingBroker()
+
+    result = run_once(broker, repo, _config(), now_ts=now)
+
+    assert [(r.rule_kind, r.decision) for r in result.reduce_results] == [
+        ("profit_take", "preview")
+    ]
+    [row] = repo.get_sell_proposals()
+    assert (row["rule_kind"], row["rule_status"], row["decision"], row["legs"]) == (
+        "profit_take",
+        "live",
+        "preview",
+        1,
+    )
+    assert row["qty"] == Decimal("0.0015")
+    assert (row["trigger"]["gain_pct"], row["trigger"]["trim_pct"]) == ("25", "15")
+    assert broker.place_calls == [] and broker.cancel_calls == []
+
+
+def test_the_next_days_trim_is_vetoed_by_the_rules_own_cooldown(repo):
+    """R15 on the real kind: `cooldown_days` (30) is read off `profit_take`'s params by the
+    pipeline, from its last `preview`, so the next day's trim is recorded `vetoed` and says why."""
+    now = _profit_take_row(repo)
+    run_once(_HoldingBroker(), repo, _config(), now_ts=now)
+    _seed_history(repo, [_candle(61 * DAY, "100000")])
+
+    result = run_once(_HoldingBroker(), repo, _config(), now_ts=now + DAY)
+
+    assert [(r.rule_kind, r.decision) for r in result.reduce_results] == [("profit_take", "vetoed")]
+    newest = repo.get_sell_proposals()[0]
+    assert (newest["decision"], newest["rails"]["sleeve"]) == ("vetoed", sleeve.COOLDOWN)
+
+
+def test_a_sleeve_rule_that_declines_logs_the_gate_that_stopped_it(repo, caplog):
+    """Spec §4: below a gate there is no proposal, and the reason is logged. The close (55000)
+    is 10% over the entry -- under the 25% trigger -- so the cycle records nothing and logs
+    `agent.reduction_declined` naming the rule's own gate (`last_rejection`)."""
+    now = _profit_take_row(repo, price="55000")
+
+    with caplog.at_level(logging.INFO):
+        result = run_once(_HoldingBroker(), repo, _config(), now_ts=now)
+
+    assert result.reduce_results == [] and repo.get_sell_proposals() == []
+    [record] = [r for r in caplog.records if r.getMessage() == "agent.reduction_declined"]
+    assert record.levelno == logging.INFO
+    assert getattr(record, _FIELDS_ATTR, {}) == {
+        "product": PRODUCT,
+        "rule": "profit_take",
+        "gate": "gain",
+        "close": "55000",
+        "trigger_price": str(Decimal("50000") * Decimal("1.25")),
+    }
+
+
 def test_a_young_tranche_is_refused_by_min_hold_days(repo, monkeypatch):
     """#916: no cycle test used to reach `_handle_reductions`' `min_hold_days` refusal -- the
     FIFO tranche the sale would consume is only 10 days old, younger than the default 30, so the

@@ -1196,3 +1196,65 @@ def test_a_missing_config_ignores_a_disabled_dca_and_one_on_another_product(btc_
     assert outcome.new_status == "live"
     [gate] = [line for line in out if "sleeve_sell gate" in line]
     assert gate.endswith("non-disabled dca on BTC-USD: no")
+
+
+# -- profit_take (P14) takes the same sleeve_sell gate, by its class alone (spec §3.7, R10) -------
+
+#: 121 daily closes rising 1000 -> 2200: over a synthetic 1-unit lot bought at the first close
+#: (`_reduction_as_detect`), `profit_take`'s 25% trigger opens at day 25 and a 15% trim nets far
+#: more than its $5 fee gate, so the lookahead walk has decisions to COMPARE (R44's fail-closed
+#: count) on every truncation past warmup.
+_RISING = [_sleeve_candle(d, str(1000 + 10 * d)) for d in range(121)]
+
+
+def _profit_take(repo: Repository, *, status: str = "candidate") -> int:
+    return repo.insert_rule(
+        "profit_take", {"product_id": "BTC-USD"}, status=status, now_ts=_SLEEVE_NOW
+    )
+
+
+def test_a_profit_take_rule_is_promoted_by_the_sleeve_gate_never_a_trade_floor(
+    repo, monkeypatch
+) -> None:
+    """No routing code names `profit_take`: `attempt_promotion` reads the registered class's
+    `promotion_class`, so the second sleeve-sell kind gets P12's gate with no change there."""
+
+    def _no_backtest(*_a: Any, **_k: Any) -> Any:
+        raise AssertionError("a sleeve_sell rule must never be backtested for a floor")
+
+    monkeypatch.setattr(backtest_mod, "backtest", _no_backtest)
+    repo.upsert_candles("BTC-USD", Granularity.ONE_DAY, _RISING)
+    rid = _profit_take(repo)
+    outcome, out, err = _promote(repo, rid)
+    assert err == []
+    assert outcome is not None and outcome.new_status == "paper"
+    assert _status(repo, rid) == "paper"
+    assert out[-1] == f"rule {rid} (profit_take): status -> paper"
+
+
+def test_a_profit_take_that_never_fires_is_refused_at_candidate_not_passed_clean(repo) -> None:
+    """R44's fail-closed count reaches the new kind too: over the flat-ish `_WANDER` series a
+    1-unit lot never gains 25%, so the lookahead check compares nothing and the step refuses."""
+    repo.upsert_candles("BTC-USD", Granularity.ONE_DAY, _WANDER)
+    rid = _profit_take(repo)
+    outcome, _out, err = _promote(repo, rid)
+    assert outcome is None
+    assert _status(repo, rid) == "candidate"
+    assert sum(1 for line in err if "never fired" in line) == 1
+
+
+def test_a_paper_profit_take_needs_its_sixty_days_and_a_reviewed_proposal(repo) -> None:
+    repo.upsert_candles("BTC-USD", Granularity.ONE_DAY, _RISING)
+    rid = _profit_take(repo, status="paper")
+    repo._conn.execute(
+        "UPDATE rules SET promoted_at = ? WHERE id = ?", (_SLEEVE_NOW - 61 * _DAY, rid)
+    )
+    repo._conn.commit()
+    outcome, _out, err = _promote(repo, rid)
+    assert outcome is None
+    assert _status(repo, rid) == "paper"
+    assert sum(1 for line in err if "keel dca proposals review" in line) == 1
+
+    _review(repo, rid)
+    outcome, _out, _err = _promote(repo, rid)
+    assert outcome is not None and outcome.new_status == "live"

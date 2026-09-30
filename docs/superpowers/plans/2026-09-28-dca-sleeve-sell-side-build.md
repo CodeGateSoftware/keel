@@ -336,6 +336,30 @@ Each ruling is stated as `what — why — cost if wrong`.
 - **R54** (added in P13, P12's held question b). With no config, the sleeve gate's concurrent-dca check counts ANY non-disabled `dca` on the product. The gate line labels it `non-disabled`. It no longer reads `live` alone.
   - Why: the `None` fallback exists for a caller that cannot say which status the profile's cycle runs. `live` alone missed a paper dca on a paper profile. Counting every active status can only refuse more, and the operator's answer to a refusal is the explicit `--allow-concurrent-dca`.
   - Cost if wrong: a candidate dca on the product also refuses the step when no config is given. The CLI always passes one. The refusal's text (`promotion.CONCURRENT_DCA_REASON`) is worded for both readings, so it never claims a cycle runs a dca that no cycle runs (review round 1, #935).
+- **R55** (added in P14). `profit_take`'s fee gate prices the fee at the `SellCosts` its caller resolved -- the `config.fees.taker_pct` fallback, labelled -- not at a venue-previewed fee, which spec §4's formula names. `executor.reduce` still records the venue's previewed fee on the proposal row.
+  - Why: R6. A rule is built from params alone and sees no venue; the cycle hands every sleeve kind the same `SellCosts`. The fallback (1.2%) is at or above the measured live rate, so the gate errs toward refusing a trim, never toward proposing one the venue's fee would not clear.
+  - Cost if wrong: a trim that would clear `min_net_usd` at the venue's fee but not at the fallback is not proposed. The gain view prints the net at the fallback, labelled, so the operator sees how close it was.
+- **R56** (added in P14). The gain view's params are chosen per param: a `--gain-pct`/`--trim-pct` flag when given, else the product's most advanced non-disabled `profit_take` rule (`live`, then `paper`, then `candidate`; the lowest id breaks a tie), else the spec defaults (25, 15, $5). `min_net_usd` has no flag. Each row names its source (`rule <id> (<status>)` or `spec defaults`, then any flag that overrode one).
+  - Why: the plan's "the product's rule's params" leaves which rule open when there are several. The most advanced one is the one closest to the proposals the cycle records. A flag that replaced every param would silently discard the rule's `min_net_usd`.
+  - Cost if wrong: an operator with two `profit_take` rows on one product sees the more advanced one's arithmetic. The row names which.
+- **R57** (added in P14). The gain view applies none of the pipeline's caps -- `min_hold_days`, `cooldown_days`, the same-day dca, one proposal a day -- and says so on every run (`GAIN_PIPELINE_NOTE`). Its verdict is the rule's own `reduce_signal` only.
+  - Why: the plan requires the verdict to invent none of the arithmetic, and the caps are facts about the day a proposal is made (which tranche is young then, which dca fires then, which proposal preceded it). The proposal row records them.
+  - Cost if wrong: a `would trim` row that the cycle then records `vetoed`. The note names every cap that can do it.
+- **R58** (added in P14, P13's held question a). Every sleeve view -- gain, lots, bands, and `distribute --preview` -- names the daily bar it marks at on its head line, and puts one `STALE mark:` line per product under it when that bar is behind. "Behind" is `freshness.entry_bar_ready` over the daily series (`bars_behind > 0`), the gate `agent._handle_reductions` skips a sleeve rule on (#917). No new threshold is introduced.
+  - Why: the views priced "if sold now" at the latest cached close without saying which day it was. A stale cache read as today's numbers. Reusing the cycle's own gate means the report is flagged exactly when the cycle would refuse to decide on the same bar.
+  - Cost if wrong: a report is flagged the morning a feed runs one bar late, which the cycle also refuses. The flag names both dates.
+- **R59** (added in P14). A sleeve rule that declines logs `agent.reduction_declined` (INFO) with its own `last_rejection`. No row is written for a decline.
+  - Why: spec §4 says "below the gate: no proposal, and the reason is logged". A decline is the rule working, not a veto, and R14's one row a day is kept for a sale the rule wanted.
+  - Cost if wrong: one INFO line per sleeve rule per cycle. The live deployment cycles once a UTC day.
+- **R60** (added in P14). `keel dca trim --preview` gains `--product` (gain and lots) and `--gain-pct`/`--trim-pct` (gain), per spec §4's CLI line. A flag that does not apply to the chosen view is a usage error, never silently ignored. A flag value the `ProfitTake` constructor refuses is a usage error through that constructor, not a second copy of its range.
+  - Why: a flag that is accepted and ignored reads as applied.
+  - Cost if wrong: an operator who habitually passes `--product` gets a usage error on `--view bands`, which weighs the whole sleeve.
+- **R61** (added in P14). `profit_take` is excluded from `rules seed` and the wizard although every param it has defaults. `seedable_kinds` excludes by class, as R20 and R38 say, not by whether construction would fail.
+  - Why: a seeded seller is what no one should get by accident, whatever its params.
+  - Cost if wrong: an operator creates one with `keel rules add --kind profit_take --product <p>`.
+- **R62** (added in P14, P13's held question b). `keel rules backtest`'s proposal replay with no config replays every non-disabled `dca` on the product, labelled `non-disabled` -- R54's reading, taken by the sleeve gate's own `config=None` path.
+  - Why: the replay read `live` alone, so a paper dca on a paper profile's database replayed no same-day collision.
+  - Cost if wrong: a candidate dca's cadence also vetoes replayed bars when no config loads. The CLI loads one whenever the config file is valid. Applying this exposed `live_config_path`, a fixture that wrote `mode: live`, which `load_config` refuses. The live-profile replay test had been running the no-config path. It now writes `mode: confirm` and asserts the config's fee line reached the output.
 
 ---
 

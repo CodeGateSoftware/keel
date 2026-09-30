@@ -93,6 +93,7 @@ from keel.strategy.reduction import Reduction
 from keel.strategy.rules.base import Action, Rule, Setup, Signal, completed_days
 from keel.strategy.rules.cusum_event import CusumEvent
 from keel.strategy.rules.dca import Dca
+from keel.strategy.rules.profit_take import ProfitTake
 from keel.strategy.rules.pullback_continuation import PullbackContinuation
 from keel.strategy.rules.reverse_dca import ReverseDca
 from keel.strategy.rules.rsi_meanrev import RsiMeanReversion
@@ -151,6 +152,12 @@ RULE_REGISTRY: dict[str, type[Rule]] = {
     # `seedable_kinds` below), because its `target_usd`/`min_price_floor` are required and a
     # seeded seller with invented defaults is what no one should get by accident.
     "reverse_dca": ReverseDca,
+    # #857, spec §4. The second SELL-side kind: a trim on gain over the average entry,
+    # preview-only (S2). The gain trigger is UNTESTED as a policy and no `profit_take` rule is
+    # promoted in this build (spec §4): it is registered so the trim report and the proposals log
+    # can show what a trim would do. Not seedable either (R20/R38), although every param it has
+    # defaults -- `seedable_kinds` excludes by class, not by whether construction would fail.
+    "profit_take": ProfitTake,
 }
 
 
@@ -1228,7 +1235,10 @@ def _handle_reductions(
        R14's one-proposal-per-day cap -- and `agent.reduction_bar_not_ready` logs it at WARNING,
        with the bar it was missing, so an operator can see what was lost. It does NOT withhold
        anything else on this product or any other (R31).
-    4. **A rule that raises costs that rule**, never the other kinds on this product.
+    4. **A rule that raises costs that rule**, never the other kinds on this product. **A rule
+       that declines logs why** (`agent.reduction_declined`, INFO, its own `last_rejection`):
+       spec §4's "below the gate: no proposal, and the reason is logged". No row is written for
+       a decline -- a proposal is a sale the rule wanted, and R14's one row a day is kept for it.
     5. **Arbitration is a fixed order** (`sleeve.ARBITRATION_ORDER`); every loser is recorded
        `superseded`, naming the winner, and a superseded row does not reopen the day.
     6. **The sleeve caps** (`sleeve.sleeve_refusal`: same-day DCA, `min_hold_days` on the tranches
@@ -1296,6 +1306,18 @@ def _handle_reductions(
             continue
         if reduction is not None:
             fired.append((rule, status, reduction))
+        elif rule.last_rejection:
+            # Spec §4: below a gate there is no proposal, "and the reason is logged". The gate is
+            # the rule's own (`last_rejection`); INFO, because declining is the rule working.
+            # Every figure is stringified: the record is read, never computed on.
+            log_event(
+                logger,
+                logging.INFO,
+                "agent.reduction_declined",
+                product=product_id,
+                rule=rule.name,
+                **{key: str(value) for key, value in rule.last_rejection.items()},
+            )
     if not fired:
         return []
 

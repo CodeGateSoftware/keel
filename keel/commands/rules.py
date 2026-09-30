@@ -442,7 +442,9 @@ def run_proposal_replay(
     rate (`backtest_slippage`). The rail-2 cap is `config.caps.max_per_order_usd` (unsliced
     without a config). The same-day-DCA exclusion replays the `dca` rules on the product at the
     status this profile's cycle runs (`paper` on a paper profile, `live` otherwise -- R40's
-    reading), each through its own `detect`.
+    reading), each through its own `detect`. With no config, no status is the cycle's, and every
+    NON-DISABLED dca on the product is replayed -- R54, the sleeve gate's own `config=None`
+    reading (`_cycle_dca_on`), labelled `non-disabled` on the line that names them.
 
     Refusals: an unknown id; a `--granularity` other than ONE_DAY (a sleeve-sell rule decides on
     completed daily bars); no cached ONE_DAY candles, named as such; a headline or
@@ -471,26 +473,36 @@ def run_proposal_replay(
         )
         raise RulesRefused(f"no daily candles for {product_id}")
 
+    dca_status: str | None
     if config is None:
         fee_pct, fee_label = backtest_mod.TAKER_FEE_PCT, "library default: backtest.TAKER_FEE_PCT"
         max_per_order: Decimal | None = None
-        dca_status = "live"
+        # R54, as the sleeve gate's own `config=None` path reads it (`_cycle_dca_on`): with no
+        # config no status is the cycle's, so ANY non-disabled dca on the product is replayed.
+        # `live` alone missed a paper dca on a paper profile's database.
+        dca_status = None
     else:
         fee_pct, fee_label = config.fees.taker_pct, sleeve.FALLBACK_FEE_SOURCE
         max_per_order = config.caps.max_per_order_usd
         dca_status = "paper" if config.auto_trade.mode == "paper" else "live"
     slippage_pct, measured = backtest_slippage(repo, product_id)
+    candidate_rows = (
+        [r for r in repo.get_rules() if r["status"] != "disabled"]
+        if dca_status is None
+        else repo.get_rules(dca_status)
+    )
     dca_rows = [
         r
-        for r in repo.get_rules(dca_status)
+        for r in candidate_rows
         if r["kind"] == "dca" and (r["params"] or {}).get("product_id") == product_id
     ]
+    status_label = ANY_ACTIVE_DCA if dca_status is None else dca_status
     dca_rules = [agent._build_rule(r) for r in dca_rows]
     dca_note = (
-        f"{len(dca_rules)} dca rule(s) at status {dca_status} on {product_id} replayed "
+        f"{len(dca_rules)} dca rule(s) at status {status_label} on {product_id} replayed "
         f"(ids {', '.join(str(r['id']) for r in dca_rows)})"
         if dca_rules
-        else f"no dca rule at status {dca_status} on {product_id}"
+        else f"no dca rule at status {status_label} on {product_id}"
     )
 
     rates = [(fee_pct, fee_label)]
