@@ -1271,25 +1271,43 @@ def sleeve_sell_web_refusal(rule_id: int, kind: str) -> str:
     )
 
 
+def unreadable_rule_refusal(rule_id: int) -> str:
+    """What the web promotion says when it cannot read rule `rule_id`'s kind: it fails closed."""
+    return (
+        f"nothing done -- rule {rule_id}'s kind could not be read from the database, so the "
+        "browser cannot tell a sell rule from an entry rule. Run "
+        f"`keel rules promote {rule_id}` at a terminal."
+    )
+
+
+class _UnreadableRule(Exception):
+    """The rule's kind could not be read, so the web refusal cannot be decided."""
+
+
 def _sleeve_sell_kind(db_path: Path, rule_id: int) -> str | None:
     """Rule `rule_id`'s kind when its registered class is `sleeve_sell`, else `None` -- read
-    over a read-only connection, off the CLASS (`rules._is_sleeve_sell_row`), so an unknown id
-    or an unreadable database is `None` and the job's own refusal names it."""
+    over a read-only connection, off the CLASS (`rules._is_sleeve_sell_row`). An unknown id is
+    `None`, and the job's own refusal names it.
+
+    **Fails CLOSED** (review round 2, #935): a database that cannot be opened or read raises
+    `_UnreadableRule`, and `promote_rule` starts nothing. Answering `None` there would let a
+    sleeve-sell rule through to the job whenever the read-only read fails but a writable one
+    would not."""
     from keel.commands.rules import _is_sleeve_sell_row
     from keel.data.repository import Repository
 
     try:
         conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
-    except sqlite3.Error:
-        return None
+    except sqlite3.Error as exc:
+        raise _UnreadableRule from exc
     conn.row_factory = sqlite3.Row
     try:
         repo = Repository(conn)
         if not _is_sleeve_sell_row(repo, rule_id):
             return None
         return next(str(r["kind"]) for r in repo.get_rules() if r["id"] == rule_id)
-    except sqlite3.Error:
-        return None
+    except sqlite3.Error as exc:
+        raise _UnreadableRule from exc
     finally:
         conn.close()
 
@@ -1318,7 +1336,10 @@ def promote_rule(config_path: Path, db_path: Path, values: dict[str, str]) -> Ac
         return ActionResult("rule_promoted", False, "nothing done -- give a numeric rule id")
     rule_id = int(raw)
 
-    sleeve_kind = _sleeve_sell_kind(db_path, rule_id)
+    try:
+        sleeve_kind = _sleeve_sell_kind(db_path, rule_id)
+    except _UnreadableRule:
+        return ActionResult("rule_promoted", False, unreadable_rule_refusal(rule_id))
     if sleeve_kind is not None:
         return ActionResult("rule_promoted", False, sleeve_sell_web_refusal(rule_id, sleeve_kind))
 

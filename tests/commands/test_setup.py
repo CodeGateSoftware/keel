@@ -664,3 +664,21 @@ def test_an_entry_rule_or_an_unknown_id_still_starts_the_promotion_job(
 
     assert result.changed is True
     assert started == ["rule_promoted"]
+
+
+def test_an_unreadable_database_refuses_rather_than_starting_the_job(
+    fresh: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Review round 2 (#935): the class check fails CLOSED. If the rule's kind cannot be read,
+    the browser cannot tell a sleeve-sell rule from an entry rule, so it starts nothing."""
+    from keel.commands.setup import ActionResult, promote_rule, unreadable_rule_refusal
+
+    config_path, _db_path = fresh
+    started = _spy_jobs(monkeypatch)
+    missing = tmp_path / "absent.db"
+
+    result = promote_rule(config_path, missing, {"rule_id": "1"})
+
+    assert result == ActionResult("rule_promoted", False, unreadable_rule_refusal(1))
+    assert started == []
+    assert not missing.exists()

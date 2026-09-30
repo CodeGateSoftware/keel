@@ -140,7 +140,6 @@ def test_the_bands_view_says_band_trimming_was_not_adopted(deployment) -> None: 
 
 def test_the_footer_says_nothing_is_placed() -> None:
     assert dca_cli.PREVIEW_FOOTER == "preview only: nothing is placed."
-    assert dca_cli.DISTRIBUTE_PREVIEW_FOOTER == dca_cli.PREVIEW_FOOTER
 
 
 @pytest.mark.parametrize("args", [(), ("--view", "lots"), ("--view", "bands"), ("--view", "gain")])

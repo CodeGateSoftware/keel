@@ -75,7 +75,6 @@ from keel.commands.dca_plan import (
 #: The last line every sleeve preview (`distribute`, `trim`) prints: in this build no sleeve sale
 #: is placed, by any path (S1, S2).
 PREVIEW_FOOTER = "preview only: nothing is placed."
-DISTRIBUTE_PREVIEW_FOOTER = PREVIEW_FOOTER
 
 #: The `[Y]/[E]/[N]` prompt's per-choice label, keyed by letter. One table, so the loop's prompt
 #: line and its retry message cannot disagree about what each letter means.
