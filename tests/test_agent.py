@@ -33,7 +33,7 @@ from keel_broker_api.results import (
 from keel_core.telemetry import _FIELDS_ATTR
 from keel_core.trade_scope import TradeScopeState
 
-from keel import agent
+from keel import agent, notifications
 from keel.agent import LoopResult, _build_rule, loop, run_once
 from keel.config import (
     AutoTradeConfig,
@@ -52,6 +52,7 @@ from keel.strategy.reduction import Reduction
 from keel.strategy.rules.base import Action, Rule, Setup, Signal, completed_days
 from keel.strategy.rules.dca import Dca
 from keel.strategy.rules.pullback_continuation import PullbackContinuation
+from keel.strategy.rules.sleeve_exit import SleeveExit
 from keel.strategy.rules.turtle_breakout import TurtleBreakout
 from keel.types import Candle, Granularity, Side
 from tests.conftest import attest_cash_posture, attest_subscription, attest_trade_scope
@@ -6261,6 +6262,163 @@ def test_a_sleeve_rule_that_declines_logs_the_gate_that_stopped_it(repo, caplog)
     }
 
 
+def _sleeve_exit_crash(repo: Repository, *, bought_days_ago: int = 2) -> int:
+    """A stored `sleeve_exit` row (drawdown arm only, as `rules add` stores it) over one dca
+    tranche of 0.5 bought `bought_days_ago` days before now, and 29 flat daily closes at 100
+    followed by a close of 60 -- 40% under the high, past the 35% level (65). Returns `now`."""
+    repo.insert_rule("sleeve_exit", {"product_id": PRODUCT, "arms": ["drawdown"]}, status="live")
+    now = 30 * DAY + 3_600
+    _seed_open_position(
+        repo,
+        PRODUCT,
+        Decimal("0.5"),
+        Decimal("100"),
+        ts=now - bought_days_ago * DAY,
+        rule_name="dca",
+    )
+    _seed_history(repo, [*(_candle(d * DAY, "100") for d in range(29)), _candle(29 * DAY, "60")])
+    return now
+
+
+def test_under_autonomous_mode_a_breach_is_proposed_and_nothing_is_sold(repo):
+    """P16 end to end, with NO `_build_rule` patch: the profile is autonomous, the monitor's
+    drawdown arm is breached, and the whole sleeve reaches `executor.reduce` as ONE preview --
+    although the tranche was bought this week: R13 exempts `sleeve_exit` from `min_hold_days`.
+    Nothing is placed and nothing is cancelled (S1, S2)."""
+    now = _sleeve_exit_crash(repo)
+    broker = _HoldingBroker()
+
+    result = run_once(broker, repo, _config(), now_ts=now)
+
+    assert result.mode == "autonomous"
+    assert [(r.rule_kind, r.decision) for r in result.reduce_results] == [
+        ("sleeve_exit", "preview")
+    ]
+    [row] = repo.get_sell_proposals()
+    assert (row["rule_kind"], row["rule_status"], row["decision"]) == (
+        "sleeve_exit",
+        "live",
+        "preview",
+    )
+    assert row["qty"] * row["legs"] >= Decimal("0.5") and row["legs"] >= 1
+    assert (row["trigger"]["level"], row["trigger"]["breached_arms"]) == (
+        "breached",
+        ["drawdown"],
+    )
+    assert [c for c in broker.place_calls if c["side"] is Side.SELL] == []
+    assert broker.place_calls == [] and broker.cancel_calls == []
+
+
+def test_the_whole_sleeve_is_sliced_by_rail_2_into_legs(repo):
+    """Spec §7 "Rails": a whole-sleeve sale is the one most likely to exceed rail 2. At a $10
+    per-order cap and a close of 60, 0.5 units ($30) is three legs of 0.1666... -- the proposal
+    records the first leg and how many legs (days) the sale needs; nothing is sold."""
+    now = _sleeve_exit_crash(repo)
+    caps = Caps(
+        max_per_order_usd=Decimal("10"),
+        max_per_day_usd=Decimal("300000"),
+        max_exposure_usd=Decimal("1000000"),
+        max_per_asset_pct=Decimal("1"),
+    )
+    broker = _HoldingBroker()
+
+    result = run_once(broker, repo, _config(caps=caps), now_ts=now)
+
+    [reduced] = result.reduce_results
+    assert (reduced.rule_kind, reduced.decision, reduced.legs) == ("sleeve_exit", "preview", 3)
+    [row] = repo.get_sell_proposals()
+    assert row["legs"] == 3
+    assert row["qty"] * Decimal("60") <= Decimal("10")
+    assert broker.place_calls == []
+
+
+def test_a_breach_on_a_dca_buy_day_is_vetoed_and_the_buy_still_goes_out(repo, monkeypatch):
+    """R13 exempts `sleeve_exit` from `min_hold_days` ONLY: the same-day-DCA exclusion still
+    applies, so a breach on a day the weekly `dca` buys is recorded `vetoed` (`same_day_dca`) --
+    never a sale beside the buy -- and the buy itself is untouched."""
+    now = _sleeve_exit_crash(repo, bought_days_ago=40)
+    repo.insert_rule("dca", {"product_id": PRODUCT, "cadence_days": 1}, status="live")
+    broker = _HoldingBroker()
+
+    result = run_once(broker, repo, _config(), now_ts=now)
+
+    assert [(r.rule_kind, r.decision, r.reason) for r in result.reduce_results] == [
+        ("sleeve_exit", "vetoed", sleeve.SAME_DAY_DCA)
+    ]
+    [row] = repo.get_sell_proposals()
+    assert (row["decision"], row["rails"]["sleeve"]) == ("vetoed", sleeve.SAME_DAY_DCA)
+    assert [c["side"] for c in broker.place_calls] == [Side.BUY]
+
+
+def test_a_repeated_same_day_dca_veto_is_recorded_but_not_re_announced(repo):
+    """R36 on the new kind: the next day's identical `sleeve_exit` veto repeats the previous
+    day's refusal, so its result carries `repeats_previous` and `sleeve.proposal` skips it; the
+    row is still written."""
+    now = _sleeve_exit_crash(repo, bought_days_ago=40)
+    repo.insert_rule("dca", {"product_id": PRODUCT, "cadence_days": 1}, status="live")
+    first = run_once(_HoldingBroker(), repo, _config(), now_ts=now)
+    _seed_history(repo, [_candle(30 * DAY, "60")])
+
+    second = run_once(_HoldingBroker(), repo, _config(), now_ts=now + DAY)
+
+    assert [(r.decision, r.repeats_previous) for r in first.reduce_results] == [("vetoed", False)]
+    assert [(r.decision, r.repeats_previous) for r in second.reduce_results] == [("vetoed", True)]
+    assert [row["decision"] for row in repo.get_sell_proposals()] == ["vetoed", "vetoed"]
+    events = notifications.events_from_state(
+        attestation_findings=[],
+        rail_findings=[],
+        month_to_date_spend=Decimal("0"),
+        allowance=None,
+        unplaced_setups=[],
+        stale_products=[],
+        held_products=[],
+        sleeve_proposals=[*first.reduce_results, *second.reduce_results],
+    )
+    assert [(e.key, e.fields["proposal_id"]) for e in events] == [
+        ("sleeve.proposal", first.reduce_results[0].proposal_id)
+    ]
+
+
+def test_only_the_sleeve_exit_rule_that_sets_the_levels_may_propose(repo):
+    """#940: with two `sleeve_exit` rules on one product -- live at 35%, paper at 20% -- the
+    watch and the preview judge the product at the LIVE rule's levels (`monitor_rule`). A close
+    25% under the high is `clear` there, so the paper rule must not propose the whole sleeve on
+    levels the watch says are not breached: one product, one definition of a breach."""
+    repo.insert_rule("sleeve_exit", {"product_id": PRODUCT, "arms": ["drawdown"]}, status="live")
+    paper = repo.insert_rule(
+        "sleeve_exit",
+        {"product_id": PRODUCT, "arms": ["drawdown"], "dd_pct": "20"},
+        status="paper",
+    )
+    now = 30 * DAY + 3_600
+    _seed_open_position(repo, PRODUCT, Decimal("0.5"), Decimal("100"), ts=0, rule_name="dca")
+    _seed_history(repo, [*(_candle(d * DAY, "100") for d in range(29)), _candle(29 * DAY, "75")])
+    loaded = agent._sleeve_rules(repo, _config())
+    assert sorted(rule.rule_id for rule, _status in loaded) == [paper - 1, paper], "fixture"
+
+    result = run_once(_HoldingBroker(), repo, _config(), now_ts=now)
+
+    assert result.reduce_results == [] and repo.get_sell_proposals() == []
+    assert _watched(result) == [(PRODUCT, "clear")]
+
+
+def test_a_malformed_exit_record_is_overwritten_not_stuck(repo):
+    """Held item 5 of #939's review (pre-existing from P15): a `sleeve_exit:` record that is not
+    a mapping made the watch raise before it rewrote the record, so the product was never judged
+    or alerted again. It is now read as no record: judged, recorded, and reported as a first
+    look."""
+    now = _paxg_book(repo)
+    repo.set_state("sleeve_exit:PAXG-USD", "breached")
+
+    result = run_once(_HoldingBroker(), repo, _config(), now_ts=now)
+
+    assert [(t.product_id, t.level, t.previous) for t in result.exit_watch_transitions] == [
+        (_PAXG, "clear", None)
+    ]
+    record = repo.get_state("sleeve_exit:PAXG-USD")
+    assert isinstance(record, dict) and record["level"] == "clear"
+
+
 def test_a_young_tranche_is_refused_by_min_hold_days(repo, monkeypatch):
     """#916: no cycle test used to reach `_handle_reductions`' `min_hold_days` refusal -- the
     FIFO tranche the sale would consume is only 10 days old, younger than the default 30, so the
@@ -6696,8 +6854,25 @@ def test_a_paper_cycle_watches_from_the_cache_and_polls_nothing_for_it(repo):
 def test_a_sleeve_exit_rules_params_override_the_default_levels(repo, monkeypatch):
     """R26: a `sleeve_exit` rule's params override the module constants for its product. A 20%
     fall is `clear` against the default 35% drawdown and `breached` against the rule's 10%."""
+    now = _paxg_book(repo, price="100")
+    _seed_history(repo, [_candle(41 * DAY, "80")], product=_PAXG)
+    later = now + DAY
+    default = run_once(_HoldingBroker(), repo, _config(), now_ts=later)
+    assert _watched(default) == [(_PAXG, "clear")]
 
-    class _SleeveExitDouble(_AlwaysReduceRule):
+    rule = SleeveExit(_PAXG, dd_pct=Decimal("10"), arms=("drawdown",))
+    _seed_rules(repo, monkeypatch, (rule, "live"))
+    overridden = run_once(_HoldingBroker(), repo, _config(), now_ts=later + 3_600)
+    assert _watched(overridden) == [(_PAXG, "breached")]
+
+
+def test_a_rule_merely_named_sleeve_exit_no_longer_sets_the_levels(repo, monkeypatch):
+    """P16 retires R69's duck-typed read: the levels come from the REGISTERED class
+    (`SleeveExit`), whose constructor validated them -- not from any loaded rule that happens to
+    be named `sleeve_exit`, whose raw params nothing checked. The same 20% fall under a 10%
+    impostor stays `clear` at the defaults."""
+
+    class _NamedLikeSleeveExit(_AlwaysReduceRule):
         def __init__(self, product_id: str) -> None:
             super().__init__(product_id, name="sleeve_exit")
             self.params = {"product_id": product_id, "dd_pct": "10", "arms": ["drawdown"]}
@@ -6707,13 +6882,14 @@ def test_a_sleeve_exit_rules_params_override_the_default_levels(repo, monkeypatc
 
     now = _paxg_book(repo, price="100")
     _seed_history(repo, [_candle(41 * DAY, "80")], product=_PAXG)
-    later = now + DAY
-    default = run_once(_HoldingBroker(), repo, _config(), now_ts=later)
-    assert _watched(default) == [(_PAXG, "clear")]
+    impostor = _NamedLikeSleeveExit(_PAXG)
+    _seed_rules(repo, monkeypatch, (impostor, "live"))
+    loaded = agent._sleeve_rules(repo, _config())
+    assert [rule for rule, _status in loaded] == [impostor], "fixture: the cycle loads it"
 
-    _seed_rules(repo, monkeypatch, (_SleeveExitDouble(_PAXG), "live"))
-    overridden = run_once(_HoldingBroker(), repo, _config(), now_ts=later + 3_600)
-    assert _watched(overridden) == [(_PAXG, "breached")]
+    result = run_once(_HoldingBroker(), repo, _config(), now_ts=now + DAY)
+
+    assert _watched(result) == [(_PAXG, "clear")]
 
 
 def test_a_monitor_that_raises_costs_neither_the_cycle_nor_the_dca_buy(repo, monkeypatch):
@@ -6820,15 +6996,7 @@ def test_a_sleeve_exit_rules_longer_window_sizes_the_backfill_on_a_sleeve_only_p
     `poll_once` cold-starts it with ONE bar. The watch still fills its daily history -- sized by
     the product's own `sleeve_exit` rule (a 300-day lookback here), not only by the defaults."""
 
-    class _LongWindowExit(_AlwaysReduceRule):
-        def __init__(self, product_id: str) -> None:
-            super().__init__(product_id, name="sleeve_exit")
-            self.params = {"product_id": product_id, "lookback_days": 300}
-
-        def reduce_signal(self, holding, candles_by_tf, costs):
-            return None
-
-    _seed_rules(repo, monkeypatch, (_LongWindowExit(_PAXG), "live"))
+    _seed_rules(repo, monkeypatch, (SleeveExit(_PAXG, lookback_days=300), "live"))
     _paxg_tranche(repo)
     series = [_candle(d * DAY, "4700") for d in range(400)]
     broker = _HoldingBroker(series={(_PAXG, Granularity.ONE_DAY): series})

@@ -20,6 +20,7 @@ from keel.strategy.rules.base import Rule
 from keel.strategy.rules.dca import Dca
 from keel.strategy.rules.profit_take import ProfitTake
 from keel.strategy.rules.reverse_dca import ReverseDca
+from keel.strategy.rules.sleeve_exit import SleeveExit
 from keel.types import Candle, Granularity
 from tests.strategy.rule_conformance import ReductionConformanceTests, RuleConformanceTests
 from tests.strategy.test_dca import _candle as _dca_candle
@@ -94,3 +95,23 @@ class TestProfitTakeConformance(ReductionConformanceTests):
         # 200000 is ~100% over the average entry, far past the 25% trigger, and a 15% trim of
         # 0.01 nets ~$148 at the conformance costs -- far past the $5 fee gate.
         return {Granularity.ONE_DAY: [_dca_candle(day=60, price="200000")]}
+
+
+class TestSleeveExitConformance(ReductionConformanceTests):
+    def rule(self) -> Rule:
+        return SleeveExit("BTC-USD", arms=("drawdown",))
+
+    def holding(self) -> Holding:
+        return Holding(
+            "BTC-USD", (Lot(1, "dca", 0, Decimal("0.01"), Decimal("50000"), Decimal("0")),)
+        )
+
+    def firing_candles(self) -> dict[Granularity, list[Candle]]:
+        # Ten closes at 100000, then 60000: 40% under the high, past the 35% drawdown level of
+        # 65000 -- the monitor reads `breached`, so the whole holding is proposed.
+        return {
+            Granularity.ONE_DAY: [
+                *(_dca_candle(day=d, price="100000") for d in range(50, 60)),
+                _dca_candle(day=60, price="60000"),
+            ]
+        }

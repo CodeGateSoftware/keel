@@ -1258,3 +1258,68 @@ def test_a_paper_profit_take_needs_its_sixty_days_and_a_reviewed_proposal(repo) 
     _review(repo, rid)
     outcome, _out, _err = _promote(repo, rid)
     assert outcome is not None and outcome.new_status == "live"
+
+
+# -- sleeve_exit (P16) takes the same sleeve_sell gate, by its class alone (spec §3.7, R10) -------
+
+#: 121 daily closes: 1000 through day 79, then 600 -- 40% under the high, past the 35% drawdown
+#: level (650) -- from day 80. Over the synthetic 1-unit lot `_reduction_as_detect` holds,
+#: `sleeve_exit` (drawdown arm) proposes on every truncation past day 80, so the lookahead walk
+#: has decisions to COMPARE (R44's fail-closed count). A fidelity fixture, not a market.
+_CRASH = [_sleeve_candle(d, "1000" if d < 80 else "600") for d in range(121)]
+
+
+def _sleeve_exit(repo: Repository, *, status: str = "candidate") -> int:
+    return repo.insert_rule(
+        "sleeve_exit",
+        {"product_id": "BTC-USD", "arms": ["drawdown"]},
+        status=status,
+        now_ts=_SLEEVE_NOW,
+    )
+
+
+def test_a_sleeve_exit_rule_is_promoted_by_the_sleeve_gate_never_a_trade_floor(
+    repo, monkeypatch
+) -> None:
+    """No routing code names `sleeve_exit`: `attempt_promotion` reads the registered class's
+    `promotion_class`, so the third sleeve-sell kind gets P12's gate with no change there."""
+
+    def _no_backtest(*_a: Any, **_k: Any) -> Any:
+        raise AssertionError("a sleeve_sell rule must never be backtested for a floor")
+
+    monkeypatch.setattr(backtest_mod, "backtest", _no_backtest)
+    repo.upsert_candles("BTC-USD", Granularity.ONE_DAY, _CRASH)
+    rid = _sleeve_exit(repo)
+    outcome, out, err = _promote(repo, rid)
+    assert err == []
+    assert outcome is not None and outcome.new_status == "paper"
+    assert _status(repo, rid) == "paper"
+    assert out[-1] == f"rule {rid} (sleeve_exit): status -> paper"
+
+
+def test_a_sleeve_exit_that_never_breaches_is_refused_at_candidate_not_passed_clean(repo) -> None:
+    """R44's fail-closed count reaches the new kind too: `_WANDER` never falls 35% under its
+    high, so the lookahead check compares nothing and the step refuses."""
+    repo.upsert_candles("BTC-USD", Granularity.ONE_DAY, _WANDER)
+    rid = _sleeve_exit(repo)
+    outcome, _out, err = _promote(repo, rid)
+    assert outcome is None
+    assert _status(repo, rid) == "candidate"
+    assert sum(1 for line in err if "never fired" in line) == 1
+
+
+def test_a_paper_sleeve_exit_needs_its_sixty_days_and_a_reviewed_proposal(repo) -> None:
+    repo.upsert_candles("BTC-USD", Granularity.ONE_DAY, _CRASH)
+    rid = _sleeve_exit(repo, status="paper")
+    repo._conn.execute(
+        "UPDATE rules SET promoted_at = ? WHERE id = ?", (_SLEEVE_NOW - 61 * _DAY, rid)
+    )
+    repo._conn.commit()
+    outcome, _out, err = _promote(repo, rid)
+    assert outcome is None
+    assert _status(repo, rid) == "paper"
+    assert sum(1 for line in err if "keel dca proposals review" in line) == 1
+
+    _review(repo, rid)
+    outcome, _out, _err = _promote(repo, rid)
+    assert outcome is not None and outcome.new_status == "live"

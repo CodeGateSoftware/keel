@@ -179,47 +179,6 @@ def test_the_module_is_pure() -> None:
     assert "time" not in imported
 
 
-class _Rule:
-    def __init__(self, name: str, product_id: str, rule_id: int, **params: object) -> None:
-        self.name, self.product_id, self.rule_id = name, product_id, rule_id
-        self.params = {"product_id": product_id, **params}
-
-
-def test_monitor_params_are_the_defaults_without_a_sleeve_exit_rule() -> None:
-    rules = [(_Rule("reverse_dca", "PAXG-USD", 1, dd_pct="10"), "live")]
-    assert sleeve_exit.monitor_params(rules, "PAXG-USD") == {}
-
-
-def test_monitor_params_read_the_products_sleeve_exit_rule_live_first() -> None:
-    """R26: the rule's params override the constants, coerced to `classify`'s types. A live
-    rule is the one the cycle runs for real, so it wins over a paper one; the lowest id breaks a
-    tie. Another product's rule is not this product's."""
-    rules = [
-        (_Rule("sleeve_exit", "PAXG-USD", 7, dd_pct="20", arms=["drawdown"]), "paper"),
-        (_Rule("sleeve_exit", "BTC-USD", 2, dd_pct="50"), "live"),
-        (_Rule("sleeve_exit", "PAXG-USD", 9, dd_pct="25", lookback_days="90"), "live"),
-        (_Rule("sleeve_exit", "PAXG-USD", 8, dd_pct="30", confirm_days=2), "live"),
-    ]
-    assert sleeve_exit.monitor_params(rules, "PAXG-USD") == {
-        "dd_pct": D("30"),
-        "confirm_days": 2,
-    }
-    assert sleeve_exit.monitor_params(rules[:1], "PAXG-USD") == {
-        "dd_pct": D("20"),
-        "arms": ("drawdown",),
-    }
-    both = sleeve_exit.monitor_params(
-        [
-            (
-                _Rule("sleeve_exit", "X-USD", 1, sma_period=50, warn_pct="2.5", lookback_days=10),
-                "live",
-            )
-        ],
-        "X-USD",
-    )
-    assert both == {"sma_period": 50, "warn_pct": D("2.5"), "lookback_days": 10}
-
-
 def test_the_history_the_arms_need_is_the_longer_arm_plus_one_day() -> None:
     """#938: what the watch fills a cold cache to -- the SMA's `sma_period + confirm_days - 1`
     bars or the drawdown's `lookback_days`, whichever is longer, plus the day the window's

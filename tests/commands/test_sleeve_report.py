@@ -2056,19 +2056,10 @@ def test_an_empty_exit_watch_says_nothing_is_watched() -> None:
     assert lines[1] == sleeve_report.EXIT_NOT_EVIDENCE
 
 
-def test_a_sleeve_exit_row_that_does_not_build_is_named_and_others_are_not(
-    repo, monkeypatch
-) -> None:
-    """P16 registers `sleeve_exit`; until then a double stands in. A bad `sleeve_exit` row is
-    named by the exit view -- and a bad row of ANOTHER sleeve kind is left to its own view."""
-    from keel import agent
-    from keel.strategy.rules.reverse_dca import ReverseDca
-
-    class _BrokenSleeveExit(ReverseDca):
-        def __init__(self, **_params: Any) -> None:
-            raise ValueError("dd_pct must be in (0, 100)")
-
-    monkeypatch.setitem(agent.RULE_REGISTRY, "sleeve_exit", _BrokenSleeveExit)
+def test_a_sleeve_exit_row_that_does_not_build_is_named_and_others_are_not(repo) -> None:
+    """A bad `sleeve_exit` row -- refused by the registered `SleeveExit`'s own constructor
+    (P16) -- is named by the exit view, and a bad row of ANOTHER sleeve kind is left to its own
+    view."""
     _hold(repo, "BTC-USD", qty="0.01", mark="100")
     bad = repo.insert_rule("sleeve_exit", {"product_id": "BTC-USD", "dd_pct": "0"}, status="paper")
     repo.insert_rule("reverse_dca", {"product_id": "BTC-USD"}, status="paper")
@@ -2077,6 +2068,86 @@ def test_a_sleeve_exit_row_that_does_not_build_is_named_and_others_are_not(
     [row] = sleeve_report.exit_watch_view(repo, _config(), now_ts=_NOW_100, skipped=skipped)
 
     assert row.params_source == sleeve_report.EXIT_DEFAULTS_SOURCE
-    assert [(s.rule_id, s.kind) for s in skipped] == [(bad, "sleeve_exit")]
+    assert [(s.rule_id, s.kind, s.error) for s in skipped] == [
+        (bad, "sleeve_exit", "ValueError: dd_pct must be in (0, 100), got 0")
+    ]
     lines = sleeve_report.render_exit_watch([row], skipped=skipped)
     assert lines.count(sleeve_report.skipped_rule_line(skipped[0])) == 1
+
+
+# -- P15's held item b: one malformed product costs its own row, never the report -------------
+
+
+@pytest.mark.parametrize(
+    ("record", "error"),
+    [
+        ("breached", "ValueError: its sleeve_exit record is not a mapping: 'breached'"),
+        (
+            {"level": ["near"], "observed_at": 99 * DAY},
+            "ValueError: its recorded level is not a level name: ['near']",
+        ),
+        (
+            {"level": "near", "observed_at": "yesterday"},
+            "ValueError: its recorded observed_at is not an epoch second: 'yesterday'",
+        ),
+        (
+            # #941: an int, but milliseconds -- past any date the report can print.
+            {"level": "near", "observed_at": 1_759_000_000_000},
+            "ValueError: its recorded observed_at is not an epoch second: 1759000000000",
+        ),
+    ],
+)
+def test_a_malformed_record_skips_that_product_and_reports_the_others(
+    repo, record: object, error: str
+) -> None:
+    """R68's pattern, per product: a `sleeve_exit:<product>` record the view cannot read is
+    named on one SKIPPED line, and every other watched product is still reported."""
+    for product in ("BTC-USD", "ETH-USD"):
+        _hold(repo, product, qty="0.01", mark=None)
+        repo.upsert_candles(
+            product, Granularity.ONE_DAY, [_candle(d, "100") for d in range(90, 100)]
+        )
+    repo.set_state("sleeve_exit:BTC-USD", record)
+    skipped: list[sleeve_report.SkippedProduct] = []
+
+    rows = sleeve_report.exit_watch_view(repo, _config(), now_ts=_NOW_100, skipped_products=skipped)
+
+    assert [row.watch.product_id for row in rows] == ["ETH-USD"]
+    assert skipped == [sleeve_report.SkippedProduct("BTC-USD", error)]
+    lines = sleeve_report.render_exit_watch(rows, skipped_products=skipped)
+    assert lines.count(sleeve_report.skipped_product_line(skipped[0])) == 1
+    assert [line.split()[0] for line in lines if line.startswith("  ")] == ["ETH-USD"]
+
+
+def test_a_product_whose_candles_cannot_be_read_is_skipped_not_fatal(repo, monkeypatch) -> None:
+    for product in ("BTC-USD", "ETH-USD"):
+        _hold(repo, product, qty="0.01", mark="100")
+    real = repo.get_candles
+    reads: list[str] = []
+
+    def _get_candles(product_id: str, granularity: Granularity, *a: Any, **k: Any) -> Any:
+        reads.append(product_id)
+        if product_id == "BTC-USD":
+            raise RuntimeError("database disk image is malformed")
+        return real(product_id, granularity, *a, **k)
+
+    monkeypatch.setattr(repo, "get_candles", _get_candles)
+    skipped: list[sleeve_report.SkippedProduct] = []
+
+    rows = sleeve_report.exit_watch_view(repo, _config(), now_ts=_NOW_100, skipped_products=skipped)
+
+    assert reads == ["BTC-USD", "ETH-USD"], "fixture: the failing read is reached"
+    assert [row.watch.product_id for row in rows] == ["ETH-USD"]
+    assert skipped == [
+        sleeve_report.SkippedProduct("BTC-USD", "RuntimeError: database disk image is malformed")
+    ]
+
+
+def test_the_skipped_product_line_names_the_product_the_error_and_where_to_look() -> None:
+    line = sleeve_report.skipped_product_line(
+        sleeve_report.SkippedProduct("PAXG-USD", "ValueError: bad")
+    )
+    assert line == (
+        "SKIPPED PAXG-USD: its exit watch could not be read (ValueError: bad) -- it is not in "
+        "this report; `keel doctor` names its sleeve_exit record"
+    )

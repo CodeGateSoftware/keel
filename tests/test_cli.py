@@ -1260,7 +1260,7 @@ def test_rules_seed_populates_products_times_kinds(tmp_path, valid_config_path):
     assert len(rows) == 3 * len(seedable)
     assert f"seeded={3 * len(seedable)} skipped=0" in result.output
     assert {row["kind"] for row in rows} == set(seedable)
-    for sleeve_kind in ("reverse_dca", "profit_take"):
+    for sleeve_kind in ("reverse_dca", "profit_take", "sleeve_exit"):
         assert sleeve_kind in RULE_REGISTRY and sleeve_kind not in seedable
 
 
@@ -1296,7 +1296,7 @@ def test_rules_seed_force_reseeds_even_when_present(tmp_path, valid_config_path)
     assert len(repo.get_rules()) == 2 * 3 * len(agent.seedable_kinds())
 
 
-@pytest.mark.parametrize("sleeve_kind", ["reverse_dca", "profit_take"])
+@pytest.mark.parametrize("sleeve_kind", ["reverse_dca", "profit_take", "sleeve_exit"])
 def test_rules_seed_refuses_a_sleeve_sell_kind_by_name_and_writes_nothing(
     tmp_path, valid_config_path, sleeve_kind
 ):

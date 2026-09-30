@@ -613,6 +613,8 @@ _SLEEVE_KINDS = [
     # P14: the second sleeve-sell kind is refused by its registered class, with no change to
     # the web action -- R53 reads the class, never a list of kind names.
     ("profit_take", {"product_id": "BTC-USD"}),
+    # P16: the third, by the same class read.
+    ("sleeve_exit", {"product_id": "BTC-USD"}),
 ]
 
 

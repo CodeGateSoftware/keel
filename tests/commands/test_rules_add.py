@@ -1445,6 +1445,85 @@ def test_rules_add_refuses_a_bad_profit_take_and_writes_nothing(
     assert _repo(tmp_path).get_rules() == []
 
 
+# -- sleeve_exit (#857, plan P16 Task 16.1): registered for `rules add`, preview-only (S2) -------
+
+
+def test_rules_add_writes_a_sleeve_exit_candidate_at_its_spec_defaults(tmp_path, valid_config_path):
+    result = _add(tmp_path, valid_config_path, "--kind", "sleeve_exit", "--product", "BTC-USD")
+    assert result.exit_code == 0, result.output
+    [row] = _repo(tmp_path).get_rules()
+    assert (row["kind"], row["status"]) == ("sleeve_exit", "candidate")
+    rule = _build_rule(row)
+    assert rule.params == {
+        "product_id": "BTC-USD",
+        "dd_pct": Decimal("35"),
+        "lookback_days": 200,
+        "sma_period": 200,
+        "confirm_days": 3,
+        "warn_pct": Decimal("5"),
+        "arms": ("drawdown", "sma"),
+        "execution": "preview",
+    }
+
+
+def test_rules_add_stores_a_sleeve_exit_arms_list_that_builds_back(tmp_path, valid_config_path):
+    result = _add(
+        tmp_path,
+        valid_config_path,
+        "--kind",
+        "sleeve_exit",
+        "--product",
+        "PAXG-USD",
+        "--params",
+        '{"arms": ["sma"], "dd_pct": "20"}',
+    )
+    assert result.exit_code == 0, result.output
+    [row] = _repo(tmp_path).get_rules()
+    rule = _build_rule(row)
+    assert (rule.params["arms"], rule.params["dd_pct"]) == (("sma",), Decimal("20"))
+
+
+@pytest.mark.parametrize(
+    ("params", "error"),
+    [
+        ('{"execution": "auto"}', None),
+        # `rules add` refuses these two by the declared default's JSON type, before the
+        # constructor; the constructor's own refusals are pinned in test_sleeve_exit_rule.py.
+        ('{"arms": "sma"}', "arms='sma' must be a JSON list of str (default ['drawdown', 'sma'])"),
+        ('{"dd_pct": "0"}', "dd_pct must be in (0, 100), got 0"),
+        ('{"warn_pct": "NaN"}', "warn_pct must be a finite number, got NaN"),
+        ('{"lookback_days": 0}', "lookback_days must be a positive int, got 0"),
+        (
+            '{"confirm_days": "3"}',
+            "confirm_days='3' is quoted, but sleeve_exit wants a number here (default 3)",
+        ),
+    ],
+)
+def test_rules_add_refuses_a_bad_sleeve_exit_and_writes_nothing(
+    tmp_path, valid_config_path, params, error
+):
+    """P15's held item a: every bad param is refused before a row is written -- the range and
+    finiteness checks by the constructor, the JSON types by `rules add`'s own check, and
+    `execution: auto` by the declared `Literal` (S2)."""
+    result = _add(
+        tmp_path,
+        valid_config_path,
+        "--kind",
+        "sleeve_exit",
+        "--product",
+        "BTC-USD",
+        "--params",
+        params,
+    )
+    assert result.exit_code == 1
+    assert "unknown rule kind" not in result.output
+    if error is not None:
+        assert sum(1 for line in result.output.splitlines() if line.endswith(error)) == 1
+    else:
+        assert "execution" in result.output
+    assert _repo(tmp_path).get_rules() == []
+
+
 def test_the_printed_next_command_works_for_a_sleeve_sell_kind(tmp_path, valid_config_path):
     """The hint `rules add --kind reverse_dca` prints is a command that RUNS: before P12 it
     failed with "could not determine a granularity" (a sleeve-sell rule has none). It now

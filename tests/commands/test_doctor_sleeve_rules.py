@@ -256,3 +256,19 @@ def test_an_unreadable_exit_watch_record_warns_rather_than_reading_clear(record)
     [finding] = doctor.exit_watch_findings({"PAXG-USD": record})
     assert (finding.status, finding.products) == (WARN, ("PAXG-USD",))
     assert finding.headline == doctor.EXIT_WATCH_UNREADABLE.format(product="PAXG-USD")
+
+
+@pytest.mark.parametrize(
+    "record",
+    ["breached", ["near"], {"level": "near", "ts": 1_759_000_000_000_000}],
+)
+def test_an_unreadable_exit_record_is_one_warn_not_a_crash(record) -> None:
+    """#942: `keel dca exit --preview`'s SKIPPED line points here, so doctor must not crash on
+    the record the preview skipped. A record that is not a mapping, or whose fields cannot be
+    rendered, is ONE WARN naming its product -- and the other products are still judged."""
+    findings = doctor.exit_watch_findings({"BTC-USD": {"level": "clear"}, "PAXG-USD": record})
+    assert [(f.name, f.status, f.products) for f in findings] == [
+        ("sleeve.exit_watch", OK, ()),
+        ("sleeve.exit_watch", WARN, ("PAXG-USD",)),
+    ]
+    assert findings[1].headline == doctor.EXIT_WATCH_UNREADABLE.format(product="PAXG-USD")

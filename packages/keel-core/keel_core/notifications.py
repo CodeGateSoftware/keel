@@ -95,9 +95,11 @@ class EventSpec:
 #:   held product with no resting bracket: `near` or `breached` its structural exit (a trailing
 #:   drawdown, a confirmed close under the 200-day SMA), `clear` again, or not judged
 #:   (`insufficient_history`). On transition only, never per cycle (spec §7): an alert repeated
-#:   every day trains the operator to ignore it. WARN, because a breach is a decision about the
-#:   sleeve the operator may have to make -- the monitor itself sells nothing. It rides the
-#:   cycle's result (`LoopResult.exit_watch_transitions`).
+#:   every day trains the operator to ignore it. WARN at most, because a breach is a decision
+#:   about the sleeve the operator may have to make -- the monitor itself sells nothing. Since
+#:   P16 only `near` and `breached` are sent at WARN; a first observation, a recovery and
+#:   `insufficient_history` are sent at INFO (`notification_event`'s `severity`, which may only
+#:   lower). It rides the cycle's result (`LoopResult.exit_watch_transitions`).
 EVENTS: tuple[EventSpec, ...] = (
     EventSpec("attestation.expiring", "attestation", WARN),
     EventSpec("rail.armed", "rail", WARN),
@@ -123,20 +125,41 @@ class NotificationEvent:
     fields: Mapping[str, Any] = field(default_factory=dict)
 
 
-def notification_event(key: str, message: str, **fields: Any) -> NotificationEvent:
+#: The severities in rising order -- how `notification_event` tells lowering from raising.
+_SEVERITY_RANK = {INFO: 0, WARN: 1}
+
+
+def notification_event(
+    key: str, message: str, *, severity: str | None = None, **fields: Any
+) -> NotificationEvent:
     """Build a `NotificationEvent` for a taxonomy key, refusing keys outside it.
 
     The taxonomy is closed on purpose: settings opt in by key, payloads carry the key, and a
     caller minting its own key would opt into an event nobody declared -- the drift the
     `KeyError` exists to prevent.
+
+    `severity` lowers ONE occurrence below its key's declared severity, which is the ceiling
+    (#857, P16): `sleeve.exit_watch` is WARN for a breach and INFO for a first look or a
+    recovery. It can never raise one -- an `info` key sent as `warn` would be an urgency the
+    taxonomy never declared -- and it must be in the vocabulary; either is a `ValueError`.
+    Delivery routes on the KEY (`NotificationSettings.opted_in`), never on severity, so a
+    lowered occurrence is delivered exactly as a WARN one would be.
     """
     spec = EVENTS_BY_KEY.get(key)
     if spec is None:
         raise KeyError(f"notifications: {key!r} is not in the event taxonomy")
+    chosen = spec.severity if severity is None else severity
+    if chosen not in _SEVERITY_RANK:
+        raise ValueError(f"notifications: unknown severity {chosen!r} for {key!r}")
+    if _SEVERITY_RANK[chosen] > _SEVERITY_RANK[spec.severity]:
+        raise ValueError(
+            f"notifications: {key!r} is declared {spec.severity!r}; an occurrence may not be "
+            f"sent as {chosen!r}"
+        )
     return NotificationEvent(
         key=spec.key,
         category=spec.category,
-        severity=spec.severity,
+        severity=chosen,
         message=message,
         fields=dict(fields),
     )
