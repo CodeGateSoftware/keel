@@ -1,10 +1,10 @@
-"""`keel dca trim --preview --view {lots,bands}` -- the read-only trim report (#857, plan P13
-Task 13.3; spec §5 and §8.1).
+"""`keel dca trim --preview [--view {gain,lots,bands}]` -- the read-only trim report (#857, plan
+P13 Task 13.3 and P14 Task 14.2; spec §4, §5 and §8.1).
 
 Read-only ALWAYS, like `keel dca distribute --preview`: it opens the database through
 `_common._open_repo_ro` whatever the terminal, writes nothing, and builds no broker -- every fee
-is the fallback rate, labelled as such (R25). `--view gain` arrives in P14 (R24); until then it
-is a usage error, as is a missing `--preview` or `--view`.
+is the fallback rate, labelled as such (R25). `--view gain` (P14) is the default, so bare
+`--preview` prints it (R24); a missing `--preview` is a usage error.
 """
 
 from __future__ import annotations
@@ -73,10 +73,12 @@ def _expected(db: Path, config_path: Path, view: str) -> list[str]:
     repo, config = _repo(db), load_config(config_path)
     if view == "lots":
         return sleeve_report.render_lots(sleeve_report.lots_view(repo, config))
+    if view == "gain":
+        return sleeve_report.render_gain(sleeve_report.gain_view(repo, config))
     return sleeve_report.render_bands(sleeve_report.bands_view(repo, config))
 
 
-@pytest.mark.parametrize("view", ["lots", "bands"])
+@pytest.mark.parametrize("view", ["gain", "lots", "bands"])
 @pytest.mark.parametrize("interactive", [False, True])
 def test_each_view_prints_its_report_and_writes_nothing(
     deployment,  # noqa: F811
@@ -150,20 +152,106 @@ def test_trim_without_preview_is_a_usage_error(deployment, args) -> None:  # noq
     assert _PREVIEW_REQUIRED in result.output.splitlines()
 
 
-def test_trim_without_a_view_is_a_usage_error(deployment) -> None:  # noqa: F811
+def test_bare_preview_prints_the_gain_view(deployment, monkeypatch) -> None:  # noqa: F811
+    """R24/spec §4: `gain` is `--view`'s default, so bare `--preview` prints the gain report --
+    exactly the `--view gain` lines -- and exits 0."""
+    monkeypatch.setattr(_common, "_build_broker", _no_broker)
+    db, config_path = deployment
+    _seed(db)
+    bare = _trim(deployment, "--preview")
+    explicit = _trim(deployment, "--preview", "--view", "gain")
+    assert bare.exit_code == 0, bare.output
+    expected = _expected(db, config_path, "gain")
+    lines = bare.output.splitlines()
+    start = lines.index(expected[0])
+    assert lines[start : start + len(expected)] == expected
+    assert bare.output == explicit.output
+
+
+def test_the_gain_view_lists_each_held_product_with_its_verdict(deployment) -> None:  # noqa: F811
+    db, _config_path = deployment
+    _seed(db)
     result = _trim(deployment, "--preview")
+    assert result.exit_code == 0, result.output
+    rows = [line.split()[0] for line in result.output.splitlines() if line.startswith("  ")]
+    assert rows == ["BTC-USD", "PAXG-USD"]
+    assert result.output.splitlines().count(sleeve_report.GAIN_NOT_EVIDENCE) == 1
+
+
+def test_the_gain_flags_reach_the_view(deployment) -> None:  # noqa: F811
+    """`--gain-pct` and `--trim-pct` override the spec defaults, and `--product` narrows: the
+    printed line is `gain_view`'s at those arguments, not the defaults'."""
+    db, config_path = deployment
+    _seed(db)
+    result = _trim(
+        deployment,
+        "--preview",
+        "--gain-pct",
+        "500",
+        "--trim-pct",
+        "20",
+        "--product",
+        "BTC-USD",
+    )
+    assert result.exit_code == 0, result.output
+    repo, config = _repo(db), load_config(config_path)
+    [row] = sleeve_report.gain_view(
+        repo, config, gain_pct=Decimal("500"), trim_pct=Decimal("20"), product_id="BTC-USD"
+    )
+    assert (row.gain_pct_used, row.trim_pct_used, row.verdict) == (
+        Decimal("500"),
+        Decimal("20"),
+        "below trigger",
+    )
+    [line] = [text for text in result.output.splitlines() if text.startswith("  ")]
+    assert line == [text for text in sleeve_report.render_gain([row]) if text.startswith("  ")][0]
+
+
+@pytest.mark.parametrize(
+    ("args", "named"),
+    [
+        (("--trim-pct", "25"), "--trim-pct"),
+        (("--trim-pct", "9"), "--trim-pct"),
+        (("--gain-pct", "0"), "--gain-pct"),
+        (("--gain-pct", "abc"), "--gain-pct"),
+    ],
+)
+def test_a_flag_the_rule_would_refuse_is_a_usage_error(deployment, args, named) -> None:  # noqa: F811
+    result = _trim(deployment, "--preview", *args)
     assert result.exit_code == 2
     assert any(
-        line.startswith("Error: Missing option '--view'") for line in result.output.splitlines()
+        line.startswith(f"Error: Invalid value for '{named}'")
+        for line in result.output.splitlines()
     )
 
 
-def test_the_gain_view_does_not_exist_until_p14(deployment) -> None:  # noqa: F811
-    result = _trim(deployment, "--preview", "--view", "gain")
+@pytest.mark.parametrize(
+    ("args", "named"),
+    [
+        (("--view", "lots", "--gain-pct", "30"), "--gain-pct"),
+        (("--view", "bands", "--trim-pct", "12"), "--trim-pct"),
+        (("--view", "bands", "--product", "BTC-USD"), "--product"),
+    ],
+)
+def test_a_flag_that_does_not_apply_to_the_view_is_a_usage_error(
+    deployment,  # noqa: F811
+    args,
+    named,
+) -> None:
+    """A flag silently ignored would read as applied: `--gain-pct`/`--trim-pct` belong to the gain
+    view, and the bands view weighs the whole sleeve, so it takes no `--product`."""
+    result = _trim(deployment, "--preview", *args)
     assert result.exit_code == 2
-    assert any(
-        line.startswith("Error: Invalid value for '--view'") for line in result.output.splitlines()
-    )
+    assert any(line.startswith("Error: ") and named in line for line in result.output.splitlines())
+
+
+def test_the_product_flag_narrows_the_lots_view(deployment) -> None:  # noqa: F811
+    db, _config_path = deployment
+    _seed(db)
+    result = _trim(deployment, "--preview", "--view", "lots", "--product", "PAXG-USD")
+    assert result.exit_code == 0, result.output
+    lots = [line.split()[0] for line in result.output.splitlines() if line.startswith("  #")]
+    assert lots == ["#1", "#2"]
 
 
 @pytest.mark.parametrize("interactive", [False, True])

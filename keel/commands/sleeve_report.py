@@ -1084,3 +1084,299 @@ def render_bands(report: BandsReport) -> list[str]:
     lines.append(BANDS_REDEPLOY_NOTE)
     lines.append(BANDS_NOT_ADOPTED)
     return lines
+
+
+# -- keel dca trim --preview --view gain (P14, spec §4) -------------------------------------------
+
+#: Printed once on every gain report (spec §4, "Evidence status"; the research freeze of
+#: 2026-09-27): the trigger it reports has no evidence behind it, and no rule acts on it.
+GAIN_NOT_EVIDENCE = (
+    "a report, not a recommendation: the gain-over-entry trim is untested (spec §4; #831 found "
+    "the drift half not better than static DCA after fees), no performance edge is claimed, and "
+    "no profit_take rule is promoted in this build"
+)
+#: Printed once on every gain report: what a real proposal meets that this view does not apply.
+GAIN_PIPELINE_NOTE = (
+    "not applied here -- the cycle's own caps decide a real proposal: min_hold_days on the "
+    "tranches a trim consumes, cooldown_days since the rule's last proposal, a same-day dca buy, "
+    "and one proposal per product per UTC day"
+)
+
+#: `gain_view`'s verdicts, one per outcome of `ProfitTake.reduce_signal` on the cached close.
+VERDICT_WOULD_TRIM = "would trim"
+VERDICT_BELOW_FEE_GATE = "below fee gate"
+VERDICT_BELOW_TRIGGER = "below trigger"
+VERDICT_NO_CLOSE = "no cached daily close"
+
+#: Which non-disabled `profit_take` row's params the gain view reads, most advanced first.
+_STATUS_RANK = {"live": 0, "paper": 1, "candidate": 2}
+
+
+@dataclass(frozen=True)
+class GainRow:
+    """One held product under `profit_take`'s trigger (spec §4, "CLI").
+
+    `qty`, `vwae` and `cost_basis` are the product's `Holding` (every open tranche, R8; `vwae`
+    fee-inclusive, spec Q4); `mark` is the latest cached daily close and `unrealised` the marked
+    value less the basis -- both `None` without a close. `gain_pct_used`, `trim_pct_used` and
+    `min_net_usd_used` are the params the verdict was reached at, and `params_source` says where
+    they came from (`rule <id> (<status>)` or `spec defaults`, then any flag that overrode one).
+
+    Everything after is the rule's own answer (`ProfitTake.reduce_signal` on that close):
+    `trigger_price` (`vwae x (1 + gain_pct / 100)`), `triggered`, and when the trigger is met the
+    trim's `qty_to_sell`, `fee_usd` (the fallback fee, R25) and `net_usd` -- from the `Reduction`
+    when it fires, from its `last_rejection` when the fee gate stops it. `fifo_first_tranche` is
+    the `positions` id a FIFO trim consumes first (Review Focus 3); `legs` is how many cycles rail
+    2's slicing needs for the trim (`sleeve.slice_qty`), 0 when there is no trim."""
+
+    product_id: str
+    qty: Decimal
+    vwae: Decimal | None
+    cost_basis: Decimal
+    mark: Decimal | None
+    unrealised: Decimal | None
+    gain_pct_used: Decimal
+    trim_pct_used: Decimal
+    min_net_usd_used: Decimal
+    params_source: str
+    trigger_price: Decimal | None
+    triggered: bool
+    fifo_first_tranche: int | None
+    qty_to_sell: Decimal | None
+    fee_usd: Decimal | None
+    net_usd: Decimal | None
+    verdict: str
+    legs: int
+    mark_bar: MarkBar | None = None
+
+
+def profit_take_params(
+    rule: Any | None,
+    *,
+    product_id: str = "",
+    gain_pct: Decimal | None = None,
+    trim_pct: Decimal | None = None,
+) -> Any:
+    """A `ProfitTake` at `rule`'s params (or the spec defaults, with no rule), each flag that is
+    given overriding its own param. Construction is the rule's, so a flag out of range is
+    refused by the rule's own check (`ValueError`), never by a copy of it here."""
+    from keel.strategy.rules.profit_take import ProfitTake
+
+    params = dict(rule.params) if rule is not None else {}
+    params.pop("product_id", None)
+    if gain_pct is not None:
+        params["gain_pct"] = gain_pct
+    if trim_pct is not None:
+        params["trim_pct"] = trim_pct
+    return ProfitTake(product_id or getattr(rule, "product_id", "") or "-", **params)
+
+
+def _profit_take_rule_on(repo: Any, product_id: str) -> tuple[Any | None, str]:
+    """The product's most advanced non-disabled `profit_take` rule, built from its row, and the
+    label naming it -- or `(None, "spec defaults")`. Most advanced is `live`, then `paper`, then
+    `candidate`; the lowest id breaks a tie."""
+    from keel import agent
+
+    rows = [
+        r
+        for r in repo.get_rules()
+        if r["kind"] == "profit_take"
+        and r["status"] in _STATUS_RANK
+        and (r["params"] or {}).get("product_id") == product_id
+    ]
+    if not rows:
+        return None, "spec defaults"
+    row = min(rows, key=lambda r: (_STATUS_RANK[r["status"]], int(r["id"])))
+    return agent.build_rule_from_params("profit_take", row["params"]), (
+        f"rule {row['id']} ({row['status']})"
+    )
+
+
+def gain_view(
+    repo: Any,
+    config: Any,
+    *,
+    gain_pct: Decimal | None = None,
+    trim_pct: Decimal | None = None,
+    product_id: str | None = None,
+    now_ts: int | None = None,
+) -> list[GainRow]:
+    """One `GainRow` per held product, in product-id order (spec §4's trim report; `product_id`
+    narrows to one). READ-ONLY: it writes nothing, builds no broker, and proposes nothing (R25).
+
+    **The params**, per product, each one separately: `gain_pct`/`trim_pct` when given (the
+    `--gain-pct`/`--trim-pct` flags); otherwise the product's most advanced non-disabled
+    `profit_take` rule (`_profit_take_rule_on`); otherwise the spec defaults (25, 15, $5).
+
+    **The verdict is the rule's own, not a copy of it** (plan Task 14.2): a `ProfitTake` built
+    from those params is asked `reduce_signal` over the product's `Holding` (`sleeve.holding_of`)
+    and its cached daily bars, at `sleeve.sell_costs` -- the fallback fee and the product's
+    slippage, exactly as the cycle asks it. A `Reduction` is `would trim`; a `fee_gate` rejection
+    is `below fee gate`, with the rule's own figures; a `gain` rejection is `below trigger`; no
+    cached close is no verdict at all.
+
+    **What it does not apply** (`GAIN_PIPELINE_NOTE`): the pipeline's caps -- `min_hold_days`,
+    `cooldown_days`, the same-day dca, one proposal a day. They decide a real proposal on the
+    day it is made, and the proposal row records them; this is the rule's arithmetic alone.
+    """
+    from keel.execution import executor, sleeve
+    from keel.types import Granularity
+
+    now = _now(now_ts)
+    products = sorted({str(p["product_id"]) for p in repo.get_open_positions(product_id)})
+    rows: list[GainRow] = []
+    for product in products:
+        stored, source = _profit_take_rule_on(repo, product)
+        flags = [
+            name
+            for name, value in (("--gain-pct", gain_pct), ("--trim-pct", trim_pct))
+            if value is not None
+        ]
+        rule = profit_take_params(stored, product_id=product, gain_pct=gain_pct, trim_pct=trim_pct)
+        daily = repo.get_candles(product, Granularity.ONE_DAY)
+        mark = daily[-1].close if daily else None
+        holding = sleeve.holding_of(repo, product, mark)
+        costs = sleeve.sell_costs(repo, config, product)
+        p = rule.params
+        vwae = holding.vwae
+        base = dict(
+            product_id=product,
+            qty=holding.qty,
+            vwae=vwae,
+            cost_basis=holding.cost_basis,
+            mark=mark,
+            unrealised=holding.unrealised,
+            gain_pct_used=p["gain_pct"],
+            trim_pct_used=p["trim_pct"],
+            min_net_usd_used=p["min_net_usd"],
+            params_source=", ".join([source, *flags]),
+            fifo_first_tranche=holding.lots[0].position_id if holding.lots else None,
+            mark_bar=mark_bar(daily, now),
+        )
+        reduction = rule.reduce_signal(holding, {Granularity.ONE_DAY: daily}, costs)
+        if reduction is not None:
+            trigger = reduction.trigger
+            _leg, legs = sleeve.slice_qty(
+                reduction.qty,
+                reduction.expected_price,
+                max_per_order_usd=config.caps.max_per_order_usd,
+                base_increment=executor._base_increment_for(None, repo, product, now),
+            )
+            rows.append(
+                GainRow(
+                    **base,
+                    trigger_price=Decimal(trigger["trigger_price"]),
+                    triggered=True,
+                    qty_to_sell=reduction.qty,
+                    fee_usd=Decimal(trigger["fee_usd"]),
+                    net_usd=Decimal(trigger["net_usd"]),
+                    verdict=VERDICT_WOULD_TRIM,
+                    legs=legs,
+                )
+            )
+            continue
+        rejection = rule.last_rejection or {}
+        gate = rejection.get("gate")
+        trigger_price = (
+            None
+            if vwae is None or mark is None
+            else (vwae * (Decimal("1") + p["gain_pct"] / Decimal("100")))
+        )
+        if gate == "fee_gate":
+            rows.append(
+                GainRow(
+                    **base,
+                    trigger_price=trigger_price,
+                    triggered=True,
+                    qty_to_sell=rejection["qty"],
+                    fee_usd=rejection["fee_usd"],
+                    net_usd=rejection["net_usd"],
+                    verdict=VERDICT_BELOW_FEE_GATE,
+                    legs=0,
+                )
+            )
+        elif gate == "gain":
+            rows.append(
+                GainRow(
+                    **base,
+                    trigger_price=rejection["trigger_price"],
+                    triggered=False,
+                    qty_to_sell=None,
+                    fee_usd=None,
+                    net_usd=None,
+                    verdict=VERDICT_BELOW_TRIGGER,
+                    legs=0,
+                )
+            )
+        else:  # no daily close: the rule judged nothing
+            rows.append(
+                GainRow(
+                    **base,
+                    trigger_price=None,
+                    triggered=False,
+                    qty_to_sell=None,
+                    fee_usd=None,
+                    net_usd=None,
+                    verdict=VERDICT_NO_CLOSE,
+                    legs=0,
+                )
+            )
+    return rows
+
+
+def _price(value: Decimal | None) -> str:
+    """A COMPUTED price (an average, a trigger) at ten significant digits, without trailing
+    zeros and never in exponent form: `vwae` is a quotient and can run to 28 digits that say
+    nothing."""
+    if value is None:
+        return _UNRECORDED
+    return format(Decimal(f"{value:.10g}").normalize(), "f")
+
+
+def render_gain(rows: Sequence[GainRow]) -> list[str]:
+    """The gain report: a head naming the fee source and the mark bar, a `STALE mark:` line per
+    product marked at a stale bar, `GAIN_NOT_EVIDENCE`, one line per held product --
+
+        <product> qty <q>  vwae <v>  cost $<c>  mark <m>  unrealised $<u>
+        gain <g>% trim <t>% min net $<n> (<source>)  trigger <price> met|not met
+        first tranche #<id>  [sell <q> [over <k> leg(s)]  fee $<f>  net $<n>]  -> <verdict>
+
+    (one line; wrapped here; the sale part only when the trigger is met, its legs only when the
+    trim clears the fee gate) -- or `mark none` and the params before the verdict when there is
+    no daily close -- then `GAIN_PIPELINE_NOTE` and `NOT_TAX_ADVICE`, on every run."""
+    from keel.execution.sleeve import FALLBACK_FEE_SOURCE
+
+    lines = [
+        "gain -- profit_take's trigger per held product, over the positions ledger; fees at the "
+        f"fallback rate ({FALLBACK_FEE_SOURCE}); no venue asked; "
+        f"{mark_bar_head(row.mark_bar for row in rows)}",
+        *_stale_lines((row.product_id, row.mark_bar) for row in rows),
+        GAIN_NOT_EVIDENCE,
+    ]
+    if not rows:
+        lines.append(NO_OPEN_LOTS)
+    for row in rows:
+        params = (
+            f"  gain {_plain(row.gain_pct_used)}% trim {_plain(row.trim_pct_used)}%"
+            f" min net {_usd(row.min_net_usd_used)} ({row.params_source})"
+        )
+        line = (
+            f"  {row.product_id} qty {_plain(row.qty)}  vwae {_price(row.vwae)}"
+            f"  cost {_usd(row.cost_basis)}"
+        )
+        if row.mark is None:
+            lines.append(line + "  mark none" + params + f"  -> {row.verdict}")
+            continue
+        line += f"  mark {_plain(row.mark)}  unrealised {_usd(row.unrealised)}" + params
+        line += f"  trigger {_price(row.trigger_price)} {'met' if row.triggered else 'not met'}"
+        if row.fifo_first_tranche is not None:
+            line += f"  first tranche #{row.fifo_first_tranche}"
+        if row.qty_to_sell is not None:
+            line += f"  sell {_plain(row.qty_to_sell)}"
+            if row.legs:
+                line += f" over {row.legs} leg{'' if row.legs == 1 else 's'}"
+            line += f"  fee {_usd(row.fee_usd)}  net {_usd(row.net_usd)}"
+        lines.append(line + f"  -> {row.verdict}")
+    lines.append(GAIN_PIPELINE_NOTE)
+    lines.append(NOT_TAX_ADVICE)
+    return lines

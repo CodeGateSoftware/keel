@@ -31,12 +31,16 @@ the proposal and `not a terminal: nothing written.`, and exits 0. A `superseded`
 its rule's decision and cannot be reviewed (exit 1); an already-reviewed one keeps its FIRST review
 time -- the gate reads whether a review happened, and the audit chain already holds when.
 
-**`keel dca trim --preview --view {lots,bands}` opens read-only ALWAYS, too** (#857, P13): the
+**`keel dca trim --preview [--view {gain,lots,bands}]` opens read-only ALWAYS, too** (#857, P13
+and P14): `profit_take`'s trigger per held product (`gain`, the default -- spec §4, R24), the
 per-tranche lots report (spec §8.1, "not tax advice") or the weights-against-targets drift
-display (spec §5). Neither writes, proposes or builds a broker; every fee is the fallback rate
-(R25). `--view bands` is a DISPLAY: band trimming was tested and not adopted (#831), no
-`band_rebalance` rule exists, and the report says so every run. `--view gain` arrives in P14
-(R24), where it becomes the default; until then it is a usage error.
+display (spec §5). None writes, proposes or builds a broker; every fee is the fallback rate
+(R25), and each names the daily bar it marks at and flags a stale one. `--view gain`'s verdict
+is `profit_take`'s own `reduce_signal`, at `--gain-pct`/`--trim-pct` when given, else the
+product's `profit_take` rule's params, else the spec defaults; it is a report -- the trim is
+untested and no `profit_take` rule is promoted. `--view bands` is a DISPLAY: band trimming was
+tested and not adopted (#831), no `band_rebalance` rule exists, and the report says so every
+run. A flag that does not apply to the chosen view is a usage error, never silently ignored.
 
 **`keel dca distribute --preview` opens read-only ALWAYS, too** (#857, P10): what each
 `reverse_dca` rule's next cadence day would do, on today's cached close. It writes nothing -- no
@@ -304,6 +308,30 @@ def _require_preview(_ctx: click.Context, _param: click.Parameter, value: bool) 
     return value
 
 
+def _profit_take_param(
+    _ctx: click.Context, param: click.Parameter, value: str | None
+) -> Decimal | None:
+    """`--gain-pct`/`--trim-pct` as a `Decimal`, refused as a usage error when it is not a number
+    or when `profit_take`'s own constructor refuses it (`sleeve_report.profit_take_params`) --
+    the range lives in the rule, not in a second copy here."""
+    if value is None:
+        return None
+    try:
+        number = Decimal(value)
+    except ArithmeticError as exc:
+        raise click.BadParameter(f"{value!r} is not a number") from exc
+    if not number.is_finite():
+        raise click.BadParameter(f"{value!r} is not a finite number")
+    try:
+        if param.name == "gain_pct":
+            sleeve_report.profit_take_params(None, gain_pct=number)
+        else:
+            sleeve_report.profit_take_params(None, trim_pct=number)
+    except ValueError as exc:
+        raise click.BadParameter(str(exc)) from exc
+    return number
+
+
 @dca_group.command("trim")
 @click.option(
     "--preview",
@@ -315,25 +343,79 @@ def _require_preview(_ctx: click.Context, _param: click.Parameter, value: bool) 
 )
 @click.option(
     "--view",
-    type=click.Choice(["lots", "bands"]),
-    required=True,
-    help="lots: every open tranche in FIFO order, with its unrealised and if-sold-now P&L (not "
-    "tax advice). bands: sleeve weights against target_weights (a display; band trimming was "
-    "tested and not adopted, #831).",
+    type=click.Choice(["gain", "lots", "bands"]),
+    default="gain",
+    show_default=True,
+    help="gain: profit_take's trigger on each held product -- the average entry, whether the "
+    "gain trigger is met, the tranche a FIFO trim hits, the fee, the net, the verdict and the "
+    "legs (a report; the trim is untested and no profit_take rule is promoted). lots: every open "
+    "tranche in FIFO order, with its unrealised and if-sold-now P&L (not tax advice). bands: "
+    "sleeve weights against target_weights (a display; band trimming was tested and not "
+    "adopted, #831).",
+)
+@click.option(
+    "--product",
+    "product_id",
+    default=None,
+    help="Narrow the gain or lots view to one product (e.g. BTC-USD).",
+)
+@click.option(
+    "--gain-pct",
+    "gain_pct",
+    default=None,
+    callback=_profit_take_param,
+    help="gain view only: the trigger, % over the average entry. Default: the product's "
+    "profit_take rule, else 25.",
+)
+@click.option(
+    "--trim-pct",
+    "trim_pct",
+    default=None,
+    callback=_profit_take_param,
+    help="gain view only: the part of the holding a trim sells, 10-20 %. Default: the "
+    "product's profit_take rule, else 15.",
 )
 @click.pass_context
 @with_disclaimer
-def trim_cmd(ctx: click.Context, preview: bool, view: str) -> None:
-    """A read-only report over the positions ledger: per-tranche P&L (`--view lots`) or weights
-    against targets (`--view bands`). Fees at the fallback rate. Writes nothing, asks no venue,
-    and proposes nothing."""
+def trim_cmd(
+    ctx: click.Context,
+    preview: bool,
+    view: str,
+    product_id: str | None,
+    gain_pct: Decimal | None,
+    trim_pct: Decimal | None,
+) -> None:
+    """A read-only report over the positions ledger: profit_take's trigger per product (`--view
+    gain`, the default), per-tranche P&L (`--view lots`) or weights against targets (`--view
+    bands`). Fees at the fallback rate. Writes nothing, asks no venue, and proposes nothing."""
+    if view != "gain":
+        for flag, value in (("--gain-pct", gain_pct), ("--trim-pct", trim_pct)):
+            if value is not None:
+                raise click.UsageError(f"{flag} applies to --view gain only, not --view {view}.")
+    if view == "bands" and product_id is not None:
+        raise click.UsageError(
+            "--product does not apply to --view bands: it weighs the whole sleeve."
+        )
     config = _load_cfg(ctx)
     repo = _common._open_repo_ro(ctx)
-    if view == "lots":
-        lines = sleeve_report.render_lots(sleeve_report.lots_view(repo, config))
+    now_ts = int(time.time())
+    if view == "gain":
+        rows = sleeve_report.gain_view(
+            repo,
+            config,
+            gain_pct=gain_pct,
+            trim_pct=trim_pct,
+            product_id=product_id,
+            now_ts=now_ts,
+        )
+        lines = sleeve_report.render_gain(rows)
+    elif view == "lots":
+        lines = sleeve_report.render_lots(
+            sleeve_report.lots_view(repo, config, product_id, now_ts=now_ts)
+        )
     else:
         try:
-            report = sleeve_report.bands_view(repo, config)
+            report = sleeve_report.bands_view(repo, config, now_ts=now_ts)
         except DcaPlanError as exc:  # a config-level refusal (#848), shown verbatim
             raise click.ClickException(str(exc)) from exc
         lines = sleeve_report.render_bands(report)
