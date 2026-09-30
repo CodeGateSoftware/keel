@@ -214,6 +214,25 @@ def skipped_rule_line(skipped: SkippedRule) -> str:
     )
 
 
+@dataclass(frozen=True)
+class SkippedProduct:
+    """A watched product a view could not report (`product_id`) and why (`<ExceptionType>:
+    <message>`). The view leaves it out and prints `skipped_product_line` for it (P15's held
+    item b): one malformed product costs its own row, never the report."""
+
+    product_id: str
+    error: str
+
+
+def skipped_product_line(skipped: SkippedProduct) -> str:
+    """The one line a view prints for a product it skipped -- which product, why, and where the
+    cycle's own record of it is read."""
+    return (
+        f"SKIPPED {skipped.product_id}: its exit watch could not be read ({skipped.error}) -- it "
+        "is not in this report; `keel doctor` names its sleeve_exit record"
+    )
+
+
 def render_proposal_line(row: dict[str, Any]) -> str:
     """The one-line summary of a `sell_proposals` row (as `Repository.get_sell_proposal` returns
     it): the module docstring's format."""
@@ -1485,54 +1504,85 @@ def exit_watch_view(
     *,
     now_ts: int | None = None,
     skipped: list[SkippedRule] | None = None,
+    skipped_products: list[SkippedProduct] | None = None,
 ) -> list[ExitWatchRow]:
     """One `ExitWatchRow` per product the monitor watches, in product order (spec §7). READ-ONLY:
     it writes nothing -- the `sleeve_exit:` record is the cycle's -- and builds no broker (R25).
 
     The levels are the monitor's, not a copy of it: `sleeve_exit.classify` over the product's
-    completed cached daily bars, at the params of a `sleeve_exit` rule the cycle would load for it
-    (`sleeve_exit.monitor_rule`), else R26's defaults. A `sleeve_exit` row that does not build is
-    skipped, as the cycle skips it, and appended to `skipped` for the report to name."""
+    completed cached daily bars, at the params of the registered `SleeveExit` rule the cycle
+    would load for it (`sleeve_exit_rule.monitor_rule`), else R26's defaults. A `sleeve_exit`
+    row that does not build is skipped, as the cycle skips it, and appended to `skipped` for the
+    report to name.
+
+    **One product costs only its own row** (P15's held item b, R68's pattern per product). A
+    product whose record, candles or levels cannot be read -- a `sleeve_exit:` record that is
+    not a mapping, a recorded level or `observed_at` of the wrong type, a read that raises -- is
+    left out and appended to `skipped_products` as a `SkippedProduct`, so the report prints one
+    SKIPPED line for it and still reports every other watched product. The cycle wraps each
+    product the same way (`agent._watch_sleeve_exits`); a read-only view must not be less robust
+    than the cycle it describes."""
     from keel import agent
-    from keel.execution import sleeve_exit
-    from keel.strategy.rules.base import completed_days
-    from keel.types import Granularity
+    from keel.strategy.rules import sleeve_exit as sleeve_exit_rule
 
     now = _now(now_ts)
     loaded, failed = agent._load_sleeve_rules(repo, config)
     if skipped is not None:
         skipped.extend(
-            SkippedRule.of(row, exc) for row, exc in failed if row["kind"] == sleeve_exit.RULE_KIND
+            SkippedRule.of(row, exc) for row, exc in failed if row["kind"] == sleeve_exit_rule.KIND
         )
     rows: list[ExitWatchRow] = []
     for product in agent.exit_watched_products(repo):
-        cached = repo.get_candles(product, Granularity.ONE_DAY)
-        daily = completed_days({Granularity.ONE_DAY: cached})
-        record = repo.get_state(f"{sleeve_exit.STATE_PREFIX}{product}") or {}
-        chosen = sleeve_exit.monitor_rule(loaded, product)
-        overrides = sleeve_exit.monitor_params(loaded, product)
-        watch = sleeve_exit.classify(product, daily, previous=record.get("level"), **overrides)
-        rows.append(
-            ExitWatchRow(
-                watch=watch,
-                dd_pct=overrides.get("dd_pct", sleeve_exit.DEFAULT_DD_PCT),
-                lookback_days=overrides.get("lookback_days", sleeve_exit.DEFAULT_LOOKBACK_DAYS),
-                sma_period=overrides.get("sma_period", sleeve_exit.DEFAULT_SMA_PERIOD),
-                confirm_days=overrides.get("confirm_days", sleeve_exit.DEFAULT_CONFIRM_DAYS),
-                warn_pct=overrides.get("warn_pct", sleeve_exit.DEFAULT_WARN_PCT),
-                arms=tuple(overrides.get("arms", sleeve_exit.ARMS)),
-                params_source=(
-                    EXIT_DEFAULTS_SOURCE
-                    if chosen is None
-                    else f"rule {getattr(chosen[0], 'rule_id', None)} ({chosen[1]})"
-                ),
-                recorded_level=record.get("level"),
-                recorded_at=record.get("observed_at"),
-                mark_bar=mark_bar(daily, now),
-                bars=len(daily),
-            )
-        )
+        try:
+            rows.append(_exit_watch_row(repo, loaded, product, now))
+        except Exception as exc:  # noqa: BLE001 -- one product costs its own row (held item b)
+            if skipped_products is not None:
+                skipped_products.append(SkippedProduct(product, f"{type(exc).__name__}: {exc}"))
     return rows
+
+
+def _exit_watch_row(repo: Any, loaded: Any, product: str, now: int) -> ExitWatchRow:
+    """One product's `ExitWatchRow` (`exit_watch_view`). Raises on a record it cannot read, so
+    the caller skips the product rather than render a guess."""
+    from keel.execution import sleeve_exit
+    from keel.strategy.rules import sleeve_exit as sleeve_exit_rule
+    from keel.strategy.rules.base import completed_days
+    from keel.types import Granularity
+
+    cached = repo.get_candles(product, Granularity.ONE_DAY)
+    daily = completed_days({Granularity.ONE_DAY: cached})
+    record = repo.get_state(f"{sleeve_exit.STATE_PREFIX}{product}") or {}
+    if not isinstance(record, dict):
+        raise ValueError(f"its sleeve_exit record is not a mapping: {record!r}")
+    recorded_level = record.get("level")
+    if recorded_level is not None and not isinstance(recorded_level, str):
+        raise ValueError(f"its recorded level is not a level name: {recorded_level!r}")
+    recorded_at = record.get("observed_at")
+    if recorded_at is not None and (
+        isinstance(recorded_at, bool) or not isinstance(recorded_at, int)
+    ):
+        raise ValueError(f"its recorded observed_at is not an epoch second: {recorded_at!r}")
+    chosen = sleeve_exit_rule.monitor_rule(loaded, product)
+    overrides = sleeve_exit_rule.monitor_params(loaded, product)
+    # A recorded level outside the four is shown as it is (R71) and moves no hysteresis band.
+    previous: Any = recorded_level
+    watch = sleeve_exit.classify(product, daily, previous=previous, **overrides)
+    return ExitWatchRow(
+        watch=watch,
+        dd_pct=overrides.get("dd_pct", sleeve_exit.DEFAULT_DD_PCT),
+        lookback_days=overrides.get("lookback_days", sleeve_exit.DEFAULT_LOOKBACK_DAYS),
+        sma_period=overrides.get("sma_period", sleeve_exit.DEFAULT_SMA_PERIOD),
+        confirm_days=overrides.get("confirm_days", sleeve_exit.DEFAULT_CONFIRM_DAYS),
+        warn_pct=overrides.get("warn_pct", sleeve_exit.DEFAULT_WARN_PCT),
+        arms=tuple(overrides.get("arms", sleeve_exit.ARMS)),
+        params_source=(
+            EXIT_DEFAULTS_SOURCE if chosen is None else f"rule {chosen[0].rule_id} ({chosen[1]})"
+        ),
+        recorded_level=recorded_level,
+        recorded_at=recorded_at,
+        mark_bar=mark_bar(daily, now),
+        bars=len(daily),
+    )
 
 
 def _cents(value: Decimal) -> str:
@@ -1540,10 +1590,14 @@ def _cents(value: Decimal) -> str:
 
 
 def render_exit_watch(
-    rows: Sequence[ExitWatchRow], *, skipped: Sequence[SkippedRule] = ()
+    rows: Sequence[ExitWatchRow],
+    *,
+    skipped: Sequence[SkippedRule] = (),
+    skipped_products: Sequence[SkippedProduct] = (),
 ) -> list[str]:
     """The exit report: a head naming the mark bar, a `STALE mark:` line per product marked at a
-    stale bar, a `skipped_rule_line` per `sleeve_exit` row that did not build,
+    stale bar, a `skipped_rule_line` per `sleeve_exit` row that did not build, a
+    `skipped_product_line` per watched product the view could not read (P15's held item b),
     `EXIT_NOT_EVIDENCE`, then one line per watched product --
 
         <product> <level>[ (<arms>)]  close <c> on <YYYY-MM-DD>
@@ -1560,9 +1614,10 @@ def render_exit_watch(
         f"{mark_bar_head(row.mark_bar for row in rows)}",
         *_stale_lines((row.watch.product_id, row.mark_bar) for row in rows),
         *(skipped_rule_line(entry) for entry in skipped),
+        *(skipped_product_line(entry) for entry in skipped_products),
         EXIT_NOT_EVIDENCE,
     ]
-    if not rows:
+    if not rows and not skipped_products:
         lines.append(NO_EXIT_WATCH)
     for row in rows:
         watch = row.watch

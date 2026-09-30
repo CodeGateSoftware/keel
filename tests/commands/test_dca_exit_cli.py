@@ -134,3 +134,27 @@ def test_a_missing_database_is_refused_not_created(
     assert result.exit_code == 1
     assert "read-only command" in result.output
     assert not db.exists()
+
+
+def test_a_malformed_product_prints_a_skipped_line_and_the_rest(
+    deployment,  # noqa: F811
+    frozen_now,
+) -> None:
+    """P15's held item b, end to end: a record the view cannot read no longer crashes the
+    command -- it prints one SKIPPED line for that product and every other row."""
+    db, _config_path = deployment
+    _seed(db)
+    _repo(db).set_state("sleeve_exit:BTC-USD", "breached")
+
+    result = _invoke(deployment, "--preview")
+
+    assert result.exit_code == 0, result.output
+    lines = result.output.splitlines()
+    skipped = sleeve_report.skipped_product_line(
+        sleeve_report.SkippedProduct(
+            "BTC-USD", "ValueError: its sleeve_exit record is not a mapping: 'breached'"
+        )
+    )
+    assert lines.count(skipped) == 1
+    assert [line.split()[0] for line in lines if line.startswith("  ")] == ["PAXG-USD"]
+    assert lines.count(dca_cli.EXIT_PREVIEW_FOOTER) == 1

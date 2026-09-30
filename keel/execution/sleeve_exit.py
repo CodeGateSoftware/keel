@@ -28,7 +28,10 @@ judged. A close already under the SMA but not yet confirmed has a negative dista
 **R26: the default levels are module constants** -- `DEFAULT_DD_PCT` 35, `DEFAULT_LOOKBACK_DAYS`
 200, `DEFAULT_SMA_PERIOD` 200, `DEFAULT_CONFIRM_DAYS` 3, `DEFAULT_WARN_PCT` 5, spec §7's values.
 A `sleeve_exit` rule's params override them per product; there is no config key, because a
-config key is a second place for the numbers to disagree. They are an operator alert, not a
+config key is a second place for the numbers to disagree. WHICH rule sets a product's levels is
+the rule module's to say (`keel.strategy.rules.sleeve_exit.monitor_rule`/`monitor_params`,
+selected by the registered class since P16 retired R69's duck-typed read), so this module keeps
+its one import, `keel.types`. They are an operator alert, not a
 tested edge: nothing here was tuned (the research freeze, 2026-09-27).
 
 **Spec §7's failure modes, and where each is handled:**
@@ -48,10 +51,10 @@ tested edge: nothing here was tuned (the research freeze, 2026-09-27).
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Sequence
+from collections.abc import Sequence
 from dataclasses import dataclass
 from decimal import Decimal
-from typing import Any, Literal
+from typing import Literal
 
 from keel.types import Candle
 
@@ -189,51 +192,3 @@ def history_days(
     if "sma" in arms:
         needs.append(sma_period + confirm_days - 1)
     return max(needs) + 1
-
-
-#: The rule kind whose params override the defaults for its product (P16's `sleeve_exit`).
-RULE_KIND = "sleeve_exit"
-
-#: Each overridable param and the type `classify` takes it as. A rule's params come back from
-#: the database JSON-plain (strings and lists), so they are coerced here, once.
-_PARAM_TYPES: dict[str, Any] = {
-    "dd_pct": lambda v: Decimal(str(v)),
-    "lookback_days": int,
-    "sma_period": int,
-    "confirm_days": int,
-    "warn_pct": lambda v: Decimal(str(v)),
-    "arms": tuple,
-}
-
-_STATUS_RANK = {"live": 0, "paper": 1}
-
-
-def monitor_rule(
-    sleeve_rules: Iterable[tuple[Any, str]], product_id: str
-) -> tuple[Any, str] | None:
-    """The `(rule, status)` of the `sleeve_exit` rule whose params set `product_id`'s levels, or
-    `None` -- R26's defaults. `sleeve_rules` is the cycle's `(rule, status)` pairs
-    (`agent._sleeve_rules`); a `live` rule wins over a `paper` one, then the lowest rule id."""
-    candidates = [
-        (rule, status)
-        for rule, status in sleeve_rules
-        if getattr(rule, "name", None) == RULE_KIND
-        and getattr(rule, "product_id", None) == product_id
-    ]
-    if not candidates:
-        return None
-    return min(
-        candidates,
-        key=lambda pair: (_STATUS_RANK.get(pair[1], 2), getattr(pair[0], "rule_id", None) or 0),
-    )
-
-
-def monitor_params(sleeve_rules: Iterable[tuple[Any, str]], product_id: str) -> dict[str, Any]:
-    """The `classify` keyword arguments `monitor_rule`'s rule sets for `product_id`, or `{}` --
-    the R26 defaults -- with none. Only the params the rule actually sets are returned, so an
-    unset one keeps its default."""
-    chosen = monitor_rule(sleeve_rules, product_id)
-    if chosen is None:
-        return {}
-    params = getattr(chosen[0], "params", None) or {}
-    return {name: cast(params[name]) for name, cast in _PARAM_TYPES.items() if name in params}

@@ -91,6 +91,7 @@ from keel.strategy import engine, promotion
 from keel.strategy.exit_policy import EXIT_POLICY_OFF, next_stop, policy_for, trailing_atr
 from keel.strategy.paper import PaperTrader
 from keel.strategy.reduction import Reduction
+from keel.strategy.rules import sleeve_exit as sleeve_exit_rule
 from keel.strategy.rules.base import Action, Rule, Setup, Signal, completed_days
 from keel.strategy.rules.cusum_event import CusumEvent
 from keel.strategy.rules.dca import Dca
@@ -98,6 +99,7 @@ from keel.strategy.rules.profit_take import ProfitTake
 from keel.strategy.rules.pullback_continuation import PullbackContinuation
 from keel.strategy.rules.reverse_dca import ReverseDca
 from keel.strategy.rules.rsi_meanrev import RsiMeanReversion
+from keel.strategy.rules.sleeve_exit import SleeveExit
 from keel.strategy.rules.triple_barrier import TripleBarrier
 from keel.strategy.rules.turtle_breakout import TurtleBreakout
 from keel.types import Granularity, Side
@@ -159,6 +161,11 @@ RULE_REGISTRY: dict[str, type[Rule]] = {
     # can show what a trim would do. Not seedable either (R20/R38), although every param it has
     # defaults -- `seedable_kinds` excludes by class, not by whether construction would fail.
     "profit_take": ProfitTake,
+    # #857, spec §7. The third SELL-side kind: the exit monitor's second layer, a whole-sleeve
+    # proposal when the monitor reads `breached`, preview-only (S2) and exempt from
+    # `min_hold_days` (R13, `sleeve.MIN_HOLD_EXEMPT_KINDS`). Its params set the monitor's levels
+    # for its product (`sleeve_exit_rule.monitor_params`). Not seedable (R20/R38/R61).
+    "sleeve_exit": SleeveExit,
 }
 
 
@@ -244,7 +251,10 @@ def build_rule_from_params(kind: str, params: dict[str, Any]) -> Rule:
         kwargs[gran_key] = Granularity(kwargs[gran_key])
 
     for key in rule_cls.tuple_params:
-        if key in kwargs and kwargs[key] is not None:
+        # A JSON STRING where a list belongs is handed to the constructor as it is, to be
+        # refused by name: `tuple("sma")` is `("s", "m", "a")`, which a constructor can only
+        # refuse as three unknown names (P15's held item a).
+        if key in kwargs and kwargs[key] is not None and not isinstance(kwargs[key], str):
             kwargs[key] = tuple(kwargs[key])
 
     return rule_cls(**kwargs)
@@ -1493,7 +1503,8 @@ def _watch_sleeve_exits(
 
     **The levels** are `sleeve_exit.classify` on the product's completed daily bars, at the
     params of a `sleeve_exit` rule on the product when there is one, else R26's module
-    constants (`sleeve_exit.monitor_params`). The record, `sleeve_exit:<product>`, holds
+    constants (`sleeve_exit_rule.monitor_params` -- a rule of the registered class `SleeveExit`,
+    never one merely named `sleeve_exit`, P16). The record, `sleeve_exit:<product>`, holds
     `level`, the bar `ts` it was judged on, `close`, `dd_level` and `sma` (money as `str`),
     `breached_arms`, and `observed_at`, this cycle's clock.
 
@@ -1515,7 +1526,7 @@ def _watch_sleeve_exits(
                     [product_id],
                     [Granularity.ONE_DAY],
                     sleeve_exit.history_days(
-                        **sleeve_exit.monitor_params(sleeve_rules, product_id)
+                        **sleeve_exit_rule.monitor_params(sleeve_rules, product_id)
                     ),
                     now_ts=now_ts,
                 )
@@ -1535,7 +1546,7 @@ def _watch_sleeve_exits(
                 product_id,
                 daily,
                 previous=previous,
-                **sleeve_exit.monitor_params(sleeve_rules, product_id),
+                **sleeve_exit_rule.monitor_params(sleeve_rules, product_id),
             )
             repo.set_state(
                 key,

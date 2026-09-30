@@ -333,8 +333,17 @@ def exit_cmd(ctx: click.Context, preview: bool) -> None:
     config = _load_cfg(ctx)
     repo = _common._open_repo_ro(ctx)
     skipped: list[sleeve_report.SkippedRule] = []
-    rows = sleeve_report.exit_watch_view(repo, config, now_ts=int(time.time()), skipped=skipped)
-    for line in sleeve_report.render_exit_watch(rows, skipped=skipped):
+    skipped_products: list[sleeve_report.SkippedProduct] = []
+    rows = sleeve_report.exit_watch_view(
+        repo,
+        config,
+        now_ts=int(time.time()),
+        skipped=skipped,
+        skipped_products=skipped_products,
+    )
+    for line in sleeve_report.render_exit_watch(
+        rows, skipped=skipped, skipped_products=skipped_products
+    ):
         click.echo(line)
     click.echo(EXIT_PREVIEW_FOOTER)
 
