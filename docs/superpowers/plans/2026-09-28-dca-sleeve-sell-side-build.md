@@ -389,6 +389,24 @@ Each ruling is stated as `what — why — cost if wrong`.
   - Why: "under the 200-day high" over 30 cached bars claims a window that was not judged. A malformed record read as `clear` is the silent direction.
   - Cost if wrong: none. Both are display.
 
+- **R72** (added in P16). R69 is retired. `monitor_rule`/`monitor_params` move from the pure monitor (`keel/execution/sleeve_exit.py`, which keeps its one import, `keel.types`) to the rule module (`keel/strategy/rules/sleeve_exit.py`), and select a rule by the REGISTERED class (`isinstance(rule, SleeveExit)`), not by the name `sleeve_exit`. The params are the constructed rule's (`SleeveExit.monitor_kwargs`), already validated and typed, so the duck-typed coercion table is gone.
+  - Why: a rule merely named `sleeve_exit` set a product's levels from params nothing had checked. The registered class's constructor now refuses a bad row before it is written or loaded.
+  - Cost if wrong: a test double named `sleeve_exit` no longer overrides the levels. The tests use the real class.
+- **R73** (added in P16, P15's held item a). `SleeveExit`'s constructor refuses: `arms` that is not a list or tuple of distinct known arm names (a bare string is refused as one, by name); `lookback_days`, `sma_period` and `confirm_days` that are not positive `int`s (`bool` included); `dd_pct` outside `(0, 100)` and `warn_pct` outside `[0, 100)`, each a finite `Decimal`. `agent.build_rule_from_params` no longer turns a JSON STRING into a tuple of its letters for a `tuple_params` key; it hands the string to the constructor to refuse.
+  - Why: `tuple("sma")` is `("s", "m", "a")`, which the constructor could only refuse as three unknown names. `warn_pct = 0` stays legal because it turns the `near` band off (R65).
+  - Cost if wrong: a `pullback_continuation` row with a string `ema_periods` is now refused by its constructor's own check instead of being split into characters that it refused anyway.
+- **R74** (added in P16, P15's held item b). `keel dca exit --preview` wraps each watched product. A product whose `sleeve_exit:` record is not a mapping, whose recorded level is not a string, whose recorded `observed_at` is not an int, or whose read raises is left out and named on one `SKIPPED <product>: ...` line. Every other product is still reported.
+  - Why: R68's pattern, applied per product. The cycle already wraps each product, so a read-only report must not be less robust than the cycle.
+  - Cost if wrong: a malformed record hides that product's row. The SKIPPED line names it, and doctor reads the same record.
+- **R75** (added in P16, P15's held item c). `sleeve.exit_watch` is sent at WARN only for `near` and `breached`. A first observation ("now watched", including the first judgement after `insufficient_history`), a recovery (back to `clear`) and `insufficient_history` are sent at INFO. keel-core's `notification_event` gains a keyword-only `severity` that may LOWER an occurrence below its key's declared severity (the ceiling) and never raise it; an unknown severity is a `ValueError`.
+  - Why: the taxonomy fixed severity per key, so there was no way to send one occurrence at INFO. Delivery routes on the key (`opted_in`), never on severity, so a lowered event is delivered as before. A WARN on every first look trains the operator to skim the channel the breach arrives on.
+  - Cost if wrong: a receiver that filters on `severity: warn` no longer sees first looks and recoveries. The breach, which is the alert that matters, is still WARN.
+- **R76** (added in P16, P15's held item d, HELD). The `sleeve_exit:` level is recorded by the cycle BEFORE its `sleeve.exit_watch` notification is sent, so an alert whose webhook is down is lost. No retry or outbox pattern exists to reuse. `send_event` makes one attempt by design ("the next cycle re-derives the event if the state persists"). `sleeve.proposal` has the same property and is not retried. #793's attestation ledger re-sends only because attestation events are re-derived from STATE every cycle, while exit-watch events are derived from TRANSITIONS. Applying the ledger here would need either a second key written by the notification layer, which R19 and `tests/test_notifications.py` pin to exactly one, or a notification-owned field on the cycle's record. Both are a design change for the operator to make, not a fix inside P16.
+  - Why held: the level itself is never lost. `keel doctor` WARNs on a `near`/`breached` record every run, and `keel dca exit --preview` prints it. What is lost is the one push message.
+  - Cost if wrong: a breach during a webhook outage is seen at the next `keel doctor` or preview, not on the phone.
+- **R77** (added in P16). P16's PR REFERENCES #857 and does not close it. #857 is the design issue. It was already closed when the spec merged (#859), and P17 and P18 still carry `(#857)` in their titles. The operator stopped the build after P16 (R28), so the gated placement path stays unbuilt and #857's scope is not complete.
+  - Cost if wrong: none. The issue's state does not change either way.
+
 ---
 
 ## File structure
@@ -443,7 +461,7 @@ Each ruling is stated as `what — why — cost if wrong`.
 | P13 | `feat(dca): keel dca trim --preview --view lots and --view bands (#857)` | — | M | none |
 | P14 | `feat(rules): profit_take in preview, and --view gain as trim's default (#857)` | — | M | none |
 | P15 | `feat(execution): the sleeve exit monitor -- transition alerts, doctor, keel dca exit --preview (#857)` | — | M | none |
-| P16 | `feat(rules): sleeve_exit, preview-only (#857)` | #857 | S | none |
+| P16 | `feat(rules): sleeve_exit, preview-only (#857)` | refs #857 (R77) | S | none |
 | P17 | `feat(autonomy): keel autonomy on --sells -- a separate, TTY-armed sells window, schema v23 (#857)` | — | M | **v23** |
 | P18 | `feat(dca): --confirm <proposal-id> places one sleeve sale behind the sells window and a typed yes (#857)` | — | M | none |
 
