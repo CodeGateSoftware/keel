@@ -138,6 +138,42 @@ def test_a_declared_close_releases_the_exposure_rails_4_5_6_read(repo: Repositor
     assert repo.get_open_positions("PAXG-USD") == []
 
 
+def test_the_exposure_a_declared_close_releases_stays_released_on_the_next_buy(
+    repo: Repository,
+) -> None:
+    """#943: R33 zeroed a fully closed product only while it stayed flat, so the closed tranche's
+    realized loss ($3.61 on tranche 3's own numbers) came straight back with the product's next
+    BUY -- and PAXG has a live DCA rule, so that is one 14-day cadence after the first declared
+    close. The reset now attaches to the moment the close went flat: the next buy's exposure is
+    its own full quote, fee included."""
+    pid = _tranche(repo)
+    _close(repo, pid)
+    assert "PAXG" not in guards._open_exposure_by_asset(repo)
+
+    repo.insert_order(
+        dict(  # the next PAXG DCA buy, recorded the way #905 records it (#900)
+            mode="live",
+            product_id="PAXG-USD",
+            side="BUY",
+            order_type="market",
+            qty=Decimal("0.005"),
+            filled_quantity=Decimal("0.0049"),
+            limit_price=None,
+            status="filled",
+            fee=Decimal("0.40"),
+            expected_fill=Decimal("4000"),
+            actual_fill=Decimal("4000"),
+            raw_response=None,
+            confirmation="autonomous",
+            rule_id=None,
+            created_at=NOW_TS + 3_600,
+            updated_at=NOW_TS + 3_600,
+        )
+    )
+
+    assert guards._open_exposure_by_asset(repo) == {"PAXG": Decimal("20.00")}
+
+
 def test_the_sell_is_sized_from_the_tranche_not_from_the_order_log(repo: Repository) -> None:
     """#900: the ledger, not the orders log, is what a close books -- so when #900 corrects
     tranche quantities to the venue's filled size, a declared close follows the correction and
