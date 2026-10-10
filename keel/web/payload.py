@@ -124,6 +124,7 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
     from keel.commands.dca_plan import BuyCap, DcaPlan
     from keel.commands.evidence_matrix import MatrixReport, MatrixRow
     from keel.commands.gauntlet import GauntletReport, GauntletRow
+    from keel.commands.holdings import HoldingRow, HoldingsReport
     from keel.commands.insights import (
         AccountSummary,
         EquityCurve,
@@ -826,8 +827,11 @@ def _session_payload(session: MarketSessionStatus) -> dict[str, Any]:
     }
 
 
-def _bracket_field(position: OpenPositionStatus, mode: str) -> Field:
+def _bracket_field(has_bracket: bool, initial_stop: Decimal | None, mode: str) -> Field:
     """The `bracket` column for one open position (#641).
+
+    Takes the two facts it judges on rather than a row, so Pulse's `OpenPositionStatus` and
+    Holdings' tranche (`HoldingRow`) are judged by this one function and cannot disagree.
 
     Live's meaning is untouched and load-bearing: `NO bracket` there names a real venue-order
     gap -- exactly the state `reconcile_unbracketed_positions` and the `unbracketed:` crash
@@ -843,16 +847,16 @@ def _bracket_field(position: OpenPositionStatus, mode: str) -> Field:
     predates that migration, or a DCA leg that never got one, has no number to show and says so
     (NEUTRAL, not WARN) rather than asserting one it does not have.
     """
-    if position.has_bracket or mode != "paper":
+    if has_bracket or mode != "paper":
         return flag(
-            position.has_bracket,
+            has_bracket,
             on="bracketed",
             off="NO bracket",
             on_state=GOOD,
             off_state=WARN,
         )
-    if position.initial_stop is not None:
-        stop = money(position.initial_stop)
+    if initial_stop is not None:
+        stop = money(initial_stop)
         return label(stop["value"], display=f"paper stop {stop['display']}", state=NEUTRAL)
     return label("n/a", display="n/a -- paper resolves stop/target on candle touch", state=NEUTRAL)
 
@@ -909,7 +913,7 @@ def _position_payload(position: OpenPositionStatus, mode: str) -> dict[str, Any]
         "qty": quantity(position.qty),
         "entry_price": money(position.entry_price),
         "opened_at": moment(position.opened_at),
-        "bracket": _bracket_field(position, mode),
+        "bracket": _bracket_field(position.has_bracket, position.initial_stop, mode),
     }
 
 
@@ -2067,6 +2071,25 @@ def _cancel_payload(decision: Any) -> dict[str, Any]:
     }
 
 
+def _divergence_state(adverse: bool | None) -> str:
+    """The state of a fill divergence, from the SERVICE's verdict (`fill_divergence_adverse`).
+
+    A negative divergence is GOOD on a sell and BAD on a buy, so `money`'s own sign-derived state
+    would be wrong on half the rows -- which is why the state is passed rather than inferred. One
+    expression, shared by the Orders rows and the Holdings tranches."""
+    return NEUTRAL if adverse is None else (BAD if adverse else GOOD)
+
+
+def _placement_field(is_autonomous: bool, confirmation: str) -> Field:
+    return flag(
+        is_autonomous,
+        on="AUTONOMOUS",
+        off=confirmation or "unrecorded",
+        on_state=WARN,
+        off_state=NEUTRAL,
+    )
+
+
 def _order_row_payload(row: OrderRow) -> dict[str, Any]:
     """One `OrderRow`, placed. Nothing is decided here.
 
@@ -2097,13 +2120,7 @@ def _order_row_payload(row: OrderRow) -> dict[str, Any]:
         # FIRST, and that is the layout argument rather than a JSON convention: on a deployment
         # running `autonomy: ON`, "did I approve this, or did keel place it alone" is the most
         # important thing about an order. The client renders keys in this order.
-        "placement": flag(
-            row.confirmation_is_autonomous,
-            on="AUTONOMOUS",
-            off=row.confirmation or "unrecorded",
-            on_state=WARN,
-            off_state=NEUTRAL,
-        ),
+        "placement": _placement_field(row.confirmation_is_autonomous, row.confirmation),
         "placement_note": row.confirmation_detail,
         "confirmation": label(row.confirmation or "unrecorded", state=NEUTRAL),
         "id": count(row.id),
@@ -2125,14 +2142,7 @@ def _order_row_payload(row: OrderRow) -> dict[str, Any]:
         "fill_divergence": money(
             row.fill_divergence,
             signed=True,
-            # The service decided this. A negative divergence is GOOD on a sell and BAD on a
-            # buy, so `money`'s own sign-derived state would be wrong on half the rows -- which
-            # is why the state is passed rather than inferred.
-            state=(
-                NEUTRAL
-                if row.fill_divergence_adverse is None
-                else (BAD if row.fill_divergence_adverse else GOOD)
-            ),
+            state=_divergence_state(row.fill_divergence_adverse),
         ),
         "fill_divergence_adverse": flag(
             row.fill_divergence_adverse,
@@ -2347,6 +2357,80 @@ def positions_payload(report: PositionsReport) -> dict[str, Any]:
         "open_count": count(report.open_count),
         "products": [str(product) for product in report.products],
         "rows": [_position_row_payload(row) for row in report.rows],
+    }
+
+
+def _unknown_fill() -> Field:
+    """A figure the join could not supply: the word "unknown", never `absent()`'s dash and never a
+    zero. A tranche whose entry order was not identified has no slippage to report, and a blank or
+    a `$0.00` there would read as "no slippage" -- a claim nobody made."""
+    return {"value": "", "display": "unknown", "state": UNKNOWN}
+
+
+def _holding_row_payload(row: HoldingRow, mode: str) -> dict[str, Any]:
+    """One open tranche for the Holdings view, placed. Nothing is decided here.
+
+    The cost, the join and the slippage verdict are the service's (`keel/commands/holdings.py`);
+    this function chooses states and symbols. NO mark, market value, unrealized P&L or stop
+    distance: the view is about what each tranche cost and how it was entered, and `PositionRow`
+    keeps those figures for `keel positions` and the balances view.
+
+    When no entry order was identified the placement and the three fill figures cross as UNKNOWN
+    (`_unknown_fill`), with the service's own sentence as the placement display -- never absent
+    and never zero.
+    """
+    p, o = row.position, row.entry_order
+    if o is None:
+        placement = label("unknown", display=row.entry_order_note, state=UNKNOWN)
+        expected, actual, divergence = _unknown_fill(), _unknown_fill(), _unknown_fill()
+    else:
+        placement = _placement_field(o.confirmation_is_autonomous, o.confirmation)
+        expected = money(o.expected_fill)
+        actual = money(o.actual_fill)
+        divergence = money(
+            o.fill_divergence, signed=True, state=_divergence_state(o.fill_divergence_adverse)
+        )
+    return {
+        "id": str(p.id),
+        "product_id": p.product_id,
+        "rule_name": p.rule_name,
+        "opened_at": moment(p.opened_at),
+        "qty": quantity(p.qty),
+        "entry_fill": money(p.entry_fill),
+        "entry_fee": money(p.entry_fee),
+        "cost": money(row.cost),
+        "stop": money(p.initial_stop),
+        "bracket": _bracket_field(row.has_bracket, p.initial_stop, mode),
+        "freshness": _readiness_field(p.ready, p.ready_reason),
+        "attestation": _attestation_chip(p),
+        "attest_due_at": moment(p.attest_due_ts),
+        "placement": placement,
+        "expected_fill": expected,
+        "actual_fill": actual,
+        "fill_divergence": divergence,
+        "entry_order_id": "" if o is None else str(o.id),
+        "realized_qty": quantity(p.realized_qty),
+        "realized_proceeds": money(p.realized_proceeds),
+        "realized_fees": money(p.realized_fees),
+    }
+
+
+def holdings_payload(report: HoldingsReport) -> dict[str, Any]:
+    """`gather_holdings`'s `HoldingsReport`, as JSON.
+
+    `open_count`, `rules` and `stop_rows_present` are READ from the report (Rule 6e bans `len()`
+    here). `rules` is the grouping key, in the report's own order; `stop_rows_present` lists the
+    tranche ids that carry a stop, so the view draws its stop column on that list being non-empty
+    and never by reading a `display` or `value`.
+    """
+    return {
+        "as_of": iso(report.now_ts),
+        "generated_at": moment(report.now_ts),
+        "mode": report.mode,
+        "open_count": count(report.open_count),
+        "rules": [str(rule) for rule in report.rules],
+        "stop_rows_present": [str(i) for i in report.stop_row_ids],
+        "rows": [_holding_row_payload(row, report.mode) for row in report.rows],
     }
 
 
