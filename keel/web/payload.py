@@ -144,6 +144,7 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
     from keel.commands.orders import OrderRow, OrdersReport
     from keel.commands.plans import Claim, PlansReport, Tier, Trigger
     from keel.commands.positions import PositionRow, PositionsReport
+    from keel.commands.pulse import PulseReport
     from keel.commands.research_record import RuleExploration, TrialRow, TrialsReport
     from keel.commands.slippage import SlippageReport, SlippageRow
     from keel.commands.status import (
@@ -962,6 +963,34 @@ def _subscription_payload(row: SubscriptionStatusRow) -> dict[str, Any]:
     }
 
 
+def _equity_payload(report: StatusReport) -> dict[str, Any]:
+    return {
+        "state_mode": label(report.equity_state_mode),
+        "high_water_mark": money(report.high_water_mark),
+        "paper_cash": money(report.paper_cash_usdc),
+    }
+
+
+def _drawdown_payload(report: StatusReport) -> dict[str, Any]:
+    return {
+        "total": ratio(report.drawdown_total_pct),
+        "weekly": ratio(report.drawdown_weekly_pct),
+        "max_total": ratio(report.max_total_dd_pct),
+        "max_weekly": ratio(report.max_weekly_dd_pct),
+        "rail11": label(report.rail11_status, state=_rail_state(report.rail11_status)),
+    }
+
+
+def _rule_counts_payload(report: StatusReport) -> list[dict[str, Any]]:
+    """A LIST of pairs rather than an object, because the order is a presentation decision and
+    Rule 2 says presentation decisions are made here. `sorted` matches `render_human`'s own
+    ordering, so the two front-ends list the statuses the same way."""
+    return [
+        {"status": status, "count": count(number)}
+        for status, number in sorted(report.rule_counts.items())
+    ]
+
+
 def status_payload(report: StatusReport) -> dict[str, Any]:
     """`gather_status`'s `StatusReport`, as JSON. Serialises; never re-gathers."""
     session_defused = bool(report.market_session.defused)
@@ -978,30 +1007,103 @@ def status_payload(report: StatusReport) -> dict[str, Any]:
         ),
         "autonomy": _autonomy_payload(report.autonomy),
         "market_session": _session_payload(report.market_session),
-        "equity": {
-            "state_mode": label(report.equity_state_mode),
-            "high_water_mark": money(report.high_water_mark),
-            "paper_cash": money(report.paper_cash_usdc),
-        },
-        "drawdown": {
-            "total": ratio(report.drawdown_total_pct),
-            "weekly": ratio(report.drawdown_weekly_pct),
-            "max_total": ratio(report.max_total_dd_pct),
-            "max_weekly": ratio(report.max_weekly_dd_pct),
-            "rail11": label(report.rail11_status, state=_rail_state(report.rail11_status)),
-        },
+        "equity": _equity_payload(report),
+        "drawdown": _drawdown_payload(report),
         "withdrawal_attestation": _attestation_payload(report.withdrawal_attestation),
         "open_positions": [_position_payload(p, report.mode) for p in report.open_positions],
-        # A LIST of pairs rather than an object, because the order is a presentation decision and
-        # Rule 2 says presentation decisions are made here. `sorted` matches `render_human`'s own
-        # ordering, so the two front-ends list the statuses the same way.
-        "rule_counts": [
-            {"status": status, "count": count(number)}
-            for status, number in sorted(report.rule_counts.items())
-        ],
+        "rule_counts": _rule_counts_payload(report),
         "live_rules": [_rule_payload(r) for r in report.live_rules],
         "data_freshness": [_freshness_payload(f, session_defused) for f in report.data_freshness],
         "subscriptions": [_subscription_payload(s) for s in report.subscriptions],
+    }
+
+
+# -- pulse (console PR1) ---------------------------------------------------------------------------
+
+#: Said once beside the DCA rows, never per row. The engine keys a buy off the COMPLETED daily
+#: bar's day (`Dca.detect`), so the console names a cadence DAY and the fixed way it becomes an
+#: order; when the cycle runs is the scheduler's business and is not restated here.
+NEXT_DCA_NOTE = "placed by the first cycle after that day's daily bar closes"
+
+
+def pulse_payload(report: PulseReport, *, gate: str = "") -> dict[str, Any]:
+    """`gather_pulse`'s `PulseReport`, as JSON -- the glance page, and the one place the console
+    offers a write.
+
+    Serialises the status sections through the SAME helpers `status_payload` uses (a Pulse that
+    re-worded the kill switch or the bracket warning would be two answers to one question), then
+    adds what only Pulse holds: today's counts, the why-not sentences (the engine's own words,
+    crossing unchanged), the next DCA cadence days, and the unbracketed roll-call.
+
+    `halt.resume_command` is `"keel resume"` while the kill switch is engaged and `""` otherwise.
+    The client may not read `Field.value`, so "HALT button or HALTED line" must arrive as
+    structure: the PRESENCE of that string is the branch, and the command itself comes from the
+    service so the console names `keel resume` without ever offering to run it.
+
+    `gate` is the halt route's token as a bare string, like `setup`'s CSRF token: sent for
+    `actions.js` to hold, never displayed, and not a credential without the session cookie. It
+    is the caller's to supply (`api.read_pulse`), because only the caller holds the config's
+    secret."""
+    status = report.status
+    session_defused = bool(status.market_session.defused)
+    today = report.today
+    return {
+        "as_of": iso(report.now_ts),
+        "generated_at": moment(report.now_ts),
+        "mode": status.mode,
+        "gate": str(gate),
+        "kill_switch": flag(
+            status.kill_switch_engaged,
+            on="ENGAGED",
+            off="clear",
+            on_state=BAD,
+            off_state=GOOD,
+        ),
+        "halt": {"resume_command": report.resume_command},
+        "autonomy": _autonomy_payload(status.autonomy),
+        "drawdown": _drawdown_payload(status),
+        "equity": _equity_payload(status),
+        "withdrawal_attestation": _attestation_payload(status.withdrawal_attestation),
+        "market_session": _session_payload(status.market_session),
+        "last_cycle_at": moment(report.last_cycle_ts),
+        "today": {
+            "cycles": count(today.cycles),
+            "signals": count(today.signals),
+            "blocked": count(today.blocked, state=WARN if today.blocked else NEUTRAL),
+            "entered": count(today.entered),
+            "exited": count(today.exited),
+            "errors": count(today.errors, state=BAD if today.errors else NEUTRAL),
+        },
+        "why_not": list(report.why_not),
+        "next_dca": [
+            {
+                "rule_id": str(buy.rule_id),
+                "product_id": buy.product_id,
+                "cadence": _dca_cadence(buy.cadence_days),
+                "budget": money(buy.budget_usd),
+                "budget_inferred": flag(
+                    buy.budget_inferred,
+                    on="inferred — no budget_usd stored",
+                    off="stored",
+                    on_state=WARN,
+                    off_state=NEUTRAL,
+                ),
+                "next_cadence_day": moment(buy.next_cadence_day_ts),
+            }
+            for buy in report.next_dca
+        ],
+        "next_dca_note": NEXT_DCA_NOTE,
+        "open_positions": [_position_payload(p, status.mode) for p in status.open_positions],
+        # The count is the SERVICE's (Rule 6e: no `len()` on the wire). Unbracketed live tranches
+        # are the #641 hazard, so any at all is a warning.
+        "unbracketed_count": count(
+            report.unbracketed_count, state=WARN if report.unbracketed_count else NEUTRAL
+        ),
+        "rule_counts": _rule_counts_payload(status),
+        "live_rules": [_rule_payload(r) for r in status.live_rules],
+        "data_freshness": [_freshness_payload(f, session_defused) for f in status.data_freshness],
+        "subscriptions": [_subscription_payload(s) for s in status.subscriptions],
+        "activity": activity_payload(report.feed),
     }
 
 
