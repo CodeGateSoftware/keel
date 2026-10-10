@@ -703,7 +703,7 @@ def test_the_install_identity_and_the_start_url_are_unchanged() -> None:
     lives in the terminal. Moving `start_url` would have relocated the failure, not removed it."""
     manifest = json.loads(_MANIFEST.read_text(encoding="utf-8"))
     assert manifest["id"] == "/"
-    assert manifest["start_url"] == "/status"
+    assert manifest["start_url"] == "/pulse"
 
 
 def test_a_refusal_is_not_painted_as_an_outage(running: server.ServeConfig) -> None:
@@ -723,7 +723,7 @@ def test_a_refusal_is_not_painted_as_an_outage(running: server.ServeConfig) -> N
     """
     connection = http.client.HTTPConnection(running.host, running.port, timeout=10)
     try:
-        connection.request("GET", "/api/status", headers={"Host": f"{running.host}:{running.port}"})
+        connection.request("GET", "/api/pulse", headers={"Host": f"{running.host}:{running.port}"})
         response = connection.getresponse()
         refusal = json.loads(response.read().decode("utf-8"))
     finally:

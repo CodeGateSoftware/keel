@@ -121,9 +121,8 @@
   </a>
   <nav aria-label="Views">
     <ul>
-      <li><a href="/status">Status</a></li>
+      <li><a href="/pulse">Pulse</a></li>
       <li><a href="/setup">Setup</a></li>
-      <li><a href="/activity">Activity</a></li>
       <li><a href="/orders">Orders</a></li>
       <li><a href="/positions">Positions</a></li>
       <li><a href="/balances">Balances</a></li>
@@ -132,10 +131,9 @@
       <li><a href="/research">Research</a></li>
       <li><a href="/rules">Rules</a></li>
       <li><a href="/venues">Venues</a></li>
-      <li><a href="/gates">Gates</a></li>
       <!--
-        #706. Beside Gates because it belongs to the same half of the app: what this deployment is
-        allowed to do, and what it costs. A transparency artifact rather than a paywall matrix --
+        #706. Last of the views because it is the odd one out: not this deployment's state at all,
+        but what this deployment is allowed to do, and what it costs. A transparency artifact rather than a paywall matrix --
         it lists what is free forever and why, and there is nothing on it to buy.
       -->
       <li><a href="/plans">Plans</a></li>
@@ -294,7 +292,7 @@
 
   Above `#view` rather than inside it, because the thing it reports is true of the deployment and
   not of the page: rail 17 expired on 2026-09-08 and `keel` placed no orders for three days while
-  the state sat in a card on the Status page, which is one page of eleven. Here it is on whichever
+  the state sat in a card on the Status page (Pulse now), which is one page of eleven. Here it is on whichever
   page the operator is actually reading.
 
   Below the skip link's target for `#mode-banner`'s own reason, and with no `aria-live`: this
@@ -320,7 +318,7 @@
       </p>
       <p>
         The server-rendered pages need no scripting at all and show the same data:
-        <a href="/">open the status page</a>.
+        <a href="/">open the Pulse page</a>.
       </p>
     </div>
   </noscript>

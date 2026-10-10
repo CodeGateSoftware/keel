@@ -46,7 +46,7 @@ STATIC_ROOT = Path(__file__).resolve().parent / "static"
 #:
 #: **The consequence worth stating: this prefix no longer NARROWS anything.** While it was
 #: `/static/`, `url_path.startswith(STATIC_PREFIX)` was itself a filter, and `resolve_static_asset`
-#: could not be reached by a request for `/api/status`. At `/` every path passes that test, so the
+#: could not be reached by a request for `/api/pulse`. At `/` every path passes that test, so the
 #: containment check in `resolve_static_asset` -- `resolve()` then `relative_to()` -- is the only
 #: thing keeping a request inside the static root, and `server.do_GET` orders `/api/` ahead of
 #: static resolution rather than relying on the prefix to separate them.
@@ -137,9 +137,8 @@ def resolve_static_asset(root: Path, url_path: str) -> Path | None:
 #: `main.js`'s `ROUTES` and compares it to this tuple, so a view added on one side without the
 #: other fails the build rather than 404ing in a browser nobody is running in CI.
 CLIENT_ROUTES: tuple[str, ...] = (
-    "status",
+    "pulse",
     "setup",
-    "activity",
     "orders",
     "positions",
     "balances",
@@ -148,7 +147,6 @@ CLIENT_ROUTES: tuple[str, ...] = (
     "research",
     "rules",
     "venues",
-    "gates",
     "plans",
 )
 

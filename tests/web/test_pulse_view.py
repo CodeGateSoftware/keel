@@ -1,0 +1,180 @@
+"""Pulse, the console's home view, and its one write: HALT (console PR1).
+
+Pulse replaced Status, Activity and Gates. It is the glance page -- what keel did today, what
+stopped it, what it will do next -- and the one place the browser may stop the engine. These
+tests pin the SHAPE of that: where the route sits, that the three retired views are gone from
+every table, and that the halt is wired the way `keel/web/gates.py` says it must be ("stopping
+must never be slower than starting") without ever offering the way back.
+
+**What no test in this file covers.** There is no JavaScript runtime in this suite (see
+`test_client_assets.py`'s header). Every assertion is over the SOURCE TEXT, so each one asserts a
+COUNT or a PAIRING rather than a substring -- `test_view_sections.py` records why: a scan for a
+name passes on its declaration alone. That the button halts, that the native confirm appears and
+that the HALTED line replaces the button on the next read are properties of a browser, checked by
+hand against a running `keel serve` on a throwaway copy of a deployment.
+"""
+
+from __future__ import annotations
+
+import json
+import re
+
+from keel.web import gates, staticfiles
+from tests.web.test_client_assets import (
+    _INDEX,
+    _MODULES,
+    _STATIC,
+    _code_only,
+    _comments_stripped,
+    _function_body,
+    _js_route_names,
+    _source,
+)
+from tests.web.test_view_sections import _decl
+
+
+def _pulse_region() -> str:
+    """`pulseView` and everything up to the next export -- the region `_view_keys` scans too."""
+    code = _comments_stripped(_source("render.js"))
+    start = code.index("export function pulseView(")
+    end = code.find("\nexport function ", start + 1)
+    return code[start:end]
+
+
+def test_pulse_is_the_first_route_in_both_tables_and_the_default() -> None:
+    main = _code_only(_source("main.js"))
+
+    assert _js_route_names()[0] == "pulse"
+    assert staticfiles.CLIENT_ROUTES[0] == "pulse"
+    assert _decl(main, "DEFAULT_ROUTE").strip() == "const DEFAULT_ROUTE = ROUTES[0];"
+
+
+def test_the_retired_views_are_gone_from_every_table() -> None:
+    retired = {"status", "activity", "gates"}
+    index = _INDEX.read_text(encoding="utf-8")
+    hrefs = re.findall(r'<li><a href="([^"]+)">', index)
+    render = _code_only(_source("render.js"))
+    main = _code_only(_source("main.js"))
+
+    assert retired.isdisjoint(_js_route_names())
+    assert retired.isdisjoint(staticfiles.CLIENT_ROUTES)
+    assert hrefs, "the nav scan found no links; it has stopped working"
+    assert retired.isdisjoint({href.rsplit("/", 1)[-1] for href in hrefs})
+    for name in ("statusView", "activityView", "gatesView"):
+        assert f"export function {name}(" not in render, name
+        assert name not in main, name
+    assert len(re.findall(r"route\.name === \"(?:activity|gates)\"", _comments_stripped(main))) == 0
+    # The fallthrough is the home view, so an unrecognised route lands somewhere that renders.
+    mount = _function_body(_source("main.js"), "mount").split("\n}\n")[0]
+    assert mount.endswith("  return pulseView(data);"), "mount's fallthrough must be the home view"
+
+
+def test_the_halt_control_is_one_form_with_one_button_or_one_resume_line() -> None:
+    body = _function_body(_source("render.js"), "haltControl")
+
+    assert body.count('el("form"') == 1
+    assert body.count('el("button"') == 1
+    assert body.count('"data-action", "halt"') == 1
+    # The one `<code>` is the payload's own string, placed unread.
+    assert body.count('el("code"') == 1
+    codes = re.findall(r'el\("code", undefined, ([^)]*\)?)\)', body)
+    assert codes == ["plain(data.halt.resume_command)"]
+    # The console names `keel resume` from the payload and nowhere in its own source.
+    assert "keel resume" not in _comments_stripped(_source("render.js"))
+
+
+def test_the_halt_branch_is_presence_of_the_resume_command() -> None:
+    body = _function_body(_source("render.js"), "haltControl")
+
+    assert re.findall(r"\bif \(([^\n]*)\) \{", body) == ["plain(data.halt.resume_command)"]
+    assert ".value" not in body
+
+
+def test_pulse_view_offers_no_resume_and_names_no_phrase() -> None:
+    phrases = [action.phrase for action in gates.TIER1_ACTIONS.values()]
+    assert phrases, "the gate table is empty; the scan below would pass by vacuum"
+    for name in _MODULES:
+        raw = _source(name)
+        stripped = _comments_stripped(raw)
+        assert "gates/resume" not in stripped, name
+        for key in gates.TIER1_ACTIONS:
+            assert "gates/" + key not in stripped, (name, key)
+        for phrase in phrases:
+            assert phrase not in raw, (name, phrase)
+
+
+def test_main_confirms_once_before_the_halt_and_never_elsewhere() -> None:
+    main = _comments_stripped(_source("main.js"))
+    code = _code_only(_source("main.js"))
+
+    assert code.count("confirm(") == 1
+    assert len(re.findall(r"\bhalt\(", code)) == 1
+
+    start = main.index('contentNode.addEventListener("submit"')
+    listener = main[start : main.index("\n});", start)]
+    branch = listener.index('key === "halt"')
+    confirm = listener.index("window.confirm(HALT_CONFIRM)")
+    called = listener.index("halt()")
+    generic = listener.index("perform(key, values)")
+    assert branch < confirm < called < generic
+    # The halt branch ends in a return, so the generic setup action never runs for it.
+    assert "return;" in listener[called:generic]
+
+    declared = re.findall(r'^const HALT_CONFIRM = "([^"\n]*)";$', main, re.M)
+    assert declared == ["Halt keel? Resuming requires `keel resume` at a terminal."]
+
+
+def test_the_gate_token_lives_only_in_the_write_boundary() -> None:
+    assert "let gate" in _code_only(_source("actions.js"))
+    assert "headers" not in _code_only(_source("actions.js")).lower()
+    transport = _code_only(_source("api.js"))
+    assert "let gate" not in transport and "const gate" not in transport
+
+    senders = [name for name in _MODULES if "X-Keel-Gate" in _comments_stripped(_source(name))]
+    assert senders == ["api.js"]
+    holders = [name for name in _MODULES if "data.gate" in _code_only(_source(name))]
+    assert holders == ["actions.js"]
+
+
+def test_api_js_posts_to_exactly_two_paths() -> None:
+    paths = re.findall(r'API_PREFIX \+ "([^"]+)"', _comments_stripped(_source("api.js")))
+
+    # `read` builds its URL from a variable; the two literals are the two writes.
+    assert sorted(paths) == ["gates/halt", "setup/"]
+    assert len(paths) == 2
+
+
+def test_the_pulse_view_places_every_section_once() -> None:
+    body = _function_body(_source("render.js"), "pulseView")
+    sections = (
+        "pulseState",
+        "haltControl",
+        "pulseToday",
+        "pulseWhyNot",
+        "pulseNextDca",
+        "pulsePositions",
+        "pulseFreshness",
+        "pulseSubscriptions",
+        "pulseCycles",
+    )
+
+    assert {name: body.count(name + "(") for name in sections} == dict.fromkeys(sections, 1)
+
+
+def test_pulse_tables_pair_headers_and_cells() -> None:
+    """The generic pairing scan (`test_every_table_emits_one_cell_per_declared_header`) covers
+    the pulse tables once they are found in its input; this pins that they are found."""
+    from tests.web.test_client_assets import _table_calls
+
+    region = _code_only(_pulse_region())
+    pairs = _table_calls(region)
+
+    assert len(pairs) >= 4, f"the pulse region holds {len(pairs)} tables"
+    assert [pair for pair in pairs if pair[0] != pair[1]] == []
+
+
+def test_the_manifest_starts_at_pulse() -> None:
+    manifest = json.loads((_STATIC / "manifest.webmanifest").read_text(encoding="utf-8"))
+
+    assert manifest["start_url"] == "/pulse"
+    assert manifest["id"] == "/"

@@ -627,86 +627,95 @@ export function refusedView(reading, onReconnect) {
 }
 
 /**
- * The status view: `/api/status`'s payload, in the order `/` renders it today.
+ * Pulse, the home view: `/api/pulse`'s payload -- what keel did today, what stopped it, what it
+ * will do next, and the one control that can stop it (console PR1).
  *
- * ── PARITY, AND THE FIVE PLACES IT IS DELIBERATELY NOT BYTE-FOR-BYTE ─────────────────────────
+ * It replaced Status, Activity and Gates, and keeps their information in one scroll rather than
+ * three pages: a glance page with tabs hides the thing you came to glance at, so this is not
+ * `sectioned`. The order is the order of the questions an operator brings -- can I stop it, is it
+ * alive, what did it do, why did it not trade, what comes next, what is it holding, is its data
+ * fresh -- with the cycle log last, because it is the longest and the least urgent.
  *
- * The acceptance criterion is parity with what `/` renders today. Measured against the running
- * code rather than read off the source, today's `render_status` reaches for five attributes that
- * do not exist on the report dataclasses, through `getattr(..., default)` calls that swallow the
- * mismatch, so the page renders a wrong or blank value with no error anywhere:
+ * Everything on it crosses the wire already judged. The two sentences the page shows that the
+ * payload does not carry as a `Field` -- the why-not reasons and the DCA note -- are the engine's
+ * own words (`keel/commands/pulse.py`, `payload.NEXT_DCA_NOTE`) and are placed unchanged.
  *
- *   `autonomy.enabled`      -- `AutonomyStatus` has `live` / `autonomous`. The page prints "off"
- *                              for a deployment placing orders unattended.
- *   `attestation.expired`   -- `WithdrawalAttestationStatus` has `state`. The page prints
- *                              "fresh", in green, for an EXPIRED rail-17 attestation, which is a
- *                              state that halts live entries.
- *   `position.entry_fill`   -- the field is `entry_price`. Every entry price renders `--`.
- *   `rule.name`             -- `RuleSummary` has `id` / `kind` / `status`. The column is blank.
- *   `subscription.status`,
- *   `subscription.attested_ts` -- the fields are `stored_status` / `effective_status`; there is
- *                              no attested timestamp on the row at all. Both columns are blank.
- *
- * This view shows the values the API sends, which are the correct ones. Parity is on the
- * INFORMATION -- the same sections, in the same order, answering the same questions -- and not
- * on the five wrong outputs. Reproducing them would mean writing code whose only purpose is to
- * be wrong in the same way, and the fix belongs in `render.py` (or arrives free when #540
- * deletes it).
- *
- * Two things this view adds that `/` does not show at all: the market session card, because
- * `MarketSessionStatus` exists to "name the state that gates the cycle, on its own line, before
- * an operator has to wonder why nothing trades", and the `bracket` column on open positions,
- * because an unbracketed position is a position with no stop.
- *
- * @param {any} data  `/api/status`'s `data`, known non-null by the caller.
- * @param {string} [section]  which section to show -- a `STATUS_SECTIONS` key, or `""`.
- * @param {(key: string) => void} [onSection]  omitted, and the whole page renders. See `sectioned`.
+ * @param {any} data  `/api/pulse`'s `data`, known non-null by the caller.
  * @returns {DocumentFragment}
  */
-export function statusView(data, section, onSection) {
+export function pulseView(data) {
   const fragment = document.createDocumentFragment();
-  fragment.append(el("h1", undefined, "Status"));
+  fragment.append(el("h1", undefined, "Pulse"));
 
   const sub = el("p", "sub");
   sub.append(field(data.generated_at));
   fragment.append(sub);
 
-  fragment.append(sectioned(data, STATUS_SECTIONS, section, onSection, "Status section"));
+  fragment.append(haltControl(data));
+  fragment.append(pulseState(data));
+  fragment.append(pulseToday(data));
+  fragment.append(pulseWhyNot(data));
+  fragment.append(pulseNextDca(data));
+  fragment.append(pulsePositions(data));
+  fragment.append(pulseRules(data));
+  fragment.append(pulseFreshness(data));
+  fragment.append(pulseSubscriptions(data));
+  fragment.append(pulseCycles(data));
   return fragment;
 }
 
 /**
- * The five sections of the status page, in the order it used to scroll them.
+ * The halt: one button while keel is running, one line while it is halted.
  *
- * **Reading order is preserved, and that is the point of a table rather than five branches.** An
- * operator who knew where "Data freshness" sat on the long page finds its tab in the same place,
- * and the tab bar cannot list a section the page has no builder for -- the two come from one
- * declaration.
+ * **The branch is the PRESENCE of `data.halt.resume_command`**, which the payload sends as the
+ * command when the kill switch is engaged and as `""` otherwise. This file may not read a
+ * `Field`'s value to decide anything, so "button or line" has to arrive as structure, and the
+ * accepted pattern for that is branching on a payload string being there (`cancelCell` did, and
+ * so did the activity note). The command itself is the payload's too: this source never spells
+ * it, so the console can say how to resume without ever being able to.
  *
- * **The label is written ONCE and serves as both the tab and the section's own heading**, which
- * is why every builder below takes the entry it was reached through. A tab reading "Open
- * positions" over a heading reading something else is a drift this shape cannot have.
+ * **There is no resume control, here or anywhere in the client.** Releasing the halt is a Tier 1
+ * ceremony that stays at a terminal; the line below names the command and offers nothing to
+ * press. The confirm and the request belong to `main.js` and `actions.js` -- this builds a form
+ * with `data-action="halt"` and a button, and nothing in it can send.
  *
- * @type {Section[]}
+ * @param {any} data
+ * @returns {HTMLElement}
  */
-const STATUS_SECTIONS = [
-  { key: "status", label: "Status", build: statusState },
-  { key: "positions", label: "Open positions", build: statusPositions },
-  { key: "rules", label: "Rules", build: statusRules },
-  { key: "freshness", label: "Data freshness", build: statusFreshness },
-  { key: "subscriptions", label: "Subscriptions", build: statusSubscriptions },
-];
+function haltControl(data) {
+  const card = el("div", "card halt");
+  if (plain(data.halt.resume_command)) {
+    const line = el("p", "halted");
+    line.append(
+      el("strong", undefined, "HALTED"),
+      " — resume with ",
+      el("code", undefined, plain(data.halt.resume_command)),
+      " at a terminal.",
+    );
+    card.append(line);
+    return card;
+  }
+  const form = el("form", "action");
+  form.setAttribute("data-action", "halt");
+  const button = el("button", "halt", "HALT");
+  button.setAttribute("type", "submit");
+  form.append(button, el("span", "action-outcome"));
+  card.append(form);
+  return card;
+}
 
 /**
  * The four state cards: mode and autonomy, equity and drawdown, rail 17, market session.
  *
- * No heading of its own -- the page's `<h1>` already says "Status", and the tab bar says which
- * section is on. The four tables below DO carry one, because a table needs an accessible name.
+ * No heading of its own -- the page's `<h1>` says "Pulse". The tables below DO carry one, because
+ * a table needs an accessible name. The labels are the ones `docs.js::TERMS` links to the
+ * glossary (`test_doc_links.py` fails if one stops being a `kv` label here), which is why they
+ * moved with the cards rather than being reworded.
  *
  * @param {any} data
  * @returns {DocumentFragment}
  */
-function statusState(data) {
+function pulseState(data) {
   const fragment = document.createDocumentFragment();
   fragment.append(
     gridCard([
@@ -716,6 +725,7 @@ function statusState(data) {
       kv("autonomy configured", data.autonomy.configured),
       kv("autonomy lapses", data.autonomy.lapses_at),
       kv("rail 11", data.drawdown.rail11),
+      kv("last cycle", data.last_cycle_at),
     ]),
   );
 
@@ -754,15 +764,99 @@ function statusState(data) {
 }
 
 /**
- * Open positions, with the `bracket` column the rendered page never had.
+ * Today's cycle counts, and how many open tranches have no bracket.
+ *
+ * The counts are summed by the service over the cycles in today's UTC day; the bracket count is
+ * the #641 hazard (a live position with no stop) and is judged `warn` when non-zero, here in the
+ * payload rather than by this file.
  *
  * @param {any} data
- * @param {Section} entry
  * @returns {DocumentFragment}
  */
-function statusPositions(data, entry) {
+function pulseToday(data) {
   const fragment = document.createDocumentFragment();
-  fragment.append(heading("h-positions", entry.label));
+  fragment.append(heading("h-today", "Today"));
+  fragment.append(
+    gridCard([
+      kv("cycles", data.today.cycles),
+      kv("signals", data.today.signals),
+      kv("blocked", data.today.blocked),
+      kv("entered", data.today.entered),
+      kv("exited", data.today.exited),
+      kv("errors", data.today.errors),
+      kv("brackets missing", data.unbracketed_count),
+    ]),
+  );
+  return fragment;
+}
+
+/**
+ * Why keel did not trade: the engine's own sentences, in the order the service wrote them.
+ *
+ * `stringList` answers `null` for an empty list, and that absence is the branch -- this file
+ * never inspects the list to choose the empty sentence.
+ *
+ * @param {any} data
+ * @returns {DocumentFragment}
+ */
+function pulseWhyNot(data) {
+  const fragment = document.createDocumentFragment();
+  fragment.append(heading("h-why", "Why keel didn't trade"));
+  const reasons = stringList(data.why_not, "reasons");
+  if (reasons) fragment.append(reasons);
+  else fragment.append(note("Nothing stopped keel today."));
+  return fragment;
+}
+
+/**
+ * The next DCA buy per live rule: a cadence DAY, not an order time.
+ *
+ * The fixed sentence under the table says how that day becomes an order, once, rather than a
+ * time per row that this page would have to promise and the scheduler would have to keep.
+ *
+ * @param {any} data
+ * @returns {DocumentFragment}
+ */
+function pulseNextDca(data) {
+  const fragment = document.createDocumentFragment();
+  fragment.append(heading("h-next-dca", "Next DCA buy"));
+  fragment.append(
+    table(
+      "h-next-dca",
+      [
+        { label: "product", numeric: false },
+        { label: "cadence", numeric: false },
+        { label: "budget", numeric: true },
+        { label: "budget basis", numeric: false },
+        { label: "next cadence day (UTC)", numeric: false },
+      ],
+      data.next_dca.map(
+        /** @param {any} row */ (row) => [
+          plain(row.product_id),
+          row.cadence,
+          row.budget,
+          row.budget_inferred,
+          row.next_cadence_day,
+        ],
+      ),
+      "No live DCA rules.",
+    ),
+  );
+  fragment.append(note(plain(data.next_dca_note)));
+  return fragment;
+}
+
+/**
+ * Open positions, with the `bracket` column: an unbracketed position is a position with no stop.
+ *
+ * Compact on purpose -- the roll-call that keeps the bracket warning on the glance page.
+ *
+ * @param {any} data
+ * @returns {DocumentFragment}
+ */
+function pulsePositions(data) {
+  const fragment = document.createDocumentFragment();
+  fragment.append(heading("h-positions", "Open positions"));
   fragment.append(
     table(
       "h-positions",
@@ -794,20 +888,19 @@ function statusPositions(data, entry) {
  * The live rules, under the counts by status.
  *
  * @param {any} data
- * @param {Section} entry
  * @returns {DocumentFragment}
  */
-function statusRules(data, entry) {
+function pulseRules(data) {
   const fragment = document.createDocumentFragment();
-  fragment.append(heading("h-rules", entry.label));
+  fragment.append(heading("h-live-rules", "Rules"));
   const counts = el("p", "note");
   if (data.rule_counts.length === 0) {
     counts.textContent = "no rules";
   } else {
     // `entries()` again, for the separator: index 0 gets none, every later entry gets one.
-    // The order is the server's -- `payload.status_payload` emits `rule_counts` as a LIST of
-    // pairs rather than an object precisely so that ordering stays a presentation decision made
-    // in Python, matching `render_human`'s own sort.
+    // The order is the server's -- `payload._rule_counts_payload` emits `rule_counts` as a LIST
+    // of pairs rather than an object precisely so that ordering stays a presentation decision
+    // made in Python, matching `render_human`'s own sort.
     for (const [index, count] of data.rule_counts.entries()) {
       if (index) counts.append(el("span", "muted", " · "));
       counts.append(plain(count.status), " ");
@@ -817,7 +910,7 @@ function statusRules(data, entry) {
   fragment.append(counts);
   fragment.append(
     table(
-      "h-rules",
+      "h-live-rules",
       [
         { label: "live rule", numeric: false },
         { label: "kind", numeric: false },
@@ -842,12 +935,11 @@ function statusRules(data, entry) {
  * How old the newest candle is, per allowlisted product.
  *
  * @param {any} data
- * @param {Section} entry
  * @returns {DocumentFragment}
  */
-function statusFreshness(data, entry) {
+function pulseFreshness(data) {
   const fragment = document.createDocumentFragment();
-  fragment.append(heading("h-freshness", entry.label));
+  fragment.append(heading("h-freshness", "Data freshness"));
   fragment.append(
     table(
       "h-freshness",
@@ -872,15 +964,17 @@ function statusFreshness(data, entry) {
 }
 
 /**
- * The venue subscription attestations, stored beside effective.
+ * The venue subscription attestations, stored beside effective, with the cap each one sets.
+ *
+ * On the glance page because rail 14 caps BUYS: a lapsed subscription is a reason keel did not
+ * trade, and it belongs where the other reasons are.
  *
  * @param {any} data
- * @param {Section} entry
  * @returns {DocumentFragment}
  */
-function statusSubscriptions(data, entry) {
+function pulseSubscriptions(data) {
   const fragment = document.createDocumentFragment();
-  fragment.append(heading("h-subscriptions", entry.label));
+  fragment.append(heading("h-subscriptions", "Subscriptions"));
   fragment.append(
     table(
       "h-subscriptions",
@@ -906,6 +1000,211 @@ function statusSubscriptions(data, entry) {
     ),
   );
   return fragment;
+}
+
+/**
+ * Today's cycles from the engine's own log: the table, each cycle's records as a disclosure, and
+ * the feed's caveats.
+ *
+ * The scope is fixed at today by the server (`api.read_pulse`), so there is no scope control and
+ * no sort: cycles arrive newest first, which is the order a glance wants. `data.activity` is
+ * `activity_payload`'s document, unchanged, and the helpers below take it as `feed`.
+ *
+ * @param {any} data
+ * @returns {DocumentFragment}
+ */
+function pulseCycles(data) {
+  const fragment = document.createDocumentFragment();
+  fragment.append(heading("h-cycles", "Cycles today"));
+
+  // Shown whenever the server sent one, which it does for every status except `ok` -- so the
+  // presence of the note IS the branch, and this file never inspects the status word to make it.
+  if (plain(data.activity.status_note) || plain(data.activity.detail)) {
+    const card = el("div", "card");
+    const what = el("strong", toneOf(data.activity.status));
+    what.append(field(data.activity.status));
+    card.append(what, " ");
+    card.append(el("span", "muted", plain(data.activity.status_note)));
+    if (data.activity.detail) card.append(el("div", "muted", plain(data.activity.detail)));
+    fragment.append(card);
+  }
+
+  fragment.append(
+    table(
+      "h-cycles",
+      [
+        { label: "started (UTC)", numeric: false },
+        { label: "cycle", numeric: false },
+        { label: "mode", numeric: false },
+        { label: "products", numeric: false },
+        { label: "signals", numeric: true },
+        { label: "blocked", numeric: true },
+        { label: "entered", numeric: true },
+        { label: "exited", numeric: true },
+        { label: "errors", numeric: true },
+        { label: "quiet", numeric: false },
+        { label: "highlights", numeric: false },
+      ],
+      data.activity.cycles.map(
+        /** @param {any} cycle */ (cycle) => [
+          cycle.started_at,
+          plain(cycle.cycle_id) || "uncorrelated",
+          plain(cycle.mode) || "—",
+          (cycle.products || []).join(", ") || "—",
+          cycle.signals,
+          cycle.blocked,
+          cycle.entered,
+          cycle.exited,
+          cycle.errors,
+          cycle.quiet,
+          (cycle.highlights || []).join("; "),
+        ],
+      ),
+      "No cycles today.",
+    ),
+  );
+
+  if (data.activity.cycles.length === 0) fragment.append(noCyclesToday(data.activity));
+
+  const detailed = data.activity.cycles.filter(
+    /** @param {any} cycle */ (cycle) => (cycle.events || []).length !== 0,
+  );
+  if (detailed.length !== 0) {
+    fragment.append(heading("h-events", "Cycle detail"));
+    fragment.append(note("The engine's own records, per cycle, in the order they were written."));
+    for (const cycle of detailed) fragment.append(cycleEvents(cycle));
+  }
+
+  fragment.append(feedNotes(data.activity));
+  return fragment;
+}
+
+/**
+ * What to say when today holds no cycles.
+ *
+ * Never a blank panel, and never "no activity" either. `test_tui.py` pins the distinction
+ * (`test_activity_overlay_with_nothing_today_is_never_blank_and_names_the_last_run`): a day with
+ * nothing in it is either "keel has not run yet today", which is an ordinary morning for a daily
+ * agent, or a window that could not prove it reached midnight -- which is not an observation
+ * about the engine at all. The second is carried by `scope_fully_covered`, already judged, and
+ * is in `feedNotes` below.
+ *
+ * `feed`, not `data`, because the payload root here is `activity_payload`'s document: a
+ * `data.<key>` written in this region is checked against `/api/pulse`'s own keys, and these are
+ * the feed's (`_view_keys` counts this region as `pulseView`'s).
+ *
+ * @param {any} feed  `data.activity`.
+ * @returns {HTMLElement}
+ */
+function noCyclesToday(feed) {
+  const card = el("div", "card");
+  card.append(el("strong", undefined, "keel has not run yet today."));
+  const last = feed.last_cycle_before_scope;
+  if (last) {
+    const line = el("p", "note");
+    line.append("Last cycle: ", field(last.started_at));
+    card.append(line);
+  } else {
+    card.append(note("There is no earlier cycle in the window either."));
+  }
+  return card;
+}
+
+/**
+ * One cycle's events, as a disclosure.
+ *
+ * An event's fields are rendered as `key=value` and NOT projected onto a fixed schema, matching
+ * `_event_payload`'s reason for keeping them whole: "the event vocabulary grows with every
+ * `log_event` call site, and an overlay that silently dropped a field it had not been taught
+ * about would be worse than one that renders it as key=value."
+ *
+ * The `<summary>` is what names the inner table for a screen reader -- it is on screen, it says
+ * which cycle this is, and using it means no hidden heading exists to drift out of sync with it.
+ *
+ * @param {any} cycle
+ * @returns {HTMLElement}
+ */
+function cycleEvents(cycle) {
+  const id = "h-cycle-".concat(plain(cycle.key));
+  const node = el("details", "cycle");
+  const summary = el("summary");
+  summary.id = id;
+  summary.append(
+    [
+      plain(cycle.started_at.display),
+      plain(cycle.cycle_id) || "uncorrelated",
+      (cycle.highlights || []).join("; "),
+    ].join(" · "),
+  );
+  node.append(summary);
+
+  node.append(
+    table(
+      id,
+      [
+        { label: "at (UTC)", numeric: false },
+        { label: "level", numeric: false },
+        { label: "event", numeric: false },
+        { label: "fields", numeric: false },
+      ],
+      (cycle.events || []).map(
+        /** @param {any} event */ (event) => [
+          event.at,
+          plain(event.level),
+          plain(event.event),
+          eventFields(event.fields),
+        ],
+      ),
+      "No records for this cycle.",
+    ),
+  );
+
+  // Rendered unconditionally rather than only when non-zero. Hiding a zero would mean deciding
+  // that this count is uninteresting by INSPECTING it, and this file may not read a value to
+  // decide anything; inside a collapsed disclosure the line costs nothing anyway.
+  const dropped = el("p", "note");
+  dropped.append(field(cycle.events_dropped), " record(s) beyond the display cap");
+  node.append(dropped);
+  return node;
+}
+
+/**
+ * An event's fields, as `key=value` pairs.
+ *
+ * @param {any} fields
+ * @returns {string}
+ */
+function eventFields(fields) {
+  if (!fields || typeof fields !== "object") return "";
+  return Object.entries(fields)
+    .map(/** @param {any[]} pair */ (pair) => pair.join("="))
+    .join(" ");
+}
+
+/**
+ * The feed's own caveats, as one muted line -- `render_activity`'s `notes`, plus the two flags it
+ * shows as prose and the payload sends judged.
+ *
+ * Every one of these is a reason a short or empty feed is NOT evidence that nothing happened,
+ * which is why none is filtered out: `activity_payload`'s docstring calls `scope_fully_covered`
+ * "the one field a client must not ignore".
+ *
+ * `feed`, not `data`, for `noCyclesToday`'s reason.
+ *
+ * @param {any} feed  `data.activity`.
+ * @returns {HTMLElement}
+ */
+function feedNotes(feed) {
+  const line = el("p", "note");
+  const counts = [
+    ["hidden by the scope", feed.cycles_out_of_scope],
+    ["lines read", feed.lines_read],
+    ["unusable lines skipped", feed.lines_skipped],
+    ["cycles beyond the display cap", feed.cycles_dropped],
+  ];
+  for (const [label, value] of counts) line.append(field(value), " ", label, " · ");
+  line.append(field(feed.scope_fully_covered), " · ", field(feed.window_truncated));
+  return line;
 }
 
 // -- the remaining six views (#537) ---------------------------------------------------------------
@@ -1320,35 +1619,6 @@ function jobPanel(job) {
   return card;
 }
 
-/**
- * The activity feed: `/api/activity`'s payload, scoped.
- *
- * ── WHAT THE TUI HAS THAT THE RENDERED PAGE DOES NOT, AND HOW IT LANDS HERE ──────────────────
- *
- * `tests/commands/test_tui.py` pins three things about the activity screen, and #541 verifies
- * against that file:
- *
- *   * **The scope, cycled by `t`.** `today -> 7d -> all`, reopening at `today`. The rendered page
- *     has the three as links; they are here as buttons, and the CURRENT one is read off
- *     `data.scope` -- the value `read_activity` echoes back after `normalise_scope` had its say
- *     -- rather than off what this client asked for. That is the difference between showing what
- *     was requested and showing what happened.
- *   * **"keel has not run yet today."** An empty scope is never a blank panel: the TUI names the
- *     last cycle before the scope and says how to widen it. `activity_payload` sends
- *     `last_cycle_before_scope` for exactly this.
- *   * **Expanding a cycle to its events.** The TUI's Enter. Here it is a native `<details>` per
- *     cycle, so there is no key to teach and no expansion state to remember.
- *
- * The rendered page's columns are kept in its order, plus the `quiet` flag, which the payload
- * judges (`neutral`, never `warn` -- a cycle where nothing happened is a POSITIVE observation)
- * and the HTML drops.
- *
- * @param {any} data      `/api/activity`'s `data`.
- * @param {any} sort      the response's `sort` echo, placed unread.
- * @param {(column: string, direction: string) => void} onSort
- * @param {(scope: string) => void} onScope
- * @returns {DocumentFragment}
- */
 /**
  * The Timeline view (#703): one chronology over four stores that never knew about each other.
  *
@@ -2427,82 +2697,6 @@ function orderDetail(row) {
   return node;
 }
 
-export function activityView(data, sort, onSort, onScope) {
-  const fragment = document.createDocumentFragment();
-  fragment.append(el("h1", undefined, "Activity"));
-
-  const sub = el("p", "sub");
-  sub.append(plain(data.source) || "no source", " · ");
-  sub.append(field(data.generated_at));
-  fragment.append(sub);
-
-  fragment.append(scopeSwitch(plain(data.scope), onScope));
-
-  // Shown whenever the server sent one, which it does for every status except `ok` -- so the
-  // presence of the note IS the branch, and this file never inspects the status word to make it.
-  if (plain(data.status_note) || plain(data.detail)) {
-    const card = el("div", "card");
-    const what = el("strong", toneOf(data.status));
-    what.append(field(data.status));
-    card.append(what, " ");
-    card.append(el("span", "muted", plain(data.status_note)));
-    if (data.detail) card.append(el("div", "muted", plain(data.detail)));
-    fragment.append(card);
-  }
-
-  const cycles = data.cycles || [];
-  fragment.append(heading("h-cycles", "Cycles"));
-  fragment.append(
-    table(
-      "h-cycles",
-      [
-        { label: "started (UTC)", numeric: false, key: "started_at" },
-        { label: "cycle", numeric: false, key: "cycle_id" },
-        { label: "mode", numeric: false, key: "mode" },
-        { label: "products", numeric: false },
-        { label: "signals", numeric: true, key: "signals" },
-        { label: "blocked", numeric: true, key: "blocked" },
-        { label: "entered", numeric: true, key: "entered" },
-        { label: "exited", numeric: true, key: "exited" },
-        { label: "errors", numeric: true, key: "errors" },
-        { label: "quiet", numeric: false },
-        { label: "highlights", numeric: false },
-      ],
-      cycles.map(
-        /** @param {any} cycle */ (cycle) => [
-          cycle.started_at,
-          plain(cycle.cycle_id) || "uncorrelated",
-          plain(cycle.mode) || "—",
-          (cycle.products || []).join(", ") || "—",
-          cycle.signals,
-          cycle.blocked,
-          cycle.entered,
-          cycle.exited,
-          cycle.errors,
-          cycle.quiet,
-          (cycle.highlights || []).join("; "),
-        ],
-      ),
-      "Nothing in this scope.",
-      { sort: sort, onSort: onSort },
-    ),
-  );
-
-  if (cycles.length === 0) fragment.append(emptyScope(data));
-
-  const detailed = cycles.filter(
-    /** @param {any} cycle */ (cycle) => (cycle.events || []).length !== 0,
-  );
-  if (detailed.length !== 0) {
-    fragment.append(heading("h-events", "Cycle detail"));
-    fragment.append(note("The engine's own records, per cycle, in the order they were written."));
-    for (const cycle of detailed) fragment.append(cycleEvents(cycle));
-  }
-
-  fragment.append(feedNotes(data));
-  return fragment;
-}
-
 /**
  * The Orders status tabs (#700).
  *
@@ -2564,17 +2758,17 @@ function statusSwitch(current, statuses, onStatus) {
  *
  * The `label` argument arrived with #659's second caller. Two scope switches on one site
  * announcing themselves identically would leave a screen-reader user unable to tell which view's
- * window they had just landed in, and hard-coding "Activity scope" onto the Orders view would be
- * worse than no name at all.
+ * window they had just landed in, and hard-coding another view's name onto the Orders view would be
+ * worse than no name at all. (Activity was the first caller until Pulse replaced it.)
  *
  * @param {string} current
  * @param {(scope: string) => void} onScope
- * @param {string} [label]  how the control announces itself. Defaults to Activity's wording.
+ * @param {string} [label]  how the control announces itself. Defaults to a generic wording.
  * @returns {HTMLElement}
  */
 function scopeSwitch(current, onScope, label) {
   const wrap = el("nav", "scopes");
-  wrap.setAttribute("aria-label", label || "Activity scope");
+  wrap.setAttribute("aria-label", label || "Scope");
   wrap.append(el("span", "k", "scope"));
   for (const name of SCOPES) {
     const button = el("button", "scopekey", name);
@@ -2607,8 +2801,8 @@ const SCOPES = ["today", "7d", "all"];
  *
  * `statusSwitch` and `scopeSwitch` above both re-ask the SERVER, because both narrow a collection
  * the server capped on the way out -- filtering a received page in the browser would present "the
- * rows that happened to arrive" as the whole answer. This control narrows NOTHING. `/api/status`
- * sends every section of the status page in one document and always did; choosing which of them
+ * rows that happened to arrive" as the whole answer. This control narrows NOTHING. `/api/setup`
+ * sends every section of the setup page in one document and always did; choosing which of them
  * to draw is presentation, which is what this file is for, and no section is ever unreachable --
  * every one of them has a tab, always, so there is no filter here to be stuck inside.
  *
@@ -2637,9 +2831,9 @@ const SCOPES = ["today", "7d", "all"];
  * would go on passing while a `table(...)` added inside either one resolved to an array and
  * shipped a runtime `TypeError`. That test's own docstring records this class of miss from #701.
  *
- * **`payload`, not `data` -- HERE, and only here.** These two helpers sit between `activityView`
- * and `insightsView`, so `_view_keys` counts them inside `activityView`'s region: any
- * `data.<key>` written here would be checked against `/api/activity`, which is not the endpoint
+ * **`payload`, not `data` -- HERE, and only here.** These two helpers sit between `ordersView`
+ * and `insightsView`, so `_view_keys` counts them inside `ordersView`'s region: any
+ * `data.<key>` written here would be checked against `/api/orders`, which is not the endpoint
  * it came from. Naming the parameter something else makes that mistake unspellable.
  *
  * The same rename applied to `setupPaper`/`setupLive` was an own-goal and is reverted (#776
@@ -2704,129 +2898,6 @@ function sectionSwitch(current, sections, onSection, label) {
     wrap.append(button);
   }
   return wrap;
-}
-
-/**
- * What to say when the chosen scope holds no cycles.
- *
- * Never a blank panel, and never "no activity" either. `test_tui.py` pins the distinction
- * (`test_activity_overlay_with_nothing_today_is_never_blank_and_names_the_last_run`): a scope
- * with nothing in it is either "keel has not run yet today", which is an ordinary morning for a
- * daily agent, or a window that could not prove it reached the scope's boundary -- which is not
- * an observation about the engine at all. The second is carried by `scope_fully_covered`, already
- * judged, and is in `feedNotes` below.
- *
- * @param {any} data
- * @returns {HTMLElement}
- */
-function emptyScope(data) {
-  const card = el("div", "card");
-  card.append(el("strong", undefined, "keel has not run yet in this scope."));
-  const last = data.last_cycle_before_scope;
-  if (last) {
-    const line = el("p", "note");
-    line.append("Last cycle: ", field(last.started_at));
-    card.append(line);
-    card.append(note("Widen the scope above to see it."));
-  } else {
-    card.append(note("There is no earlier cycle in the window either."));
-  }
-  return card;
-}
-
-/**
- * One cycle's events, as a disclosure.
- *
- * An event's fields are rendered as `key=value` and NOT projected onto a fixed schema, matching
- * `_event_payload`'s reason for keeping them whole: "the event vocabulary grows with every
- * `log_event` call site, and an overlay that silently dropped a field it had not been taught
- * about would be worse than one that renders it as key=value."
- *
- * The `<summary>` is what names the inner table for a screen reader -- it is on screen, it says
- * which cycle this is, and using it means no hidden heading exists to drift out of sync with it.
- *
- * @param {any} cycle
- * @returns {HTMLElement}
- */
-function cycleEvents(cycle) {
-  const id = "h-cycle-".concat(plain(cycle.key));
-  const node = el("details", "cycle");
-  const summary = el("summary");
-  summary.id = id;
-  summary.append(
-    [
-      plain(cycle.started_at.display),
-      plain(cycle.cycle_id) || "uncorrelated",
-      (cycle.highlights || []).join("; "),
-    ].join(" · "),
-  );
-  node.append(summary);
-
-  node.append(
-    table(
-      id,
-      [
-        { label: "at (UTC)", numeric: false },
-        { label: "level", numeric: false },
-        { label: "event", numeric: false },
-        { label: "fields", numeric: false },
-      ],
-      (cycle.events || []).map(
-        /** @param {any} event */ (event) => [
-          event.at,
-          plain(event.level),
-          plain(event.event),
-          eventFields(event.fields),
-        ],
-      ),
-      "No records for this cycle.",
-    ),
-  );
-
-  // Rendered unconditionally rather than only when non-zero. Hiding a zero would mean deciding
-  // that this count is uninteresting by INSPECTING it, and this file may not read a value to
-  // decide anything; inside a collapsed disclosure the line costs nothing anyway.
-  const dropped = el("p", "note");
-  dropped.append(field(cycle.events_dropped), " record(s) beyond the display cap");
-  node.append(dropped);
-  return node;
-}
-
-/**
- * An event's fields, as `key=value` pairs.
- *
- * @param {any} fields
- * @returns {string}
- */
-function eventFields(fields) {
-  if (!fields || typeof fields !== "object") return "";
-  return Object.entries(fields)
-    .map(/** @param {any[]} pair */ (pair) => pair.join("="))
-    .join(" ");
-}
-
-/**
- * The feed's own caveats, as one muted line -- `render_activity`'s `notes`, plus the two flags it
- * shows as prose and the payload sends judged.
- *
- * Every one of these is a reason a short or empty feed is NOT evidence that nothing happened,
- * which is why none is filtered out: `activity_payload`'s docstring calls `scope_fully_covered`
- * "the one field a client must not ignore".
- *
- * @param {any} data
- * @returns {HTMLElement}
- */
-function feedNotes(data) {
-  const line = el("p", "note");
-  const counts = [
-    ["hidden by the scope", data.cycles_out_of_scope],
-    ["lines read", data.lines_read],
-    ["unusable lines skipped", data.lines_skipped],
-    ["cycles beyond the display cap", data.cycles_dropped],
-  ];
-  for (const [label, value] of counts) line.append(field(value), " ", label, " · ");
-  line.append(field(data.scope_fully_covered), " · ", field(data.window_truncated));
-  return line;
 }
 
 /**
@@ -3703,107 +3774,6 @@ function citation(claim) {
 }
 
 /**
- * Gates: `/api/gates`'s payload -- the capability inventory (#436).
- *
- * **This view is the reason a browser interface can be honest about its own limits.** The read
- * surface cannot reach one of these actions: the server implements no verb that would, and the
- * page says so beside the list of what it cannot do and who can. `gates_payload` reads a pure
- * declaration -- no config, no database, no network -- which is why this view has something to
- * show on a machine with nothing set up.
- *
- * The action count in each heading is `actions.length`, and `gates_payload`'s own docstring
- * sanctions it: "a client renders `actions.length`, which is a list length in the language that
- * owns the list, not a figure this layer invented." `Gate` holds no count, and Rule 6e bans
- * `len()` in the serialiser, so this is the one number on any of these views the server did not
- * send.
- *
- * @param {any} data
- * @returns {DocumentFragment}
- */
-export function gatesView(data) {
-  const fragment = document.createDocumentFragment();
-  fragment.append(el("h1", undefined, "Gates"));
-  fragment.append(
-    el(
-      "p",
-      "sub",
-      "every action that increases what keel can do without asking again",
-    ),
-  );
-
-  const card = el("div", "card");
-  card.append(el("strong", undefined, "This view cannot perform any of them."));
-  card.append(" ");
-  card.append(
-    el(
-      "span",
-      "muted",
-      "keel's JSON API answers GET only and implements no action verb, so there is no request this page can make that changes anything. Each action below needs a human at a terminal.",
-    ),
-  );
-  fragment.append(card);
-
-  const gates = data.gates || [];
-  if (gates.length === 0) {
-    fragment.append(el("p", "empty", "No gates are declared."));
-    return fragment;
-  }
-
-  for (const gate of gates) {
-    const id = "h-gate-".concat(plain(gate.name));
-    const title = el("h2");
-    title.id = id;
-    title.append(plain(gate.name), " · ", gate.actions.length, " action(s)");
-    fragment.append(title);
-
-    const detail = el("div", "card");
-    detail.append(kv("evidence required", plain(gate.evidence)));
-    const closes = el("p", "note");
-    closes.append("Fails closed against ", plain(gate.fails_closed_against), ".");
-    detail.append(closes);
-    const where = el("p", "note");
-    where.append("Implemented once, at ", el("code", undefined, plain(gate.implementation)));
-    detail.append(where);
-    fragment.append(detail);
-
-    fragment.append(
-      table(
-        id,
-        [
-          { label: "surface", numeric: false },
-          { label: "action", numeric: false },
-          { label: "grants", numeric: false },
-          { label: "call site", numeric: false },
-        ],
-        (gate.actions || []).map(
-          /** @param {any} action */ (action) => [
-            pill(plain(action.surface)),
-            invocationCell(action),
-            plain(action.increases),
-            el("code", undefined, plain(action.call_site)),
-          ],
-        ),
-        "No actions are covered by this gate.",
-      ),
-    );
-  }
-  return fragment;
-}
-
-/**
- * An action's invocation, and what it mirrors.
- *
- * @param {any} action
- * @returns {HTMLElement}
- */
-function invocationCell(action) {
-  const cell = el("span");
-  cell.append(el("code", undefined, plain(action.invocation)));
-  if (action.mirrors) cell.append(" ", pill("mirrors ".concat(plain(action.mirrors))));
-  return cell;
-}
-
-/**
  * The emphasis each mode word carries in the badge. See `modeBadge` below for why paper is the
  * quiet one and why there is no `state` anywhere in this table.
  *
@@ -4035,7 +4005,7 @@ export function paperBanner(node, config) {
  * The attestation banner (#793) -- what is about to halt keel, or has already.
  *
  * Rail 17 expired on 2026-09-08 and live placed nothing for three days. The state was on the
- * Status page the whole time, in a card, below the fold, on one page of eleven. So this is
+ * Status page (now Pulse) the whole time, in a card, below the fold, on one page of eleven. So this is
  * carried by the ENVELOPE and drawn from the shell, above `#view`: it is on whatever page the
  * operator is actually reading.
  *

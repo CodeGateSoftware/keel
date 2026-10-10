@@ -1269,6 +1269,18 @@ button.run:disabled { cursor: progress; opacity: 0.7; }
 .action-outcome { margin: 0.5rem 0 0; }
 .action-outcome:empty { margin: 0; }
 
+/* ── Pulse: the halt, and the reasons keel did not trade (console PR1) ────────────────────────
+ *
+ * The one filled button that is red. `--bad` is `state`'s vocabulary for "this needs you", and a
+ * control that stops the engine is the one place that vocabulary belongs on a button; `--card`
+ * text on it clears AA in both themes (6.2:1 light, 5.6:1 dark), measured rather than assumed.
+ * The HALTED line is the same colour for the same reason, as text rather than as a control.
+ */
+.halt button.halt { background: var(--bad); border-color: var(--bad); }
+.halted { margin: 0; }
+.halted strong { color: var(--bad); }
+.reasons li { margin: 0.2rem 0; }
+
 /* The "a newer build is ready" offer (#538). Sized like the footer text it sits in rather than
    like the action buttons: it is an offer an operator may ignore indefinitely, and a page that
    shouts about an available upgrade while somebody is reading a drawdown has its priorities
