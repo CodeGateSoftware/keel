@@ -290,7 +290,7 @@ def test_the_renderer_shows_the_book_pair_without_computing_one() -> None:
     stated by name so the reason survives with it."""
     source = _code("render.js")
     start = source.index("export function ordersView(")
-    end = source.index("export function activityView(", start)
+    end = source.index("function statusSwitch(", start)
     body = source[start:end]
     assert "submit_best_bid" in body
     assert "submit_best_ask" in body
@@ -736,10 +736,11 @@ def test_the_renderer_never_mentions_raw_response_and_computes_no_rate() -> None
     which is exactly the sort of change this pin exists to fail."""
     source = _code("render.js")
     start = source.index("export function ordersView(")
-    # Bounded at `activityView`, the next export, so this scans THIS view's three functions
+    # Bounded at `statusSwitch`, the first function after the orders view's own, so this scans
+    # THIS view's three functions
     # (`ordersView`, `emptyOrders`, `orderDetail`) and does not quietly borrow another view's
     # cleanliness or fail on another view's legitimate arithmetic.
-    end = source.index("export function activityView(", start)
+    end = source.index("function statusSwitch(", start)
     body = source[start:end]
     assert "raw_response" not in body
     # No arithmetic of any kind in this view's code. A percentage is the specific thing being

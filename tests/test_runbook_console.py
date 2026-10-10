@@ -50,11 +50,18 @@ def test_the_section_says_what_the_console_is_and_that_it_is_thin() -> None:
 
 
 def test_the_section_names_every_view() -> None:
-    """Seven views, named. An operator looking for one should find it here rather than by
-    clicking around."""
+    """Every view the console serves, named. An operator looking for one should find it here
+    rather than by clicking around.
+
+    Read off `staticfiles.CLIENT_ROUTES` rather than retyped (console PR1, #951): the list was a
+    literal of seven names, and the four-view slimming changes it once per PR -- a literal would
+    pin the runbook to whichever list was true when the test was last edited."""
+    from keel.web.staticfiles import CLIENT_ROUTES
+
     section = _section()
-    for view in ("Status", "Setup", "Activity", "Insights", "Rules", "Venues", "Gates"):
-        assert view in section, view
+    assert len(CLIENT_ROUTES) >= 4, "the route table parsed to almost nothing"
+    for route in CLIENT_ROUTES:
+        assert route.capitalize() in section, route
 
 
 def test_the_section_documents_the_one_time_token_and_where_it_can_land() -> None:

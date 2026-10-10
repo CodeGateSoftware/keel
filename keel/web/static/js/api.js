@@ -270,7 +270,7 @@ function isField(value) {
 }
 
 /**
- * Perform one declared setup action (#540). The ONLY write this client can make.
+ * Perform one declared setup action (#540). The write that changes a deployment's SETUP.
  *
  * ── WHAT MAKES THIS SAFE IS NOT IN THIS FILE ────────────────────────────────────────────────
  * `key` reaches the server as a path segment and is looked up in `keel.commands.setup.ACTIONS`,
@@ -296,20 +296,62 @@ function isField(value) {
  */
 export async function runAction(key, values, csrf) {
   const url = new URL(API_PREFIX + "setup/" + encodeURIComponent(key), window.location.origin);
+  return post(url, { "X-Keel-CSRF": csrf }, values);
+}
 
+/**
+ * Engage the kill switch (console PR1). The one write that is not a setup step, and the only
+ * other path this client POSTs to.
+ *
+ * `server._gated_action` wants the session, `X-Keel-Client` and `X-Keel-Gate`, and nothing else:
+ * no typed phrase, no locality check, because "stopping must never be slower than starting"
+ * (`keel/web/gates.py`). The way back -- `keel resume` -- is deliberately not a call this module
+ * can make: there is no function here that names it, and `test_pulse_view.py` pins that.
+ *
+ * Never rejects, exactly like `read`: a failure is a `Reading` the view can show.
+ *
+ * @param {string} gate  `/api/pulse`'s `data.gate` for this session.
+ * @returns {Promise<Reading>}
+ */
+export async function runHalt(gate) {
+  const url = new URL(API_PREFIX + "gates/halt", window.location.origin);
+  return post(url, { "X-Keel-Gate": gate });
+}
+
+/**
+ * One POST, folded into the same `Reading` a GET becomes.
+ *
+ * The part of a write that does not depend on which write it is: `X-Keel-Client` (and the token
+ * header the caller adds), same-origin credentials, no caching, no redirects, and the three ways
+ * an answer can fail to arrive -- no connection, an unreadable body, a refusal -- each ending as
+ * a stated `Reading` rather than an exception. Extracted when the halt became the second write,
+ * so the two cannot come to disagree about what "the server did not answer" looks like.
+ *
+ * **A write whose route reads no body sends none.** The halt route never reads one, and on a
+ * kept-alive connection bytes a handler leaves unread are parsed as the start of the NEXT request:
+ * the PR1 browser check saw the repaint's `GET /api/pulse` arrive as `{}GET` and refused 501. So
+ * `body` is optional, and the JSON content type travels only with a body.
+ *
+ * @param {URL} url
+ * @param {Record<string, string>} extraHeaders  the token header for this write.
+ * @param {Record<string, string>} [body]        omitted for a route that reads no body.
+ * @returns {Promise<Reading>}
+ */
+async function post(url, extraHeaders, body) {
+  const init = {
+    method: "POST",
+    headers: Object.assign({}, HEADERS, extraHeaders),
+    credentials: "same-origin",
+    cache: "no-store",
+    redirect: "error",
+  };
+  if (body !== undefined) {
+    init.headers["Content-Type"] = "application/json";
+    init.body = JSON.stringify(body);
+  }
   let response;
   try {
-    response = await fetch(url, {
-      method: "POST",
-      headers: Object.assign({}, HEADERS, {
-        "Content-Type": "application/json",
-        "X-Keel-CSRF": csrf,
-      }),
-      credentials: "same-origin",
-      cache: "no-store",
-      redirect: "error",
-      body: JSON.stringify(values),
-    });
+    response = await fetch(url, init);
   } catch (cause) {
     return {
       as_of: "",

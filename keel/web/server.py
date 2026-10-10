@@ -1061,9 +1061,10 @@ class KeelHandler(BaseHTTPRequestHandler):
             self._send_json(code, document)
             return
 
-        # Everything else is the client: a file under the static root, or one of the seven names
-        # `CLIENT_ROUTES` answers with the shell. `_serve_static` 404s anything that is neither,
-        # which is what keeps a mistyped asset a 404 rather than a 200 carrying HTML.
+        # Everything else is the client: a file under the static root, or one of the names
+        # `CLIENT_ROUTES` (or `RETIRED_CLIENT_ROUTES`) answers with the shell. `_serve_static`
+        # 404s anything that is neither, which is what keeps a mistyped asset a 404 rather than a
+        # 200 carrying HTML.
         #
         # This is the last branch because the prefix stopped narrowing anything when #540 moved
         # the mount to `/`: `staticfiles.STATIC_PREFIX` matches every path now, so the ORDER of

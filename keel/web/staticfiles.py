@@ -46,7 +46,7 @@ STATIC_ROOT = Path(__file__).resolve().parent / "static"
 #:
 #: **The consequence worth stating: this prefix no longer NARROWS anything.** While it was
 #: `/static/`, `url_path.startswith(STATIC_PREFIX)` was itself a filter, and `resolve_static_asset`
-#: could not be reached by a request for `/api/status`. At `/` every path passes that test, so the
+#: could not be reached by a request for `/api/pulse`. At `/` every path passes that test, so the
 #: containment check in `resolve_static_asset` -- `resolve()` then `relative_to()` -- is the only
 #: thing keeping a request inside the static root, and `server.do_GET` orders `/api/` ahead of
 #: static resolution rather than relying on the prefix to separate them.
@@ -130,16 +130,15 @@ def resolve_static_asset(root: Path, url_path: str) -> Path | None:
 #: mistyped or missing `.js` asset stops being a 404 and becomes a 200 carrying HTML with a
 #: `text/html` Content-Type. The browser then refuses to execute it -- correctly, under `nosniff`
 #: -- and reports a MIME-type error naming the module, which is several steps removed from
-#: "that file is not there." With a closed list, a missing asset is still a 404 and only these
-#: seven names ever reach the shell.
+#: "that file is not there." With a closed list, a missing asset is still a 404 and only the names
+#: in `CLIENT_ROUTES` and `RETIRED_CLIENT_ROUTES` ever reach the shell.
 #:
 #: `tests/web/test_client_assets.py::test_the_python_and_javascript_route_tables_agree` parses
 #: `main.js`'s `ROUTES` and compares it to this tuple, so a view added on one side without the
 #: other fails the build rather than 404ing in a browser nobody is running in CI.
 CLIENT_ROUTES: tuple[str, ...] = (
-    "status",
+    "pulse",
     "setup",
-    "activity",
     "orders",
     "positions",
     "balances",
@@ -148,12 +147,21 @@ CLIENT_ROUTES: tuple[str, ...] = (
     "research",
     "rules",
     "venues",
-    "gates",
     "plans",
 )
 
 #: The shell every client route is served from, relative to `STATIC_ROOT`.
 CLIENT_ENTRY = "index.html"
+
+#: Names that WERE client routes and are not any more, answered with the shell all the same.
+#: `main.js`'s `routeFor` sends a name it does not know to the home view and rewrites the address
+#: bar (its docstring: "a typo or a link written before a rename ... the landing page is more use
+#: than an error"). That is only true if the server delivers the shell; without it the old path is
+#: a plain-text 404 for a bookmark, an installed app whose cached manifest still says
+#: `start_url: "/status"`, or a `/status?token=...` redirect, whenever no service worker answers.
+#: **Closed, like `CLIENT_ROUTES`**, for the same reason: it is names, never a wildcard. Console
+#: PRs 2-4 retire more views and each adds its names here. Disjoint from `CLIENT_ROUTES`.
+RETIRED_CLIENT_ROUTES: tuple[str, ...] = ("status", "activity", "gates")
 
 
 def resolve_client_route(root: Path, url_path: str) -> Path | None:
@@ -161,8 +169,8 @@ def resolve_client_route(root: Path, url_path: str) -> Path | None:
 
     Called only after `resolve_static_asset` has returned `None`, so a real file always wins and
     this can never shadow one. The three paths that resolve here are `STATIC_PREFIX` itself,
-    `STATIC_PREFIX` plus a name in `CLIENT_ROUTES`, and nothing else -- an unknown name is `None`
-    and becomes the same 404 any other unmapped path gets.
+    `STATIC_PREFIX` plus a name in `CLIENT_ROUTES` or `RETIRED_CLIENT_ROUTES`, and nothing else --
+    an unknown name is `None` and becomes the same 404 any other unmapped path gets.
 
     **Why the server has to know about client routes at all.** `main.js` routes with the History
     API rather than a hash, so `pushState` puts `/static/insights` in the address bar; without
@@ -171,14 +179,15 @@ def resolve_client_route(root: Path, url_path: str) -> Path | None:
     putting a `#` in every URL an operator copies -- see `main.js`'s module docstring. This is the
     fifteen lines that buys.
 
-    **This is a read, and it widens nothing.** It maps seven names onto one file that is already
-    served at `STATIC_PREFIX + CLIENT_ENTRY`; the same session cookie and the same `Host` check
-    gate it, because `server.do_GET` checks both before any static path is looked at.
+    **This is a read, and it widens nothing.** It maps the names in `CLIENT_ROUTES` and
+    `RETIRED_CLIENT_ROUTES` onto one file that is already served at
+    `STATIC_PREFIX + CLIENT_ENTRY`; the same session cookie and the same `Host` check gate it,
+    because `server.do_GET` checks both before any static path is looked at.
     """
     if not url_path.startswith(STATIC_PREFIX):
         return None
     name = unquote(url_path[len(STATIC_PREFIX) :])
-    if name and name not in CLIENT_ROUTES:
+    if name and name not in CLIENT_ROUTES and name not in RETIRED_CLIENT_ROUTES:
         return None
 
     shell = (root / CLIENT_ENTRY).resolve()

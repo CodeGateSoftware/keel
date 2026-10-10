@@ -836,9 +836,11 @@ Rewards item: account settings no rail can see, re-checked after any account cha
 
 ## The operator console, in a browser
 
-`keel serve` opens keel's **operator console**: a local web page showing Status, Setup, Activity,
-Insights, Rules, Venues and Gates, over the same `keel/commands/*` service layer the CLI commands
-call. An architectural test (`tests/commands/test_console_thinness.py`) pins that thinness -- the
+`keel serve` opens keel's **operator console**: a local web page showing Pulse (the home view),
+Setup, Orders, Positions, Balances, Timeline, Insights, Research, Rules, Venues and Plans, over the
+same `keel/commands/*` service layer the CLI commands call. It is being slimmed to four engine
+views -- Pulse, Holdings, Rules, Audit & Setup; see
+`docs/superpowers/plans/2026-10-10-console-four-views.md`. An architectural test (`tests/commands/test_console_thinness.py`) pins that thinness -- the
 front-end renders and dispatches, and every behaviour comes from the services.
 
 ```bash
@@ -847,6 +849,12 @@ keel --config config.live-sandbox.yaml --db keel-live.db serve
 
 It binds loopback and prints a URL carrying a one-time token for that run. Stopping the server
 invalidates it: the token is new every run.
+
+**Halting from the browser.** Pulse carries a HALT button. It engages the kill switch through the
+same operation `keel kill` performs (`POST /api/gates/halt`), after one confirm dialog and nothing
+else: stopping must never be slower than starting. It needs the console session and the gate token
+Pulse hands the page, and it works from a tunnel as well as from loopback. There is no browser
+resume: once halted, Pulse shows a HALTED line, and resuming is `keel resume` at a terminal.
 
 **Whether that token touches disk depends on who is watching (#756).** Started from a terminal --
 the command above -- nothing is written, and the URL exists only in your scrollback. Started

@@ -144,6 +144,7 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
     from keel.commands.orders import OrderRow, OrdersReport
     from keel.commands.plans import Claim, PlansReport, Tier, Trigger
     from keel.commands.positions import PositionRow, PositionsReport
+    from keel.commands.pulse import PulseReport
     from keel.commands.research_record import RuleExploration, TrialRow, TrialsReport
     from keel.commands.slippage import SlippageReport, SlippageRow
     from keel.commands.status import (
@@ -897,7 +898,7 @@ def _position_payload(position: OpenPositionStatus, mode: str) -> dict[str, Any]
     a `unit` for the day `OpenPositionStatus` carries a `base_asset`; until then the exact
     quantity sits beside the `product_id` and nothing is guessed.
 
-    `mode` is `report.mode` (`status_payload`'s own `StatusReport.mode`), passed down purely so
+    `mode` is `report.mode` (`pulse_payload`'s own `StatusReport.mode`), passed down purely so
     `_bracket_field` can tell paper from live -- it is never stored on the position itself and
     never used for anything but that one judgement (#641).
     """
@@ -962,46 +963,151 @@ def _subscription_payload(row: SubscriptionStatusRow) -> dict[str, Any]:
     }
 
 
-def status_payload(report: StatusReport) -> dict[str, Any]:
-    """`gather_status`'s `StatusReport`, as JSON. Serialises; never re-gathers."""
-    session_defused = bool(report.market_session.defused)
+def _equity_payload(report: StatusReport) -> dict[str, Any]:
+    return {
+        "state_mode": label(report.equity_state_mode),
+        "high_water_mark": money(report.high_water_mark),
+        "paper_cash": money(report.paper_cash_usdc),
+    }
+
+
+def _drawdown_payload(report: StatusReport) -> dict[str, Any]:
+    return {
+        "total": ratio(report.drawdown_total_pct),
+        "weekly": ratio(report.drawdown_weekly_pct),
+        "max_total": ratio(report.max_total_dd_pct),
+        "max_weekly": ratio(report.max_weekly_dd_pct),
+        "rail11": label(report.rail11_status, state=_rail_state(report.rail11_status)),
+    }
+
+
+def _rule_counts_payload(report: StatusReport) -> list[dict[str, Any]]:
+    """A LIST of pairs rather than an object, because the order is a presentation decision and
+    Rule 2 says presentation decisions are made here. `sorted` matches `render_human`'s own
+    ordering, so the two front-ends list the statuses the same way."""
+    return [
+        {"status": status, "count": count(number)}
+        for status, number in sorted(report.rule_counts.items())
+    ]
+
+
+# -- pulse (console PR1) ---------------------------------------------------------------------------
+
+#: Said once beside the DCA rows, never per row. The engine keys a buy off the COMPLETED daily
+#: bar's day (`Dca.detect`), so the console names a cadence DAY and the fixed way it becomes an
+#: order; when the cycle runs is the scheduler's business and is not restated here.
+NEXT_DCA_NOTE = "placed by the first cycle after that day's daily bar closes"
+
+
+_TODAY_BASIS = {
+    "complete": ("complete", GOOD),
+    "partial": ("partial — the log read began after midnight", WARN),
+    "unavailable": ("unavailable — the log could not be read", BAD),
+}
+
+
+def _today_basis_field(basis: str) -> Field:
+    """How much of the day the Pulse figures cover, judged: the one line that says whether the
+    zeros above it are measured or merely not seen."""
+    display, state = _TODAY_BASIS.get(basis, (basis, UNKNOWN))
+    return label(basis, display=display, state=state)
+
+
+def pulse_payload(report: PulseReport, *, gate: str = "") -> dict[str, Any]:
+    """`gather_pulse`'s `PulseReport`, as JSON -- the glance page, and the one place the console
+    offers a write.
+
+    Serialises the status sections through the SAME helpers the retired Status view used (a
+    Pulse that re-worded the kill switch or the bracket warning would be two answers to one
+    question), then adds what only Pulse holds: today's counts, the why-not sentences (the
+    engine's own words, crossing unchanged), the next DCA cadence days, and the unbracketed
+    roll-call.
+
+    `today.basis` and `why_not_none` carry how much of the day the figures cover (complete,
+    partial, unavailable), judged by the service: an unread log sends every `today` figure
+    ABSENT rather than zero, and a partial window sends them `warn`, so no zero on this page is
+    an unread log and the empty-reasons sentence is never "nothing stopped keel" over a log that
+    could not say so.
+
+    `no_cycles_line` is the service's sentence for a day with no cycle in it (`""` when one ran or
+    the log could not be read): the client shows its empty-today card on the string's presence and
+    never words "keel has not run" from the emptiness of a list.
+
+    `halt.resume_command` is `"keel resume"` while the kill switch is engaged and `""` otherwise.
+    The client may not read `Field.value`, so "HALT button or HALTED line" must arrive as
+    structure: the PRESENCE of that string is the branch, and the command itself comes from the
+    service so the console names `keel resume` without ever offering to run it.
+
+    `gate` is the halt route's token as a bare string, like `setup`'s CSRF token: sent for
+    `actions.js` to hold, never displayed, and not a credential without the session cookie. It
+    is the caller's to supply (`api.read_pulse`), because only the caller holds the config's
+    secret."""
+    status = report.status
+    session_defused = bool(status.market_session.defused)
+    today = report.today
+    # A partial day's sums are a lower bound, so no figure on it may read as the day's own
+    # neutral number (`ActivityFeed.scope_fully_covered`: "the one field a client must not ignore").
+    quiet = WARN if report.today_basis == "partial" else NEUTRAL
     return {
         "as_of": iso(report.now_ts),
         "generated_at": moment(report.now_ts),
-        "mode": report.mode,
+        "mode": status.mode,
+        "gate": str(gate),
         "kill_switch": flag(
-            report.kill_switch_engaged,
+            status.kill_switch_engaged,
             on="ENGAGED",
             off="clear",
             on_state=BAD,
             off_state=GOOD,
         ),
-        "autonomy": _autonomy_payload(report.autonomy),
-        "market_session": _session_payload(report.market_session),
-        "equity": {
-            "state_mode": label(report.equity_state_mode),
-            "high_water_mark": money(report.high_water_mark),
-            "paper_cash": money(report.paper_cash_usdc),
+        "halt": {"resume_command": report.resume_command},
+        "autonomy": _autonomy_payload(status.autonomy),
+        "drawdown": _drawdown_payload(status),
+        "equity": _equity_payload(status),
+        "withdrawal_attestation": _attestation_payload(status.withdrawal_attestation),
+        "market_session": _session_payload(status.market_session),
+        "last_cycle_at": moment(report.last_cycle_ts),
+        "today": {
+            "basis": _today_basis_field(report.today_basis),
+            "cycles": count(today.cycles, state=quiet),
+            "signals": count(today.signals, state=quiet),
+            "blocked": count(today.blocked, state=WARN if today.blocked else quiet),
+            "entered": count(today.entered, state=quiet),
+            "exited": count(today.exited, state=quiet),
+            "errors": count(today.errors, state=BAD if today.errors else quiet),
         },
-        "drawdown": {
-            "total": ratio(report.drawdown_total_pct),
-            "weekly": ratio(report.drawdown_weekly_pct),
-            "max_total": ratio(report.max_total_dd_pct),
-            "max_weekly": ratio(report.max_weekly_dd_pct),
-            "rail11": label(report.rail11_status, state=_rail_state(report.rail11_status)),
-        },
-        "withdrawal_attestation": _attestation_payload(report.withdrawal_attestation),
-        "open_positions": [_position_payload(p, report.mode) for p in report.open_positions],
-        # A LIST of pairs rather than an object, because the order is a presentation decision and
-        # Rule 2 says presentation decisions are made here. `sorted` matches `render_human`'s own
-        # ordering, so the two front-ends list the statuses the same way.
-        "rule_counts": [
-            {"status": status, "count": count(number)}
-            for status, number in sorted(report.rule_counts.items())
+        "why_not": list(report.why_not),
+        "why_not_none": report.why_not_none,
+        "no_cycles_line": report.no_cycles_line,
+        "next_dca": [
+            {
+                "rule_id": str(buy.rule_id),
+                "product_id": buy.product_id,
+                "cadence": _dca_cadence(buy.cadence_days),
+                "budget": money(buy.budget_usd),
+                "budget_inferred": flag(
+                    buy.budget_inferred,
+                    on="inferred — no budget_usd stored",
+                    off="stored",
+                    on_state=WARN,
+                    off_state=NEUTRAL,
+                ),
+                "next_cadence_day": moment(buy.next_cadence_day_ts),
+            }
+            for buy in report.next_dca
         ],
-        "live_rules": [_rule_payload(r) for r in report.live_rules],
-        "data_freshness": [_freshness_payload(f, session_defused) for f in report.data_freshness],
-        "subscriptions": [_subscription_payload(s) for s in report.subscriptions],
+        "next_dca_note": NEXT_DCA_NOTE,
+        "open_positions": [_position_payload(p, status.mode) for p in status.open_positions],
+        # The count is the SERVICE's (Rule 6e: no `len()` on the wire). Unbracketed live tranches
+        # are the #641 hazard, so any at all is a warning.
+        "unbracketed_count": count(
+            report.unbracketed_count, state=WARN if report.unbracketed_count else NEUTRAL
+        ),
+        "rule_counts": _rule_counts_payload(status),
+        "live_rules": [_rule_payload(r) for r in status.live_rules],
+        "data_freshness": [_freshness_payload(f, session_defused) for f in status.data_freshness],
+        "subscriptions": [_subscription_payload(s) for s in status.subscriptions],
+        "activity": activity_payload(report.feed),
     }
 
 
@@ -1712,8 +1818,8 @@ def plans_payload(report: PlansReport) -> dict[str, Any]:
     )
 
     return {
-        # NO `as_of`/`generated_at`, matching `gates_payload` next door, which also describes
-        # capability rather than deployment and also sends none. Nothing on this page was
+        # NO `as_of`/`generated_at`: this page describes the project rather than a deployment.
+        # Nothing on this page was
         # OBSERVED at a moment -- it changes when a document changes -- and a stamp nobody renders
         # is a stamp that eventually gets rendered, dating a page that has no date.
         "for_sale": flag(
@@ -3933,50 +4039,4 @@ def venues_payload(
     return {
         "venues": [_venue_payload(info) for info in infos],
         "readiness": [_readiness_payload(row) for row in readiness],
-    }
-
-
-# -- gates (#534) --------------------------------------------------------------------------------
-
-
-def _capability_payload(capability: Any) -> dict[str, Any]:
-    return {
-        "surface": capability.surface,
-        "invocation": capability.invocation,
-        "increases": capability.increases,
-        "call_site": f"{capability.module}.{capability.function}",
-        "mirrors": (
-            f"{capability.mirrors[0]}.{capability.mirrors[1]}" if capability.mirrors else ""
-        ),
-    }
-
-
-def gates_payload(gates: Sequence[Any], capabilities: Sequence[Any]) -> dict[str, Any]:
-    """`keel/capabilities.py`'s declaration, as JSON.
-
-    A pure declaration -- no config, no database, no network. It describes the BINARY that is
-    answering, which is why this endpoint has data to serve on a machine with no deployment on it.
-
-    **No `count` of covered actions**, unlike the HTML page's `esc(len(covered))`. Rule 6e of
-    `test_console_thinness.py` bans `len()` in this module, because a count on the wire must be one
-    the report already holds -- and `Gate` holds none. Unlike `JournalReport.shown_count` there is
-    no report builder to add it to either, `keel/capabilities.py` being a declaration rather than a
-    report. A client renders `actions.length`, which is a list length in the language that owns the
-    list, not a figure this layer invented.
-    """
-    return {
-        "gates": [
-            {
-                "name": gate.name,
-                "evidence": gate.evidence,
-                "fails_closed_against": gate.fails_closed_against,
-                "implementation": gate.implementation,
-                "actions": [
-                    _capability_payload(capability)
-                    for capability in capabilities
-                    if capability.gate == gate.name
-                ],
-            }
-            for gate in gates
-        ]
     }

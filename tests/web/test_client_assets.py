@@ -738,7 +738,7 @@ def test_the_route_table_parser_actually_found_something() -> None:
     writing a number into prose beside a test that deliberately does not assert one."""
     names = _js_route_names()
     assert len(names) >= 7, f"parsed {names} out of main.js -- the parser has stopped working"
-    assert "status" in names
+    assert "pulse" in names
 
 
 def _js_route_names() -> list[str]:
@@ -1127,6 +1127,31 @@ def test_a_path_that_is_not_a_client_route_is_still_a_404(running) -> None:  # t
     assert status == 404
 
 
+def test_the_retired_client_routes_are_a_closed_tuple_of_exactly_these_names() -> None:
+    """Console PR1 (#951) retired three views; PRs 2-4 will add to this tuple, one name each."""
+    assert staticfiles.RETIRED_CLIENT_ROUTES == ("status", "activity", "gates")
+    assert set(staticfiles.RETIRED_CLIENT_ROUTES).isdisjoint(staticfiles.CLIENT_ROUTES)
+
+
+@pytest.mark.parametrize("name", ["status", "activity", "gates"])
+def test_a_retired_route_serves_the_shell_so_the_client_can_land_on_the_home_view(
+    name: str,
+    running,  # type: ignore[no-untyped-def]
+) -> None:
+    """**Review F1.** `main.js`'s `routeFor` sends an unknown name to the home view, but only if
+    the shell is delivered. Without this, a bookmark, a cached `start_url` or a `?token=` redirect
+    to a retired path is a plain-text 404 whenever no service worker answers the navigation."""
+    status, headers, body = _request(running, _P(name), cookie=_session(running))
+    assert status == 200, name
+    assert headers["Content-Type"] == "text/html; charset=utf-8"
+    assert '<script type="module"' in body
+
+
+def test_a_retired_route_is_still_behind_the_same_admission(running) -> None:  # type: ignore[no-untyped-def]
+    status, _headers, _body = _request(running, _P("status"))  # no cookie
+    assert status == 403
+
+
 def test_a_missing_asset_is_a_404_and_never_the_shell(running) -> None:  # type: ignore[no-untyped-def]
     """The failure mode the closed list exists to prevent, asserted directly."""
     status, _headers, body = _request(running, _P("js/nope.js"), cookie=_session(running))
@@ -1148,7 +1173,7 @@ def test_a_real_file_wins_over_a_client_route(running) -> None:  # type: ignore[
 def test_the_client_route_fallback_is_behind_the_same_admission(running) -> None:  # type: ignore[no-untyped-def]
     """Never weakened. A path that resolves to the shell is not exempt from the loopback-plus-
     session model for having been synthesised rather than found on disk."""
-    status, _headers, _body = _request(running, _P("status"))  # no cookie
+    status, _headers, _body = _request(running, _P("pulse"))  # no cookie
     assert status == 403
 
 
@@ -1184,7 +1209,7 @@ def test_the_shell_is_served_with_the_static_header_set(running) -> None:  # typ
     the tightest policy that does. Asserted here on the SHELL specifically, because
     `test_server.py` asserts it on the placeholder asset that used to be the only HTML under
     `/static/`."""
-    status, headers, _body = _request(running, _P("status"), cookie=_session(running))
+    status, headers, _body = _request(running, _P("pulse"), cookie=_session(running))
     assert status == 200
     csp = headers["Content-Security-Policy"]
     assert "default-src 'self'" in csp
@@ -1196,39 +1221,15 @@ def test_the_shell_is_served_with_the_static_header_set(running) -> None:  # typ
     assert "Strict-Transport-Security" not in headers
 
 
-def test_the_status_payload_carries_every_field_the_status_view_places(running) -> None:  # type: ignore[no-untyped-def]
-    """**Parity, checked against the payload rather than against the screen.**
-
-    `js/render.js::statusView` reads a fixed set of keys. A browser cannot run here, so the risk
-    this test removes is the one a browserless suite is otherwise blind to: `render.js` reaching
-    for a key `payload.py` does not emit, rendering `?` forever, exactly as `render.py`'s five
-    `getattr(..., default)` calls render blanks today (see `statusView`'s own docstring). The key
-    list is parsed out of the JavaScript rather than restated here, so it cannot drift.
-    """
-    status, _headers, body = _request(running, "/api/status", cookie=_session(running))
-    assert status == 200
-    document = json.loads(body)
-    # A migrated but empty deployment: `engine` is running, so `data` is a real payload.
-    assert document["engine"]["value"] == "running", document
-    data = document["data"]
-
-    for path in _status_view_keys():
-        cursor = data
-        for part in path.split("."):
-            assert isinstance(cursor, dict), f"{path} -- {part} is not an object in the payload"
-            assert part in cursor, f"statusView reads data.{path}; /api/status does not send it"
-            cursor = cursor[part]
-
-
 def _view_keys(view: str, root: str) -> list[str]:
     """Every `<root>.<...>` path a view function reads, from the source.
 
-    Generalised from `_status_view_keys` at #537, when six more views needed the same check --
-    and the generalisation is a REQUIRED second argument, never a default. The views do not all
-    name their payload `data`: `insightsView` takes `insights` and `journal`, because it reads two
-    endpoints. A helper defaulting to `"data"` would have scanned nothing for that view, found no
-    keys, and passed -- over the view with the most keys in it. Every existing caller passes
-    `("statusView", "data")` and gets exactly what it got before.
+    Generalised from the status view's own key scan at #537, when six more views needed the same
+    check -- and the generalisation is a REQUIRED second argument, never a default. The views do
+    not all name their payload `data`: `insightsView` takes `insights` and `journal`, because it
+    reads two endpoints. A helper defaulting to `"data"` would have scanned nothing for that view,
+    found no keys, and passed -- over the view with the most keys in it. Every existing caller
+    passes `("pulseView", "data")` and gets exactly what it got before.
 
     Row-level keys (`row.qty`, `row.product_id`) are out of scope: they live inside collections
     that are empty on a fresh deployment, so there is nothing to check them against here. They are
@@ -1239,7 +1240,7 @@ def _view_keys(view: str, root: str) -> list[str]:
     # explaining where the current scope comes from. Since a region runs up to the next `export
     # function` LINE, the next view's docstring falls inside the previous view's region, and
     # scanning the raw text reported `setupView` reading a key of `/api/activity`. Found by this
-    # test failing on its first run, which is the same way `_status_view_keys` learned it had to
+    # test failing on its first run, which is the same way the status view's scan learned it had to
     # be bounded at all. It is the same lesson `_markup_only` records for `index.html`: a file
     # that explains itself well is a file a naive grep cannot check.
     source = _code_only(_source("render.js"))
@@ -1271,11 +1272,6 @@ def _view_keys(view: str, root: str) -> list[str]:
     return sorted({path for path in found if not path.endswith((".length", ".display"))})
 
 
-def _status_view_keys() -> list[str]:
-    """`statusView`'s keys. Kept under its own name because three tests call it that."""
-    return _view_keys("statusView", "data")
-
-
 #: Each ported view, the parameter it reads a payload through, and the endpoint that fills it.
 #:
 #: `insightsView` appears twice because it reads two endpoints. `api.py` splits them so that "one
@@ -1283,7 +1279,8 @@ def _status_view_keys() -> list[str]:
 #: their `html_route` -- which is the server saying they are one page.
 _VIEW_ENDPOINTS: tuple[tuple[str, str, str], ...] = (
     ("setupView", "data", "/api/setup"),
-    ("activityView", "data", "/api/activity"),
+    # Pulse (console PR1): the home view, and the one that replaced Status, Activity and Gates.
+    ("pulseView", "data", "/api/pulse"),
     # #659/#701/#702's views were added to the client without being added here, so nothing
     # checked that they read keys their endpoint actually sends. Demonstrated on #702: renaming
     # `data.hwm` to `data.high_water_mark` in `balancesView` left the whole web suite green, and
@@ -1302,7 +1299,6 @@ _VIEW_ENDPOINTS: tuple[tuple[str, str, str], ...] = (
     # carries every key the ready shape does (`payload.dca_plan_awaiting_payload`).
     ("dcaPlanCard", "plan", "/api/dca-plan"),
     ("venuesView", "data", "/api/venues"),
-    ("gatesView", "data", "/api/gates"),
 )
 
 
@@ -1349,14 +1345,18 @@ def test_the_view_key_scan_reads_every_ported_view() -> None:
     for view, root, _endpoint in _VIEW_ENDPOINTS:
         assert _view_keys(view, root), f"{view} reads nothing off {root} -- the parser has broken"
 
-    assert "status_note" in _view_keys("activityView", "data")
+    assert "halt.resume_command" in _view_keys("pulseView", "data")
+    assert "activity.status_note" in _view_keys("pulseView", "data")
     assert "curve" in _view_keys("insightsView", "journal")
     assert "steps" in _view_keys("setupView", "data")
 
 
-def test_the_status_key_scan_found_the_keys_it_claims_to_check() -> None:
-    """The premise. A regex that matched nothing would make the test above pass on any payload."""
-    keys = _status_view_keys()
+def test_the_pulse_key_scan_found_the_keys_it_claims_to_check() -> None:
+    """The premise. A regex that matched nothing would make the parity test pass on any payload.
+
+    (The status view's version of this test moved here with its keys: Pulse reads the same
+    sections through the same helpers.)"""
+    keys = _view_keys("pulseView", "data")
     assert "equity.high_water_mark" in keys
     assert "autonomy.live" in keys
     assert "withdrawal_attestation.state" in keys
@@ -1364,13 +1364,13 @@ def test_the_status_key_scan_found_the_keys_it_claims_to_check() -> None:
 
     # The two filters, asserted rather than assumed -- both were added because this test failed
     # on a real key that was not a key. A method name or `.length` reaching the payload check
-    # reports a gap in `/api/status` that does not exist, which is a false failure pointing at
+    # reports a gap in `/api/pulse` that does not exist, which is a false failure pointing at
     # the wrong file entirely.
     assert "data_freshness" in keys and "data_freshness.map" not in keys
     assert not any(key.endswith(".length") for key in keys), keys
 
     # And the scan is bounded: `data.build` belongs to `/api/config` and is read by `buildLine`,
-    # which lives BELOW `statusView` in the same file.
+    # which lives BELOW `pulseView` in the same file.
     assert "build" not in keys, keys
 
 
@@ -1786,6 +1786,10 @@ _ROW_ENDPOINTS: tuple[tuple[str, str, str, str, str], ...] = (
     ("balancesView", "data", "assets", "/api/balances", "positions"),
     ("timelineView", "data", "rows", "/api/timeline", "orders"),
     ("rulesView", "data", "rules", "/api/rules", "rules"),
+    # Pulse's two row tables a seeded deployment can fill: the open tranche, and a LIVE dca rule's
+    # next cadence day. Registered WITH the code that reads them.
+    ("pulseView", "data", "open_positions", "/api/pulse", "positions"),
+    ("pulseView", "data", "next_dca", "/api/pulse", "dca_live"),
     ("researchView", "slippage", "rows", "/api/research/slippage", "none"),
     ("researchView", "gauntlet", "rows", "/api/research/gauntlet", "gauntlet"),
     # #708 view 2. Registered WITH the code that reads it -- the rule `_ROW_ENDPOINTS` states.
@@ -1806,15 +1810,17 @@ _ROW_ENDPOINTS: tuple[tuple[str, str, str, str, str], ...] = (
 #: an uncovered collection that nobody wrote down is indistinguishable from one nobody noticed,
 #: and `test_every_mapped_collection_is_either_checked_or_named` fails on anything in neither set.
 _ROW_ENDPOINTS_UNCOVERED: dict[tuple[str, str, str], str] = {
-    ("statusView", "data", "open_positions"): "covered by test_api's sort-column pin, same rows",
-    ("statusView", "data", "live_rules"): "needs a promoted rule; no seeder in this module yet",
-    ("statusView", "data", "data_freshness"): "needs cached candles per configured product",
-    ("statusView", "data", "subscriptions"): "needs a venue subscription record",
+    ("pulseView", "data", "live_rules"): "needs a promoted rule; no seeder in this module yet",
+    ("pulseView", "data", "data_freshness"): "needs cached candles per configured product",
+    ("pulseView", "data", "subscriptions"): "needs a venue subscription record",
+    ("pulseView", "activity", "cycles"): (
+        "needs a cycle log file beside the deployment; the service is pinned in "
+        "tests/commands/test_pulse.py and the reader in test_api.py"
+    ),
     ("setupView", "data", "not_automated"): "the checklist is config-derived, not row-seeded",
     ("setupView", "data", "actions"): "the checklist is config-derived, not row-seeded",
     ("researchView", "data", "exploration"): "needs a trials ledger; #708 view 1 seeds one",
     ("researchView", "data", "rows"): "needs a trials ledger; #708 view 1's own tests seed one",
-    ("activityView", "data", "cycles"): "needs a cycle log file beside the deployment",
     ("insightsView", "insights", "rules"): "needs closed trades to build a track record",
     ("insightsView", "journal", "entries"): "needs journal entries",
     ("venuesView", "data", "venues"): "config-derived; no rows to seed",
@@ -1822,8 +1828,7 @@ _ROW_ENDPOINTS_UNCOVERED: dict[tuple[str, str, str], str] = {
     # Nested one level down: the root is a ROW variable, not a payload root, so the check above
     # cannot address them by `(root, collection)` at all. Naming them is what stops the scan from
     # looking complete while quietly skipping every nested collection in the client.
-    ("gatesView", "gate", "actions"): "nested under a gate row; root is a loop variable",
-    ("activityView", "cycle", "events"): "nested under a cycle row; root is a loop variable",
+    ("pulseView", "cycle", "events"): "nested under a cycle row; root is a loop variable",
 }
 
 
@@ -1878,6 +1883,17 @@ def _seed_for(kind: str, db_path: str, monkeypatch: pytest.MonkeyPatch) -> None:
         conn = connect(db_path)
         migrate(conn)
         _insert_dca(Repository(conn), "ETH-USD", "candidate")
+        conn.close()
+    elif kind == "dca_live":
+        # A LIVE dca rule, written through the repository: Pulse lists only live ones, so a
+        # candidate would leave `next_dca` empty and the row-key check would fail by vacuum.
+        from keel.data.db import connect, migrate
+        from keel.data.repository import Repository
+        from tests.commands.test_dca_plan import _insert_dca
+
+        conn = connect(db_path)
+        migrate(conn)
+        _insert_dca(Repository(conn), "ETH-USD", "live")
         conn.close()
     elif kind == "gauntlet":
         _seed_ledger(Path(db_path).parent)
@@ -2019,7 +2035,7 @@ def test_every_mapped_collection_is_either_checked_or_named() -> None:
         (view, root, collection.rsplit(".", 1)[-1])
         for view, root, collection, _e, _s in _ROW_ENDPOINTS
     }
-    views = {view for view, _root, _endpoint in _VIEW_ENDPOINTS} | {"statusView", "gatesView"}
+    views = {view for view, _root, _endpoint in _VIEW_ENDPOINTS}
 
     mapped = {(view, root, collection) for view in views for (root, collection) in _row_reads(view)}
 

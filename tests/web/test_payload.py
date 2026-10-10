@@ -39,7 +39,6 @@ from typing import Any
 import pytest
 from keel_core.types import EquityReading
 
-from keel.capabilities import CAPABILITIES, GATES
 from keel.commands.activity import ActivityCycle, ActivityEvent, ActivityFeed
 from keel.commands.insights import (
     AccountSummary,
@@ -52,6 +51,7 @@ from keel.commands.insights import (
     build_equity_series,
 )
 from keel.commands.jobs import JobStatus
+from keel.commands.pulse import RESUME_COMMAND, NextDcaBuy, PulseReport, TodayCounts
 from keel.commands.setup import ACTIONS, STEPS, DeploymentState, StepState
 from keel.commands.status import (
     AutonomyStatus,
@@ -323,6 +323,45 @@ def _activity_feed(**overrides: Any) -> ActivityFeed:
     return ActivityFeed(**base)
 
 
+def _pulse_report(**overrides: Any) -> PulseReport:
+    """A populated `PulseReport`: today has a block and errors, the why-not list is non-empty, one
+    DCA rule has its budget inferred, and one open tranche is unbracketed -- so the walkers reach
+    every branch of `pulse_payload` instead of passing over empty collections."""
+    status = overrides.pop("status", None) or _status_report()
+    base: dict[str, Any] = dict(
+        now_ts=NOW_TS,
+        status=status,
+        feed=_activity_feed(),
+        today=TodayCounts(cycles=3, signals=2, blocked=1, entered=0, exited=0, errors=2),
+        last_cycle_ts=float(NOW_TS - 600),
+        why_not=("rail veto: per_asset_concentration_cap", "not placed: paper: vetoed by rails"),
+        next_dca=(
+            NextDcaBuy(
+                rule_id=3,
+                product_id="ETH-USD",
+                cadence_days=7,
+                budget_usd=Decimal("50"),
+                next_cadence_day_ts=NOW_TS - NOW_TS % 86_400 + 86_400,
+                budget_inferred=True,
+            ),
+        ),
+        unbracketed=tuple(status.open_positions),
+        unbracketed_count=len(status.open_positions),
+        resume_command="",
+        today_basis="complete",
+        why_not_none="Nothing stopped keel today.",
+        no_cycles_line="",
+    )
+    base.update(overrides)
+    return PulseReport(**base)
+
+
+def _pulse_payload(status: StatusReport, **overrides: Any) -> dict[str, Any]:
+    """`pulse_payload` over a report built from `status`: how the status-shaped pins below read
+    the same keys the retired `status_payload` served."""
+    return payload.pulse_payload(_pulse_report(status=status, **overrides))
+
+
 def _deployment_state() -> DeploymentState:
     """A half-built deployment: one step done, one outstanding, one that could not be determined.
 
@@ -404,14 +443,12 @@ def _every_payload() -> dict[str, Any]:
     contract that holds for `status` and leaks on `journal` is not a contract.
 
     #534 added five entries here -- the endpoints behind `/api/config`, `/api/setup`, `/api/rules`,
-    `/api/venues` and `/api/gates` -- and that is the point of the helper being shared: a new
-    serialiser joins the money-as-strings walk, the `state`-vocabulary check and the
+    `/api/venues` and the former `/api/gates` -- and that is the point of the helper being shared:
+    a new serialiser joins the money-as-strings walk, the `state`-vocabulary check and the
     no-custom-encoder check by being listed once, rather than by its author remembering three
-    separate guards. `gates` reads the REAL `keel/capabilities.py` registry rather than a fixture,
-    because that module is a declaration with no external inputs and a fixture of it would be a
-    second copy to drift."""
+    separate guards."""
     return {
-        "status": payload.status_payload(_status_report()),
+        "pulse": payload.pulse_payload(_pulse_report(), gate="gate-token"),
         "insights": payload.insights_payload(
             _insights_report(),
             series=build_equity_series(_equity_readings(), max_total_dd_pct=Decimal("0.20")),
@@ -455,7 +492,6 @@ def _every_payload() -> dict[str, Any]:
             [_BrokerInfo(), _BrokerInfo(name="broken", error="ImportError: no module")],
             _READINESS_ROWS,
         ),
-        "gates": payload.gates_payload(GATES, CAPABILITIES),
     }
 
 
@@ -579,7 +615,7 @@ def test_scientific_notation_never_reaches_the_wire() -> None:
         paper_cash_usdc=Decimal("1E-9"),
         drawdown_total_pct=Decimal("2E-3"),
     )
-    document = json.loads(json.dumps(payload.status_payload(report)))
+    document = json.loads(json.dumps(payload.pulse_payload(_pulse_report(status=report))))
 
     offenders = [
         (path, leaf)
@@ -694,7 +730,7 @@ def test_the_serialiser_computes_nothing_every_wire_figure_came_from_the_report(
     covered by their own test below.
     """
     for name, reports, built in (
-        ("status", (_status_report(),), payload.status_payload(_status_report())),
+        ("pulse", (_pulse_report(),), payload.pulse_payload(_pulse_report())),
         _journal_case(),
     ):
         available: set[Decimal] = set()
@@ -737,7 +773,7 @@ def test_live_position_with_no_bracket_still_warns() -> None:
     positions` and the `unbracketed:` crash ledger (#519, #502) exist to heal. Whatever paper's
     rendering becomes, this one must render byte-identically to before #641."""
     report = _status_report(mode="confirm", open_positions=[_position(has_bracket=False)])
-    bracket = payload.status_payload(report)["open_positions"][0]["bracket"]
+    bracket = _pulse_payload(report)["open_positions"][0]["bracket"]
     assert bracket["display"] == "NO bracket"
     assert bracket["state"] == "warn"
 
@@ -745,7 +781,7 @@ def test_live_position_with_no_bracket_still_warns() -> None:
 def test_live_position_with_a_bracket_still_reads_good() -> None:
     """The other half of the live case, unchanged: a real bracket still reads GOOD."""
     report = _status_report(mode="confirm", open_positions=[_position(has_bracket=True)])
-    bracket = payload.status_payload(report)["open_positions"][0]["bracket"]
+    bracket = _pulse_payload(report)["open_positions"][0]["bracket"]
     assert bracket["display"] == "bracketed"
     assert bracket["state"] == "good"
 
@@ -755,7 +791,7 @@ def test_paper_position_with_no_bracket_does_not_warn() -> None:
     position by construction, and the old rendering WARNed on all of them -- unactionable, nine
     of nine. A paper row without a bracket must not read `warn`."""
     report = _status_report(mode="paper", open_positions=[_position(has_bracket=False)])
-    bracket = payload.status_payload(report)["open_positions"][0]["bracket"]
+    bracket = _pulse_payload(report)["open_positions"][0]["bracket"]
     assert bracket["state"] != "warn"
 
 
@@ -767,7 +803,7 @@ def test_paper_position_with_a_recorded_stop_shows_it_instead_of_the_absent_brac
     report = _status_report(
         mode="paper", open_positions=[_position(has_bracket=False, initial_stop=Decimal("64000"))]
     )
-    bracket = payload.status_payload(report)["open_positions"][0]["bracket"]
+    bracket = _pulse_payload(report)["open_positions"][0]["bracket"]
     assert bracket["state"] == "neutral"
     assert "64,000" in bracket["display"]
 
@@ -779,7 +815,7 @@ def test_paper_position_without_a_recorded_stop_falls_back_to_mode_aware_text() 
     report = _status_report(
         mode="paper", open_positions=[_position(has_bracket=False, initial_stop=None)]
     )
-    bracket = payload.status_payload(report)["open_positions"][0]["bracket"]
+    bracket = _pulse_payload(report)["open_positions"][0]["bracket"]
     assert bracket["state"] == "neutral"
     assert "candle touch" in bracket["display"]
 
@@ -796,7 +832,7 @@ def test_an_open_position_carries_no_notional_because_the_report_holds_none() ->
     If a notional is wanted, it is added to `gather_status`, where the rails can see it. Then this
     test changes -- deliberately, in a commit that says so.
     """
-    position = payload.status_payload(_status_report())["open_positions"][0]
+    position = _pulse_payload(_status_report())["open_positions"][0]
 
     assert "notional" not in position
     assert "pnl" not in position
@@ -814,7 +850,7 @@ def test_a_drawdown_fraction_is_not_rescaled_into_a_percentage() -> None:
     raw fraction and therefore prints "0.05%" for a 5% drawdown. The contract does not inherit
     that; fixing the HTML renderer is a separate change against a separate surface.)
     """
-    built = payload.status_payload(_status_report())
+    built = _pulse_payload(_status_report())
 
     assert built["drawdown"]["total"]["value"] == "0.05"
     assert "%" not in built["drawdown"]["total"]["display"]
@@ -1037,8 +1073,8 @@ def test_absence_is_unknown_and_never_a_zero() -> None:
 def test_a_kill_switch_carries_its_own_judgement() -> None:
     """A boolean the operator must act on is not a bare `true`: it arrives with the word to show
     and the state to style it by."""
-    engaged = payload.status_payload(_status_report(kill_switch_engaged=True))["kill_switch"]
-    clear = payload.status_payload(_status_report(kill_switch_engaged=False))["kill_switch"]
+    engaged = _pulse_payload(_status_report(kill_switch_engaged=True))["kill_switch"]
+    clear = _pulse_payload(_status_report(kill_switch_engaged=False))["kill_switch"]
 
     assert engaged["display"] == "ENGAGED"
     assert engaged["state"] == "bad"
@@ -1054,9 +1090,9 @@ def test_an_unknown_rail_state_is_unknown_and_not_quietly_good() -> None:
     "breach"/"halt"/"warn" and falls through to `"good"` -- so it styles a rail nobody has measured
     as if it had passed.
     """
-    halted = payload.status_payload(_status_report(rail11_status="HALTED"))
-    unknown = payload.status_payload(_status_report(rail11_status="unknown"))
-    ok = payload.status_payload(_status_report(rail11_status="ok"))
+    halted = _pulse_payload(_status_report(rail11_status="HALTED"))
+    unknown = _pulse_payload(_status_report(rail11_status="unknown"))
+    ok = _pulse_payload(_status_report(rail11_status="ok"))
 
     assert halted["drawdown"]["rail11"]["state"] == "bad"
     assert unknown["drawdown"]["rail11"]["state"] == "unknown"
@@ -1065,7 +1101,7 @@ def test_an_unknown_rail_state_is_unknown_and_not_quietly_good() -> None:
 
 def test_an_expired_withdrawal_attestation_reads_as_bad() -> None:
     """Rail 17's state is the one an operator must act on within a TTL; it arrives judged."""
-    expired = payload.status_payload(
+    expired = _pulse_payload(
         _status_report(
             withdrawal_attestation=WithdrawalAttestationStatus(
                 state="expired",
@@ -1301,6 +1337,142 @@ def test_a_ready_row_carries_an_empty_next_step_not_null() -> None:
     assert document["readiness"][0]["next_step"] == ""
 
 
+# -- pulse (console PR1) -------------------------------------------------------------------------
+
+
+def test_the_pulse_payload_carries_no_json_number() -> None:
+    document = json.loads(json.dumps(payload.pulse_payload(_pulse_report(), gate="g")))
+    assert _json_numbers(document) == []
+    # the walk saw the sections it is meant to guard, not an empty shell
+    assert document["today"]["cycles"]["value"] == "3"
+    assert document["next_dca"] and document["open_positions"] and document["activity"]["cycles"]
+
+
+def test_the_halt_block_names_the_resume_command_only_when_engaged() -> None:
+    engaged = payload.pulse_payload(
+        _pulse_report(
+            status=_status_report(kill_switch_engaged=True), resume_command=RESUME_COMMAND
+        )
+    )
+    clear = payload.pulse_payload(
+        _pulse_report(status=_status_report(kill_switch_engaged=False), resume_command="")
+    )
+    assert engaged["kill_switch"]["value"] == "true"
+    assert engaged["halt"]["resume_command"] == RESUME_COMMAND  # the service's constant, not a copy
+    assert clear["kill_switch"]["value"] == "false"
+    assert clear["halt"]["resume_command"] == ""
+
+
+def test_the_gate_is_a_bare_string_and_never_a_field() -> None:
+    carried = payload.pulse_payload(_pulse_report(), gate="tok-123")
+    assert carried["gate"] == "tok-123"
+    assert isinstance(carried["gate"], str)
+    # absent unless given: the default is the empty string, not a missing key or a Field
+    assert payload.pulse_payload(_pulse_report())["gate"] == ""
+    # and it appears on this payload alone -- no other builder names it
+    others = {k: v for k, v in _every_payload().items() if k != "pulse"}
+    assert others  # the sweep reached other payloads
+    for name, built in others.items():
+        assert "gate" not in built, name
+
+
+def test_why_not_crosses_as_a_list_of_sentences_unchanged() -> None:
+    report = _pulse_report()
+    assert report.why_not  # the fixture reached the builder
+    assert payload.pulse_payload(report)["why_not"] == list(report.why_not)
+
+
+def test_a_blocked_or_erroring_day_is_judged_here() -> None:
+    busy = payload.pulse_payload(_pulse_report())["today"]
+    assert busy["blocked"]["state"] == "warn"
+    assert busy["errors"]["state"] == "bad"
+    quiet = payload.pulse_payload(
+        _pulse_report(
+            today=TodayCounts(cycles=3, signals=0, blocked=0, entered=0, exited=0, errors=0)
+        )
+    )["today"]
+    assert quiet["blocked"]["state"] == "neutral"
+    assert quiet["errors"]["state"] == "neutral"
+
+
+def test_an_unread_log_crosses_as_absent_counts_and_a_bad_basis_never_as_zeros() -> None:
+    """**Review F3.** Every figure absent (state unknown), the basis judged `bad`, and the
+    empty-reasons sentence the service's own."""
+    blank = TodayCounts(
+        cycles=None, signals=None, blocked=None, entered=None, exited=None, errors=None
+    )
+    document = payload.pulse_payload(
+        _pulse_report(
+            today=blank,
+            today_basis="unavailable",
+            why_not=(),
+            why_not_none="Today's log could not be read, so reasons may be missing.",
+            no_cycles_line="",
+        )
+    )
+
+    assert document["no_cycles_line"] == ""
+    assert sorted(document["today"]) == [
+        "basis", "blocked", "cycles", "entered", "errors", "exited", "signals"
+    ]  # fmt: skip
+    for key in ("cycles", "signals", "blocked", "entered", "exited", "errors"):
+        assert document["today"][key] == payload.absent(), key
+    assert document["today"]["basis"]["state"] == "bad"
+    assert document["today"]["basis"]["value"] == "unavailable"
+    assert document["why_not_none"] == "Today's log could not be read, so reasons may be missing."
+
+
+def test_a_partial_day_is_judged_warn_on_every_figure_and_on_the_basis() -> None:
+    document = payload.pulse_payload(_pulse_report(today_basis="partial"))["today"]
+
+    assert document["basis"]["state"] == "warn"
+    for key in ("cycles", "signals", "entered", "exited"):
+        assert document[key]["state"] == "warn", key
+    assert document["blocked"]["state"] == "warn"
+    assert document["errors"]["state"] == "bad"  # a seen error is an error whatever the coverage
+
+
+def test_a_complete_day_keeps_its_neutral_judgements() -> None:
+    document = payload.pulse_payload(_pulse_report())["today"]
+    assert document["basis"]["state"] == "good"
+    assert document["cycles"]["state"] == "neutral"
+
+
+def test_next_dca_rows_carry_the_cadence_day_as_a_moment_and_the_note_once() -> None:
+    built = payload.pulse_payload(_pulse_report())
+    assert len(built["next_dca"]) == 1  # the fixture's one live rule reached the payload
+    row = built["next_dca"][0]
+    assert row["rule_id"] == "3"
+    assert row["product_id"] == "ETH-USD"
+    assert row["cadence"]["display"] == "every 7 days"
+    assert row["budget"]["value"] == "50"
+    assert row["budget_inferred"]["state"] == "warn"
+    assert row["next_cadence_day"]["value"].endswith("T00:00:00Z")  # a day, not an order time
+    assert built["next_dca_note"] == payload.NEXT_DCA_NOTE
+    assert "daily bar closes" in payload.NEXT_DCA_NOTE
+    assert "next_dca_note" not in row  # said once, beside the rows
+
+
+def test_the_unbracketed_count_is_the_reports_and_judged_here() -> None:
+    warned = payload.pulse_payload(_pulse_report(unbracketed_count=2))["unbracketed_count"]
+    assert (warned["value"], warned["state"]) == ("2", "warn")
+    none = payload.pulse_payload(_pulse_report(unbracketed_count=0))["unbracketed_count"]
+    assert (none["value"], none["state"]) == ("0", "neutral")
+
+
+def test_the_pulse_payload_serialises_the_status_sections_through_the_shared_helpers() -> None:
+    """Pulse replaced Status, and the sections Status served are served by the SAME helpers
+    (`_equity_payload`, `_drawdown_payload`, `_rule_counts_payload`) rather than copies: a Pulse
+    that re-worded the drawdown would be two answers to one question."""
+    status = _status_report()
+    built = payload.pulse_payload(_pulse_report(status=status))
+
+    assert built["equity"] == payload._equity_payload(status)
+    assert built["drawdown"] == payload._drawdown_payload(status)
+    assert built["rule_counts"] == payload._rule_counts_payload(status)
+    assert built["activity"] == payload.activity_payload(_activity_feed())
+
+
 # -- totality ------------------------------------------------------------------------------------
 
 
@@ -1336,7 +1508,23 @@ def test_every_builder_survives_a_completely_empty_report() -> None:
         market_session=MarketSessionStatus(state=None, recorded_ts=None),
     )
     documents = {
-        "status": payload.status_payload(empty_status),
+        "pulse": payload.pulse_payload(
+            _pulse_report(
+                status=empty_status,
+                feed=ActivityFeed(status="missing", source="/tmp/nope.log"),
+                today=TodayCounts(
+                    cycles=None, signals=None, blocked=None, entered=None, exited=None, errors=None
+                ),
+                today_basis="unavailable",
+                why_not_none="Today's log could not be read, so reasons may be missing.",
+                no_cycles_line="",
+                last_cycle_ts=None,
+                why_not=(),
+                next_dca=(),
+                unbracketed=(),
+                unbracketed_count=0,
+            )
+        ),
         "insights": payload.insights_payload(
             _insights_report(rules=[], closed_trade_count=0),
             series=build_equity_series([]),
@@ -1353,7 +1541,7 @@ def test_every_builder_survives_a_completely_empty_report() -> None:
 
 @pytest.mark.parametrize(
     "builder",
-    ["status_payload", "insights_payload", "journal_payload", "activity_payload"],
+    ["pulse_payload", "insights_payload", "journal_payload", "activity_payload"],
 )
 def test_every_payload_is_json_serialisable_without_a_custom_encoder(builder: str) -> None:
     """The builders return plain `dict`/`list`/`str` -- no `Decimal` reaches `json.dumps`. That
@@ -1382,8 +1570,13 @@ def test_every_payload_is_json_serialisable_without_a_custom_encoder(builder: st
         )
         return
 
+    if builder == "pulse_payload":
+        # Its own required `PulseReport` plus the optional gate: spelled out, like
+        # `insights_payload`'s `series`, so no default ever stands in for either.
+        json.dumps(payload.pulse_payload(_pulse_report(), gate="gate-token"))
+        return
+
     other = {
-        "status_payload": _status_report(),
         "activity_payload": _activity_feed(),
     }[builder]
 
@@ -2208,3 +2401,10 @@ def test_no_dca_wire_value_is_a_json_number_and_none_says_fee_free(
     ):
         assert _json_numbers(body) == []
         assert "fee-free" not in json.dumps(body).lower()
+
+
+def test_the_no_cycles_line_crosses_exactly_as_the_service_worded_it() -> None:
+    """**Review R2-F1.** The client appends the empty-today card on the PRESENCE of this string."""
+    line = "keel has not run yet today."
+    assert payload.pulse_payload(_pulse_report(no_cycles_line=line))["no_cycles_line"] == line
+    assert payload.pulse_payload(_pulse_report(no_cycles_line=""))["no_cycles_line"] == ""

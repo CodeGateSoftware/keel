@@ -32,17 +32,15 @@
  * it is worth paying.
  */
 
-import { perform, recorded, remember } from "./actions.js";
+import { halt, perform, recorded, remember, rememberGate } from "./actions.js";
 import { read } from "./api.js";
 import { highlightTrade, showTradeAt } from "./chart.js";
 import { indexUrl, rememberVersion } from "./docs.js";
 import { available, subscribe } from "./live.js";
 import {
-  activityView,
   attestationBanner,
   buildLine,
   engineBanner,
-  gatesView,
   plansView,
   insightsView,
   deploymentCard,
@@ -54,11 +52,11 @@ import {
   balancesView,
   timelineView,
   positionsView,
+  pulseView,
   refusedView,
   researchView,
   rulesView,
   setupView,
-  statusView,
   stoppedView,
   venuesView,
 } from "./render.js";
@@ -70,6 +68,17 @@ import {
 const BASE = "/";
 
 /**
+ * The one question asked before the halt (console PR1). A native `confirm`, on purpose: it is
+ * keyboard-accessible, needs no markup or CSS, and cannot be left stale across a repaint -- and
+ * "stopping must never be slower than starting" (`keel/web/gates.py`) rules out anything slower.
+ * It names the way back, because the way back is a terminal and the operator should know that
+ * before pressing, not after. `window.confirm` is called with this and nothing else.
+ *
+ * @type {string}
+ */
+const HALT_CONFIRM = "Halt keel? Resuming requires `keel resume` at a terminal.";
+
+/**
  * One route.
  * @typedef {object} Route
  * @property {string} name        the path segment under `BASE`, and the nav link's target.
@@ -78,8 +87,10 @@ const BASE = "/";
  */
 
 /**
- * The seven views, in `render.py::NAV`'s order -- status first, "because the status page is the
- * answer to 'is it alive'", as that table's own comment puts it.
+ * The console's views, Pulse first. It was Status that led `render.py::NAV`, "because the status
+ * page is the answer to 'is it alive'", as that table's own comment put it; Pulse is that answer
+ * now -- and it is where the HALT button lives, so the first thing in the nav is also the one
+ * place the console can stop the engine.
  *
  * **`/glossary` is deliberately absent, and that is the spec's decision rather than an
  * oversight.** `api.py`'s route table records it: glossary "gets no counterpart: it becomes an
@@ -103,9 +114,8 @@ const BASE = "/";
  * @type {Route[]}
  */
 const ROUTES = [
-  { name: "status", label: "Status", endpoints: ["status"] },
+  { name: "pulse", label: "Pulse", endpoints: ["pulse"] },
   { name: "setup", label: "Setup", endpoints: ["setup"] },
-  { name: "activity", label: "Activity", endpoints: ["activity"] },
   { name: "orders", label: "Orders", endpoints: ["orders"] },
   { name: "positions", label: "Positions", endpoints: ["positions"] },
   { name: "balances", label: "Balances", endpoints: ["balances"] },
@@ -114,7 +124,6 @@ const ROUTES = [
   { name: "research", label: "Research", endpoints: ["research/trials", "research/gauntlet", "research/slippage", "research/matrix"] },
   { name: "rules", label: "Rules", endpoints: ["rules", "dca-plan"] },
   { name: "venues", label: "Venues", endpoints: ["venues"] },
-  { name: "gates", label: "Gates", endpoints: ["gates"] },
   { name: "plans", label: "Plans", endpoints: ["plans"] },
 ];
 
@@ -187,7 +196,7 @@ function must(id) {
  * The route a pathname names.
  *
  * `BASE`, `BASE + "index.html"` and anything unrecognised all resolve to the default. An unknown
- * name resolving to Status rather than to a "no such view" page is a deliberate choice for a
+ * name resolving to Pulse rather than to a "no such view" page is a deliberate choice for a
  * seven-route client with no user-generated URLs: the only ways to reach one are a typo or a
  * link written before a rename, and in both cases the landing page is more use than an error.
  *
@@ -265,10 +274,10 @@ function paramsFor(endpoint) {
 /**
  * Which section each sectioned view is showing (#773).
  *
- * **Keyed by `route.name`, not held once for the client.** Status and Setup are two pages with
- * two section tables, and a single shared "current section" would have a reader who opened
- * Setup's "To go live" find Status showing whichever of its five sections happened to sit at
- * that key -- or, for a key Status does not have, falling back to its first section every time.
+ * **Keyed by `route.name`, not held once for the client.** Setup is the one sectioned page today
+ * (Status was the other, until Pulse replaced it as a single scroll), and the key stays per route
+ * so that a second sectioned page cannot show whichever of its sections happened to sit at
+ * Setup's key -- or, for a key it does not have, fall back to its first section every time.
  *
  * Not in the query string, and not in the URL: nothing is asked of the server here. `sectioned`
  * chooses which part of a document the client already holds to draw, and a `?section=` would be
@@ -488,16 +497,16 @@ function mount(route, readings) {
     remember(data);
     return setupView(data, sectionOf(route), onSectionFor(route));
   }
-  if (route.name === "activity") {
-    return activityView(data, primary.sort, onSort, (scope) => {
-      paramsFor(route.endpoints[0]).scope = scope;
-      void paint(route, true, true);
-    });
+  if (route.name === "pulse") {
+    // The halt token, for the submit handler below. Read off the document that was just fetched
+    // and kept in `actions.js`, exactly like the setup token above: it dies with the process that
+    // minted it, and a stale one produces a 403 the view shows rather than a silent no-op.
+    rememberGate(data);
+    return pulseView(data);
   }
   if (route.name === "orders") {
-    // The same server-side scope switch Activity uses, and deliberately the same control: two
-    // views over one deployment whose "how far back" behaved differently would be a thing an
-    // operator has to learn twice.
+    // A server-side scope switch: filtering the received page here would present the rows that
+    // happened to arrive under `?limit=` as the whole scope.
     return ordersView(
       data,
       primary.sort,
@@ -572,9 +581,10 @@ function mount(route, readings) {
     );
   }
   if (route.name === "venues") return venuesView(data, primary.sort, onSort);
-  if (route.name === "gates") return gatesView(data);
   if (route.name === "plans") return plansView(data);
-  return statusView(data, sectionOf(route), onSectionFor(route));
+  // Unreachable while every route above is named, and the right landing if one is added without
+  // a branch: the home view renders, where a missing return would hand `paint` `undefined`.
+  return pulseView(data);
 }
 
 /**
@@ -946,6 +956,20 @@ contentNode.addEventListener("submit", (event) => {
   // its semantics and its keyboard behaviour (Enter submits, labels bind to controls), and the
   // navigation it would otherwise cause is exactly what a client-rendered view must not do.
   event.preventDefault();
+
+  // The halt (console PR1): the one action that is not a setup step, with its own token, its own
+  // route and no values. It confirms once, then goes -- and returns before the setup path below,
+  // so a halt can never be sent as a setup action nor a setup action as a halt.
+  if (key === "halt") {
+    if (!window.confirm(HALT_CONFIRM)) return;
+    setBusy(form, true);
+    showOutcome(key, "Halting…");
+    void halt().then((outcome) => {
+      showOutcome(key, outcome);
+      void paint(routeFor(window.location.pathname), true, false);
+    });
+    return;
+  }
 
   const values = {};
   for (const control of form.elements) {
@@ -1575,7 +1599,7 @@ subscribe((reading, seen) => {
 // -- boot ---------------------------------------------------------------------------------------
 
 /**
- * Normalise `/` and `/index.html` to `/status` with `replaceState`.
+ * Normalise `/` and `/index.html` to the home view (`DEFAULT_ROUTE`, `/pulse`) with `replaceState`.
  *
  * `replaceState`, never `pushState`: this happens before the user has done anything, and a
  * history entry here would make the first press of the back button appear to do nothing.

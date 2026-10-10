@@ -1,6 +1,11 @@
 """Status and Setup, broken into sections behind one tab bar (#773), and the review that
 followed it (#775).
 
+**Status is gone (console PR1) and Setup alone is sectioned.** Pulse replaced it as a single
+scroll of cards and short tables -- a glance page with tabs hides the thing you came to glance
+at -- so every pin below that named `STATUS_SECTIONS` went with it. The dispatcher and the tab
+bar stay, generic over the table they are handed, and the pins on them stay unchanged.
+
 Both pages had grown past the point where an operator could see anything at a glance: Status
 scrolled through four state cards and four tables, Setup through fifteen step cards. Each now
 shows ONE section at a time, chosen from a tab bar, and the sections are declared as a table --
@@ -161,22 +166,6 @@ def _delegate(code: str, builder: str) -> str:
 # -- the two tables ----------------------------------------------------------------------------
 
 
-def test_the_status_page_offers_the_five_sections_in_the_order_it_used_to_scroll_them() -> None:
-    """The tab bar is the page's own reading order, not a re-think of it.
-
-    An operator who knew where "Data freshness" sat on the long page should find its tab in the
-    same place. Order is asserted as a list, not as a set, for exactly that reason."""
-    table = _sections(_code("render.js"), "STATUS_SECTIONS")
-
-    assert [entry[1] for entry in table] == [
-        "Status",
-        "Open positions",
-        "Rules",
-        "Data freshness",
-        "Subscriptions",
-    ]
-
-
 def test_the_setup_page_offers_the_three_sections_the_runbook_works_down() -> None:
     """`Setup` is the deployment card and what to do next; the other two are the runbook's own
     stages, whose wording is `render_setup`'s -- "To run in paper" carries the argument that
@@ -194,7 +183,7 @@ def test_the_setup_stages_are_still_the_runbook_stages() -> None:
     assert keys == ["setup", "paper", "live"]
 
 
-@pytest.mark.parametrize("name", ["STATUS_SECTIONS", "SETUP_SECTIONS"])
+@pytest.mark.parametrize("name", ["SETUP_SECTIONS"])
 def test_every_section_has_a_builder_of_its_own_and_no_two_share_one(name: str) -> None:
     """**The pairing, not the mere presence of the words.**
 
@@ -211,7 +200,7 @@ def test_every_section_has_a_builder_of_its_own_and_no_two_share_one(name: str) 
         assert declared == 1, builder + " is declared " + str(declared) + " times, want exactly 1"
 
 
-@pytest.mark.parametrize("name", ["STATUS_SECTIONS", "SETUP_SECTIONS"])
+@pytest.mark.parametrize("name", ["SETUP_SECTIONS"])
 def test_every_section_key_is_distinct(name: str) -> None:
     """The key is what the pressed tab stores and what the next paint resolves back to a section.
     Two entries sharing one would make the second unreachable -- a tab that renders its
@@ -364,26 +353,26 @@ def test_only_the_tab_that_is_on_is_marked_current() -> None:
     )
 
 
-def test_one_switch_serves_both_pages_and_each_announces_itself_by_name() -> None:
+def test_one_switch_serves_the_sectioned_page_and_announces_itself_by_name() -> None:
     """Two tab bars on one site announcing themselves identically would leave a screen-reader
     user unable to tell which page's sections they had landed in -- `scopeSwitch` learned this at
-    #659 and took a `label` argument for it. Same argument, same shape."""
+    #659 and took a `label` argument for it. Same argument, same shape; one page uses it today,
+    and the label is still required of it."""
     code = _code("render.js")
 
     assert code.count("function sectionSwitch(") == 1, "one control, declared once"
     assert code.count("function sectioned(") == 1, "one dispatcher, declared once"
 
     # The TABLE as well as the label. `[A-Z_]+` accepted any table, so handing `statusView` the
-    # `SETUP_SECTIONS` list passed -- the Status page rendering Setup's three sections. The two
+    # `SETUP_SECTIONS` list passed -- another page rendering Setup's three sections. The two
     # call lines are otherwise identical, which is what makes that the likely copy-paste when a
     # third sectioned view arrives (#776 review).
-    for view, table in (("statusView", "STATUS_SECTIONS"), ("setupView", "SETUP_SECTIONS")):
+    for view, table in (("setupView", "SETUP_SECTIONS"),):
         wiring = "sectioned(data, " + table + ", section, onSection, "
         assert wiring in _decl(code, view), view + " must be wired to " + table
 
     labels = re.findall(r'sectioned\(data, [A-Z_]+, section, onSection, "([^"]+)"\)', code)
-    assert len(labels) == 2, "both views must wire the switch: " + repr(labels)
-    assert len(set(labels)) == 2, "the two bars must not announce themselves alike: " + repr(labels)
+    assert labels == ["Setup section"], "the sectioned view must wire the switch: " + repr(labels)
 
 
 # -- the runbook stages ------------------------------------------------------------------------
@@ -481,45 +470,14 @@ def test_a_delegating_builder_forwards_its_own_entry_and_not_a_table_index() -> 
 # -- nothing was lost, and nothing was duplicated ----------------------------------------------
 
 
-def test_each_status_heading_is_written_once_by_the_builder_its_entry_names() -> None:
-    """**Kills: a second `heading("h-positions", ...)` in another section.**
-
-    Two elements carrying one id make `table()`'s `aria-labelledby` resolve to whichever comes
-    first, so a table is announced under another section's heading. The predecessor asserted
-    `count(...) >= 1`, which proves "not dropped" and can never prove "not duplicated" -- while
-    its own docstring claimed both."""
-    code = _code("render.js")
-    table = _sections(code, "STATUS_SECTIONS")
-    wanted = {
-        "positions": "h-positions",
-        "rules": "h-rules",
-        "freshness": "h-freshness",
-        "subscriptions": "h-subscriptions",
-    }
-
-    for key, heading in wanted.items():
-        written = code.count('heading("' + heading + '"')
-        assert written == 1, heading + " is written by " + str(written) + " headings, want 1"
-        builder = next(entry[2] for entry in table if entry[0] == key)
-        body = _decl(code, builder)
-        assert 'heading("' + heading + '"' in body, heading + " is not written by " + builder
-        # TWICE in the builder: once as the heading's id, once as the `table()` id that becomes
-        # its `aria-labelledby`. Pinning the heading alone left the id in the `table(...)` call
-        # free to drift, which silently unnames the table for a screen reader while the heading
-        # above it still looks right (#776 review).
-        assert body.count('"' + heading + '"') == 2, (
-            heading + " must name both the heading and the table it labels"
-        )
-
-
-#: The sections that carry a heading of their own. The other two -- `status` and `setup` -- are
-#: the page each tab bar sits on, so their `<h1>` already says it and a second heading would
-#: repeat the title. Written down because the count test below needs an EXPECTED number: without
+#: The sections that carry a heading of their own. The other one -- `setup` -- is the page the
+#: tab bar sits on, so its `<h1>` already says it and a second heading would repeat the title.
+#: Written down because the count test below needs an EXPECTED number: without
 #: one it can only compare two counts, and two counts agree at zero.
-_HEADED_SECTIONS = frozenset({"positions", "rules", "freshness", "subscriptions", "paper", "live"})
+_HEADED_SECTIONS = frozenset({"paper", "live"})
 
 
-@pytest.mark.parametrize("name", ["STATUS_SECTIONS", "SETUP_SECTIONS"])
+@pytest.mark.parametrize("name", ["SETUP_SECTIONS"])
 def test_a_section_heading_is_the_tab_wording_and_never_a_second_copy_of_it(name: str) -> None:
     """**Kills: `heading("h-stage-".concat(entry.key), "Steps")` -- a heading spelling its own.**
 
@@ -604,41 +562,9 @@ def test_the_job_panel_is_page_level_and_not_inside_any_section() -> None:
         )
 
 
-#: `statusView`'s payload reads, as they stood before the sections split. Pinned so that a
-#: section builder moved OUT of the view's region -- where `_view_keys` can no longer see it --
-#: fails here rather than quietly making the parity check in `test_client_assets` blind to a key.
-_STATUS_KEYS = (
-    "autonomy.configured",
-    "autonomy.lapses_at",
-    "autonomy.live",
-    "autonomy.profile_readable",
-    "data_freshness",
-    "drawdown.max_total",
-    "drawdown.max_weekly",
-    "drawdown.rail11",
-    "drawdown.total",
-    "drawdown.weekly",
-    "equity.high_water_mark",
-    "equity.paper_cash",
-    "equity.state_mode",
-    "generated_at",
-    "kill_switch",
-    "live_rules",
-    "market_session.defused",
-    "market_session.recorded_at",
-    "market_session.state",
-    "mode",
-    "open_positions",
-    "rule_counts",
-    "subscriptions",
-    "withdrawal_attestation.attested_at",
-    "withdrawal_attestation.enabled",
-    "withdrawal_attestation.expired_for",
-    "withdrawal_attestation.expires_in",
-    "withdrawal_attestation.state",
-)
-
-#: The same, for `setupView`.
+#: `setupView`'s payload reads. Pinned so that a section builder moved OUT of the view's region --
+#: where `_view_keys` can no longer see it -- fails here rather than quietly making the parity
+#: check in `test_client_assets` blind to a key.
 _SETUP_KEYS = (
     "actions",
     "config_path",
@@ -654,9 +580,72 @@ _SETUP_KEYS = (
 )
 
 
-@pytest.mark.parametrize(
-    ("view", "keys"), [("statusView", _STATUS_KEYS), ("setupView", _SETUP_KEYS)]
+#: `pulseView`'s payload reads, EXACT (review F4/F5). The ledger requires "last cycle time",
+#: "missing-bracket warnings" and "today's cycle stats" on the home page; before this table
+#: existed, deleting `kv("last cycle", ...)`, `kv("brackets missing", ...)` or `kv("errors", ...)`
+#: left every fixture-free test green, because the fixture-taking parity test only checks that a
+#: key the view DOES read is sent. The `activity.*` entries are the feed caveats `noCyclesToday`
+#: and `feedNotes` read -- they take `data` and say `data.activity.<key>` so that the scan sees
+#: them; a parameter renamed to `feed` made them invisible to every check (F5).
+_PULSE_KEYS = (
+    "activity.cycles",
+    "activity.cycles_dropped",
+    "activity.cycles_out_of_scope",
+    "activity.detail",
+    "activity.last_cycle_before_scope",
+    "activity.lines_read",
+    "activity.lines_skipped",
+    "activity.scope_fully_covered",
+    "activity.status",
+    "activity.status_note",
+    "activity.window_truncated",
+    "autonomy.configured",
+    "autonomy.lapses_at",
+    "autonomy.live",
+    "autonomy.profile_readable",
+    "data_freshness",
+    "drawdown.max_total",
+    "drawdown.max_weekly",
+    "drawdown.rail11",
+    "drawdown.total",
+    "drawdown.weekly",
+    "equity.high_water_mark",
+    "equity.paper_cash",
+    "equity.state_mode",
+    "generated_at",
+    "halt.resume_command",
+    "kill_switch",
+    "last_cycle_at",
+    "live_rules",
+    "market_session.defused",
+    "market_session.recorded_at",
+    "market_session.state",
+    "mode",
+    "next_dca",
+    "next_dca_note",
+    "no_cycles_line",
+    "open_positions",
+    "rule_counts",
+    "subscriptions",
+    "today.basis",
+    "today.blocked",
+    "today.cycles",
+    "today.entered",
+    "today.errors",
+    "today.exited",
+    "today.signals",
+    "unbracketed_count",
+    "why_not",
+    "why_not_none",
+    "withdrawal_attestation.attested_at",
+    "withdrawal_attestation.enabled",
+    "withdrawal_attestation.expired_for",
+    "withdrawal_attestation.expires_in",
+    "withdrawal_attestation.state",
 )
+
+
+@pytest.mark.parametrize(("view", "keys"), [("setupView", _SETUP_KEYS), ("pulseView", _PULSE_KEYS)])
 def test_the_split_reads_every_payload_key_the_long_page_read(
     view: str, keys: tuple[str, ...]
 ) -> None:
@@ -670,12 +659,13 @@ def test_the_split_reads_every_payload_key_the_long_page_read(
 
 
 def test_each_sectioned_route_remembers_its_own_section() -> None:
-    """Status and Setup are two pages. One shared "current section" would have a reader who
-    opened Setup's "To go live" find Status showing whichever of its five sections happened to
-    sit at that key -- or nothing at all. Both views read it through the same pair of helpers."""
+    """Status and Setup were two pages. One shared "current section" would have a reader who
+    opened Setup's "To go live" find another sectioned page showing whichever of its sections
+    happened to sit at that key -- or nothing at all. Every sectioned view reads it through the
+    same pair of helpers, keyed by its own route."""
     code = _code("main.js")
 
-    for view in ("statusView", "setupView"):
+    for view in ("setupView",):
         call = view + "(data, sectionOf(route), onSectionFor(route))"
         assert call in code, "the shell must mount " + view + " with its own section: " + call
 

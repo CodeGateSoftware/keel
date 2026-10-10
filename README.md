@@ -244,7 +244,7 @@ keel/                          the agent and CLI
 ├── execution/sizing.py        position sizing
 ├── compliance/screen.py       attested allowlist admission (fails closed)
 ├── research/                  the thirteen modules behind `keel research`
-├── web/                       the local console `keel serve` renders, read-only
+├── web/                       the local console `keel serve` renders — reads, setup steps and a halt
 ├── mcp/                       the read-only MCP server `keel mcp` speaks
 └── commands/                  CLI command implementations
 

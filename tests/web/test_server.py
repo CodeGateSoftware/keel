@@ -38,15 +38,13 @@ from keel.web.security import SESSION_COOKIE, new_session_token, session_cookie
 #: would also have to leak into the document that page was built from, and this reads the
 #: documents directly.
 ROUTES = (
-    "/api/status",
+    "/api/pulse",
     "/api/setup",
-    "/api/activity",
     "/api/orders",
     "/api/insights",
     "/api/journal",
     "/api/rules",
     "/api/venues",
-    "/api/gates",
     "/api/config",
 )
 
@@ -161,7 +159,7 @@ def test_post_is_refused_everywhere_except_the_setup_actions(
 ) -> None:
     """The write surface is one prefix. A POST anywhere else is not "method not allowed" -- there
     is no write surface at that path at all."""
-    for path in ("/", "/insights", "/gates", "/setup"):
+    for path in ("/", "/insights", "/pulse", "/setup"):
         status, _headers, body = _request(
             running, path, method="POST", cookie=_session(running), form={}, csrf=_csrf(running)
         )
@@ -885,7 +883,7 @@ def test_a_cookie_from_another_serve_run_is_refused(
     assert other_run != running.token
 
     status, _headers, body = _request(
-        running, "/api/status", cookie=session_cookie(other_run).partition(";")[0]
+        running, "/api/pulse", cookie=session_cookie(other_run).partition(";")[0]
     )
 
     assert status == 403
