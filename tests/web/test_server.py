@@ -41,6 +41,7 @@ ROUTES = (
     "/api/pulse",
     "/api/setup",
     "/api/orders",
+    "/api/holdings",
     "/api/insights",
     "/api/journal",
     "/api/rules",

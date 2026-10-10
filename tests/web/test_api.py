@@ -58,6 +58,7 @@ API_ROUTES = (
     "/api/setup",
     "/api/orders",
     "/api/positions",
+    "/api/holdings",
     "/api/balances",
     "/api/timeline",
     "/api/insights",
@@ -220,6 +221,62 @@ def _seed_positions(db_path: str, rows: tuple[tuple[str, str, str], ...]) -> Non
         conn.commit()
     finally:
         conn.close()
+
+
+def _seed_holding(
+    db_path: str,
+    *,
+    qty: str = "2",
+    entry_fill: str = "100050",
+    entry_fee: str = "0",
+    opened_at: int = 1_700_000_000,
+    order_created_at: int | None = None,
+    expected_fill: str = "100000",
+    actual_fill: str | None = None,
+    rule_name: str = "turtle_breakout",
+) -> tuple[int, int | None]:
+    """One open tranche and, when `order_created_at` is given, the BUY that opened it -- written
+    through the REAL writers (`Repository.insert_order` / `open_position`), so the side spelling
+    and the decimal encoding are the ones the join will meet in production. Returns
+    `(position_id, order_id)`."""
+    from decimal import Decimal
+
+    from keel.data.repository import Repository
+    from keel.types import Side
+
+    conn = connect(db_path)
+    try:
+        repo = Repository(conn)
+        order_id = None
+        if order_created_at is not None:
+            order_id = repo.insert_order(
+                {
+                    "mode": "live",
+                    "product_id": "BTC-USD",
+                    "side": Side.BUY.value,
+                    "order_type": "market",
+                    "qty": Decimal(qty),
+                    "status": "filled",
+                    "expected_fill": Decimal(expected_fill),
+                    "actual_fill": Decimal(actual_fill or entry_fill),
+                    "filled_quantity": Decimal(qty),
+                    "confirmation": "autonomous",
+                    "created_at": order_created_at,
+                    "updated_at": order_created_at,
+                }
+            )
+        position_id = repo.open_position(
+            product_id="BTC-USD",
+            rule_name=rule_name,
+            opened_at=opened_at,
+            qty=Decimal(qty),
+            entry_fill=Decimal(entry_fill),
+            entry_fee=Decimal(entry_fee),
+            initial_stop=Decimal("90000"),
+        )
+    finally:
+        conn.close()
+    return position_id, order_id
 
 
 def _seed_orders(db_path: str, rows: tuple[tuple[str, str, str], ...]) -> None:
@@ -563,8 +620,11 @@ def test_every_declared_sort_column_is_a_column_the_rows_actually_have(
     _seed_rules(running.db_path, ("breakout",))
     _seed_orders(running.db_path, (("BTC-USD", "buy", "50000"),))
 
+    _seed_holding(running.db_path, order_created_at=1_699_000_000, opened_at=1_699_000_000)
+
     for path, collection in (
         ("/api/positions", "rows"),
+        ("/api/holdings", "rows"),
         ("/api/rules", "rules"),
         ("/api/timeline", "rows"),
     ):
@@ -2114,3 +2174,66 @@ def test_screen_cache_is_thread_safe_under_concurrent_misses(
 
     assert calls["n"] == 1, "concurrent misses on the same key must build exactly once"
     assert results == ["report"] * 8
+
+
+# -- /api/holdings --------------------------------------------------------------------------------
+
+
+def test_holdings_rows_carry_the_entry_order_figures_when_one_matches(
+    running: web_server.ServeConfig,
+) -> None:
+    """The join end to end, through the real writers. The matched row's `entry_order_id` is the
+    seeded order's id -- the assertion that proves the seeded order reached the reader, so the
+    figures below cannot be green by vacuum. The paper-shaped gap (order stamped with the BAR's
+    ts, more than a day before the tranche) is the harder case and is the one seeded."""
+    _position_id, order_id = _seed_holding(
+        running.db_path,
+        opened_at=1_700_100_000,
+        order_created_at=1_700_000_000,
+        expected_fill="100000",
+        entry_fill="100050",
+    )
+    assert order_id is not None
+
+    _status, _headers, document = _json(running, "/api/holdings")
+    (row,) = document["data"]["rows"]
+
+    assert row["entry_order_id"] == str(order_id)
+    assert row["expected_fill"]["value"] == "100000"
+    assert row["actual_fill"]["value"] == "100050"
+    assert row["fill_divergence"]["value"] == "50"
+    assert row["fill_divergence"]["state"] == "bad"
+    assert row["placement"]["display"] == "AUTONOMOUS"
+    assert document["data"]["rules"] == ["turtle_breakout"]
+    assert document["data"]["open_count"]["value"] == "1"
+
+
+def test_holdings_rows_say_unknown_when_no_order_matches(
+    running: web_server.ServeConfig,
+) -> None:
+    _seed_holding(running.db_path, order_created_at=None)
+
+    _status, _headers, document = _json(running, "/api/holdings")
+    (row,) = document["data"]["rows"]
+
+    assert row["entry_order_id"] == ""
+    assert row["placement"]["state"] == "unknown"
+    for key in ("expected_fill", "actual_fill", "fill_divergence"):
+        assert row[key]["display"] == "unknown", key
+        assert row[key]["state"] == "unknown", key
+
+
+def test_holdings_sorts_by_decimal_on_cost(running: web_server.ServeConfig) -> None:
+    """Cost is `qty * 1 + 0` here, so the three costs are the three wei-apart quantities: the
+    pair a `float` cannot tell apart. Sorted by the server, as `Decimal`."""
+    for qty in WEI_APART:
+        _seed_holding(running.db_path, qty=qty, entry_fill="1")
+
+    _status, _headers, unsorted = _json(running, "/api/holdings")
+    _status, _headers, document = _json(running, "/api/holdings?sort=cost")
+
+    as_built = [row["cost"]["value"] for row in unsorted["data"]["rows"]]
+    ordered = [row["cost"]["value"] for row in document["data"]["rows"]]
+    assert sorted(as_built) == sorted(WEI_APART)  # the seeded rows reached the reader
+    assert ordered == [WEI_APART[2], WEI_APART[1], WEI_APART[0]]
+    assert ordered != sorted(as_built, key=float)

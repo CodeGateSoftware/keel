@@ -945,6 +945,10 @@ def test_serving_the_orders_page_imports_no_credential_code(tmp_path) -> None:
     conn = connect(str(db_path))
     migrate(conn)
     conn.close()
+    # `read_holdings` loads the config (the entry-gate verdict and the mode come from it).
+    from tests.conftest import VALID_CONFIG_YAML
+
+    (tmp_path / "config.yaml").write_text(VALID_CONFIG_YAML, encoding="utf-8")
 
     probe = "\n".join(
         (
@@ -953,9 +957,10 @@ def test_serving_the_orders_page_imports_no_credential_code(tmp_path) -> None:
             "from keel.web.server import ServeConfig",
             "cfg = ServeConfig(",
             "    host='127.0.0.1', port=0, token='t',",
-            f"    db_path={str(db_path)!r}, config_path={str(tmp_path / 'nope.yaml')!r},",
+            f"    db_path={str(db_path)!r}, config_path={str(tmp_path / 'config.yaml')!r},",
             ")",
             "api.read_orders(cfg, {}, None, 0)",
+            "api.read_holdings(cfg, {}, None, 0)",
             "print('secrets' if 'keel_core.secrets' in sys.modules else 'clean')",
         )
     )
@@ -995,7 +1000,9 @@ def test_the_console_hands_over_the_command_rather_than_composing_it() -> None:
     assert "keel orders cancel" not in modal
 
 
-def test_the_orders_payload_carries_the_classification_and_the_command() -> None:
+def test_the_orders_payload_carries_no_cancel_classification_and_states_its_posture() -> None:
+    """The console no longer hands over a cancel command: `OrderRow.cancel` and `classify_cancel`
+    stay in the service for `keel orders cancel`, but nothing here crosses the wire for them."""
     from decimal import Decimal
 
     from keel.commands.orders import gather_orders
@@ -1006,7 +1013,7 @@ def test_the_orders_payload_carries_the_classification_and_the_command() -> None
     conn = connect(":memory:")
     migrate(conn)
     repo = Repository(conn)
-    order_id = repo.insert_order(
+    repo.insert_order(
         {
             "mode": "live",
             "product_id": "BTC-USD",
@@ -1019,10 +1026,6 @@ def test_the_orders_payload_carries_the_classification_and_the_command() -> None
     body = payload.orders_payload(gather_orders(repo, now_ts=2_000, scope="all"))
 
     (row,) = body["rows"]
-    assert row["cancel"]["invocation"] == f"keel orders cancel {order_id}"
-    assert row["cancel"]["kind"]["value"] == "entry"
-    assert row["cancel"]["typed"]["value"] == "false"
-    assert "#" in row["cancel"]["headline"]
-    # And the page says why it cannot do this itself.
+    assert "cancel" not in row
     assert "read-only" in body["write_posture"]["value"]
     assert "no venue credentials" in body["write_posture"]["display"]

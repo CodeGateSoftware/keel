@@ -436,6 +436,33 @@ def read_positions(cfg: ServeConfig, _query: Query, _state: Any, now_ts: int) ->
     return payload.positions_payload(report)
 
 
+def read_holdings(cfg: ServeConfig, _query: Query, _state: Any, now_ts: int) -> dict[str, Any]:
+    """What is held right now: each open tranche's cost, gate verdict and entry order (console PR2).
+
+    **READ ONLY, and there is no write route on this path.** #701's own refusal, carried over from
+    `read_positions`: a position is closed through the typed-phrase friction of the exit path,
+    never a table-row tap, so the affordance does not exist here to be tapped.
+
+    No `?limit=` and no `?scope=`. Both exist on `/api/orders` because a book of orders grows
+    without bound; OPEN tranches do not -- the number is bounded by what the deployment holds
+    right now, and rail 4's concurrent-position cap bounds that. A cap here would hide a position
+    an operator is looking for, which is the one thing this page must never do.
+
+    ONE repo open, `config` loaded (the entry-gate verdict and the deployment's mode come from
+    it), and `now_ts` is `respond`'s -- no second clock. The entry-order join and the per-tranche
+    cost are `keel/commands/holdings.py`'s; nothing is computed here.
+    """
+    from keel.commands.holdings import gather_holdings
+
+    repo = open_repo(cfg.db_path)
+    try:
+        config = load_config(cfg.config_path)
+        report = gather_holdings(repo, config, now_ts=now_ts)
+    finally:
+        close_repo(repo)
+    return payload.holdings_payload(report)
+
+
 def read_balances(cfg: ServeConfig, _query: Query, _state: Any, now_ts: int) -> dict[str, Any]:
     """What the account holds, as the last cycle recorded it (#702).
 
@@ -1127,6 +1154,24 @@ API_ROUTES: dict[str, ApiRoute] = {
             "initial_stop",
             "stop_distance",
             "stop_distance_pct",
+        ),
+    ),
+    # Holdings (console PR2) supersedes `/api/positions` for the client; the old route stays until
+    # the client stops reading it, so every commit between the two is a working console. The
+    # sortable columns are the figures an operator scans a tranche by -- `cost` and
+    # `fill_divergence` are Decimals, so they are sorted server-side, never by a browser's double.
+    "/api/holdings": ApiRoute(
+        html_route="/holdings",
+        read=read_holdings,
+        collection="rows",
+        sortable=(
+            "rule_name",
+            "product_id",
+            "opened_at",
+            "qty",
+            "entry_fill",
+            "cost",
+            "fill_divergence",
         ),
     ),
     "/api/balances": ApiRoute(
