@@ -1128,12 +1128,19 @@ def test_a_path_that_is_not_a_client_route_is_still_a_404(running) -> None:  # t
 
 
 def test_the_retired_client_routes_are_a_closed_tuple_of_exactly_these_names() -> None:
-    """Console PR1 (#951) retired three views; PRs 2-4 will add to this tuple, one name each."""
-    assert staticfiles.RETIRED_CLIENT_ROUTES == ("status", "activity", "gates")
+    """Console PR1 (#951) retired three views and PR2 two more; PRs 3-4 add to this tuple, one
+    name each."""
+    assert staticfiles.RETIRED_CLIENT_ROUTES == (
+        "status",
+        "activity",
+        "gates",
+        "orders",
+        "positions",
+    )
     assert set(staticfiles.RETIRED_CLIENT_ROUTES).isdisjoint(staticfiles.CLIENT_ROUTES)
 
 
-@pytest.mark.parametrize("name", ["status", "activity", "gates"])
+@pytest.mark.parametrize("name", ["status", "activity", "gates", "orders", "positions"])
 def test_a_retired_route_serves_the_shell_so_the_client_can_land_on_the_home_view(
     name: str,
     running,  # type: ignore[no-untyped-def]
@@ -1285,8 +1292,10 @@ _VIEW_ENDPOINTS: tuple[tuple[str, str, str], ...] = (
     # checked that they read keys their endpoint actually sends. Demonstrated on #702: renaming
     # `data.hwm` to `data.high_water_mark` in `balancesView` left the whole web suite green, and
     # the tile would have rendered blank forever with nothing in the console naming the gap.
-    ("ordersView", "data", "/api/orders"),
-    ("positionsView", "data", "/api/positions"),
+    ("holdingsView", "data", "/api/holdings"),
+    # Holdings reads a SECOND endpoint for its recent-orders section, through a parameter named
+    # `orders` -- the root that keeps the two payloads' keys apart in `_view_keys`' one region.
+    ("holdingsView", "orders", "/api/orders"),
     ("balancesView", "data", "/api/balances"),
     ("timelineView", "data", "/api/timeline"),
     ("insightsView", "insights", "/api/insights"),
@@ -1618,7 +1627,7 @@ def _undefined_calls(name: str) -> list[str]:
 
     Scoped PER FUNCTION, which is the part that took two attempts. A first version collected
     every function's parameters into one module-wide set, so `sorting` -- a parameter of `table`
-    and of `headerCell` -- counted as defined inside `positionsView`, and that is exactly the bug
+    and of `headerCell` -- counted as defined inside a view function, and that is exactly the bug
     this scan exists to catch. Parameters are in scope in their own function only.
 
     KNOWN BLIND SPOTS, stated rather than implied. Object-literal and class methods are not
@@ -1731,7 +1740,7 @@ def _row_reads(view: str) -> dict[tuple[str, str], set[str]]:
 
     Returns `{(root, collection): {keys}}`. Handles the three receiver shapes `render.js` uses:
     `(root.coll || []).map(`, `root.coll.map(`, and a local `const name = root.coll || [];`
-    followed by `name.map(` -- plus one further hop for `positionsView`, which narrows a bound
+    followed by `name.map(` -- plus one further hop for `holdingsSection`, which narrows a bound
     collection with `.filter()` before mapping it.
     """
     source = _code_only(_source("render.js"))
@@ -1781,8 +1790,10 @@ _DCA_PLAN_ASKED = "/api/dca-plan?budget=500&buffer=0.1"
 #: the client would agree with the client by construction, which is the disagreement this test
 #: exists to find.
 _ROW_ENDPOINTS: tuple[tuple[str, str, str, str, str], ...] = (
-    ("ordersView", "data", "rows", "/api/orders", "orders"),
-    ("positionsView", "data", "rows", "/api/positions", "positions"),
+    # Holdings' tranche table, seeded with a tranche AND the entry order it joins to, so the
+    # placement and fill cells a row carries are the matched shape and not the "unknown" one.
+    ("holdingsView", "data", "rows", "/api/holdings", "holdings"),
+    ("holdingsView", "orders", "rows", "/api/orders", "orders"),
     ("balancesView", "data", "assets", "/api/balances", "positions"),
     ("timelineView", "data", "rows", "/api/timeline", "orders"),
     ("rulesView", "data", "rules", "/api/rules", "rules"),
@@ -1868,9 +1879,12 @@ def _seed_ledger(tmp_path: Path) -> None:
 
 
 def _seed_for(kind: str, db_path: str, monkeypatch: pytest.MonkeyPatch) -> None:
-    from tests.web.test_api import _seed_orders, _seed_positions, _seed_rules
+    from tests.web.test_api import _seed_holding, _seed_orders, _seed_positions, _seed_rules
 
-    if kind == "dca_plan":
+    if kind == "holdings":
+        # The tranche and its BUY share one clock, the way both rows are written in production.
+        _seed_holding(db_path, opened_at=1_700_000_000, order_created_at=1_700_000_000)
+    elif kind == "dca_plan":
         # The admission screen, patched at its module (the reader resolves it per call), plus
         # one existing `dca` rule written through the repository -- the card's three
         # collections then each hold a row.
@@ -2000,6 +2014,22 @@ def test_every_row_key_a_view_reads_is_a_key_its_endpoint_sends(
     for row in rows:
         missing = reads - set(row)
         assert not missing, f"{view} reads {sorted(missing)}; {endpoint} does not send them"
+
+
+def test_the_holdings_seed_reaches_the_reader_with_its_entry_order(
+    running,  # type: ignore[no-untyped-def]
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The row-key check above is vacuous if the seeded BUY never joined its tranche: the row would
+    still exist, with every fill cell "unknown". So the join is asserted on the served payload."""
+    _seed_for("holdings", running.db_path, monkeypatch)
+
+    status, _headers, body = _request(running, "/api/holdings", cookie=_session(running))
+    assert status == 200
+    (row,) = json.loads(body)["data"]["rows"]
+    assert row["entry_order_id"] != "", "the seeded entry order did not reach the holdings reader"
+    assert row["placement"]["state"] != "unknown"
+    assert row["actual_fill"]["display"] != "unknown"
 
 
 def test_the_dca_card_places_every_key_an_existing_rule_row_sends(

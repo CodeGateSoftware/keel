@@ -7,13 +7,14 @@ front-ends cannot come to disagree:
 * the payload PLACES values and derives none -- no rate, no count it measured itself, no
   `raw_response`;
 * `/api/orders` reaches the service with no `mode` filter and no way for a caller to add one;
-* the client's route table, nav and renderer all know the view exists, in step with Python's.
+* the client's Holdings view (which absorbed this one as its recent-orders section) reads the
+  endpoint through the section the pins below parse, in step with Python's route tables.
 
 **What no test in this file covers**: there is no JavaScript runtime in this suite. Every
 assertion about `render.js` and `main.js` is over the SOURCE TEXT -- that the function is
 exported, that the columns are declared in a given order, that no forbidden call appears. That
-`ordersView` produces the DOM those declarations describe, that the disclosure opens, and that
-the scope buttons dispatch, are properties of a real browser and are NOT established here.
+`recentOrdersSection` produces the DOM those declarations describe, and that the scope buttons
+dispatch, are properties of a real browser and are NOT established here.
 """
 
 from __future__ import annotations
@@ -59,9 +60,9 @@ def _code(name: str) -> str:
     """`name`'s source with comments gone and string literals intact.
 
     `test_client_assets.py::_comments_only`, reused rather than re-walked: the comments in
-    `ordersView` DESCRIBE `raw_response` and the arithmetic this file forbids, at length and on
-    purpose, so a raw substring search would find the prose instead of the code -- the same trap
-    `_markup_only` exists for on `index.html`."""
+    the recent-orders section DESCRIBE `raw_response` and the arithmetic this file forbids, at
+    length and on purpose, so a raw substring search would find the prose instead of the code --
+    the same trap `_markup_only` exists for on `index.html`."""
     from tests.web.test_client_assets import _comments_only
 
     return _comments_only(_source(name))
@@ -283,18 +284,6 @@ def test_an_unobserved_book_says_which_kind_of_absence_it_is(tmp_path: Path) -> 
     assert "no readable book" in live["submit_book_note"]
     assert "against no venue" in paper["submit_book_note"]
     assert paper["submit_book_note"] != live["submit_book_note"]
-
-
-def test_the_renderer_shows_the_book_pair_without_computing_one() -> None:
-    """The client half. Already covered by the arithmetic ban over `ordersView`'s code, but
-    stated by name so the reason survives with it."""
-    source = _code("render.js")
-    start = source.index("export function ordersView(")
-    end = source.index("function statusSwitch(", start)
-    body = source[start:end]
-    assert "submit_best_bid" in body
-    assert "submit_best_ask" in body
-    assert "spread" not in body.lower()
 
 
 # -- the two front-ends agree ---------------------------------------------------------------------
@@ -673,9 +662,9 @@ def test_a_bad_limit_is_refused_rather_than_silently_substituted(
     assert "limit" in json.dumps(document).lower()
 
 
-def test_the_endpoint_is_registered_for_the_orders_view() -> None:
+def test_the_endpoint_is_registered_for_the_holdings_view() -> None:
     route = web_api.API_ROUTES["/api/orders"]
-    assert route.html_route == "/orders"
+    assert route.html_route == "/holdings"
     assert route.collection == "rows"
     assert "placement" in route.sortable
 
@@ -696,52 +685,57 @@ def test_the_orders_view_needs_no_capability_row() -> None:
 # -- the client, over its source text -------------------------------------------------------------
 
 
-def test_the_route_tables_agree_about_orders() -> None:
+def test_the_route_tables_agree_that_orders_is_read_by_holdings() -> None:
     """Python's `CLIENT_ROUTES`, JavaScript's `ROUTES` and the shell's nav are three tables that
-    cannot import each other. A view in one alone routes on a click and 404s on a reload."""
-    assert "orders" in staticfiles.CLIENT_ROUTES
+    cannot import each other. `/orders` is no longer a page: `/api/orders` is the SECOND endpoint
+    of the `holdings` route, and the retired name still serves the shell."""
+    assert "orders" not in staticfiles.CLIENT_ROUTES
+    assert "orders" in staticfiles.RETIRED_CLIENT_ROUTES
+    main = _source("main.js")
     names = re.findall(
         r'\{\s*name:\s*"([a-z]+)"',
-        _source("main.js")[
-            _source("main.js").index("const ROUTES = [") : _source("main.js").index(
-                "];", _source("main.js").index("const ROUTES = [")
-            )
-        ],
+        main[main.index("const ROUTES = [") : main.index("];", main.index("const ROUTES = ["))],
     )
     assert names == list(staticfiles.CLIENT_ROUTES)
+    assert re.search(
+        r'name: "holdings", label: "Holdings", endpoints: \["holdings", "orders"\]', main
+    )
     html = (_STATIC / "index.html").read_text(encoding="utf-8")
-    assert '<li><a href="/orders">Orders</a></li>' in html
+    assert '<li><a href="/orders">' not in html
+    assert '<li><a href="/holdings">Holdings</a></li>' in html
+
+
+def _section(name: str) -> str:
+    from tests.web.test_client_assets import _function_body
+
+    return _function_body(_source("render.js"), name)
 
 
 def test_the_renderer_declares_the_placement_column_first() -> None:
     """The layout argument, pinned in the source that makes it. `placement` before `product` is
-    the whole reason this view is not a generic table dump."""
-    source = _source("render.js")
-    start = source.index("export function ordersView(")
-    end = source.index("function emptyOrders(", start)
-    body = source[start:end]
-    assert body.index('label: "placement"') < body.index('label: "product"')
-    assert body.index('label: "placement"') < body.index('label: "fee"')
-    # expected / actual / divergence adjacent, in that order.
-    assert (
-        body.index('label: "expected"')
-        < body.index('label: "actual"')
-        < body.index('label: "divergence"')
-    )
+    the whole reason this table is not a generic dump. Parsed from the table call as a LIST, so a
+    label that merely appears somewhere in the section cannot satisfy it."""
+    body = _section("recentOrdersSection")
+    block_at = body.index("[", body.index("table("))
+    from tests.web.test_client_assets import _balanced_block
+
+    labels = re.findall(r'label: "([^"]+)"', _balanced_block(body, block_at)[0])
+
+    assert labels[0] == "placement"
+    # expected / actual / slippage adjacent, in that order.
+    at = labels.index("expected")
+    assert labels[at : at + 3] == ["expected", "actual", "slippage"]
 
 
 def test_the_renderer_never_mentions_raw_response_and_computes_no_rate() -> None:
     """It could not render the blob -- the payload has no such key -- but a future author
     reaching for `row.raw_response` would get `undefined` and a blank cell rather than an error,
     which is exactly the sort of change this pin exists to fail."""
-    source = _code("render.js")
-    start = source.index("export function ordersView(")
-    # Bounded at `statusSwitch`, the first function after the orders view's own, so this scans
-    # THIS view's three functions
-    # (`ordersView`, `emptyOrders`, `orderDetail`) and does not quietly borrow another view's
-    # cleanliness or fail on another view's legitimate arithmetic.
-    end = source.index("function statusSwitch(", start)
-    body = source[start:end]
+    # The section and its empty sentence, each bounded at the next top-level function, so this
+    # scans THIS section's code and does not quietly borrow another view's cleanliness or fail on
+    # another view's legitimate arithmetic. The scanned text must exist, or it passes by vacuum.
+    body = _section("recentOrdersSection") + _section("emptyOrders")
+    assert "orders.rows" in body
     assert "raw_response" not in body
     # No arithmetic of any kind in this view's code. A percentage is the specific thing being
     # forbidden -- a fee rate derived in the browser would be a figure no report holds -- and an
@@ -750,27 +744,31 @@ def test_the_renderer_never_mentions_raw_response_and_computes_no_rate() -> None
         assert operator not in body, operator
 
 
-def test_the_orders_view_is_wired_into_the_client_router() -> None:
+def test_the_orders_section_is_wired_into_the_client_router() -> None:
     source = _source("main.js")
-    assert "ordersView," in source
-    assert 'route.name === "orders"' in source
-    # The ARGUMENTS, not one line's worth of whitespace: #700 added a fifth (the status tab
-    # callback), which reflowed the call across lines and broke the literal without changing
-    # anything this test is here to protect.
-    call = re.search(r"ordersView\(\s*data,\s*primary\.sort,\s*onSort,", source)
-    assert call is not None, "ordersView must still be called with (data, sort, onSort, ...)"
+    # The ARGUMENTS, not one line's worth of whitespace: the call reflows whenever a callback is
+    # added. The orders payload is the SECOND reading, with its own sort echo and its own sorter.
+    call = re.search(
+        r"holdingsView\(\s*data,\s*primary\.sort,\s*onSort,\s*"
+        r"orders \? orders\.data : null,\s*orders \? orders\.sort : null,\s*"
+        r"sorter\(route, route\.endpoints\[1\]\),",
+        source,
+    )
+    assert call is not None, "holdingsView must be handed the orders reading, sort and sorter"
+    assert "const orders = readings[1];" in source
 
 
 def test_the_scope_switch_names_itself_per_view() -> None:
-    """Two scope controls on one site announcing themselves as "Activity scope" would leave a
+    """Two scope controls on one site announcing themselves identically would leave a
     screen-reader user unable to tell which view's window they had landed in."""
     source = _source("render.js")
     assert "function scopeSwitch(current, onScope, label)" in source
-    assert '"Orders scope"' in source
+    body = _section("recentOrdersSection")
+    assert body.count('scopeSwitch(plain(orders.scope), onScope, "Orders scope")') == 1
 
 
 def test_the_client_added_no_new_asset_to_precache() -> None:
-    """`ordersView` lives in `render.js` rather than in a module of its own, so `sw.js`'s
+    """The orders section lives in `render.js` rather than in a module of its own, so `sw.js`'s
     `PRECACHE` needed no entry and `tests/web/test_pwa.py`'s shipped-versus-precached comparison
     needed no exemption. Stated as an assertion so a later split of this view into its own file
     fails here with the reason attached."""
@@ -862,11 +860,11 @@ def test_the_status_note_does_not_echo_the_requested_word_back(tmp_path: Path) -
 
 def test_the_status_tabs_are_built_from_the_book_not_from_a_hardcoded_list() -> None:
     """A tab bar listing statuses this deployment never recorded invites a reader to click into
-    four empty tabs and conclude something about the engine. `data.statuses` is what the book
+    four empty tabs and conclude something about the engine. `orders.statuses` is what the book
     actually holds, which is why the service carries it."""
-    code = _code("render.js")
-    assert "data.statuses" in code, "the tabs must come from the payload, not from a constant"
-    assert "statusSwitch" in code, "the tab bar needs a control of its own"
+    body = _section("recentOrdersSection")
+    assert body.count("orders.statuses") == 1, "the tabs must come from the payload"
+    assert re.search(r"statusSwitch\(plain\(orders\.status\), orders\.statuses \|\| \[\]", body)
 
 
 def test_the_tab_bar_offers_a_way_back_to_every_status() -> None:
@@ -879,22 +877,29 @@ def test_the_tab_bar_offers_a_way_back_to_every_status() -> None:
 
 
 def test_the_active_tab_is_read_from_what_the_report_applied() -> None:
-    """`data.status`, never the value the client last sent. If the two ever disagree the report
+    """`orders.status`, never the value the client last sent. If the two ever disagree the report
     is right, and a tab bar drawn from the request would show a filter that is not in force."""
-    assert "data.status" in _code("render.js")
+    assert _section("recentOrdersSection").count("plain(orders.status)") == 1
 
 
 def test_the_orders_table_names_the_rule_that_placed_each_order() -> None:
     """`rule_id` alone is a foreign key -- a number a reader cannot act on."""
-    code = _code("render.js")
-    assert '"rule_name"' in code, "the orders table must carry the rule NAME column"
+    body = _section("recentOrdersSection")
+    assert body.count("row.rule_name") == 1, "the orders table must carry the rule NAME column"
 
 
 def test_the_status_tab_reaches_the_query_string_not_a_client_side_filter() -> None:
     """The tabs must re-ask the SERVER. Filtering the received page in the browser would filter
     the fifty rows that arrived and label the result "every canceled order"."""
     code = _code("main.js")
-    assert ".status = status" in code, "the tab must set the endpoint's status param"
+    branch = code[code.index('route.name === "holdings"') :]
+    branch = branch[: branch.index("\n  }\n")]
+    # The ORDERS endpoint's params (`endpoints[1]`): writing to the primary's would send a
+    # `?status=` to /api/holdings, which has no such parameter, and re-read nothing.
+    assert branch.count("paramsFor(route.endpoints[1]).status = status;") == 1
+    assert branch.count("paramsFor(route.endpoints[1]).scope = scope;") == 1
+    assert "paramsFor(route.endpoints[0])" not in branch
+    assert branch.count("void paint(route, true, true);") == 2
 
 
 # -- the cancel asymmetry, console side (#707) ---------------------------------------------------
@@ -972,32 +977,6 @@ def test_serving_the_orders_page_imports_no_credential_code(tmp_path) -> None:
     assert result.stdout.strip() == "clean", (
         "serving /api/orders imported keel_core.secrets -- the console is no longer credential-free"
     )
-
-
-def test_the_console_never_builds_a_control_that_cancels() -> None:
-    """The button opens instructions. `openCancelHelp` may copy text and close itself, and it may
-    not post, fetch or navigate -- there is nothing to post to (see the route test above), and a
-    client that tried would fail silently rather than loudly."""
-    body = _source("render.js")
-    start = body.index("function openCancelHelp(")
-    end = body.index("\nfunction ", start + 1)
-    modal = body[start:end]
-
-    for forbidden in ("fetch(", "XMLHttpRequest", "location", "submit", "method:", '"POST"'):
-        assert forbidden not in modal, f"the cancel modal reaches for {forbidden}"
-
-
-def test_the_console_hands_over_the_command_rather_than_composing_it() -> None:
-    """Rule 2. A client that concatenated `keel orders cancel ` and an id could print a command
-    that does not exist -- and it would have to read `Field.value` to find the id, which this
-    file may not do."""
-    body = _source("render.js")
-    start = body.index("function openCancelHelp(")
-    end = body.index("\nfunction ", start + 1)
-    modal = body[start:end]
-
-    assert "cancel.invocation" in modal
-    assert "keel orders cancel" not in modal
 
 
 def test_the_orders_payload_carries_no_cancel_classification_and_states_its_posture() -> None:

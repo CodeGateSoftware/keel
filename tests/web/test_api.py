@@ -57,7 +57,6 @@ API_ROUTES = (
     "/api/pulse",
     "/api/setup",
     "/api/orders",
-    "/api/positions",
     "/api/holdings",
     "/api/balances",
     "/api/timeline",
@@ -96,9 +95,10 @@ def test_this_module_pins_every_route_the_server_serves() -> None:
     the envelope, the no-JSON-number walk, the cache headers, the nosniff header and the
     POST refusal. A route left out of it is served with none of those checked.
 
-    That happened: `/api/positions` (#701) shipped outside the tuple, so its reader was executed
-    by no test at all while its payload builder was well covered -- and this module's own header
-    says those are not the same statement. Cross-checked here so the next one cannot.
+    That happened: `/api/positions` (#701, retired for `/api/holdings`) shipped outside the tuple,
+    so its reader was executed by no test at all while its payload builder was well covered --
+    and this module's own header says those are not the same statement. Cross-checked here so the
+    next one cannot.
     """
     from keel.web import api as web_api
 
@@ -623,7 +623,6 @@ def test_every_declared_sort_column_is_a_column_the_rows_actually_have(
     _seed_holding(running.db_path, order_created_at=1_699_000_000, opened_at=1_699_000_000)
 
     for path, collection in (
-        ("/api/positions", "rows"),
         ("/api/holdings", "rows"),
         ("/api/rules", "rules"),
         ("/api/timeline", "rows"),
@@ -650,7 +649,7 @@ WEI_APART = (
 
 
 def test_float_and_decimal_orderings_of_the_same_column_genuinely_differ() -> None:
-    """The premise of the test below, asserted rather than assumed.
+    """The premise of `test_holdings_sorts_by_decimal_on_cost`, asserted rather than assumed.
 
     If `float` and `Decimal` agreed on these three strings, the endpoint test would be green for
     no reason -- it would prove only that sorting sorts. So this states the disagreement first:
@@ -663,32 +662,6 @@ def test_float_and_decimal_orderings_of_the_same_column_genuinely_differ() -> No
     # Ascending by float keeps the input order of the tied pair; ascending by Decimal swaps it.
     assert sorted(WEI_APART, key=float) == [WEI_APART[2], WEI_APART[0], WEI_APART[1]]
     assert sorted(WEI_APART, key=Decimal) == [WEI_APART[2], WEI_APART[1], WEI_APART[0]]
-
-
-def test_the_endpoint_orders_with_decimal_not_float(running: web_server.ServeConfig) -> None:
-    """The end-to-end half: the same three quantities through the real table, the real report
-    builder, the real serialiser and the real sort.
-
-    A float-keyed implementation would answer `[0.099, ...002, ...001]` here -- the tied pair left
-    in insertion order, because the comparison cannot tell them apart. `Decimal` answers
-    `[0.099, ...001, ...002]`. The difference is one wei on one row, which is exactly the size of
-    error that survives review and shows up in a reconciliation."""
-    _seed_positions(
-        running.db_path, tuple((f"TKN{i}-USD", qty, "50000") for i, qty in enumerate(WEI_APART))
-    )
-
-    _status, _headers, unsorted = _json(running, "/api/positions")
-    _status, _headers, document = _json(running, "/api/positions?sort=qty")
-
-    as_built = [row["qty"]["value"] for row in unsorted["data"]["rows"]]
-    ordered = [row["qty"]["value"] for row in document["data"]["rows"]]
-
-    assert ordered == [WEI_APART[2], WEI_APART[1], WEI_APART[0]]
-    # The comparison that makes this test say something: the SAME rows, in the order the report
-    # built them, keyed by `float` instead. Python's sort is stable, so the tied pair keeps its
-    # arrival order and the answer differs from the one above by one row.
-    assert sorted(as_built, key=float) == [WEI_APART[2], WEI_APART[0], WEI_APART[1]]
-    assert ordered != sorted(as_built, key=float)
 
 
 def test_a_missing_figure_sorts_last_in_both_directions() -> None:
@@ -979,7 +952,8 @@ def test_pulse_lists_the_next_cadence_day_for_live_dca_rules_only(
 
 def test_pulse_declares_no_sortable_collection() -> None:
     """Its tables are intrinsic orders (`rule_counts`, freshness in the config's product order,
-    cycles newest first); a display sort would destroy them. `/api/positions` owns the sort."""
+    cycles newest first); a display sort would destroy them. `/api/holdings` owns the tranche
+    sort."""
     route = web_api.API_ROUTES["/api/pulse"]
 
     assert route.sortable == ()

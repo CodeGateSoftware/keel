@@ -138,7 +138,7 @@ def test_every_endpoint_answers_with_the_banner_not_just_the_status_one(
     17 and 22 are both `MISSING` and every page says so."""
     from keel.web import api as web_api
 
-    for path in ("/api/pulse", "/api/orders", "/api/positions", "/api/holdings"):
+    for path in ("/api/pulse", "/api/orders", "/api/holdings"):
         _, document = web_api.respond(_cfg(deployment), path, {})
         rails = {alert["rail"] for alert in document["attestations"]}
         assert rails == {"17", "22"}, path

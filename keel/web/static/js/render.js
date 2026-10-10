@@ -670,8 +670,8 @@ export function pulseView(data) {
  * **The branch is the PRESENCE of `data.halt.resume_command`**, which the payload sends as the
  * command when the kill switch is engaged and as `""` otherwise. This file may not read a
  * `Field`'s value to decide anything, so "button or line" has to arrive as structure, and the
- * accepted pattern for that is branching on a payload string being there (`cancelCell` did, and
- * so did the activity note). The command itself is the payload's too: this source never spells
+ * accepted pattern for that is branching on a payload string being there (the activity note did,
+ * and so does the Holdings view's stop column on a list). The command itself is the payload's too: this source never spells
  * it, so the console can say how to resume without ever being able to.
  *
  * **There is no resume control, here or anywhere in the client.** Releasing the halt is a Tier 1
@@ -1801,7 +1801,7 @@ function kindSwitch(current, kinds, onKind) {
  *
  * #702's refusal. Cash is a fact, not an affordance. keel is cash-spot by constitution, so a
  * "buying power" tile would advertise leverage the engine refuses to take, and a deposit button
- * would be this page's version of the close button the Positions view also does not have.
+ * would be this page's version of the close button the Holdings view also does not have.
  * Pinned by `tests/web/test_balances_view.py`.
  *
  * ── THE SETTLED SPLIT IS NAMED AS MISSING WHEN IT IS, NOT OMITTED ────────────────────────────
@@ -2292,63 +2292,113 @@ export function balancesView(data, sort, onSort) {
 
 
 /**
- * The Positions view (#701): what is held, what it is worth, and how close it is to its stop.
+ * The Holdings view (console PR2): what is held, what each tranche cost, how it was entered, and
+ * the orders keel has placed lately. It replaced the Positions and Orders views.
  *
- * ── NO CLOSE ACTION, AND THAT IS THE DESIGN ──────────────────────────────────────────────────
+ * ── NO CLOSE ACTION, NO CANCEL ACTION, AND THAT IS THE DESIGN ────────────────────────────────
  *
- * Alpaca's positions page has a per-row close. This one does not, ever. An exit goes through the
+ * Alpaca's positions page has a per-row close. This one does not, ever: an exit goes through the
  * typed-phrase friction of the terminal path, because a panic tap on a table row must not be the
- * last line of defence between an operator and an unplanned market sell. The absence is pinned by
- * `tests/web/test_positions_view.py::test_the_positions_view_has_no_close_action_anywhere`, so it
- * survives the day it looks like an obvious convenience to add.
+ * last line of defence between an operator and an unplanned market sell. The orders section has no
+ * cancel cell either -- `keel orders cancel` and the exit path stay at the terminal, and the console
+ * is a reader plus the one halt on Pulse. The absence is pinned by
+ * `tests/web/test_holdings_view.py::test_the_holdings_view_has_no_close_or_cancel_action_anywhere`,
+ * which counts the buttons and listeners in the builders below (none), so it survives the day it
+ * looks like an obvious convenience to add.
  *
- * ── GROUPED BY THE REPORT'S OWN PRODUCT LIST ─────────────────────────────────────────────────
+ * ── TWO READINGS, ONE PAGE ───────────────────────────────────────────────────────────────────
  *
- * `data.products` rather than a set this file assembles from the rows: two answers to "which
- * products does this book hold" is one too many, and the ordered one is already on the report.
- * A product holds several TRANCHES -- that is what tranches are for -- so each section is a
- * table of them rather than one row pretending to be the position.
+ * `data` is `/api/holdings`, the primary: it supplies the engine banner and the tranche sort.
+ * `orders` is `/api/orders`, a SECONDARY read with its own `?scope=`, `?status=` and `?sort=`
+ * surface -- which is why the two payloads are named differently here. `_view_keys` scans this
+ * view's region once per root, and a shared name would check one endpoint's keys against the other.
  *
- * ── THE CHIP EXPLAINS THE IDLE DEPLOYMENT ────────────────────────────────────────────────────
- *
- * `freshness` is the ENTRY GATE's verdict, not a data age: `missing`/`behind`/`unconfirmed` are
- * the agent's own reasons for refusing to open here. It is the most common answer to "why has
- * nothing happened", which is why it sits beside the money rather than under a disclosure.
- *
- * It is a COLUMN and not a per-product chip, because the gate granularity is the one the RULE
- * that opened the tranche declares. Two tranches of one product, opened by rules on different
- * timeframes, have two verdicts -- and a chip above the table would have to pick one.
- *
- * @param {any} data  `/api/positions`'s `data`.
+ * @param {any} data  `/api/holdings`'s `data`.
  * @param {any} sort
  * @param {(column: string) => void} onSort
+ * @param {any} orders  `/api/orders`'s `data`, or `null` when that read failed.
+ * @param {any} ordersSort
+ * @param {(column: string) => void} onOrdersSort
+ * @param {(scope: string) => void} onScope
+ * @param {(status: string) => void} onStatus
  * @returns {DocumentFragment}
  */
-export function positionsView(data, sort, onSort) {
+export function holdingsView(
+  data,
+  sort,
+  onSort,
+  orders,
+  ordersSort,
+  onOrdersSort,
+  onScope,
+  onStatus,
+) {
   const fragment = document.createDocumentFragment();
-  fragment.append(el("h1", undefined, "Positions"));
+  fragment.append(el("h1", undefined, "Holdings"));
 
   const sub = el("p", "sub");
   sub.append(field(data.generated_at), " · ");
   sub.append(field(data.open_count), " open tranche(s)");
   fragment.append(sub);
 
+  fragment.append(holdingsSection(data, sort, onSort));
+  fragment.append(recentOrdersSection(orders, ordersSort, onOrdersSort, onScope, onStatus));
+  return fragment;
+}
+
+/**
+ * The open tranches, one heading and table per rule, then each tranche's realized legs.
+ *
+ * ── GROUPED BY THE REPORT'S OWN RULE LIST ────────────────────────────────────────────────────
+ *
+ * `data.rules` rather than a set this file assembles from the rows: two answers to "which rules
+ * hold tranches" is one too many, and the ordered one is already on the report. A rule holds
+ * several TRANCHES -- that is what tranches are for -- so each section is a table of them rather
+ * than one row pretending to be the position. Filtering the rows by that key is string equality on
+ * a bare name, the same thing the Positions view did with the product; no value is judged.
+ *
+ * ── THE COLUMNS ARE THE ENTRY'S, NOT THE MARKET'S ────────────────────────────────────────────
+ *
+ * There is no mark, market value, unrealized figure or distance to the stop: this view is about
+ * what each tranche cost and how it was entered, and `keel positions` keeps the marked figures.
+ * `cost` is the service's (`keel/commands/holdings.py`); nothing here multiplies anything.
+ *
+ * `entry gate` is the ENTRY GATE's verdict, not a data age -- `missing`/`behind`/`unconfirmed` are
+ * the agent's own reasons for refusing to open here, the most common answer to "why has nothing
+ * happened". It is a COLUMN and not a per-rule chip because the gate granularity is the one the
+ * rule that opened each tranche declares. `attestation` sits BESIDE it and never merged with it:
+ * one is a claim about the WORLD (what this token is, and whether the claim is in date) and the
+ * other a claim about DATA, and they disagree in both directions.
+ *
+ * ── THE STOP COLUMN IS DRAWN ON A LIST ───────────────────────────────────────────────────────
+ *
+ * Spliced into the header AND the cells only when `data.stop_rows_present` -- the tranche ids that
+ * carry a stop -- is non-empty. List emptiness is the sanctioned branch (this file may not read a
+ * `Field`'s `display` or `value` to decide anything), and a column of "—" on a book where no
+ * tranche has a stop would say nothing. One guard serves both splices so they cannot disagree.
+ *
+ * @param {any} data
+ * @param {any} sort
+ * @param {(column: string) => void} onSort
+ * @returns {DocumentFragment}
+ */
+function holdingsSection(data, sort, onSort) {
+  const fragment = document.createDocumentFragment();
+
   const rows = data.rows || [];
   if (rows.length === 0) {
     // A real answer, not a blank panel: an account holding nothing is an ordinary state for a
     // daily agent between entries, and it is not the same as a page that failed to load.
-    fragment.append(el("p", "empty", "No open positions. keel is holding nothing right now."));
+    fragment.append(el("p", "empty", "No open tranches. keel is holding nothing right now."));
     return fragment;
   }
 
-  for (const product of data.products || []) {
-    const held = rows.filter(/** @param {any} row */ (row) => row.product_id === product);
-    const id = ["h-pos", product].join("-");
-    fragment.append(heading(id, product));
+  const withStop = (data.stop_rows_present || []).length !== 0;
 
-    // The chip belongs to the PRODUCT, not the tranche: the entry gate asks about a series, so
-    // every tranche of one product shares one verdict and repeating it per row would suggest
-    // they could differ.
+  for (const rule of data.rules || []) {
+    const held = rows.filter(/** @param {any} row */ (row) => row.rule_name === rule);
+    const id = ["h-hold", rule].join("-");
+    fragment.append(heading(id, plain(rule) || "unattributed"));
     if (held.length === 0) continue;
 
     fragment.append(
@@ -2356,44 +2406,40 @@ export function positionsView(data, sort, onSort) {
         id,
         [
           { label: "opened (UTC)", numeric: false, key: "opened_at" },
-          { label: "rule", numeric: false, key: "rule_name" },
-          { label: "qty held", numeric: true, key: "qty" },
+          { label: "product", numeric: false, key: "product_id" },
+          { label: "qty", numeric: true, key: "qty" },
           { label: "entry", numeric: true, key: "entry_fill" },
-          { label: "entry fee", numeric: true, key: "entry_fee" },
-          { label: "mark", numeric: true, key: "mark" },
-          { label: "value", numeric: true, key: "market_value" },
-          { label: "unrealized", numeric: true, key: "unrealized" },
-          { label: "stop", numeric: true, key: "initial_stop" },
-          { label: "to stop", numeric: true, key: "stop_distance" },
-          { label: "to stop %", numeric: true, key: "stop_distance_pct" },
-          // PER TRANCHE, not per product. The gate granularity comes from the RULE that opened
-          // this tranche (`_gate_granularity_for`), so one product holding tranches from rules
-          // on different timeframes has two verdicts -- a single chip above the table would
-          // state one of them over the other.
-          { label: "entry gate", numeric: false, key: "freshness" },
-          // #701. BESIDE the entry gate, never merged with it. One is a claim about the WORLD --
-          // what this token is, and whether the operator's claim is still in date -- and the
-          // other is a claim about DATA. They disagree in both directions, and a row flagged for
-          // one reason must not read as flagged for the other. No sort key: an attestation state
-          // is not a figure to rank tranches by.
+          { label: "fee", numeric: true },
+          { label: "cost", numeric: true, key: "cost" },
+          ...(withStop ? [{ label: "stop", numeric: true }] : []),
+          { label: "bracket", numeric: false },
+          // PER TRANCHE, not per rule: see the note above.
+          { label: "entry gate", numeric: false },
           { label: "attestation", numeric: false },
+          // How the entry order was placed and what it filled at. All three fill figures say
+          // "unknown" when no entry order was identified -- never a zero, never a blank.
+          { label: "placement", numeric: false },
+          { label: "expected", numeric: true },
+          { label: "actual", numeric: true },
+          { label: "slippage", numeric: true, key: "fill_divergence" },
         ],
         held.map(/** @param {any} row */ (row) => [
           row.opened_at,
-          plain(row.rule_name) || "—",
+          plain(row.product_id) || "—",
           row.qty,
           row.entry_fill,
           row.entry_fee,
-          row.mark,
-          row.market_value,
-          row.unrealized,
-          row.initial_stop,
-          row.stop_distance,
-          row.stop_distance_pct,
+          row.cost,
+          ...(withStop ? [row.stop] : []),
+          row.bracket,
           row.freshness,
           row.attestation,
+          row.placement,
+          row.expected_fill,
+          row.actual_fill,
+          row.fill_divergence,
         ]),
-        "No open tranches for this product.",
+        "No open tranches for this rule.",
         { sort: sort, onSort: onSort },
       ),
     );
@@ -2401,7 +2447,8 @@ export function positionsView(data, sort, onSort) {
     for (const row of held) {
       // The realized side, under a disclosure: a scaled-out tranche has legs already booked, and
       // they belong beside the running position rather than in the journal's separate account of
-      // the same trade. Collapsed because most tranches have never been scaled out.
+      // the same trade. Collapsed because most tranches have never been scaled out. There is no
+      // "marked at" here because there is no mark.
       const node = el("details", "row");
       const summary = el("summary");
       summary.append("tranche ", plain(row.id), " · realized legs");
@@ -2411,7 +2458,6 @@ export function positionsView(data, sort, onSort) {
           kv("realized qty", row.realized_qty),
           kv("realized proceeds", row.realized_proceeds),
           kv("realized fees", row.realized_fees),
-          kv("marked at", row.mark_at),
         ]),
       );
       fragment.append(node);
@@ -2421,132 +2467,105 @@ export function positionsView(data, sort, onSort) {
   return fragment;
 }
 
-
 /**
- * The orders view (#659): what keel actually bought and sold, and whether anybody agreed to it.
+ * What keel has placed lately (#659): the orders book, compact, under the tranches.
  *
- * **`placement` is the first column, and that is the argument this view exists to make.** On a
- * deployment running `autonomy: ON`, "did I approve this, or did keel place it alone" is the
- * first question about an order, not the last -- so it leads the row, ahead of the product and
- * ahead of the price. The word and its tone both arrive already decided
- * (`payload._order_row_payload`), because `bypass` meaning the same thing as `autonomous` is a
- * judgement, and judgements are made in Python.
+ * **`placement` is the first column, and that is the argument this table exists to make.** On a
+ * deployment running `autonomy: ON`, "did I approve this, or did keel place it alone" is the first
+ * question about an order, not the last -- so it leads the row. The word and its tone arrive
+ * already decided (`payload._order_row_payload`), because `bypass` meaning the same thing as
+ * `autonomous` is a judgement, and judgements are made in Python.
  *
- * **`expected` and `actual` are adjacent, with the divergence between them.** That difference is
- * realised slippage. Its tone is side-aware and comes from the server for the reason
- * `_order_row_payload` states: paying more than expected is bad on a buy and good on a sell, so
- * a client colouring the minus sign would be wrong on half the rows.
+ * **`expected`, `actual` and `slippage` are adjacent.** The last is the difference between the
+ * first two, with a side-aware tone from the server for the reason `_order_row_payload` states:
+ * paying more than expected is bad on a buy and good on a sell, so a client colouring the minus
+ * sign would be wrong on half the rows.
  *
- * **`fee` is the figure as recorded and never a rate.** No percentage is computed here, and none
- * crosses the wire. A paper row's fee carries a `modelled` badge instead, because
- * `PaperTrader` derives it from the configured rate and reading it back as a measurement of that
- * rate is circular.
+ * **`orders` is `null` when the secondary read failed**, and the section then says so in a
+ * sentence and draws nothing else. An empty table there would read as "keel placed no orders",
+ * which is a claim nobody made. The heading is drawn first, so the sentence has a place.
  *
- * **`raw_response` is not in the payload at all**, so this function could not render it if it
- * tried. The venue's order id is, when there is one, and a sentence saying why there is not,
- * when there is not.
+ * **`raw_response` is not in the payload at all**, so this function could not render it if it tried.
  *
- * @param {any} data
- * @param {any} sort
- * @param {(column: string) => void} onSort
+ * @param {any} orders  `/api/orders`'s `data`, or `null`.
+ * @param {any} ordersSort
+ * @param {(column: string) => void} onOrdersSort
  * @param {(scope: string) => void} onScope
+ * @param {(status: string) => void} onStatus
  * @returns {DocumentFragment}
  */
-export function ordersView(data, sort, onSort, onScope, onStatus) {
+function recentOrdersSection(orders, ordersSort, onOrdersSort, onScope, onStatus) {
   const fragment = document.createDocumentFragment();
-  fragment.append(el("h1", undefined, "Orders"));
-
-  const sub = el("p", "sub");
-  sub.append(field(data.generated_at));
-  // #707. The badge, on the page where an operator would otherwise expect a Cancel that acts.
-  // It is not an apology for a missing feature: `keel serve` holds no venue credentials, which
-  // is what keeps the worst case of a bug in this layer at "reads a local file".
-  if (data.write_posture) sub.append(" · ", field(data.write_posture));
-  fragment.append(sub);
-
-  fragment.append(scopeSwitch(plain(data.scope), onScope, "Orders scope"));
-  // Guarded, so a caller that has not wired the tabs renders the view unchanged rather
-  // than a bar whose buttons do nothing.
-  if (onStatus) {
-    fragment.append(statusSwitch(plain(data.status), data.statuses || [], onStatus));
+  fragment.append(heading("h-orders", "Recent orders by keel"));
+  if (!orders) {
+    fragment.append(
+      el(
+        "p",
+        "empty",
+        "The recent orders could not be read just now, so none are shown. That is a failed read, not an empty book.",
+      ),
+    );
+    return fragment;
   }
 
-  fragment.append(
-    gridCard([
-      kv("shown", data.shown_count),
-      // Only when a status is actually on. Unfiltered, `filtered_count` equals `scoped_count`
-      // by construction, so the row would repeat the number below it under a label naming a
-      // filter that is not in force. With a tab open it is the denominator "shown" is a page
-      // of -- and the report is the only place allowed to work that out (Rule 2 keeps the
-      // subtraction out of the browser).
-      ...(plain(data.status) ? [kv("in this status", data.filtered_count)] : []),
-      kv("in scope", data.scoped_count),
-      kv("in this book", data.total_count),
-      // Which modes this book actually holds. A deployment book holds one, and saying which
-      // means a reader never concludes it from an empty section -- the same reason `mode` is
-      // on every row below.
-      kv("modes", (data.modes || []).join(", ") || "none"),
-    ]),
-  );
+  const sub = el("p", "sub");
+  // #707. The badge says what this console does about orders: it places and cancels none.
+  if (orders.write_posture) sub.append(field(orders.write_posture));
+  fragment.append(sub);
 
-  const rows = data.rows || [];
-  fragment.append(heading("h-orders", "Placed orders"));
+  // A server-side scope switch: filtering the received page here would present the rows that
+  // happened to arrive under `?limit=` as the whole scope.
+  fragment.append(scopeSwitch(plain(orders.scope), onScope, "Orders scope"));
+  // Guarded, so a caller that has not wired the tabs renders the section unchanged rather than a
+  // bar whose buttons do nothing.
+  if (onStatus) {
+    fragment.append(statusSwitch(plain(orders.status), orders.statuses || [], onStatus));
+  }
+
+  const placed = orders.rows || [];
+  if (placed.length === 0) {
+    // The specific fact, not a bare empty table: "this book has never held an order" and "the
+    // window you chose excluded them" are different claims.
+    fragment.append(emptyOrders(orders));
+    return fragment;
+  }
+
   fragment.append(
     table(
       "h-orders",
       [
         { label: "placement", numeric: false, key: "placement" },
-        { label: "id", numeric: true, key: "id" },
-        { label: "mode", numeric: false, key: "mode" },
+        // The rule's NAME, beside the placement rather than buried in a disclosure: on a book with
+        // several rules live, which one placed an order is a scanning question. Not sortable --
+        // `/api/orders` declares no such column -- so it carries no `key`.
+        { label: "rule", numeric: false },
         { label: "side", numeric: false, key: "side" },
         { label: "product", numeric: false, key: "product_id" },
         { label: "status", numeric: false, key: "status" },
-        // The rule's NAME, beside the status rather than buried in the disclosure: on a
-        // book with several rules live, which one placed an order is a scanning
-        // question, and a foreign key in a detail panel does not answer it.
-        { label: "rule", numeric: false, key: "rule_name" },
-        { label: "qty", numeric: true, key: "qty" },
-        { label: "filled", numeric: true, key: "filled_quantity" },
         { label: "expected", numeric: true, key: "expected_fill" },
         { label: "actual", numeric: true, key: "actual_fill" },
-        { label: "divergence", numeric: true, key: "fill_divergence" },
-        { label: "fee", numeric: true, key: "fee" },
+        { label: "slippage", numeric: true, key: "fill_divergence" },
         { label: "placed (UTC)", numeric: false, key: "created_at" },
-        // No `key`: there is nothing to sort by, and the column is an action rather than a fact.
-        { label: "cancel", numeric: false },
       ],
-      rows.map(
+      placed.map(
         /** @param {any} row */ (row) => [
           row.placement,
-          row.id,
-          row.mode,
-          row.side,
-          plain(row.product_id) || "—",
-          row.status,
           // Positional: `table()` pairs `columns[index]` with this array by index, so this cell
           // sits where the "rule" header does and every later one shifts if it is missing.
           row.rule_name,
-          row.qty,
-          row.filled_quantity,
+          row.side,
+          plain(row.product_id) || "—",
+          row.status,
           row.expected_fill,
           row.actual_fill,
           row.fill_divergence,
-          row.fee,
           row.created_at,
-          cancelCell(row),
         ],
       ),
-      // Never reached when `rows` is empty, because `emptyOrders` below answers first with the
-      // specific fact; kept as the table's own fallback rather than a lie about which empty it
-      // is.
       "No orders to show.",
-      { sort: sort, onSort: onSort },
+      { sort: ordersSort, onSort: onOrdersSort },
     ),
   );
-
-  if (rows.length === 0) fragment.append(emptyOrders(data));
-  else for (const row of rows) fragment.append(orderDetail(row));
-
   return fragment;
 }
 
@@ -2558,160 +2577,13 @@ export function ordersView(data, sort, onSort, onScope, onStatus) {
  * established. The sentence arrives already chosen (`payload._EMPTY_NOTES`) because selecting
  * prose from an enum word is a branch on a value, which this file does not do.
  *
- * @param {any} data
+ * @param {any} orders  `/api/orders`'s `data`, named for the root `_view_keys` scans it under.
  * @returns {HTMLElement}
  */
-function emptyOrders(data) {
+function emptyOrders(orders) {
   const card = el("div", "card");
-  card.append(el("strong", undefined, plain(data.empty_note) || "No orders to show."));
+  card.append(el("strong", undefined, plain(orders.empty_note) || "No orders to show."));
   return card;
-}
-
-/**
- * One order's full record, as a disclosure under the table.
- *
- * The table is the scan; this is the audit. It carries the three things a row cannot fit and an
- * operator needs anyway: what the placement WORD means in a sentence, whether the fee was
- * charged or modelled, and the venue's own order id (or why there is none).
- *
- * @param {any} row
- * @returns {HTMLElement}
- */
-/**
- * The cancel cell: a button that opens instructions, never a button that cancels (#707).
- *
- * **This console cannot cancel anything, and that is the design.** `keel serve` holds no venue
- * credential and no broker handle — the whole application is a loopback reader of a SQLite file —
- * so the worst case of a bug in this layer stays "reads a local database" rather than becoming
- * "exfiltrates live trading keys". Unlocking the keychain and signing a request to a venue happens
- * inside a terminal invocation the operator started, never from an ambient daemon.
- *
- * So what the button does is CLASSIFY and hand over the exact command. The classification is a
- * read, it comes off the payload, and it is the same `classify_cancel` the terminal gates on — a
- * console that decided for itself could call an order a frictionless entry while `keel orders
- * cancel` demanded the typed phrase for it.
- *
- * An order that cannot be cancelled gets the reason instead of a button. Offering a command that
- * would be refused is worse than offering none.
- *
- * @param {any} row
- * @returns {HTMLElement}
- */
-function cancelCell(row) {
-  const cancel = row.cancel;
-  if (!cancel) return el("span", "muted", "—");
-  // The INVOCATION's presence is the fact, not a `.value` read: `classify_cancel` composes a
-  // command only for an order that can actually take one, so an empty string here means the
-  // terminal would refuse it too. `render.js` may place `display` and style by `state` and may
-  // never inspect `value` -- and this is a bare string, not a `Field`.
-  if (!plain(cancel.invocation)) {
-    return el("span", "muted", plain(cancel.cancellable.display));
-  }
-  const open = el("button", "linklike", "Cancel…");
-  open.setAttribute("type", "button");
-  open.addEventListener("click", () => openCancelHelp(row));
-  return open;
-}
-
-/**
- * The modal that tells an operator how to cancel, and copies the command (#707).
- *
- * The heading says WHAT the order is, because that is the decision: cancelling an entry refuses
- * risk, and cancelling a protective leg removes a stop from a position that is relying on it. Both
- * sentences come from the payload (Rule 2) and both invocations are the same command — the
- * asymmetry lives in the terminal, where an exit will ask for a typed phrase.
- *
- * `<dialog>` rather than a hand-built overlay: focus trapping, Escape, and the backdrop are the
- * browser's, and a modal that traps focus badly is worse than none on a page an operator reaches
- * with a keyboard.
- *
- * @param {any} row
- */
-function openCancelHelp(row) {
-  const cancel = row.cancel;
-  // Any dialog still open belongs to a previous read. The view repaints every 15 seconds and
-  // `main.js` replaces `#content`, which this node is deliberately outside of -- so without this
-  // an open modal survives the repaint and can go on offering a command for an order that has
-  // since filled. The CLI would refuse it by name, but a console showing a stale instruction is
-  // the console being wrong rather than the terminal being careful.
-  for (const stale of document.querySelectorAll("dialog.cancelhelp")) stale.remove();
-  const dialog = el("dialog", "cancelhelp");
-
-  // Composed in Python: "Entry order #42" and "Protective bracket #43 — live protection" are two
-  // different warnings, and choosing between them is a judgement (Rule 2).
-  dialog.append(el("h2", undefined, plain(cancel.headline)));
-
-  dialog.append(el("p", undefined, plain(cancel.note)));
-
-  const command = el("pre", "invocation", plain(cancel.invocation));
-  dialog.append(command);
-
-  const actions = el("p", "note");
-  const copy = el("button", "linklike", "Copy command");
-  copy.setAttribute("type", "button");
-  copy.addEventListener("click", () => {
-    // Clipboard writes are permitted on a secure context, and `localhost` is one. Where it is
-    // refused the command is still selectable text above — this is a convenience, never the only
-    // way to get the command.
-    if (navigator.clipboard) void navigator.clipboard.writeText(plain(cancel.invocation));
-    copy.textContent = "Copied";
-  });
-  actions.append(copy, " ");
-  actions.append(field(cancel.typed));
-  dialog.append(actions);
-
-  const close = el("button", "linklike", "Close");
-  close.setAttribute("type", "button");
-  close.addEventListener("click", () => dialog.close());
-  dialog.append(close);
-
-  dialog.addEventListener("close", () => dialog.remove());
-  document.body.append(dialog);
-  dialog.showModal();
-}
-
-function orderDetail(row) {
-  const node = el("details", "cycle");
-  const summary = el("summary");
-  summary.append(field(row.placement), " · ", field(row.mode), " ", field(row.side), " ");
-  summary.append(plain(row.product_id) || "—", " · ");
-  summary.append(field(row.created_at));
-  node.append(summary);
-  node.append(
-    gridCard([
-      kv("placement", field(row.placement)),
-      kv("what that means", plain(row.placement_note)),
-      kv("order type", row.order_type),
-      kv("status", row.status),
-      kv("expected fill", row.expected_fill),
-      kv("actual fill", row.actual_fill),
-      kv("divergence", row.fill_divergence),
-      kv("divergence direction", row.fill_divergence_adverse),
-      kv("fee", row.fee),
-      kv("fee basis", field(row.fee_modelled)),
-      kv("about this fee", plain(row.fee_note)),
-      // The venue's book at submit (#626), as the PAIR. No spread is derived here: the two
-      // columns exist precisely so that the three different spread questions stay askable, and
-      // a view that answered one of them silently would be choosing for the reader.
-      kv("best bid at submit", row.submit_best_bid),
-      kv("best ask at submit", row.submit_best_ask),
-      kv("book at submit", plain(row.submit_book_note) || field(row.submit_book_observed)),
-      // The ONLY thing read out of `raw_response`, upstream, already bounded. When it is empty
-      // the note says why -- a blank cell reads as missing data, and "the paper trader placed
-      // this" reads as the answer it is.
-      kv(
-        "venue order id",
-        plain(row.venue_order_id) || plain(row.venue_order_id_note) || "—",
-      ),
-      // The name is in the table; this is the id it resolved from, plus the sentence
-      // that tells the two absences apart -- no rule recorded at all, versus a rule
-      // that has left the book. A blank cell would collapse them.
-      kv("rule", plain(row.rule_note) || field(row.rule_name)),
-      kv("rule id", row.rule_id),
-      kv("last updated", row.updated_at),
-    ]),
-  );
-  return node;
 }
 
 /**
@@ -2775,7 +2647,7 @@ function statusSwitch(current, statuses, onStatus) {
  *
  * The `label` argument arrived with #659's second caller. Two scope switches on one site
  * announcing themselves identically would leave a screen-reader user unable to tell which view's
- * window they had just landed in, and hard-coding another view's name onto the Orders view would be
+ * window they had just landed in, and hard-coding another view's name onto the orders section would be
  * worse than no name at all. (Activity was the first caller until Pulse replaced it.)
  *
  * @param {string} current
@@ -2833,8 +2705,8 @@ const SCOPES = ["today", "7d", "all"];
  * `onSection` is optional, and a caller that omits it gets every section, in order, with no tab
  * bar -- the page exactly as it read before it was cut up. The alternative degradation, one
  * section and no way to reach the others, would be a client hiding information that is sitting
- * in a payload it already has. Same guard as `ordersView`'s `onStatus`, and the same reason:
- * a control nobody wired must not cost a reader anything.
+ * in a payload it already has. Same guard as `recentOrdersSection`'s `onStatus`, and the same
+ * reason: a control nobody wired must not cost a reader anything.
  *
  * `current` is resolved against the table rather than trusted: a key that names no section --
  * a section renamed while a reader had its tab open -- falls back to the first, which is a page
@@ -2848,9 +2720,9 @@ const SCOPES = ["today", "7d", "all"];
  * would go on passing while a `table(...)` added inside either one resolved to an array and
  * shipped a runtime `TypeError`. That test's own docstring records this class of miss from #701.
  *
- * **`payload`, not `data` -- HERE, and only here.** These two helpers sit between `ordersView`
- * and `insightsView`, so `_view_keys` counts them inside `ordersView`'s region: any
- * `data.<key>` written here would be checked against `/api/orders`, which is not the endpoint
+ * **`payload`, not `data` -- HERE, and only here.** These two helpers sit between `holdingsView`
+ * and `insightsView`, so `_view_keys` counts them inside `holdingsView`'s region: any
+ * `data.<key>` written here would be checked against `/api/holdings`, which is not the endpoint
  * it came from. Naming the parameter something else makes that mistake unspellable.
  *
  * The same rename applied to `setupPaper`/`setupLive` was an own-goal and is reverted (#776

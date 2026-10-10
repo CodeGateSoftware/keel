@@ -144,7 +144,7 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
     from keel.commands.journal import JournalReport as DiscretionaryJournal
     from keel.commands.orders import OrderRow, OrdersReport
     from keel.commands.plans import Claim, PlansReport, Tier, Trigger
-    from keel.commands.positions import PositionRow, PositionsReport
+    from keel.commands.positions import PositionRow
     from keel.commands.pulse import PulseReport
     from keel.commands.research_record import RuleExploration, TrialRow, TrialsReport
     from keel.commands.slippage import SlippageReport, SlippageRow
@@ -2229,76 +2229,6 @@ def _readiness_field(ready: bool, reason: str | None) -> Field:
         display=_ENTRY_GATE_NOTES.get(word, "the entry gate would not open here"),
         state=_ENTRY_GATE_STATES.get(word, UNKNOWN),
     )
-
-
-def _position_row_payload(row: PositionRow) -> dict[str, Any]:
-    """One open tranche, placed. Nothing is decided here.
-
-    Every judgement was made by `keel/commands/positions.py`: what the mark is, whether there is
-    one, what the stop distance is and whether the entry gate would open. This function chooses a
-    `state` word and a symbol for each figure, which is all -- and is what makes this page and
-    `keel status` incapable of disagreeing about the same tranche.
-
-    **`unrealized` and `stop_distance` are the only two figures that carry a verdict**, because
-    they are the only two whose sign means something. A market value is a magnitude: an account
-    is not good for being worth something, and a glyph on every balance would hide the one figure
-    that matters. On `stop_distance`, negative means the tranche is trading THROUGH the
-    protection it was sized against -- keel is cash-spot and long-only (`CashAccountRequired`,
-    #372), so a stop always sits below the mark and the sign has one meaning.
-
-    **No notional, no cost basis, no ratio this layer computed.** Everything here is on the
-    report. `stop_distance_pct` crosses as the raw FRACTION with no `%`, the same posture `ratio`
-    documents for the drawdown scalars -- rescaling it by 100 would be arithmetic Rule 2 forbids.
-    """
-    return {
-        "id": str(row.id),
-        "product_id": row.product_id,
-        "rule_name": row.rule_name,
-        "opened_at": moment(row.opened_at),
-        "qty": quantity(row.qty),
-        "entry_fill": money(row.entry_fill),
-        "entry_fee": money(row.entry_fee),
-        "mark": money(row.mark),
-        "mark_at": moment(row.mark_ts),
-        "market_value": money(row.market_value),
-        "unrealized": money(row.unrealized_pnl, signed=True),
-        "initial_stop": money(row.initial_stop),
-        "stop_distance": money(row.stop_distance, signed=True),
-        # FOUR places, not `ratio`'s default two. At two, a tranche 0.2% through its stop and one
-        # 0.2% above it render as "-0.00" and "0.00" side by side -- illegible in exactly the
-        # range this column exists to show, since a position near its stop is the one worth
-        # finding. The paired `stop_distance` still carries the verdict.
-        "stop_distance_pct": ratio(row.stop_distance_pct, places=4),
-        "realized_qty": quantity(row.realized_qty),
-        "realized_proceeds": money(row.realized_proceeds),
-        "realized_fees": money(row.realized_fees),
-        "freshness": _readiness_field(row.ready, row.ready_reason),
-        # #701. BESIDE the freshness verdict, never merged with it: one is a claim about the
-        # WORLD (what this token is, and whether the claim is in date) and the other is a
-        # claim about DATA. They disagree in both directions, and a reader needs to know
-        # which of the two is the reason a row is flagged.
-        "attestation": _attestation_chip(row),
-        "attest_due_at": moment(row.attest_due_ts),
-    }
-
-
-def positions_payload(report: PositionsReport) -> dict[str, Any]:
-    """`gather_positions`'s `PositionsReport`, as JSON.
-
-    `open_count` and `products` are READ from the report, never measured here -- Rule 6e bans
-    `len()` in this module, and both properties exist on the report so the ban costs nothing.
-
-    `products` is the grouping key a view renders sections from. It is the report's own list, in
-    its own order, so a client cannot build a second one and reach a different answer about which
-    products this book holds.
-    """
-    return {
-        "as_of": iso(report.now_ts),
-        "generated_at": moment(report.now_ts),
-        "open_count": count(report.open_count),
-        "products": [str(product) for product in report.products],
-        "rows": [_position_row_payload(row) for row in report.rows],
-    }
 
 
 def _unknown_fill() -> Field:

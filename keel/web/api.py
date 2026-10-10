@@ -409,39 +409,12 @@ def read_orders(cfg: ServeConfig, query: Query, _state: Any, now_ts: int) -> dic
     return payload.orders_payload(report)
 
 
-def read_positions(cfg: ServeConfig, _query: Query, _state: Any, now_ts: int) -> dict[str, Any]:
-    """What is held right now, marked at the price the rails used (#701).
-
-    **READ ONLY, and there is no write route on this path.** #701's own refusal: a position is
-    closed through the typed-phrase friction of the exit path, never a table-row tap. A panic tap
-    must not be the last line of defence, so the affordance does not exist here to be tapped.
-
-    No `?limit=` and no `?scope=`. Both exist on `/api/orders` because a book of orders grows
-    without bound; OPEN tranches do not -- the number is bounded by what the deployment holds
-    right now, and rail 4's concurrent-position cap bounds that. A cap here would hide a position
-    an operator is looking for, which is the one thing this page must never do.
-
-    `config` is loaded because the mark comes from the FINEST configured series -- the same read
-    `agent._mark_to_market_parts` makes. Reading a different series would put a different current
-    price on the page from the one that moved rail 11's drawdown scalars.
-    """
-    from keel.commands.positions import gather_positions
-
-    repo = open_repo(cfg.db_path)
-    try:
-        config = load_config(cfg.config_path)
-        report = gather_positions(repo, config, now_ts=now_ts)
-    finally:
-        close_repo(repo)
-    return payload.positions_payload(report)
-
-
 def read_holdings(cfg: ServeConfig, _query: Query, _state: Any, now_ts: int) -> dict[str, Any]:
     """What is held right now: each open tranche's cost, gate verdict and entry order (console PR2).
 
     **READ ONLY, and there is no write route on this path.** #701's own refusal, carried over from
-    `read_positions`: a position is closed through the typed-phrase friction of the exit path,
-    never a table-row tap, so the affordance does not exist here to be tapped.
+    the positions reader this replaced: a position is closed through the typed-phrase friction of
+    the exit path, never a table-row tap, so the affordance does not exist here to be tapped.
 
     No `?limit=` and no `?scope=`. Both exist on `/api/orders` because a book of orders grows
     without bound; OPEN tranches do not -- the number is bounded by what the deployment holds
@@ -1066,7 +1039,7 @@ API_ROUTES: dict[str, ApiRoute] = {
         # No sortable collection: every table on the glance page is an intrinsic order --
         # `rule_counts` by status, `data_freshness` in the config's product order, `live_rules`
         # in the ledger's, cycles newest first -- and a display sort would destroy each rather
-        # than improve it. `/api/positions` owns the sort of the tranches.
+        # than improve it. `/api/holdings` owns the sort of the tranches.
     ),
     "/api/setup": ApiRoute(
         html_route="/setup",
@@ -1111,8 +1084,9 @@ API_ROUTES: dict[str, ApiRoute] = {
             "outcome",
         ),
     ),
+    # The Holdings view's second read: its recent-orders section. There is no `/orders` page.
     "/api/orders": ApiRoute(
-        html_route="/orders",
+        html_route="/holdings",
         read=read_orders,
         collection="rows",
         # The money columns and the audit ones. `placement` sorts the rows an operator most
@@ -1134,32 +1108,10 @@ API_ROUTES: dict[str, ApiRoute] = {
             "created_at",
         ),
     ),
-    "/api/positions": ApiRoute(
-        html_route="/positions",
-        read=read_positions,
-        collection="rows",
-        # The figures an operator scans by. `unrealized` and `stop_distance` first in intent:
-        # "what is losing" and "what is closest to its stop" are the two questions this page
-        # exists to answer, and both are sorted server-side because both are Decimals that a
-        # browser would compare as doubles.
-        sortable=(
-            "product_id",
-            "rule_name",
-            "opened_at",
-            "qty",
-            "entry_fill",
-            "mark",
-            "market_value",
-            "unrealized",
-            "initial_stop",
-            "stop_distance",
-            "stop_distance_pct",
-        ),
-    ),
-    # Holdings (console PR2) supersedes `/api/positions` for the client; the old route stays until
-    # the client stops reading it, so every commit between the two is a working console. The
-    # sortable columns are the figures an operator scans a tranche by -- `cost` and
-    # `fill_divergence` are Decimals, so they are sorted server-side, never by a browser's double.
+    # Holdings (console PR2) is what `/api/positions` was, with the mark-derived columns gone and
+    # the entry order joined on. The sortable columns are the figures an operator scans a tranche
+    # by -- `cost` and `fill_divergence` are Decimals, so they are sorted server-side, never by a
+    # browser's double.
     "/api/holdings": ApiRoute(
         html_route="/holdings",
         read=read_holdings,

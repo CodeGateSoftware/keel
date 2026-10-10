@@ -7,15 +7,15 @@
  *
  * `pushState` on a click, `popstate` on back and forward, `location.pathname` as the single
  * source of truth for which view is showing. There is no route table with patterns, no
- * parameters, no nested routes and no hash: there are seven names, and `ROUTES` below is the
- * whole thing.
+ * parameters, no nested routes and no hash: the names are the ones in `ROUTES` below, and that table is
+ * the whole thing.
  *
  * *Hash routing (`#/status`) was the alternative, and it is what a client served from a static
  * directory usually reaches for*, because a hash needs no server cooperation at all: every deep
  * link is a request for the same file. It is rejected because it puts a `#` in every URL an
  * operator copies, and because the cooperation it avoids is fifteen lines --
- * `staticfiles.resolve_client_route`, which serves `index.html` for the seven names in
- * `CLIENT_ROUTES` and 404s everything else. That function is also exactly what step 7 of the
+ * `staticfiles.resolve_client_route`, which serves `index.html` for the names in
+ * `CLIENT_ROUTES` (and `RETIRED_CLIENT_ROUTES`) and 404s everything else. That function is also exactly what step 7 of the
  * spec's build order needs anyway, when this shell moves to `/`.
  *
  * ── THE MOUNT IS `/` ─────────────────────────────────────────────────────────────────────────
@@ -44,14 +44,13 @@ import {
   plansView,
   insightsView,
   deploymentCard,
+  holdingsView,
   modeBadge,
   paperBanner,
   consoleSwitcher,
   sessionChip,
-  ordersView,
   balancesView,
   timelineView,
-  positionsView,
   pulseView,
   refusedView,
   researchView,
@@ -96,8 +95,8 @@ const HALT_CONFIRM = "Halt keel? Resuming requires `keel resume` at a terminal."
  * oversight.** `api.py`'s route table records it: glossary "gets no counterpart: it becomes an
  * outbound keeltrading.com link in #539 and `render_glossary` is deleted in #540, so an
  * `/api/glossary` would be a surface built in order to be removed". A client route for it would
- * be the same surface one layer up. That makes seven views here against the eight entries in
- * `render.py::NAV`, and the eighth arrives in #539 as a link, not a view.
+ * be the same surface one layer up. That left the views here one short of the entries in `render.py::NAV`, and the missing one
+ * arrived in #539 as a link, not a view.
  *
  * **`endpoints` is a list because one view reads two endpoints.** `/insights` is served by
  * `/api/insights` and `/api/journal`, and that split is `api.py`'s own decision rather than a
@@ -116,8 +115,7 @@ const HALT_CONFIRM = "Halt keel? Resuming requires `keel resume` at a terminal."
 const ROUTES = [
   { name: "pulse", label: "Pulse", endpoints: ["pulse"] },
   { name: "setup", label: "Setup", endpoints: ["setup"] },
-  { name: "orders", label: "Orders", endpoints: ["orders"] },
-  { name: "positions", label: "Positions", endpoints: ["positions"] },
+  { name: "holdings", label: "Holdings", endpoints: ["holdings", "orders"] },
   { name: "balances", label: "Balances", endpoints: ["balances"] },
   { name: "timeline", label: "Timeline", endpoints: ["timeline"] },
   { name: "insights", label: "Insights", endpoints: ["insights", "journal"] },
@@ -197,7 +195,7 @@ function must(id) {
  *
  * `BASE`, `BASE + "index.html"` and anything unrecognised all resolve to the default. An unknown
  * name resolving to Pulse rather than to a "no such view" page is a deliberate choice for a
- * seven-route client with no user-generated URLs: the only ways to reach one are a typo or a
+ * small client with no user-generated URLs: the only ways to reach one are a typo or a
  * link written before a rename, and in both cases the landing page is more use than an error.
  *
  * @param {string} pathname
@@ -504,22 +502,29 @@ function mount(route, readings) {
     rememberGate(data);
     return pulseView(data);
   }
-  if (route.name === "orders") {
+  if (route.name === "holdings") {
+    // The recent-orders section reads `/api/orders`, a SECONDARY endpoint, so its sort, scope and
+    // status all belong to `route.endpoints[1]` -- writing a `?status=` onto the primary's
+    // params would send it to `/api/holdings`, which has no such parameter, and re-read nothing.
+    const orders = readings[1];
     // A server-side scope switch: filtering the received page here would present the rows that
     // happened to arrive under `?limit=` as the whole scope.
-    return ordersView(
+    return holdingsView(
       data,
       primary.sort,
       onSort,
+      orders ? orders.data : null,
+      orders ? orders.sort : null,
+      sorter(route, route.endpoints[1]),
       (scope) => {
-        paramsFor(route.endpoints[0]).scope = scope;
+        paramsFor(route.endpoints[1]).scope = scope;
         void paint(route, true, true);
       },
       // #700: the status tab re-asks the SERVER. Filtering the received page here would filter
       // the rows that happened to arrive under `?limit=` and present the result as every
       // canceled order -- the same argument that puts `?sort=` on the server.
       (status) => {
-        paramsFor(route.endpoints[0]).status = status;
+        paramsFor(route.endpoints[1]).status = status;
         void paint(route, true, true);
       },
     );
@@ -539,7 +544,6 @@ function mount(route, readings) {
       sorter(route, route.endpoints[1]),
     );
   }
-  if (route.name === "positions") return positionsView(data, primary.sort, onSort);
   if (route.name === "balances") return balancesView(data, primary.sort, onSort);
   if (route.name === "timeline") {
     return timelineView(data, primary.sort, onSort, (kind) => {
