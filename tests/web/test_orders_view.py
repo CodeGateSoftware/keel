@@ -1029,3 +1029,10 @@ def test_the_orders_payload_carries_no_cancel_classification_and_states_its_post
     assert "cancel" not in row
     assert "read-only" in body["write_posture"]["value"]
     assert "no venue credentials" in body["write_posture"]["display"]
+    # Since console PR1 the console HALTS (and has always run setup steps), so a sentence saying
+    # every state-changing action runs through the CLI is false. What stays true is about ORDERS:
+    # the console places and cancels none, and the badge says exactly that.
+    assert body["write_posture"]["display"] == (
+        "This console places and cancels no orders: it holds no venue credentials. "
+        "Orders are cancelled with `keel orders cancel` at a terminal."
+    )

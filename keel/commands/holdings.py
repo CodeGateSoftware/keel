@@ -132,7 +132,12 @@ def gather_holdings(repo: Repository, config: Config, *, now_ts: int) -> Holding
     claimed: set[int] = set()
     rows: list[HoldingRow] = []
     for position in positions.rows:
-        raw = raw_by_id[position.id]
+        raw = raw_by_id.get(position.id)
+        if raw is None:
+            # Closed between the two reads of the open book (the agent writes from its own
+            # process). It is no longer held, so it is left out rather than shown with a bracket
+            # and rule id nobody read.
+            continue
         if position.product_id not in book:
             book[position.product_id] = repo.get_orders(product_id=position.product_id)
         match = _entry_order(raw, book[position.product_id], claimed)

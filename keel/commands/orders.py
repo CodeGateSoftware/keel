@@ -880,9 +880,13 @@ CANCEL_INVOCATION = "keel orders cancel {order_id}"
 #: signing a request to a venue happens during a terminal invocation the operator started, never
 #: from an ambient loopback daemon.
 WEB_READ_ONLY_BADGE = "read-only"
+#:
+#: About ORDERS, not the whole console: the console also runs setup steps and, since console PR1,
+#: halts (`keel kill`'s operation). Neither reaches a venue, so the credential claim stands; a
+#: sentence saying every state change runs through the CLI would not.
 WEB_READ_ONLY_NOTE = (
-    "The web console is read-only for security: it holds no venue credentials. "
-    "State-changing actions run through the CLI."
+    "This console places and cancels no orders: it holds no venue credentials. "
+    "Orders are cancelled with `keel orders cancel` at a terminal."
 )
 
 #: What each kind of cancel MEANS, for the modal that hands over the command. The word is a term of

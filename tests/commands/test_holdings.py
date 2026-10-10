@@ -299,3 +299,28 @@ def test_the_service_reads_no_clock() -> None:
     calls = [ast.unparse(n.func) for n in ast.walk(tree) if isinstance(n, ast.Call)]
     assert calls  # the scan saw real calls
     assert not {"time.time", "datetime.datetime.now", "datetime.now"} & set(calls)
+
+
+def test_a_tranche_that_closes_between_the_two_reads_is_left_out_not_a_crash(
+    repo: Repository, config: Config, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`gather_positions` reads the open book, then this service reads it again for
+    `bracket_order_id` and `rule_id`. The agent writes on its own process while the console
+    reads, so a tranche can close in between. It is no longer open, so it is left out -- a
+    `KeyError` would fail the whole page, and a row built without its raw read would claim
+    "NO bracket" about a tranche nobody looked at."""
+    _tranche(repo)
+    _tranche(repo, opened_at=NOW_TS - 2 * DAY)
+    real = repo.get_open_positions
+    calls = {"n": 0}
+
+    def closing_one(product_id: str | None = None) -> list[dict[str, Any]]:
+        calls["n"] += 1
+        rows = real(product_id)
+        return rows if calls["n"] == 1 else rows[:1]
+
+    monkeypatch.setattr(repo, "get_open_positions", closing_one)
+    report = gather_holdings(repo, config, now_ts=NOW_TS)
+
+    assert calls["n"] == 2, "both reads must reach the patched book"
+    assert report.open_count == 1
