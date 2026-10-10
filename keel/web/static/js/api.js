@@ -315,11 +315,11 @@ export async function runAction(key, values, csrf) {
  */
 export async function runHalt(gate) {
   const url = new URL(API_PREFIX + "gates/halt", window.location.origin);
-  return post(url, { "X-Keel-Gate": gate }, {});
+  return post(url, { "X-Keel-Gate": gate });
 }
 
 /**
- * One JSON POST, folded into the same `Reading` a GET becomes.
+ * One POST, folded into the same `Reading` a GET becomes.
  *
  * The part of a write that does not depend on which write it is: `X-Keel-Client` (and the token
  * header the caller adds), same-origin credentials, no caching, no redirects, and the three ways
@@ -327,22 +327,31 @@ export async function runHalt(gate) {
  * a stated `Reading` rather than an exception. Extracted when the halt became the second write,
  * so the two cannot come to disagree about what "the server did not answer" looks like.
  *
+ * **A write whose route reads no body sends none.** The halt route never reads one, and on a
+ * kept-alive connection bytes a handler leaves unread are parsed as the start of the NEXT request:
+ * the PR1 browser check saw the repaint's `GET /api/pulse` arrive as `{}GET` and refused 501. So
+ * `body` is optional, and the JSON content type travels only with a body.
+ *
  * @param {URL} url
  * @param {Record<string, string>} extraHeaders  the token header for this write.
- * @param {Record<string, string>} body
+ * @param {Record<string, string>} [body]        omitted for a route that reads no body.
  * @returns {Promise<Reading>}
  */
 async function post(url, extraHeaders, body) {
+  const init = {
+    method: "POST",
+    headers: Object.assign({}, HEADERS, extraHeaders),
+    credentials: "same-origin",
+    cache: "no-store",
+    redirect: "error",
+  };
+  if (body !== undefined) {
+    init.headers["Content-Type"] = "application/json";
+    init.body = JSON.stringify(body);
+  }
   let response;
   try {
-    response = await fetch(url, {
-      method: "POST",
-      headers: Object.assign({}, HEADERS, { "Content-Type": "application/json" }, extraHeaders),
-      credentials: "same-origin",
-      cache: "no-store",
-      redirect: "error",
-      body: JSON.stringify(body),
-    });
+    response = await fetch(url, init);
   } catch (cause) {
     return {
       as_of: "",

@@ -144,6 +144,42 @@ def test_api_js_posts_to_exactly_two_paths() -> None:
     assert len(paths) == 2
 
 
+def _async_function(source: str, name: str) -> str:
+    """One top-level `async function` of `api.js`, from its declaration to its closing brace at
+    column 0. `_function_body`'s end markers do not know `async`, so they would run on past it."""
+    code = _comments_stripped(source)
+    for marker in (f"export async function {name}(", f"async function {name}("):
+        if marker in code:
+            start = code.index(marker)
+            break
+    else:
+        raise AssertionError(f"api.js declares no async function {name}")
+    end = code.index("\n}\n", start)
+    return code[start:end]
+
+
+def test_the_halt_sends_no_body_because_its_route_reads_none() -> None:
+    """Found by the PR1 browser check, not by reading: the halt POST carried `{}` and
+    `server._gated_action` never reads a body for the halt, so on a kept-alive connection the two
+    unread bytes were parsed as the start of the NEXT request line -- the repaint's
+    `GET /api/pulse` arrived as `{}GET` and was refused 501. A write whose route reads no body
+    must send none; the setup actions, whose route does read one, still send theirs."""
+    api = _source("api.js")
+    halt = _async_function(api, "runHalt")
+    assert halt.count("post(") == 1
+    assert re.search(r'return post\(url, \{ "X-Keel-Gate": gate \}\);', halt), halt
+
+    run_action = _async_function(api, "runAction")
+    assert re.search(r'return post\(url, \{ "X-Keel-CSRF": csrf \}, values\);', run_action)
+
+    post = _async_function(api, "post")
+    guard = post.index("if (body !== undefined) {")
+    block = post[guard : post.index("\n  }", guard)]
+    # The body AND its content type exist only inside the guard, each exactly once.
+    assert post.count("JSON.stringify(body)") == 1 and "JSON.stringify(body)" in block
+    assert post.count('"Content-Type"') == 1 and '"Content-Type"' in block
+
+
 def test_the_pulse_view_places_every_section_once() -> None:
     body = _function_body(_source("render.js"), "pulseView")
     sections = (
