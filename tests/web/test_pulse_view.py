@@ -181,20 +181,39 @@ def test_the_halt_sends_no_body_because_its_route_reads_none() -> None:
 
 
 def test_the_pulse_view_places_every_section_once() -> None:
-    body = _function_body(_source("render.js"), "pulseView")
-    sections = (
-        "pulseState",
-        "haltControl",
-        "pulseToday",
-        "pulseWhyNot",
-        "pulseNextDca",
-        "pulsePositions",
-        "pulseFreshness",
-        "pulseSubscriptions",
-        "pulseCycles",
-    )
+    """Every section builder is called exactly once, and the set is DERIVED from the source.
 
-    assert {name: body.count(name + "(") for name in sections} == dict.fromkeys(sections, 1)
+    A hand-listed tuple drops a section silently (`pulseRules` was missing from one, so deleting
+    its call passed the suite): the expected names are every `pulse*` declaration but `pulseView`
+    itself, plus `haltControl`, and what `pulseView` calls must equal that set.
+    """
+    code = _comments_stripped(_source("render.js"))
+    body = _function_body(_source("render.js"), "pulseView")
+    declared = set(re.findall(r"^function (pulse[A-Za-z]+)\(", code, re.M)) | {"haltControl"}
+    declared.discard("pulseView")
+    called = re.findall(r"fragment\.append\((\w+)\(data\)\)", body)
+
+    assert len(declared) == 10, sorted(declared)
+    assert sorted(called) == sorted(declared)
+
+
+def test_the_empty_cycles_card_is_the_services_sentence_on_its_presence() -> None:
+    """R2-F1's client half: the card shows on the PRESENCE of `data.no_cycles_line`, and its
+    sentence is the parameter. The engine claim is judged in Python, per basis; if the client
+    words it or branches on the emptiness of a list, an unread log reads as "keel has not run"."""
+    source = _source("render.js")
+    cycles = _function_body(source, "pulseCycles")
+    today = _function_body(source, "noCyclesToday")
+
+    assert re.findall(r"\bif \(([^\n]*)\) fragment\.append\(noCyclesToday", cycles) == [
+        'noCycles !== ""'
+    ]
+    assert re.findall(r"const noCycles = ([^;]*);", cycles) == ["plain(data.no_cycles_line)"]
+    assert len(re.findall(r"noCyclesToday\(", cycles)) == 1
+    assert re.findall(r'el\("strong", undefined, ([^)]*)\)', today) == ["line"]
+    code = _comments_stripped(source).lower()
+    assert "has not run" not in code
+    assert "no cycles today" not in code
 
 
 def test_pulse_tables_pair_headers_and_cells() -> None:

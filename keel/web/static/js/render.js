@@ -1015,6 +1015,10 @@ function pulseSubscriptions(data) {
  * no sort: cycles arrive newest first, which is the order a glance wants. `data.activity` is
  * `activity_payload`'s document, unchanged, and the helpers below take it as `feed`.
  *
+ * The table's own empty text is scope-neutral ("Nothing in this scope.", as the Activity view
+ * said): an empty list is also what an unreadable log and a partial window look like, so the
+ * table never says whether keel ran. Only `data.no_cycles_line` does, below.
+ *
  * @param {any} data
  * @returns {DocumentFragment}
  */
@@ -1065,7 +1069,7 @@ function pulseCycles(data) {
           (cycle.highlights || []).join("; "),
         ],
       ),
-      "No cycles today.",
+      "Nothing in this scope.",
     ),
   );
 
