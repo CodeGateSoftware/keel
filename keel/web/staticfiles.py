@@ -130,8 +130,8 @@ def resolve_static_asset(root: Path, url_path: str) -> Path | None:
 #: mistyped or missing `.js` asset stops being a 404 and becomes a 200 carrying HTML with a
 #: `text/html` Content-Type. The browser then refuses to execute it -- correctly, under `nosniff`
 #: -- and reports a MIME-type error naming the module, which is several steps removed from
-#: "that file is not there." With a closed list, a missing asset is still a 404 and only these
-#: seven names ever reach the shell.
+#: "that file is not there." With a closed list, a missing asset is still a 404 and only the names
+#: in `CLIENT_ROUTES` and `RETIRED_CLIENT_ROUTES` ever reach the shell.
 #:
 #: `tests/web/test_client_assets.py::test_the_python_and_javascript_route_tables_agree` parses
 #: `main.js`'s `ROUTES` and compares it to this tuple, so a view added on one side without the
@@ -179,9 +179,10 @@ def resolve_client_route(root: Path, url_path: str) -> Path | None:
     putting a `#` in every URL an operator copies -- see `main.js`'s module docstring. This is the
     fifteen lines that buys.
 
-    **This is a read, and it widens nothing.** It maps seven names onto one file that is already
-    served at `STATIC_PREFIX + CLIENT_ENTRY`; the same session cookie and the same `Host` check
-    gate it, because `server.do_GET` checks both before any static path is looked at.
+    **This is a read, and it widens nothing.** It maps the names in `CLIENT_ROUTES` and
+    `RETIRED_CLIENT_ROUTES` onto one file that is already served at
+    `STATIC_PREFIX + CLIENT_ENTRY`; the same session cookie and the same `Host` check gate it,
+    because `server.do_GET` checks both before any static path is looked at.
     """
     if not url_path.startswith(STATIC_PREFIX):
         return None

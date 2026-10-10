@@ -1069,7 +1069,8 @@ function pulseCycles(data) {
     ),
   );
 
-  if (data.activity.cycles.length === 0) fragment.append(noCyclesToday(data));
+  const noCycles = plain(data.no_cycles_line);
+  if (noCycles !== "") fragment.append(noCyclesToday(noCycles, data));
 
   const detailed = data.activity.cycles.filter(
     /** @param {any} cycle */ (cycle) => (cycle.events || []).length !== 0,
@@ -1092,18 +1093,21 @@ function pulseCycles(data) {
  * nothing in it is either "keel has not run yet today", which is an ordinary morning for a daily
  * agent, or a window that could not prove it reached midnight -- which is not an observation
  * about the engine at all. The second is carried by `scope_fully_covered`, already judged, and
- * is in `feedNotes` below.
+ * is in `feedNotes` below. The sentence itself is the service's (`data.no_cycles_line`, judged per
+ * `today.basis`, and empty when the log could not be read): this file shows the card on its
+ * presence and never words "keel has not run" from the emptiness of a list.
  *
  * Takes `data` and reads `data.activity.<key>`, NOT a parameter named `feed`: `_view_keys` checks
  * every `data.<key>` written in this region against `/api/pulse`, and a renamed root made these
  * reads invisible to it -- `feed.lines_reed` passed the suite (review F5).
  *
+ * @param {string} line  `data.no_cycles_line`, the service's sentence.
  * @param {any} data  `/api/pulse`'s `data`.
  * @returns {HTMLElement}
  */
-function noCyclesToday(data) {
+function noCyclesToday(line, data) {
   const card = el("div", "card");
-  card.append(el("strong", undefined, "keel has not run yet today."));
+  card.append(el("strong", undefined, line));
   const last = data.activity.last_cycle_before_scope;
   if (last) {
     const line = el("p", "note");

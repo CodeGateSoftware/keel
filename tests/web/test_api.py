@@ -1510,6 +1510,7 @@ def test_read_pulse_keeps_the_readers_status_for_a_log_it_could_not_read(
         assert body["today"][key]["display"] == "—", key
     assert body["today"]["basis"]["value"] == "unavailable"
     assert body["why_not_none"] == "Today's log could not be read, so reasons may be missing."
+    assert body["no_cycles_line"] == ""
 
 
 def test_read_pulse_scopes_by_the_clock_it_was_handed(deployment: tuple[str, str]) -> None:

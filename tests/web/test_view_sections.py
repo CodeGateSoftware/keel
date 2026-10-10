@@ -623,6 +623,7 @@ _PULSE_KEYS = (
     "mode",
     "next_dca",
     "next_dca_note",
+    "no_cycles_line",
     "open_positions",
     "rule_counts",
     "subscriptions",

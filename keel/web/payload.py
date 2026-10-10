@@ -1029,6 +1029,10 @@ def pulse_payload(report: PulseReport, *, gate: str = "") -> dict[str, Any]:
     an unread log and the empty-reasons sentence is never "nothing stopped keel" over a log that
     could not say so.
 
+    `no_cycles_line` is the service's sentence for a day with no cycle in it (`""` when one ran or
+    the log could not be read): the client shows its empty-today card on the string's presence and
+    never words "keel has not run" from the emptiness of a list.
+
     `halt.resume_command` is `"keel resume"` while the kill switch is engaged and `""` otherwise.
     The client may not read `Field.value`, so "HALT button or HALTED line" must arrive as
     structure: the PRESENCE of that string is the branch, and the command itself comes from the
@@ -1074,6 +1078,7 @@ def pulse_payload(report: PulseReport, *, gate: str = "") -> dict[str, Any]:
         },
         "why_not": list(report.why_not),
         "why_not_none": report.why_not_none,
+        "no_cycles_line": report.no_cycles_line,
         "next_dca": [
             {
                 "rule_id": str(buy.rule_id),

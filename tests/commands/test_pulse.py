@@ -299,3 +299,31 @@ def test_the_service_imports_no_click() -> None:
         for a in (n.names if isinstance(n, ast.Import) else [None])
     }
     assert "keel" in imported and "click" not in imported
+
+
+@pytest.mark.parametrize("status", ["missing", "unreadable", "unparseable", "oversized"])
+def test_no_cycles_line_is_empty_when_the_log_could_not_be_read(status: str) -> None:
+    """**Review R2-F1.** The status card already explains an unread log; "keel has not run yet
+    today." over it would be an engine claim the log never made."""
+    feed = apply_scope(ActivityFeed(status=status, source="/x/keel.log"), "today", now_ts=NOW)
+    assert build_pulse(_status_report(), feed, (), now_ts=NOW).no_cycles_line == ""
+
+
+def test_no_cycles_line_is_worded_per_basis_and_empty_when_a_cycle_ran_today() -> None:
+    blank = apply_scope(ActivityFeed(status="empty", source="/x/keel.log"), "today", now_ts=NOW)
+    assert build_pulse(_status_report(), blank, (), now_ts=NOW).no_cycles_line == (
+        "keel has not run yet today."
+    )
+
+    # a bounded read that held no cycle at all: it cannot say the day was quiet
+    cut = ActivityFeed(status="ok", source="/x/keel.log", window_truncated=True)
+    partial = apply_scope(cut, "today", now_ts=NOW)
+    assert partial.status == "ok" and not partial.cycles  # the fixture reached the service
+    assert partial.scope_fully_covered is False
+    assert build_pulse(_status_report(), partial, (), now_ts=NOW).no_cycles_line == (
+        "No cycle in the part of today's log that was read."
+    )
+
+    ran = _today_feed(_quiet_cycle_lines("b" * 16, TODAY_START + 3600))
+    assert ran.cycles
+    assert build_pulse(_status_report(), ran, (), now_ts=NOW).no_cycles_line == ""

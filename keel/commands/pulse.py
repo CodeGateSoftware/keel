@@ -102,6 +102,12 @@ class PulseReport:
     #: The sentence for an empty `why_not`, worded for `today_basis`. Sent so the client never
     #: infers "nothing stopped keel" from the emptiness of a list.
     why_not_none: str
+    #: The line for a Pulse with no cycle today, worded for `today_basis`: `""` when a cycle ran
+    #: (nothing to say), when the log could not be read (the status card already says so, and
+    #: "keel has not run" would be an engine claim the log never made) -- else the sentence. The
+    #: client shows its card on the PRESENCE of this string, as the TUI says
+    #: `activity.describe_empty_scope` only when the read was fine.
+    no_cycles_line: str
     #: Newest cycle today, else the last one before the scope, else None (keel has no log yet).
     last_cycle_ts: float | None
     #: Ordered, de-duplicated sentences: standing blockers first, then today's cycle reasons.
@@ -131,6 +137,13 @@ _WHY_NOT_NONE = {
         "back to midnight, so reasons may be missing."
     ),
     "unavailable": "Today's log could not be read, so reasons may be missing.",
+}
+
+
+_NO_CYCLES_LINE = {
+    "complete": "keel has not run yet today.",
+    "partial": "No cycle in the part of today's log that was read.",
+    "unavailable": "",
 }
 
 
@@ -223,6 +236,7 @@ def build_pulse(
         today=_today_counts(feed),
         today_basis=basis,
         why_not_none=_WHY_NOT_NONE[basis],
+        no_cycles_line="" if feed.cycles else _NO_CYCLES_LINE[basis],
         last_cycle_ts=_last_cycle_ts(feed),
         why_not=_why_not(status, feed),
         next_dca=_next_dca(dca_rules, now_ts),

@@ -350,6 +350,7 @@ def _pulse_report(**overrides: Any) -> PulseReport:
         resume_command="",
         today_basis="complete",
         why_not_none="Nothing stopped keel today.",
+        no_cycles_line="",
     )
     base.update(overrides)
     return PulseReport(**base)
@@ -1406,9 +1407,11 @@ def test_an_unread_log_crosses_as_absent_counts_and_a_bad_basis_never_as_zeros()
             today_basis="unavailable",
             why_not=(),
             why_not_none="Today's log could not be read, so reasons may be missing.",
+            no_cycles_line="",
         )
     )
 
+    assert document["no_cycles_line"] == ""
     assert sorted(document["today"]) == [
         "basis", "blocked", "cycles", "entered", "errors", "exited", "signals"
     ]  # fmt: skip
@@ -1514,6 +1517,7 @@ def test_every_builder_survives_a_completely_empty_report() -> None:
                 ),
                 today_basis="unavailable",
                 why_not_none="Today's log could not be read, so reasons may be missing.",
+                no_cycles_line="",
                 last_cycle_ts=None,
                 why_not=(),
                 next_dca=(),
@@ -2397,3 +2401,10 @@ def test_no_dca_wire_value_is_a_json_number_and_none_says_fee_free(
     ):
         assert _json_numbers(body) == []
         assert "fee-free" not in json.dumps(body).lower()
+
+
+def test_the_no_cycles_line_crosses_exactly_as_the_service_worded_it() -> None:
+    """**Review R2-F1.** The client appends the empty-today card on the PRESENCE of this string."""
+    line = "keel has not run yet today."
+    assert payload.pulse_payload(_pulse_report(no_cycles_line=line))["no_cycles_line"] == line
+    assert payload.pulse_payload(_pulse_report(no_cycles_line=""))["no_cycles_line"] == ""
