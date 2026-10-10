@@ -153,14 +153,24 @@ CLIENT_ROUTES: tuple[str, ...] = (
 #: The shell every client route is served from, relative to `STATIC_ROOT`.
 CLIENT_ENTRY = "index.html"
 
+#: Names that WERE client routes and are not any more, answered with the shell all the same.
+#: `main.js`'s `routeFor` sends a name it does not know to the home view and rewrites the address
+#: bar (its docstring: "a typo or a link written before a rename ... the landing page is more use
+#: than an error"). That is only true if the server delivers the shell; without it the old path is
+#: a plain-text 404 for a bookmark, an installed app whose cached manifest still says
+#: `start_url: "/status"`, or a `/status?token=...` redirect, whenever no service worker answers.
+#: **Closed, like `CLIENT_ROUTES`**, for the same reason: it is names, never a wildcard. Console
+#: PRs 2-4 retire more views and each adds its names here. Disjoint from `CLIENT_ROUTES`.
+RETIRED_CLIENT_ROUTES: tuple[str, ...] = ("status", "activity", "gates")
+
 
 def resolve_client_route(root: Path, url_path: str) -> Path | None:
     """The client shell for a path the BROWSER routes, or `None`.
 
     Called only after `resolve_static_asset` has returned `None`, so a real file always wins and
     this can never shadow one. The three paths that resolve here are `STATIC_PREFIX` itself,
-    `STATIC_PREFIX` plus a name in `CLIENT_ROUTES`, and nothing else -- an unknown name is `None`
-    and becomes the same 404 any other unmapped path gets.
+    `STATIC_PREFIX` plus a name in `CLIENT_ROUTES` or `RETIRED_CLIENT_ROUTES`, and nothing else --
+    an unknown name is `None` and becomes the same 404 any other unmapped path gets.
 
     **Why the server has to know about client routes at all.** `main.js` routes with the History
     API rather than a hash, so `pushState` puts `/static/insights` in the address bar; without
@@ -176,7 +186,7 @@ def resolve_client_route(root: Path, url_path: str) -> Path | None:
     if not url_path.startswith(STATIC_PREFIX):
         return None
     name = unquote(url_path[len(STATIC_PREFIX) :])
-    if name and name not in CLIENT_ROUTES:
+    if name and name not in CLIENT_ROUTES and name not in RETIRED_CLIENT_ROUTES:
         return None
 
     shell = (root / CLIENT_ENTRY).resolve()

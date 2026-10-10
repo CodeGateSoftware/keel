@@ -1127,6 +1127,31 @@ def test_a_path_that_is_not_a_client_route_is_still_a_404(running) -> None:  # t
     assert status == 404
 
 
+def test_the_retired_client_routes_are_a_closed_tuple_of_exactly_these_names() -> None:
+    """Console PR1 (#951) retired three views; PRs 2-4 will add to this tuple, one name each."""
+    assert staticfiles.RETIRED_CLIENT_ROUTES == ("status", "activity", "gates")
+    assert set(staticfiles.RETIRED_CLIENT_ROUTES).isdisjoint(staticfiles.CLIENT_ROUTES)
+
+
+@pytest.mark.parametrize("name", ["status", "activity", "gates"])
+def test_a_retired_route_serves_the_shell_so_the_client_can_land_on_the_home_view(
+    name: str,
+    running,  # type: ignore[no-untyped-def]
+) -> None:
+    """**Review F1.** `main.js`'s `routeFor` sends an unknown name to the home view, but only if
+    the shell is delivered. Without this, a bookmark, a cached `start_url` or a `?token=` redirect
+    to a retired path is a plain-text 404 whenever no service worker answers the navigation."""
+    status, headers, body = _request(running, _P(name), cookie=_session(running))
+    assert status == 200, name
+    assert headers["Content-Type"] == "text/html; charset=utf-8"
+    assert '<script type="module"' in body
+
+
+def test_a_retired_route_is_still_behind_the_same_admission(running) -> None:  # type: ignore[no-untyped-def]
+    status, _headers, _body = _request(running, _P("status"))  # no cookie
+    assert status == 403
+
+
 def test_a_missing_asset_is_a_404_and_never_the_shell(running) -> None:  # type: ignore[no-untyped-def]
     """The failure mode the closed list exists to prevent, asserted directly."""
     status, _headers, body = _request(running, _P("js/nope.js"), cookie=_session(running))
