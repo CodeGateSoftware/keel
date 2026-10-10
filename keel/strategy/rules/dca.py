@@ -26,6 +26,26 @@ from keel.types import Candle, Granularity
 _SECONDS_PER_DAY = 86_400
 
 
+def is_cadence_day(ts: int, cadence_days: int) -> bool:
+    """Whether the daily bar stamped `ts` is a cadence boundary. THE expression `Dca.detect`
+    keys the buy off (`(ts // 86400) % cadence_days == 0`), in one place so a console that says
+    "next buy" and the engine that places it cannot drift. `agent.py` (the stale-daily-bar
+    gate) and `dca_plan.py` (the plan's cadence arithmetic) cite this expression in prose."""
+    if cadence_days <= 0:
+        raise ValueError("cadence_days must be positive")
+    return (ts // _SECONDS_PER_DAY) % cadence_days == 0
+
+
+def next_cadence_day_ts(now_ts: int, cadence_days: int) -> int:
+    """00:00 UTC of the first cadence day on or after `now_ts`'s UTC day. A cadence DAY, not an
+    order time: the buy is placed by the first cycle that sees that day's bar COMPLETED."""
+    if cadence_days <= 0:
+        raise ValueError("cadence_days must be positive")
+    day = now_ts // _SECONDS_PER_DAY
+    remainder = day % cadence_days
+    return (day if remainder == 0 else day + cadence_days - remainder) * _SECONDS_PER_DAY
+
+
 class Dca(Rule):
     """Cadence-based dip-buy accumulation rule.
 
@@ -110,7 +130,7 @@ class Dca(Rule):
 
         latest = candles[-1]
         cadence_days = self.params["cadence_days"]
-        if (latest.ts // _SECONDS_PER_DAY) % cadence_days != 0:
+        if not is_cadence_day(latest.ts, cadence_days):
             return None  # off-cadence: no buy today
 
         budget_usd: Decimal = self.params["budget_usd"]
