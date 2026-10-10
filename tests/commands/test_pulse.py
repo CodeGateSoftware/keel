@@ -148,6 +148,20 @@ def test_why_not_omits_rail_17_in_paper_and_names_it_in_live() -> None:
     assert _pulse(mode="live", withdrawal_attestation=attested).why_not == ()
 
 
+def test_why_not_names_rail_17_wherever_status_says_entries_are_halted() -> None:
+    """`status._rail17_line` evaluates rail 17 in every non-paper mode and says "entries halted"
+    for suspended, expired and never-attested alike; the why-not list must not be narrower."""
+    lapsed = WithdrawalAttestationStatus("expired", True, NOW - 9 * _DAY, None, 2 * _DAY)
+    assert _pulse(mode="confirm", withdrawal_attestation=lapsed).why_not == (
+        "rail 17: withdrawal attestation expired",
+    )
+    suspended = WithdrawalAttestationStatus("suspended", False, NOW - 3600, None, None)
+    assert _pulse(mode="live", withdrawal_attestation=suspended).why_not == (
+        "rail 17: withdrawal attestation suspended",
+    )
+    assert _pulse(mode="paper", withdrawal_attestation=suspended).why_not == ()
+
+
 # -- next DCA buy -------------------------------------------------------------------------------
 
 

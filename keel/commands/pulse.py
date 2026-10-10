@@ -51,6 +51,11 @@ _WHY_PREFIXES = (
 )
 
 
+#: The attestation states rail 17 halts entries on -- the ones `status._rail17_line` renders
+#: with "entries halted". "attested" passes; "unknown" is unreadable, and status says so itself.
+_RAIL17_HALTING = frozenset({"suspended", "expired", "unattested"})
+
+
 @dataclass(frozen=True)
 class TodayCounts:
     """The scoped cycles' five counts (plus the cycle count), summed. `blocked` is the wide one
@@ -122,15 +127,16 @@ def _last_cycle_ts(feed: ActivityFeed) -> float | None:
 
 def _why_not(status: StatusReport, feed: ActivityFeed) -> tuple[str, ...]:
     """Standing blockers, then every reason today's cycles recorded, newest cycle first, each
-    sentence once. Rail 17 is named in live only: it is a LIVE_STATE rail, not evaluated in paper
-    (`status._rail17_line`'s own reasoning), so a lapsed attestation there halts nothing."""
+    sentence once. Rail 17 is named in every mode but paper, for every state that
+    `status._rail17_line` says halts entries (suspended, expired, never attested): it is a
+    LIVE_STATE rail, not evaluated in paper, so a lapsed attestation there halts nothing."""
     reasons: list[str] = []
     if status.kill_switch_engaged:
         reasons.append(KILL_ENGAGED_LINE)
     if status.rail11_status == "HALTED":
         reasons.append(f"rail 11: {status.rail11_status}")
     attestation = status.withdrawal_attestation.state
-    if status.mode == "live" and attestation in {"expired", "unattested"}:
+    if status.mode != "paper" and attestation in _RAIL17_HALTING:
         reasons.append(f"rail 17: withdrawal attestation {attestation}")
     # `feed.cycles` is newest-first (`feed_from_lines`), so iteration order is the order asked for.
     for cycle in feed.cycles:
