@@ -39,7 +39,6 @@ from typing import Any
 import pytest
 from keel_core.types import EquityReading
 
-from keel.capabilities import CAPABILITIES, GATES
 from keel.commands.activity import ActivityCycle, ActivityEvent, ActivityFeed
 from keel.commands.insights import (
     AccountSummary,
@@ -356,7 +355,7 @@ def _pulse_report(**overrides: Any) -> PulseReport:
 
 def _pulse_payload(status: StatusReport, **overrides: Any) -> dict[str, Any]:
     """`pulse_payload` over a report built from `status`: how the status-shaped pins below read
-    the same keys `status_payload` used to serve them."""
+    the same keys the retired `status_payload` served."""
     return payload.pulse_payload(_pulse_report(status=status, **overrides))
 
 
@@ -441,14 +440,11 @@ def _every_payload() -> dict[str, Any]:
     contract that holds for `status` and leaks on `journal` is not a contract.
 
     #534 added five entries here -- the endpoints behind `/api/config`, `/api/setup`, `/api/rules`,
-    `/api/venues` and `/api/gates` -- and that is the point of the helper being shared: a new
-    serialiser joins the money-as-strings walk, the `state`-vocabulary check and the
+    `/api/venues` and the former `/api/gates` -- and that is the point of the helper being shared:
+    a new serialiser joins the money-as-strings walk, the `state`-vocabulary check and the
     no-custom-encoder check by being listed once, rather than by its author remembering three
-    separate guards. `gates` reads the REAL `keel/capabilities.py` registry rather than a fixture,
-    because that module is a declaration with no external inputs and a fixture of it would be a
-    second copy to drift."""
+    separate guards."""
     return {
-        "status": payload.status_payload(_status_report()),
         "pulse": payload.pulse_payload(_pulse_report(), gate="gate-token"),
         "insights": payload.insights_payload(
             _insights_report(),
@@ -493,7 +489,6 @@ def _every_payload() -> dict[str, Any]:
             [_BrokerInfo(), _BrokerInfo(name="broken", error="ImportError: no module")],
             _READINESS_ROWS,
         ),
-        "gates": payload.gates_payload(GATES, CAPABILITIES),
     }
 
 
@@ -617,7 +612,7 @@ def test_scientific_notation_never_reaches_the_wire() -> None:
         paper_cash_usdc=Decimal("1E-9"),
         drawdown_total_pct=Decimal("2E-3"),
     )
-    document = json.loads(json.dumps(payload.status_payload(report)))
+    document = json.loads(json.dumps(payload.pulse_payload(_pulse_report(status=report))))
 
     offenders = [
         (path, leaf)
@@ -732,7 +727,6 @@ def test_the_serialiser_computes_nothing_every_wire_figure_came_from_the_report(
     covered by their own test below.
     """
     for name, reports, built in (
-        ("status", (_status_report(),), payload.status_payload(_status_report())),
         ("pulse", (_pulse_report(),), payload.pulse_payload(_pulse_report())),
         _journal_case(),
     ):
@@ -1376,7 +1370,7 @@ def test_the_gate_is_a_bare_string_and_never_a_field() -> None:
     others = {k: v for k, v in _every_payload().items() if k != "pulse"}
     assert others  # the sweep reached other payloads
     for name, built in others.items():
-        assert "gate" not in built or name == "gates", name
+        assert "gate" not in built, name
 
 
 def test_why_not_crosses_as_a_list_of_sentences_unchanged() -> None:
@@ -1420,28 +1414,17 @@ def test_the_unbracketed_count_is_the_reports_and_judged_here() -> None:
     assert (none["value"], none["state"]) == ("0", "neutral")
 
 
-def test_the_pulse_payload_reuses_the_status_sections_unchanged() -> None:
-    """Pulse replaces Status, so every section Status served must still be served, byte for byte
-    (the helpers are shared, not copied)."""
+def test_the_pulse_payload_serialises_the_status_sections_through_the_shared_helpers() -> None:
+    """Pulse replaced Status, and the sections Status served are served by the SAME helpers
+    (`_equity_payload`, `_drawdown_payload`, `_rule_counts_payload`) rather than copies: a Pulse
+    that re-worded the drawdown would be two answers to one question."""
     status = _status_report()
-    old = payload.status_payload(status)
-    new = payload.pulse_payload(_pulse_report(status=status))
-    for key in (
-        "mode",
-        "kill_switch",
-        "autonomy",
-        "market_session",
-        "equity",
-        "drawdown",
-        "withdrawal_attestation",
-        "open_positions",
-        "rule_counts",
-        "live_rules",
-        "data_freshness",
-        "subscriptions",
-    ):
-        assert new[key] == old[key], key
-    assert new["activity"] == payload.activity_payload(_activity_feed())
+    built = payload.pulse_payload(_pulse_report(status=status))
+
+    assert built["equity"] == payload._equity_payload(status)
+    assert built["drawdown"] == payload._drawdown_payload(status)
+    assert built["rule_counts"] == payload._rule_counts_payload(status)
+    assert built["activity"] == payload.activity_payload(_activity_feed())
 
 
 # -- totality ------------------------------------------------------------------------------------
@@ -1479,7 +1462,6 @@ def test_every_builder_survives_a_completely_empty_report() -> None:
         market_session=MarketSessionStatus(state=None, recorded_ts=None),
     )
     documents = {
-        "status": payload.status_payload(empty_status),
         "pulse": payload.pulse_payload(
             _pulse_report(
                 status=empty_status,
@@ -1508,7 +1490,7 @@ def test_every_builder_survives_a_completely_empty_report() -> None:
 
 @pytest.mark.parametrize(
     "builder",
-    ["status_payload", "pulse_payload", "insights_payload", "journal_payload", "activity_payload"],
+    ["pulse_payload", "insights_payload", "journal_payload", "activity_payload"],
 )
 def test_every_payload_is_json_serialisable_without_a_custom_encoder(builder: str) -> None:
     """The builders return plain `dict`/`list`/`str` -- no `Decimal` reaches `json.dumps`. That
@@ -1544,7 +1526,6 @@ def test_every_payload_is_json_serialisable_without_a_custom_encoder(builder: st
         return
 
     other = {
-        "status_payload": _status_report(),
         "activity_payload": _activity_feed(),
     }[builder]
 

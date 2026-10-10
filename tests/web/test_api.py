@@ -46,7 +46,7 @@ from keel.data.db import connect, migrate
 from keel.web import api as web_api
 from keel.web import payload
 from keel.web import server as web_server
-from keel.web.security import SESSION_COOKIE, csrf_token, new_session_token
+from keel.web.security import SESSION_COOKIE, csrf_token, gates_token, new_session_token
 from tests.conftest import VALID_CONFIG_YAML
 
 #: Every read the HTML routes perform, as its JSON counterpart. `/glossary` is absent on purpose
@@ -54,9 +54,8 @@ from tests.conftest import VALID_CONFIG_YAML
 #: it here later cannot silently mean "we forgot".
 API_ROUTES = (
     "/api/config",
-    "/api/status",
+    "/api/pulse",
     "/api/setup",
-    "/api/activity",
     "/api/orders",
     "/api/positions",
     "/api/balances",
@@ -70,7 +69,6 @@ API_ROUTES = (
     "/api/rules",
     "/api/dca-plan",
     "/api/venues",
-    "/api/gates",
     "/api/plans",
 )
 
@@ -307,8 +305,6 @@ def test_the_api_routes_cover_every_html_route_that_reads(
     from keel.web import staticfiles
 
     views = {"/" + name for name in staticfiles.CLIENT_ROUTES}
-    # The client's `status` view is served by the endpoint that named the old landing page `/`.
-    views = {"/" if view == "/status" else view for view in views}
     covered = {web_api.HTML_ROUTE_FOR[name] for name in web_api.API_ROUTES}
 
     assert views <= covered, views - covered
@@ -352,7 +348,7 @@ def test_config_names_the_served_deployment(running: web_server.ServeConfig) -> 
     `/api/config` is the one endpoint the client reads regardless of route -- it keys the
     service worker and the docs links at boot -- so the deployment's identity rides the answer
     that is already arriving, rather than a second endpoint or a badge that only hydrates where
-    `/api/status` happens to be the view.
+    `/api/pulse` happens to be the view.
 
     `mode` is the config's own word for `auto_trade.mode`, copied verbatim and not judged:
     `paper` beside `confirm` is neither good nor bad, and a `Field` with a `state` would force
@@ -568,7 +564,7 @@ def test_every_declared_sort_column_is_a_column_the_rows_actually_have(
     _seed_orders(running.db_path, (("BTC-USD", "buy", "50000"),))
 
     for path, collection in (
-        ("/api/status", "open_positions"),
+        ("/api/positions", "rows"),
         ("/api/rules", "rules"),
         ("/api/timeline", "rows"),
     ):
@@ -621,11 +617,11 @@ def test_the_endpoint_orders_with_decimal_not_float(running: web_server.ServeCon
         running.db_path, tuple((f"TKN{i}-USD", qty, "50000") for i, qty in enumerate(WEI_APART))
     )
 
-    _status, _headers, unsorted = _json(running, "/api/status")
-    _status, _headers, document = _json(running, "/api/status?sort=qty")
+    _status, _headers, unsorted = _json(running, "/api/positions")
+    _status, _headers, document = _json(running, "/api/positions?sort=qty")
 
-    as_built = [row["qty"]["value"] for row in unsorted["data"]["open_positions"]]
-    ordered = [row["qty"]["value"] for row in document["data"]["open_positions"]]
+    as_built = [row["qty"]["value"] for row in unsorted["data"]["rows"]]
+    ordered = [row["qty"]["value"] for row in document["data"]["rows"]]
 
     assert ordered == [WEI_APART[2], WEI_APART[1], WEI_APART[0]]
     # The comparison that makes this test say something: the SAME rows, in the order the report
@@ -714,7 +710,7 @@ def test_a_stopped_engine_says_so_rather_than_answering_an_empty_payload(
 
     `data` is `null` and not `{}`: an empty object is a payload with every figure missing, and a
     view given one renders zeros. `null` cannot be rendered by accident."""
-    status, _headers, document = _json(empty_machine, "/api/status")
+    status, _headers, document = _json(empty_machine, "/api/pulse")
 
     assert status == 200
     assert document["engine"]["value"] == "stopped"
@@ -729,7 +725,7 @@ def test_a_stopped_engine_is_a_200_not_an_error(empty_machine: web_server.ServeC
     wrapper both read as "the server is unreachable", which would put a first-run user in an
     outage state when their actual position is that they have not set anything up yet -- and the
     two need different words on screen."""
-    status, _headers, _document = _json(empty_machine, "/api/status")
+    status, _headers, _document = _json(empty_machine, "/api/pulse")
 
     assert status == 200
 
@@ -737,7 +733,7 @@ def test_a_stopped_engine_is_a_200_not_an_error(empty_machine: web_server.ServeC
 def test_a_stopped_engine_still_answers_the_endpoints_that_describe_the_binary(
     empty_machine: web_server.ServeConfig,
 ) -> None:
-    """`/api/config` and `/api/gates` read no deployment at all -- they describe the binary that
+    """`/api/config` reads no deployment at all -- it describes the binary that
     is answering. `/api/venues` is `needs_database=False` for the same reason (still answers
     with nothing set up) but, since #233 PR4, DOES attempt a best-effort read of this
     deployment's venue readiness -- `read_venues` checks `state.has_usable_database` first and
@@ -749,7 +745,7 @@ def test_a_stopped_engine_still_answers_the_endpoints_that_describe_the_binary(
     # than the deployment, so it reads no repository at all -- and a page explaining that keel is
     # free and runs on the operator's own hardware would be a strange one to gate behind having
     # already installed it.
-    for path in ("/api/config", "/api/venues", "/api/gates", "/api/plans"):
+    for path in ("/api/config", "/api/venues", "/api/plans"):
         status, _headers, document = _json(empty_machine, path)
 
         assert status == 200, path
@@ -857,9 +853,73 @@ def test_setup_carries_the_csrf_token_and_only_setup_does(
     _status, _headers, document = _json(empty_machine, "/api/setup")
     assert document["data"]["csrf"] == csrf_token(empty_machine.token)
 
-    for path in ("/api/config", "/api/status", "/api/venues", "/api/gates", "/api/plans"):
+    for path in ("/api/config", "/api/pulse", "/api/venues", "/api/plans"):
         _status, _headers, other = _json(empty_machine, path)
         assert csrf_token(empty_machine.token) not in json.dumps(other), path
+
+
+def test_pulse_carries_the_gate_token_and_only_pulse_does(
+    running: web_server.ServeConfig,
+) -> None:
+    """The HALT button's token rides `/api/pulse`'s body exactly as the CSRF token rides
+    `/api/setup`'s (`payload.setup_payload` carries the argument: it authorises nothing without
+    the session cookie, and `/api/*` is `no-store`). The scope is what is asserted: the gate token
+    appears on the one endpoint whose view halts, and on no other -- in particular not on
+    `/api/setup`, whose own token is the CSRF one, derived apart so that neither surface's token
+    unlocks the other (`security.gates_token`)."""
+    _status, _headers, document = _json(running, "/api/pulse")
+    assert document["data"]["gate"] == gates_token(running.token)
+    assert gates_token(running.token) != csrf_token(running.token)
+
+    for path in API_ROUTES:
+        if path == "/api/pulse":
+            continue
+        _status, _headers, other = _json(running, path)
+        assert gates_token(running.token) not in json.dumps(other), path
+
+
+def test_pulse_answers_data_null_when_nothing_is_set_up(
+    empty_machine: web_server.ServeConfig,
+) -> None:
+    status, _headers, document = _json(empty_machine, "/api/pulse")
+
+    assert status == 200
+    assert document["engine"]["value"] == "stopped"
+    assert document["data"] is None
+
+
+def test_pulse_lists_the_next_cadence_day_for_live_dca_rules_only(
+    deployment: tuple[str, str],
+) -> None:
+    """A `live` rule is listed and a `candidate` is not -- and the seeded row reaches the reader,
+    asserted by the live row's product appearing at all (an empty fixture passes by vacuum)."""
+    from keel.data.repository import Repository
+    from tests.commands.test_dca_plan import _insert_dca
+
+    db_path, config_path = deployment
+    conn = connect(db_path)
+    live_id = _insert_dca(Repository(conn), "ETH-USD", "live", budget="25")
+    _insert_dca(Repository(conn), "SOL-USD", "candidate")
+    conn.commit()
+    conn.close()
+
+    status, document = web_api.respond(_serve_config(db_path, config_path), "/api/pulse", {})
+
+    assert status == 200
+    rows = document["data"]["next_dca"]
+    assert [(row["rule_id"], row["product_id"]) for row in rows] == [(str(live_id), "ETH-USD")]
+    assert rows[0]["next_cadence_day"]["value"].endswith("T00:00:00Z"), "a day, not an order time"
+    assert document["data"]["next_dca_note"] == payload.NEXT_DCA_NOTE
+
+
+def test_pulse_declares_no_sortable_collection() -> None:
+    """Its tables are intrinsic orders (`rule_counts`, freshness in the config's product order,
+    cycles newest first); a display sort would destroy them. `/api/positions` owns the sort."""
+    route = web_api.API_ROUTES["/api/pulse"]
+
+    assert route.sortable == ()
+    assert route.collection == ""
+    assert "/api/pulse" not in web_api.sortable_columns()
 
 
 def test_a_report_that_cannot_be_built_is_reported_not_swallowed(
@@ -870,9 +930,11 @@ def test_a_report_that_cannot_be_built_is_reported_not_swallowed(
     client's point of view a report that cannot be built and an engine that is not there require
     the SAME behaviour -- show no figures -- and the difference is already carried by the status
     code and `error.detail`."""
-    monkeypatch.setattr(web_api, "_status_report", _raise, raising=True)
+    # `read_pulse` imports `gather_pulse` per call, so replacing it at its module reaches the
+    # reader -- and the 500 below is what proves it did.
+    monkeypatch.setattr("keel.commands.pulse.gather_pulse", _raise, raising=True)
 
-    status, headers, document = _json(running, "/api/status")
+    status, headers, document = _json(running, "/api/pulse")
 
     assert status == 500
     assert headers["Content-Type"] == "application/json; charset=utf-8"
@@ -913,7 +975,7 @@ def test_json_is_served_with_nosniff_and_no_csp(running: web_server.ServeConfig,
 
 
 def test_head_returns_the_headers_and_no_body(running: web_server.ServeConfig) -> None:
-    status, headers, body = _get(running, "/api/status", method="HEAD", cookie=_session(running))
+    status, headers, body = _get(running, "/api/pulse", method="HEAD", cookie=_session(running))
 
     assert status == 200
     assert headers["Content-Type"] == "application/json; charset=utf-8"
@@ -933,10 +995,10 @@ def test_a_read_needs_no_client_header(running: web_server.ServeConfig) -> None:
     first place, so the read is refused at admission before any of this matters.
 
     Requiring it anyway would cost the thing §4 of the design philosophy is about: `curl
-    http://127.0.0.1:8765/api/status` and a browser address bar are how an operator checks that
+    http://127.0.0.1:8765/api/pulse` and a browser address bar are how an operator checks that
     the interface is telling the truth, and neither can set a header. Reverse this the day a GET
     can change something."""
-    status, _headers, document = _json(running, "/api/status")
+    status, _headers, document = _json(running, "/api/pulse")
 
     assert status == 200
     assert document["data"] is not None
@@ -948,7 +1010,7 @@ def test_a_read_without_the_session_cookie_is_refused_in_json(
     """Same admission as every rendered page -- never weakened for being an API -- but the refusal
     speaks the caller's language. An HTML error page handed to `res.json()` is a parse error in
     the client, which is a worse diagnostic than the 403 it is hiding."""
-    status, headers, body = _get(running, "/api/status")
+    status, headers, body = _get(running, "/api/pulse")
 
     assert status == 403
     assert headers["Content-Type"] == "application/json; charset=utf-8"
@@ -962,7 +1024,7 @@ def test_a_read_from_a_foreign_host_header_is_refused_in_json(
     the bind check passed, and only the header tells the truth about who the browser thinks it is
     talking to."""
     status, headers, body = _get(
-        running, "/api/status", cookie=_session(running), host="keel.example.com"
+        running, "/api/pulse", cookie=_session(running), host="keel.example.com"
     )
 
     assert status == 403
@@ -1030,7 +1092,7 @@ def test_the_client_header_gate_still_guards_every_api_post(
     route table under that prefix is no longer empty."""
     status, _headers, _body = _get(
         running,
-        "/api/status",
+        "/api/pulse",
         method="POST",
         cookie=_session(running),
         headers={"Content-Length": "0"},
@@ -1420,8 +1482,8 @@ def _iso(ts: int) -> str:
     return datetime.datetime.fromtimestamp(ts, datetime.UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-def test_read_activity_scopes_by_the_clock_it_was_handed(tmp_path: Path) -> None:
-    """**Kills: `apply_scope(feed, scope, now_ts=time.time())`, and filtering on a second clock.**
+def test_read_pulse_scopes_by_the_clock_it_was_handed(deployment: tuple[str, str]) -> None:
+    """**Kills: `apply_scope(feed, "today", now_ts=time.time())`, and filtering on a second clock.**
 
     Two cycles, one either side of the injected day's boundary, in a log this test actually
     OWNS. The first version pointed `tmp_path` at a config and asserted `scope_start_at` -- but
@@ -1432,37 +1494,39 @@ def test_read_activity_scopes_by_the_clock_it_was_handed(tmp_path: Path) -> None
 
     So the count is asserted, not the label. `logging.file` is written ABSOLUTE for the same
     reason the relative default exists -- see `resolve_log_path` -- because a test that depends
-    on its own working directory is the bug this one is fixing."""
+    on its own working directory is the bug this one is fixing. (`/api/activity` carried this
+    test until Pulse took its feed; the rule it pins moved with the reader.)"""
     import datetime
 
     from keel.commands.activity import scope_start_ts as activity_scope_start_ts
-    from keel.web.api import read_activity
+    from keel.web.api import read_pulse
     from tests.commands.test_activity import _cycle_at
 
+    db_path, config_path = deployment
     chosen = 1_788_998_400 + 3652 * 86_400 + 43_200
     boundary = activity_scope_start_ts("today", chosen)
     assert boundary is not None
 
-    log_path = tmp_path / "keel.log"
+    log_path = Path(config_path).parent / "keel.log"
     inside = _cycle_at(boundary + 3_600, "cycle-inside")
     outside = _cycle_at(boundary - 3_600, "cycle-yesterday")
     log_path.write_text("\n".join(outside + inside) + "\n", encoding="utf-8")
+    Path(config_path).write_text(VALID_CONFIG_YAML + f"\nlogging:\n  file: {log_path}\n")
+    cfg = _serve_config(db_path, config_path)
 
-    config_path = tmp_path / "config.yaml"
-    config_path.write_text(VALID_CONFIG_YAML + f"\nlogging:\n  file: {log_path}\n")
-    cfg = _serve_config(str(tmp_path / "keel.db"), str(config_path))
-
-    body = read_activity(cfg, {"scope": ["today"]}, None, chosen)
+    body = read_pulse(cfg, {}, None, chosen)
 
     # The FEED, which only reaches this assertion if the fixture reached the reader.
-    assert len(body["cycles"]) == 1, "one cycle is inside the injected day: " + repr(body["cycles"])
-    assert body["cycles"][0]["cycle_id"] == "cycle-inside", "and it is the RIGHT one"
+    cycles = body["activity"]["cycles"]
+    assert len(cycles) == 1, "one cycle is inside the injected day: " + repr(cycles)
+    assert cycles[0]["cycle_id"] == "cycle-inside", "and it is the RIGHT one"
+    assert body["today"]["cycles"]["value"] == "1", "and the counts are summed over that one"
 
     # And the label, derived from the service's own boundary rather than restated.
     expected = datetime.datetime.fromtimestamp(boundary, datetime.UTC).strftime(
         "%Y-%m-%dT%H:%M:%SZ"
     )
-    assert body["scope_start_at"]["value"] == expected
+    assert body["activity"]["scope_start_at"]["value"] == expected
     assert expected.startswith("2036-"), "the injected instant is a decade from any wall clock"
 
 

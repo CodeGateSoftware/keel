@@ -138,7 +138,7 @@ def test_every_endpoint_answers_with_the_banner_not_just_the_status_one(
     17 and 22 are both `MISSING` and every page says so."""
     from keel.web import api as web_api
 
-    for path in ("/api/status", "/api/orders", "/api/positions"):
+    for path in ("/api/pulse", "/api/orders", "/api/positions"):
         _, document = web_api.respond(_cfg(deployment), path, {})
         rails = {alert["rail"] for alert in document["attestations"]}
         assert rails == {"17", "22"}, path
@@ -160,7 +160,7 @@ def test_an_attested_deployment_raises_no_banner(deployment: tuple[str, str]) ->
     repo.set_state("withdrawals_enabled", "true")
     web_api.close_repo(repo)
 
-    _, document = web_api.respond(_cfg(deployment), "/api/status", {})
+    _, document = web_api.respond(_cfg(deployment), "/api/pulse", {})
     assert [alert["rail"] for alert in document["attestations"]] == ["22"]
 
 
@@ -175,7 +175,7 @@ def test_a_stopped_engine_reports_null_rather_than_nothing_is_wrong(tmp_path: An
         db_path=str(tmp_path / "absent.db"),
         config_path=str(tmp_path / "absent.yaml"),
     )
-    _, document = web_api.respond(cfg, "/api/status", {})
+    _, document = web_api.respond(cfg, "/api/pulse", {})
     assert document["engine"]["value"] != "running"
     assert document["attestations"] is None
 
@@ -343,7 +343,7 @@ def test_the_banner_reads_the_venue_the_deployment_is_bound_to(deployment: tuple
 
     web_api.open_repo = _spy  # type: ignore[assignment]
     try:
-        web_api.respond(_cfg(deployment), "/api/status", {})
+        web_api.respond(_cfg(deployment), "/api/pulse", {})
     finally:
         web_api.open_repo = original  # type: ignore[assignment]
 

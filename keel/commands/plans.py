@@ -257,9 +257,9 @@ def every_claim() -> Iterator[Claim]:
 
 @dataclass(frozen=True)
 class PlansReport:
-    #: NO TIMESTAMP, deliberately, and the sibling settles it: `gates_payload` describes capability
-    #: rather than deployment and takes no `now_ts` at all. Every other view stamps itself because
-    #: its figures were observed at a moment; nothing on this page was observed. The first cut sent
+    #: NO TIMESTAMP, deliberately: this describes the project rather than a deployment and takes no
+    #: `now_ts` at all. Every other view stamps itself because its figures were observed at a
+    #: moment; nothing on this page was observed. The first cut sent
     #: `as_of` and `generated_at` and rendered neither -- a stamp nobody shows is a stamp that will
     #: eventually be shown, and it would date a page whose content changes only when a document
     #: does.

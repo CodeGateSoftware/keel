@@ -898,7 +898,7 @@ def _position_payload(position: OpenPositionStatus, mode: str) -> dict[str, Any]
     a `unit` for the day `OpenPositionStatus` carries a `base_asset`; until then the exact
     quantity sits beside the `product_id` and nothing is guessed.
 
-    `mode` is `report.mode` (`status_payload`'s own `StatusReport.mode`), passed down purely so
+    `mode` is `report.mode` (`pulse_payload`'s own `StatusReport.mode`), passed down purely so
     `_bracket_field` can tell paper from live -- it is never stored on the position itself and
     never used for anything but that one judgement (#641).
     """
@@ -991,33 +991,6 @@ def _rule_counts_payload(report: StatusReport) -> list[dict[str, Any]]:
     ]
 
 
-def status_payload(report: StatusReport) -> dict[str, Any]:
-    """`gather_status`'s `StatusReport`, as JSON. Serialises; never re-gathers."""
-    session_defused = bool(report.market_session.defused)
-    return {
-        "as_of": iso(report.now_ts),
-        "generated_at": moment(report.now_ts),
-        "mode": report.mode,
-        "kill_switch": flag(
-            report.kill_switch_engaged,
-            on="ENGAGED",
-            off="clear",
-            on_state=BAD,
-            off_state=GOOD,
-        ),
-        "autonomy": _autonomy_payload(report.autonomy),
-        "market_session": _session_payload(report.market_session),
-        "equity": _equity_payload(report),
-        "drawdown": _drawdown_payload(report),
-        "withdrawal_attestation": _attestation_payload(report.withdrawal_attestation),
-        "open_positions": [_position_payload(p, report.mode) for p in report.open_positions],
-        "rule_counts": _rule_counts_payload(report),
-        "live_rules": [_rule_payload(r) for r in report.live_rules],
-        "data_freshness": [_freshness_payload(f, session_defused) for f in report.data_freshness],
-        "subscriptions": [_subscription_payload(s) for s in report.subscriptions],
-    }
-
-
 # -- pulse (console PR1) ---------------------------------------------------------------------------
 
 #: Said once beside the DCA rows, never per row. The engine keys a buy off the COMPLETED daily
@@ -1030,10 +1003,11 @@ def pulse_payload(report: PulseReport, *, gate: str = "") -> dict[str, Any]:
     """`gather_pulse`'s `PulseReport`, as JSON -- the glance page, and the one place the console
     offers a write.
 
-    Serialises the status sections through the SAME helpers `status_payload` uses (a Pulse that
-    re-worded the kill switch or the bracket warning would be two answers to one question), then
-    adds what only Pulse holds: today's counts, the why-not sentences (the engine's own words,
-    crossing unchanged), the next DCA cadence days, and the unbracketed roll-call.
+    Serialises the status sections through the SAME helpers the retired Status view used (a
+    Pulse that re-worded the kill switch or the bracket warning would be two answers to one
+    question), then adds what only Pulse holds: today's counts, the why-not sentences (the
+    engine's own words, crossing unchanged), the next DCA cadence days, and the unbracketed
+    roll-call.
 
     `halt.resume_command` is `"keel resume"` while the kill switch is engaged and `""` otherwise.
     The client may not read `Field.value`, so "HALT button or HALTED line" must arrive as
@@ -1814,8 +1788,8 @@ def plans_payload(report: PlansReport) -> dict[str, Any]:
     )
 
     return {
-        # NO `as_of`/`generated_at`, matching `gates_payload` next door, which also describes
-        # capability rather than deployment and also sends none. Nothing on this page was
+        # NO `as_of`/`generated_at`: this page describes the project rather than a deployment.
+        # Nothing on this page was
         # OBSERVED at a moment -- it changes when a document changes -- and a stamp nobody renders
         # is a stamp that eventually gets rendered, dating a page that has no date.
         "for_sale": flag(
@@ -4035,50 +4009,4 @@ def venues_payload(
     return {
         "venues": [_venue_payload(info) for info in infos],
         "readiness": [_readiness_payload(row) for row in readiness],
-    }
-
-
-# -- gates (#534) --------------------------------------------------------------------------------
-
-
-def _capability_payload(capability: Any) -> dict[str, Any]:
-    return {
-        "surface": capability.surface,
-        "invocation": capability.invocation,
-        "increases": capability.increases,
-        "call_site": f"{capability.module}.{capability.function}",
-        "mirrors": (
-            f"{capability.mirrors[0]}.{capability.mirrors[1]}" if capability.mirrors else ""
-        ),
-    }
-
-
-def gates_payload(gates: Sequence[Any], capabilities: Sequence[Any]) -> dict[str, Any]:
-    """`keel/capabilities.py`'s declaration, as JSON.
-
-    A pure declaration -- no config, no database, no network. It describes the BINARY that is
-    answering, which is why this endpoint has data to serve on a machine with no deployment on it.
-
-    **No `count` of covered actions**, unlike the HTML page's `esc(len(covered))`. Rule 6e of
-    `test_console_thinness.py` bans `len()` in this module, because a count on the wire must be one
-    the report already holds -- and `Gate` holds none. Unlike `JournalReport.shown_count` there is
-    no report builder to add it to either, `keel/capabilities.py` being a declaration rather than a
-    report. A client renders `actions.length`, which is a list length in the language that owns the
-    list, not a figure this layer invented.
-    """
-    return {
-        "gates": [
-            {
-                "name": gate.name,
-                "evidence": gate.evidence,
-                "fails_closed_against": gate.fails_closed_against,
-                "implementation": gate.implementation,
-                "actions": [
-                    _capability_payload(capability)
-                    for capability in capabilities
-                    if capability.gate == gate.name
-                ],
-            }
-            for gate in gates
-        ]
     }

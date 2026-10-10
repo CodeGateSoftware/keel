@@ -43,7 +43,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from keel.web import payload, runtime
-from keel.web.security import csrf_token, local_deployment
+from keel.web.security import csrf_token, gates_token, local_deployment
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from keel.web.server import ServeConfig
@@ -166,9 +166,10 @@ class ApiRefusal(Exception):
 def _status_report(cfg: ServeConfig, now_ts: int) -> Any:
     """`gather_status`'s frozen report, over its own connection.
 
-    A named module-level function rather than an inline call inside `read_status` so a test can
-    replace it -- pinning that a report which cannot be built becomes a stated 500 rather than a
-    200 with an empty payload, which is the failure mode this whole envelope exists to prevent."""
+    A named module-level function rather than an inline call inside `read_insights` and
+    `read_journal` so a test can replace it -- pinning that a report which cannot be built
+    becomes a stated 500 rather than a 200 with an empty payload, which is the failure mode this
+    whole envelope exists to prevent."""
     from keel.commands.status import gather_status
 
     repo = open_repo(cfg.db_path)
@@ -286,7 +287,7 @@ def _auto_trade_mode(config_path: str) -> str:
     """The served config's own word for `auto_trade.mode`, or `""` when it cannot be read.
 
     The config file is re-read per request rather than resolved at bind time on purpose: mode
-    changes are config-file edits by design, and `read_status` re-reads the same file on every
+    changes are config-file edits by design, and `read_pulse` re-reads the same file on every
     poll already -- a badge that showed a mode the served config no longer declares would be
     worse than one that says nothing.
 
@@ -300,10 +301,6 @@ def _auto_trade_mode(config_path: str) -> str:
     except Exception:  # every unreadable config is one answer here: the mode is unknown
         return ""
     return str(getattr(getattr(config, "auto_trade", None), "mode", "") or "")
-
-
-def read_status(cfg: ServeConfig, _query: Query, _state: Any, now_ts: int) -> dict[str, Any]:
-    return payload.status_payload(_status_report(cfg, now_ts))
 
 
 def read_setup(cfg: ServeConfig, _query: Query, state: Any, _now_ts: int) -> dict[str, Any]:
@@ -330,32 +327,41 @@ def read_setup(cfg: ServeConfig, _query: Query, state: Any, _now_ts: int) -> dic
     )
 
 
-def read_activity(cfg: ServeConfig, query: Query, _state: Any, now_ts: int) -> dict[str, Any]:
-    """The engine's own log, scoped.
+def read_pulse(cfg: ServeConfig, _query: Query, _state: Any, now_ts: int) -> dict[str, Any]:
+    """The home view: what keel did today, what stopped it, what it will do next (console PR1).
 
-    An unrecognised `?scope=` is NORMALISED rather than refused, unlike an unrecognised `?sort=`,
-    and the difference is not an inconsistency. `normalise_scope` is the activity SERVICE's own
-    function with the CLI's own default behind it, so refusing here would mean the browser and the
-    terminal disagreeing about the same input -- and the resolved value is echoed back in
-    `data.scope`, so a client can see that its input was changed. A sort column has no service, no
-    default and no echo that would make a silent substitution visible, so it is refused."""
+    ONE status report, ONE log window, ONE repo open; `now_ts` is `respond`'s -- no second clock,
+    which is also what makes "today" the same UTC day for the counts and for the envelope's stamp.
+
+    The log is read through `activity`'s own bounded window and scoped to `today` here rather than
+    taken from a query string: Pulse has no scope control, and an unrecognised `?scope=` was never
+    this endpoint's to interpret. A read that failed and a window that held nothing are different
+    facts, so the reader's status is kept when the feed would otherwise flatten it to "empty".
+
+    `gate` is `security.gates_token(cfg.token)`, on this endpoint only, for the HALT button: see
+    `payload.setup_payload` for why a derived write token may ride a GET body, and
+    `server._gated_action` for why the halt needs nothing else."""
     from keel.commands.activity import (
         apply_scope,
         feed_from_lines,
-        normalise_scope,
         read_log_window,
         resolve_log_path,
     )
+    from keel.commands.pulse import gather_pulse
 
-    scope = normalise_scope(_first(query, "scope"))
-    path = resolve_log_path(load_config(cfg.config_path))
+    config = load_config(cfg.config_path)
+    path = resolve_log_path(config)
     window = read_log_window(path)
     feed = feed_from_lines(window.lines, source=str(path), truncated=window.truncated)
     if window.status != "ok" and feed.status == "empty":
-        # A read that failed and a window that held nothing are different facts; the reader's
-        # status is the more specific one and must not be flattened into "empty".
         feed = feed_from_lines((), source=str(path))
-    return payload.activity_payload(apply_scope(feed, scope, now_ts=now_ts))
+    feed = apply_scope(feed, "today", now_ts=now_ts)
+    repo = open_repo(cfg.db_path)
+    try:
+        report = gather_pulse(repo, config, feed, now_ts=now_ts)
+    finally:
+        close_repo(repo)
+    return payload.pulse_payload(report, gate=gates_token(cfg.token))
 
 
 def read_orders(cfg: ServeConfig, query: Query, _state: Any, now_ts: int) -> dict[str, Any]:
@@ -619,8 +625,8 @@ def _log_cycles(config: Any) -> tuple[tuple[Any, ...], str]:
       reality while looking healthy.
     * RAISING on any status but `ok`/`missing` made an EMPTY log -- an ordinary state, a freshly
       created handler or the moment after a rotation -- take out orders, flows and attestations
-      as well. A total outage to report a non-problem, and a divergence from `/api/activity`,
-      which renders these same statuses as a stated feed state.
+      as well. A total outage to report a non-problem, and a divergence from the feed
+      `/api/pulse` serves, which renders these same statuses as a stated feed state.
 
     So the status is returned, the report carries it, and the page and the CSV say it.
     """
@@ -978,14 +984,6 @@ def read_venues(cfg: ServeConfig, _query: Query, state: Any, _now_ts: int) -> di
     return payload.venues_payload(infos, readiness)
 
 
-def read_gates(_cfg: ServeConfig, _query: Query, _state: Any, _now_ts: int) -> dict[str, Any]:
-    """Read from `keel.capabilities`, which is a pure declaration -- no config, no database, no
-    network. It describes the binary that is serving the response."""
-    from keel.capabilities import CAPABILITIES, GATES
-
-    return payload.gates_payload(GATES, CAPABILITIES)
-
-
 # -- the route table -------------------------------------------------------------------------------
 
 #: A parsed query string, as `urllib.parse.parse_qs` returns it.
@@ -1026,26 +1024,17 @@ class ApiRoute:
 #: its `html_route` except `/glossary`, which gets no counterpart: it becomes an outbound
 #: keeltrading.com link in #539 and `render_glossary` is deleted in #540, so an `/api/glossary`
 #: would be a surface built in order to be removed -- and any client written against it would break
-#: on the release that removes it.
+#: on the release that removes it. `/api/pulse` carries the landing route (`/pulse`, the client's
+#: default): the glance page, and the one whose body holds the halt's gate token.
 API_ROUTES: dict[str, ApiRoute] = {
     "/api/config": ApiRoute(html_route="", read=read_config, needs_database=False),
-    "/api/status": ApiRoute(
-        html_route="/",
-        read=read_status,
-        collection="open_positions",
-        # The one collection on this payload with money in it. `rule_counts` is already ordered by
-        # status to match `render_human`, `data_freshness` follows the config's product order and
-        # `live_rules` the ledger's -- three intrinsic orders that a display sort would destroy
-        # rather than improve.
-        sortable=(
-            "id",
-            "product_id",
-            "rule_name",
-            "qty",
-            "entry_price",
-            "opened_at",
-            "bracket",
-        ),
+    "/api/pulse": ApiRoute(
+        html_route="/pulse",
+        read=read_pulse,
+        # No sortable collection: every table on the glance page is an intrinsic order --
+        # `rule_counts` by status, `data_freshness` in the config's product order, `live_rules`
+        # in the ledger's, cycles newest first -- and a display sort would destroy each rather
+        # than improve it. `/api/positions` owns the sort of the tranches.
     ),
     "/api/setup": ApiRoute(
         html_route="/setup",
@@ -1053,24 +1042,6 @@ API_ROUTES: dict[str, ApiRoute] = {
         # No sortable collection: the steps are in RUNBOOK order, and that order is the
         # information. A checklist sorted by title is a checklist you cannot work down.
         needs_database=False,
-    ),
-    "/api/activity": ApiRoute(
-        html_route="/activity",
-        read=read_activity,
-        collection="cycles",
-        sortable=(
-            "key",
-            "cycle_id",
-            "started_at",
-            "ended_at",
-            "mode",
-            "signals",
-            "blocked",
-            "entered",
-            "exited",
-            "errors",
-            "events_dropped",
-        ),
     ),
     "/api/insights": ApiRoute(
         html_route="/insights",
@@ -1240,14 +1211,6 @@ API_ROUTES: dict[str, ApiRoute] = {
         needs_database=False,
         collection="venues",
         sortable=("name", "venue", "deployment", "package_version"),
-    ),
-    "/api/gates": ApiRoute(
-        html_route="/gates",
-        read=read_gates,
-        needs_database=False,
-        # No sortable collection: a gate's rows are the actions it covers, nested one level down,
-        # and `?sort=` names a column of ONE top-level list. Sorting the gates themselves would
-        # order a tuple that has one member.
     ),
 }
 
@@ -1445,7 +1408,7 @@ def respond(cfg: ServeConfig, path: str, query: Query) -> tuple[int, dict[str, A
         data=data,
         sort=_sort_echo(route, column, descending),
         # `running`, not `route.needs_database`: the routes that answer without a database
-        # (`/api/setup`, `/api/venues`, `/api/gates`) are pages too, and an operator reading the
+        # (`/api/setup`, `/api/venues`) are pages too, and an operator reading the
         # setup checklist is exactly who needs to be told an attestation lapsed.
         attestations=attestation_alerts(cfg, now_ts) if running else None,
     )
@@ -1455,7 +1418,7 @@ def attestation_alerts(cfg: ServeConfig, now_ts: int) -> list[dict[str, Any]] | 
     """The banner rows for this deployment, on EVERY answered request (#793).
 
     One extra read per request, and it is bought deliberately. The alternative -- computing it on
-    `/api/status` only -- is what shipped, and it put rail 17's expiry in a card on the one page
+    `/api/pulse` only -- is what shipped, and it put rail 17's expiry in a card on the one page
     an operator was not looking at for three days while live placed nothing.
 
     Never raises. `survey` already answers an unreadable attestation with `MISSING` rather than an
