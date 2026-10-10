@@ -12,6 +12,7 @@ import ast
 from decimal import Decimal
 from pathlib import Path
 
+import pytest
 from keel_core.config import load_config
 
 from keel.commands import pulse as pulse_mod
@@ -70,6 +71,49 @@ def test_today_counts_sum_the_scoped_cycles_and_nothing_outside_them() -> None:
     assert report.today == TodayCounts(
         cycles=2, signals=1, blocked=1, entered=0, exited=0, errors=0
     )
+
+
+@pytest.mark.parametrize("status", ["missing", "unreadable", "unparseable", "oversized"])
+def test_a_log_that_could_not_be_read_gives_no_counts_not_zeros(status: str) -> None:
+    """**Review F3.** `None` is "not recorded", `0` is "recorded as zero"; summing an unread log
+    into zeros is the always-passing fee rail's shape (#198)."""
+    feed = apply_scope(ActivityFeed(status=status, source="/x/keel.log"), "today", now_ts=NOW)
+    report = build_pulse(_status_report(), feed, (), now_ts=NOW)
+
+    assert report.today == TodayCounts(
+        cycles=None, signals=None, blocked=None, entered=None, exited=None, errors=None
+    )
+    assert report.today_basis == "unavailable"
+    assert report.why_not_none == "Today's log could not be read, so reasons may be missing."
+
+
+def test_a_window_that_stops_after_midnight_is_partial_not_the_days_total() -> None:
+    lines = _rail_veto_cycle_lines("aaaaaaaaaaaaaaaa", TODAY_START + 3600)
+    feed = apply_scope(feed_from_lines(lines, truncated=True), "today", now_ts=NOW)
+    assert feed.status == "ok" and feed.cycles  # the fixture reached the service
+    assert feed.scope_fully_covered is False  # and the window did not prove it reached midnight
+
+    report = build_pulse(_status_report(), feed, (), now_ts=NOW)
+
+    assert report.today_basis == "partial"
+    assert report.today.cycles == 1  # still the counts it saw, labelled as a lower bound
+    assert report.why_not_none == (
+        "No reason in the part of today's log that was read, and the log may not reach "
+        "back to midnight, so reasons may be missing."
+    )
+
+
+def test_a_fully_covered_day_is_complete_and_an_empty_file_is_a_real_zero() -> None:
+    complete = build_pulse(
+        _status_report(), _today_feed(_quiet_cycle_lines("b" * 16, NOW)), (), now_ts=NOW
+    )
+    assert complete.today_basis == "complete"
+    assert complete.why_not_none == "Nothing stopped keel today."
+
+    blank = apply_scope(ActivityFeed(status="empty", source="/x/keel.log"), "today", now_ts=NOW)
+    report = build_pulse(_status_report(), blank, (), now_ts=NOW)
+    assert report.today_basis == "complete"
+    assert report.today.cycles == 0
 
 
 def test_last_cycle_is_the_newest_today_or_the_one_before_the_scope_or_none() -> None:

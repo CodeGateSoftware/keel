@@ -59,14 +59,18 @@ _RAIL17_HALTING = frozenset({"suspended", "expired", "unattested"})
 @dataclass(frozen=True)
 class TodayCounts:
     """The scoped cycles' five counts (plus the cycle count), summed. `blocked` is the wide one
-    `summarise_cycle` documents: entries withheld, rail-vetoed or otherwise not placed."""
+    `summarise_cycle` documents: entries withheld, rail-vetoed or otherwise not placed.
 
-    cycles: int
-    signals: int
-    blocked: int
-    entered: int
-    exited: int
-    errors: int
+    Every figure is `None` when the log could not be read (`today_basis == "unavailable"`): "not
+    recorded" is not "recorded as zero", and summing nothing into six zeros is the always-passing
+    fee rail's shape (#198)."""
+
+    cycles: int | None
+    signals: int | None
+    blocked: int | None
+    entered: int | None
+    exited: int | None
+    errors: int | None
 
 
 @dataclass(frozen=True)
@@ -89,6 +93,15 @@ class PulseReport:
     #: Already scoped to "today" by the caller (`activity.apply_scope`).
     feed: ActivityFeed
     today: TodayCounts
+    #: How much of the day `today` and `why_not` cover: `"complete"` (the log was read back past
+    #: midnight, or it is a real empty file), `"partial"` (the bounded read began after midnight,
+    #: so the sums are a lower bound -- `ActivityFeed.scope_fully_covered`) or `"unavailable"`
+    #: (the log could not be read at all). Judged HERE, because the empty-reasons sentence below
+    #: is only true for `"complete"`.
+    today_basis: str
+    #: The sentence for an empty `why_not`, worded for `today_basis`. Sent so the client never
+    #: infers "nothing stopped keel" from the emptiness of a list.
+    why_not_none: str
     #: Newest cycle today, else the last one before the scope, else None (keel has no log yet).
     last_cycle_ts: float | None
     #: Ordered, de-duplicated sentences: standing blockers first, then today's cycle reasons.
@@ -105,7 +118,35 @@ class PulseReport:
     resume_command: str
 
 
+#: `ActivityFeed.status` values whose `cycles` are a real reading of the log (an `empty` file is
+#: a true zero). Every other status -- missing, unreadable, unparseable, oversized -- means the
+#: log says nothing about today.
+_READ_STATUSES = frozenset({"ok", "empty"})
+
+_NOTHING_STOPPED = "Nothing stopped keel today."
+_WHY_NOT_NONE = {
+    "complete": _NOTHING_STOPPED,
+    "partial": (
+        "No reason in the part of today's log that was read, and the log may not reach "
+        "back to midnight, so reasons may be missing."
+    ),
+    "unavailable": "Today's log could not be read, so reasons may be missing.",
+}
+
+
+def _today_basis(feed: ActivityFeed) -> str:
+    if feed.status not in _READ_STATUSES:
+        return "unavailable"
+    if not feed.scope_fully_covered:
+        return "partial"
+    return "complete"
+
+
 def _today_counts(feed: ActivityFeed) -> TodayCounts:
+    if feed.status not in _READ_STATUSES:
+        return TodayCounts(
+            cycles=None, signals=None, blocked=None, entered=None, exited=None, errors=None
+        )
     cycles = feed.cycles
     return TodayCounts(
         cycles=len(cycles),
@@ -174,11 +215,14 @@ def build_pulse(
         if status.mode == "paper"
         else tuple(p for p in status.open_positions if not p.has_bracket)
     )
+    basis = _today_basis(feed)
     return PulseReport(
         now_ts=now_ts,
         status=status,
         feed=feed,
         today=_today_counts(feed),
+        today_basis=basis,
+        why_not_none=_WHY_NOT_NONE[basis],
         last_cycle_ts=_last_cycle_ts(feed),
         why_not=_why_not(status, feed),
         next_dca=_next_dca(dca_rules, now_ts),

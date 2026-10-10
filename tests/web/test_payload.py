@@ -348,6 +348,8 @@ def _pulse_report(**overrides: Any) -> PulseReport:
         unbracketed=tuple(status.open_positions),
         unbracketed_count=len(status.open_positions),
         resume_command="",
+        today_basis="complete",
+        why_not_none="Nothing stopped keel today.",
     )
     base.update(overrides)
     return PulseReport(**base)
@@ -1392,6 +1394,47 @@ def test_a_blocked_or_erroring_day_is_judged_here() -> None:
     assert quiet["errors"]["state"] == "neutral"
 
 
+def test_an_unread_log_crosses_as_absent_counts_and_a_bad_basis_never_as_zeros() -> None:
+    """**Review F3.** Every figure absent (state unknown), the basis judged `bad`, and the
+    empty-reasons sentence the service's own."""
+    blank = TodayCounts(
+        cycles=None, signals=None, blocked=None, entered=None, exited=None, errors=None
+    )
+    document = payload.pulse_payload(
+        _pulse_report(
+            today=blank,
+            today_basis="unavailable",
+            why_not=(),
+            why_not_none="Today's log could not be read, so reasons may be missing.",
+        )
+    )
+
+    assert sorted(document["today"]) == [
+        "basis", "blocked", "cycles", "entered", "errors", "exited", "signals"
+    ]  # fmt: skip
+    for key in ("cycles", "signals", "blocked", "entered", "exited", "errors"):
+        assert document["today"][key] == payload.absent(), key
+    assert document["today"]["basis"]["state"] == "bad"
+    assert document["today"]["basis"]["value"] == "unavailable"
+    assert document["why_not_none"] == "Today's log could not be read, so reasons may be missing."
+
+
+def test_a_partial_day_is_judged_warn_on_every_figure_and_on_the_basis() -> None:
+    document = payload.pulse_payload(_pulse_report(today_basis="partial"))["today"]
+
+    assert document["basis"]["state"] == "warn"
+    for key in ("cycles", "signals", "entered", "exited"):
+        assert document[key]["state"] == "warn", key
+    assert document["blocked"]["state"] == "warn"
+    assert document["errors"]["state"] == "bad"  # a seen error is an error whatever the coverage
+
+
+def test_a_complete_day_keeps_its_neutral_judgements() -> None:
+    document = payload.pulse_payload(_pulse_report())["today"]
+    assert document["basis"]["state"] == "good"
+    assert document["cycles"]["state"] == "neutral"
+
+
 def test_next_dca_rows_carry_the_cadence_day_as_a_moment_and_the_note_once() -> None:
     built = payload.pulse_payload(_pulse_report())
     assert len(built["next_dca"]) == 1  # the fixture's one live rule reached the payload
@@ -1466,7 +1509,11 @@ def test_every_builder_survives_a_completely_empty_report() -> None:
             _pulse_report(
                 status=empty_status,
                 feed=ActivityFeed(status="missing", source="/tmp/nope.log"),
-                today=TodayCounts(cycles=0, signals=0, blocked=0, entered=0, exited=0, errors=0),
+                today=TodayCounts(
+                    cycles=None, signals=None, blocked=None, entered=None, exited=None, errors=None
+                ),
+                today_basis="unavailable",
+                why_not_none="Today's log could not be read, so reasons may be missing.",
                 last_cycle_ts=None,
                 why_not=(),
                 next_dca=(),

@@ -876,6 +876,11 @@ def test_pulse_carries_the_gate_token_and_only_pulse_does(
             continue
         _status, _headers, other = _json(running, path)
         assert gates_token(running.token) not in json.dumps(other), path
+    # The other direction, on a deployment that actually HAS a pulse body (`empty_machine`
+    # answers `data: null`, which holds no token whatever the payload builder does): the CSRF
+    # token must not ride the endpoint that carries the gate token (review F6).
+    assert document["data"] is not None
+    assert csrf_token(running.token) not in json.dumps(document)
 
 
 def test_pulse_answers_data_null_when_nothing_is_set_up(
@@ -1480,6 +1485,31 @@ def _iso(ts: int) -> str:
     import datetime
 
     return datetime.datetime.fromtimestamp(ts, datetime.UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+@pytest.mark.parametrize("kind", ["missing", "unreadable"])
+def test_read_pulse_keeps_the_readers_status_for_a_log_it_could_not_read(
+    deployment: tuple[str, str], kind: str
+) -> None:
+    """**Review F2/F3.** A nonexistent log is `missing`, a directory where the file should be is
+    `unreadable`, and neither is flattened to `empty` or summed into zeros on the glance page."""
+    from keel.web.api import read_pulse
+
+    db_path, config_path = deployment
+    log_path = Path(config_path).parent / ("nope.log" if kind == "missing" else "a-directory")
+    if kind == "unreadable":
+        log_path.mkdir()
+    Path(config_path).write_text(VALID_CONFIG_YAML + f"\nlogging:\n  file: {log_path}\n")
+
+    body = read_pulse(_serve_config(db_path, config_path), {}, None, 1_788_998_400 + 43_200)
+
+    assert body["activity"]["status"]["value"] == kind
+    assert kind == "missing" or body["activity"]["detail"], "the OSError names the fix"
+    for key in ("cycles", "signals", "blocked", "entered", "exited", "errors"):
+        assert body["today"][key]["state"] == "unknown", key
+        assert body["today"][key]["display"] == "—", key
+    assert body["today"]["basis"]["value"] == "unavailable"
+    assert body["why_not_none"] == "Today's log could not be read, so reasons may be missing."
 
 
 def test_read_pulse_scopes_by_the_clock_it_was_handed(deployment: tuple[str, str]) -> None:

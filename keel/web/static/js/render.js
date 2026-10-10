@@ -766,7 +766,9 @@ function pulseState(data) {
 /**
  * Today's cycle counts, and how many open tranches have no bracket.
  *
- * The counts are summed by the service over the cycles in today's UTC day; the bracket count is
+ * The counts are summed by the service over the cycles in today's UTC day, and are ABSENT when the
+ * log could not be read; `data.today.basis` says which (complete, partial from a window that began
+ * after midnight, or unavailable), so a zero here is never an unread log. The bracket count is
  * the #641 hazard (a live position with no stop) and is judged `warn` when non-zero, here in the
  * payload rather than by this file.
  *
@@ -778,6 +780,7 @@ function pulseToday(data) {
   fragment.append(heading("h-today", "Today"));
   fragment.append(
     gridCard([
+      kv("log coverage", data.today.basis),
       kv("cycles", data.today.cycles),
       kv("signals", data.today.signals),
       kv("blocked", data.today.blocked),
@@ -794,7 +797,9 @@ function pulseToday(data) {
  * Why keel did not trade: the engine's own sentences, in the order the service wrote them.
  *
  * `stringList` answers `null` for an empty list, and that absence is the branch -- this file
- * never inspects the list to choose the empty sentence.
+ * never inspects the list to choose the empty sentence, and never words it either: whether
+ * "nothing stopped keel" is TRUE depends on whether the log could be read back to midnight, which
+ * the service judged (`data.why_not_none`).
  *
  * @param {any} data
  * @returns {DocumentFragment}
@@ -804,7 +809,7 @@ function pulseWhyNot(data) {
   fragment.append(heading("h-why", "Why keel didn't trade"));
   const reasons = stringList(data.why_not, "reasons");
   if (reasons) fragment.append(reasons);
-  else fragment.append(note("Nothing stopped keel today."));
+  else fragment.append(note(data.why_not_none));
   return fragment;
 }
 
@@ -1064,7 +1069,7 @@ function pulseCycles(data) {
     ),
   );
 
-  if (data.activity.cycles.length === 0) fragment.append(noCyclesToday(data.activity));
+  if (data.activity.cycles.length === 0) fragment.append(noCyclesToday(data));
 
   const detailed = data.activity.cycles.filter(
     /** @param {any} cycle */ (cycle) => (cycle.events || []).length !== 0,
@@ -1075,7 +1080,7 @@ function pulseCycles(data) {
     for (const cycle of detailed) fragment.append(cycleEvents(cycle));
   }
 
-  fragment.append(feedNotes(data.activity));
+  fragment.append(feedNotes(data));
   return fragment;
 }
 
@@ -1089,17 +1094,17 @@ function pulseCycles(data) {
  * about the engine at all. The second is carried by `scope_fully_covered`, already judged, and
  * is in `feedNotes` below.
  *
- * `feed`, not `data`, because the payload root here is `activity_payload`'s document: a
- * `data.<key>` written in this region is checked against `/api/pulse`'s own keys, and these are
- * the feed's (`_view_keys` counts this region as `pulseView`'s).
+ * Takes `data` and reads `data.activity.<key>`, NOT a parameter named `feed`: `_view_keys` checks
+ * every `data.<key>` written in this region against `/api/pulse`, and a renamed root made these
+ * reads invisible to it -- `feed.lines_reed` passed the suite (review F5).
  *
- * @param {any} feed  `data.activity`.
+ * @param {any} data  `/api/pulse`'s `data`.
  * @returns {HTMLElement}
  */
-function noCyclesToday(feed) {
+function noCyclesToday(data) {
   const card = el("div", "card");
   card.append(el("strong", undefined, "keel has not run yet today."));
-  const last = feed.last_cycle_before_scope;
+  const last = data.activity.last_cycle_before_scope;
   if (last) {
     const line = el("p", "note");
     line.append("Last cycle: ", field(last.started_at));
@@ -1189,21 +1194,25 @@ function eventFields(fields) {
  * which is why none is filtered out: `activity_payload`'s docstring calls `scope_fully_covered`
  * "the one field a client must not ignore".
  *
- * `feed`, not `data`, for `noCyclesToday`'s reason.
+ * Takes `data` for `noCyclesToday`'s reason.
  *
- * @param {any} feed  `data.activity`.
+ * @param {any} data  `/api/pulse`'s `data`.
  * @returns {HTMLElement}
  */
-function feedNotes(feed) {
+function feedNotes(data) {
   const line = el("p", "note");
   const counts = [
-    ["hidden by the scope", feed.cycles_out_of_scope],
-    ["lines read", feed.lines_read],
-    ["unusable lines skipped", feed.lines_skipped],
-    ["cycles beyond the display cap", feed.cycles_dropped],
+    ["hidden by the scope", data.activity.cycles_out_of_scope],
+    ["lines read", data.activity.lines_read],
+    ["unusable lines skipped", data.activity.lines_skipped],
+    ["cycles beyond the display cap", data.activity.cycles_dropped],
   ];
   for (const [label, value] of counts) line.append(field(value), " ", label, " · ");
-  line.append(field(feed.scope_fully_covered), " · ", field(feed.window_truncated));
+  line.append(
+    field(data.activity.scope_fully_covered),
+    " · ",
+    field(data.activity.window_truncated),
+  );
   return line;
 }
 

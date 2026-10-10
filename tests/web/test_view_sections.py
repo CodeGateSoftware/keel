@@ -580,7 +580,71 @@ _SETUP_KEYS = (
 )
 
 
-@pytest.mark.parametrize(("view", "keys"), [("setupView", _SETUP_KEYS)])
+#: `pulseView`'s payload reads, EXACT (review F4/F5). The ledger requires "last cycle time",
+#: "missing-bracket warnings" and "today's cycle stats" on the home page; before this table
+#: existed, deleting `kv("last cycle", ...)`, `kv("brackets missing", ...)` or `kv("errors", ...)`
+#: left every fixture-free test green, because the fixture-taking parity test only checks that a
+#: key the view DOES read is sent. The `activity.*` entries are the feed caveats `noCyclesToday`
+#: and `feedNotes` read -- they take `data` and say `data.activity.<key>` so that the scan sees
+#: them; a parameter renamed to `feed` made them invisible to every check (F5).
+_PULSE_KEYS = (
+    "activity.cycles",
+    "activity.cycles_dropped",
+    "activity.cycles_out_of_scope",
+    "activity.detail",
+    "activity.last_cycle_before_scope",
+    "activity.lines_read",
+    "activity.lines_skipped",
+    "activity.scope_fully_covered",
+    "activity.status",
+    "activity.status_note",
+    "activity.window_truncated",
+    "autonomy.configured",
+    "autonomy.lapses_at",
+    "autonomy.live",
+    "autonomy.profile_readable",
+    "data_freshness",
+    "drawdown.max_total",
+    "drawdown.max_weekly",
+    "drawdown.rail11",
+    "drawdown.total",
+    "drawdown.weekly",
+    "equity.high_water_mark",
+    "equity.paper_cash",
+    "equity.state_mode",
+    "generated_at",
+    "halt.resume_command",
+    "kill_switch",
+    "last_cycle_at",
+    "live_rules",
+    "market_session.defused",
+    "market_session.recorded_at",
+    "market_session.state",
+    "mode",
+    "next_dca",
+    "next_dca_note",
+    "open_positions",
+    "rule_counts",
+    "subscriptions",
+    "today.basis",
+    "today.blocked",
+    "today.cycles",
+    "today.entered",
+    "today.errors",
+    "today.exited",
+    "today.signals",
+    "unbracketed_count",
+    "why_not",
+    "why_not_none",
+    "withdrawal_attestation.attested_at",
+    "withdrawal_attestation.enabled",
+    "withdrawal_attestation.expired_for",
+    "withdrawal_attestation.expires_in",
+    "withdrawal_attestation.state",
+)
+
+
+@pytest.mark.parametrize(("view", "keys"), [("setupView", _SETUP_KEYS), ("pulseView", _PULSE_KEYS)])
 def test_the_split_reads_every_payload_key_the_long_page_read(
     view: str, keys: tuple[str, ...]
 ) -> None:

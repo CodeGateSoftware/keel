@@ -1599,7 +1599,7 @@ subscribe((reading, seen) => {
 // -- boot ---------------------------------------------------------------------------------------
 
 /**
- * Normalise `/` and `/index.html` to `/status` with `replaceState`.
+ * Normalise `/` and `/index.html` to the home view (`DEFAULT_ROUTE`, `/pulse`) with `replaceState`.
  *
  * `replaceState`, never `pushState`: this happens before the user has done anything, and a
  * history entry here would make the first press of the back button appear to do nothing.

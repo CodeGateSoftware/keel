@@ -336,12 +336,13 @@ def read_pulse(cfg: ServeConfig, _query: Query, _state: Any, now_ts: int) -> dic
     The log is read through `activity`'s own bounded window and scoped to `today` here rather than
     taken from a query string: Pulse has no scope control, and an unrecognised `?scope=` was never
     this endpoint's to interpret. A read that failed and a window that held nothing are different
-    facts, so the reader's status is kept when the feed would otherwise flatten it to "empty".
+    facts, so a non-ok window keeps its own status and detail rather than flattening to "empty".
 
     `gate` is `security.gates_token(cfg.token)`, on this endpoint only, for the HALT button: see
     `payload.setup_payload` for why a derived write token may ride a GET body, and
     `server._gated_action` for why the halt needs nothing else."""
     from keel.commands.activity import (
+        ActivityFeed,
         apply_scope,
         feed_from_lines,
         read_log_window,
@@ -352,9 +353,13 @@ def read_pulse(cfg: ServeConfig, _query: Query, _state: Any, now_ts: int) -> dic
     config = load_config(cfg.config_path)
     path = resolve_log_path(config)
     window = read_log_window(path)
-    feed = feed_from_lines(window.lines, source=str(path), truncated=window.truncated)
-    if window.status != "ok" and feed.status == "empty":
-        feed = feed_from_lines((), source=str(path))
+    if window.status != "ok":
+        # The reader's own status and detail, as `activity.build_activity_feed` does: `missing`,
+        # `unreadable` and `oversized` are three different fixes, and `feed_from_lines` over no
+        # lines can only ever say `empty`.
+        feed = ActivityFeed(status=window.status, source=str(path), detail=window.detail)
+    else:
+        feed = feed_from_lines(window.lines, source=str(path), truncated=window.truncated)
     feed = apply_scope(feed, "today", now_ts=now_ts)
     repo = open_repo(cfg.db_path)
     try:

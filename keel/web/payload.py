@@ -999,6 +999,20 @@ def _rule_counts_payload(report: StatusReport) -> list[dict[str, Any]]:
 NEXT_DCA_NOTE = "placed by the first cycle after that day's daily bar closes"
 
 
+_TODAY_BASIS = {
+    "complete": ("complete", GOOD),
+    "partial": ("partial — the log read began after midnight", WARN),
+    "unavailable": ("unavailable — the log could not be read", BAD),
+}
+
+
+def _today_basis_field(basis: str) -> Field:
+    """How much of the day the Pulse figures cover, judged: the one line that says whether the
+    zeros above it are measured or merely not seen."""
+    display, state = _TODAY_BASIS.get(basis, (basis, UNKNOWN))
+    return label(basis, display=display, state=state)
+
+
 def pulse_payload(report: PulseReport, *, gate: str = "") -> dict[str, Any]:
     """`gather_pulse`'s `PulseReport`, as JSON -- the glance page, and the one place the console
     offers a write.
@@ -1008,6 +1022,12 @@ def pulse_payload(report: PulseReport, *, gate: str = "") -> dict[str, Any]:
     question), then adds what only Pulse holds: today's counts, the why-not sentences (the
     engine's own words, crossing unchanged), the next DCA cadence days, and the unbracketed
     roll-call.
+
+    `today.basis` and `why_not_none` carry how much of the day the figures cover (complete,
+    partial, unavailable), judged by the service: an unread log sends every `today` figure
+    ABSENT rather than zero, and a partial window sends them `warn`, so no zero on this page is
+    an unread log and the empty-reasons sentence is never "nothing stopped keel" over a log that
+    could not say so.
 
     `halt.resume_command` is `"keel resume"` while the kill switch is engaged and `""` otherwise.
     The client may not read `Field.value`, so "HALT button or HALTED line" must arrive as
@@ -1021,6 +1041,9 @@ def pulse_payload(report: PulseReport, *, gate: str = "") -> dict[str, Any]:
     status = report.status
     session_defused = bool(status.market_session.defused)
     today = report.today
+    # A partial day's sums are a lower bound, so no figure on it may read as the day's own
+    # neutral number (`ActivityFeed.scope_fully_covered`: "the one field a client must not ignore").
+    quiet = WARN if report.today_basis == "partial" else NEUTRAL
     return {
         "as_of": iso(report.now_ts),
         "generated_at": moment(report.now_ts),
@@ -1041,14 +1064,16 @@ def pulse_payload(report: PulseReport, *, gate: str = "") -> dict[str, Any]:
         "market_session": _session_payload(status.market_session),
         "last_cycle_at": moment(report.last_cycle_ts),
         "today": {
-            "cycles": count(today.cycles),
-            "signals": count(today.signals),
-            "blocked": count(today.blocked, state=WARN if today.blocked else NEUTRAL),
-            "entered": count(today.entered),
-            "exited": count(today.exited),
-            "errors": count(today.errors, state=BAD if today.errors else NEUTRAL),
+            "basis": _today_basis_field(report.today_basis),
+            "cycles": count(today.cycles, state=quiet),
+            "signals": count(today.signals, state=quiet),
+            "blocked": count(today.blocked, state=WARN if today.blocked else quiet),
+            "entered": count(today.entered, state=quiet),
+            "exited": count(today.exited, state=quiet),
+            "errors": count(today.errors, state=BAD if today.errors else quiet),
         },
         "why_not": list(report.why_not),
+        "why_not_none": report.why_not_none,
         "next_dca": [
             {
                 "rule_id": str(buy.rule_id),

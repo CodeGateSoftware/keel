@@ -690,20 +690,26 @@ def _strip_js_comments(source: str) -> str:
     return "".join(out)
 
 
-def test_the_install_identity_and_the_start_url_are_unchanged() -> None:
+def test_the_install_identity_is_unchanged_and_the_start_url_is_the_home_view() -> None:
     """#634 changed neither, and both were candidates.
 
     `id` is install identity: a browser that sees a different `id` treats the manifest as a
     different app, so an operator who already installed keel would end up with two icons and the
     old one pointing at nothing. It is `"/"` and it stays `"/"`.
 
-    `start_url` was the more tempting edit -- the issue is literally titled around it -- and it is
-    unchanged on purpose. The tokenless cold start is not fixed by pointing it somewhere else,
-    because there is no path on this server that carries a token: the token is minted per run and
-    lives in the terminal. Moving `start_url` would have relocated the failure, not removed it."""
+    `start_url` was the more tempting edit -- the issue is literally titled around it -- and #634
+    left it alone: the tokenless cold start is not fixed by pointing it somewhere else, because
+    there is no path on this server that carries a token (the token is minted per run and lives in
+    the terminal), so moving it would have relocated the failure, not removed it.
+
+    It moved later, for a different reason (console PR1, #951): `/status` stopped being a client
+    route, so a `start_url` still naming it would open a retired page. It now names the home view,
+    read off `CLIENT_ROUTES[0]` rather than restated. Installs that still carry the old
+    `start_url` land on the same view, because `staticfiles.RETIRED_CLIENT_ROUTES` keeps serving
+    the shell for it."""
     manifest = json.loads(_MANIFEST.read_text(encoding="utf-8"))
     assert manifest["id"] == "/"
-    assert manifest["start_url"] == "/pulse"
+    assert manifest["start_url"] == "/" + staticfiles.CLIENT_ROUTES[0] == "/pulse"
 
 
 def test_a_refusal_is_not_painted_as_an_outage(running: server.ServeConfig) -> None:
