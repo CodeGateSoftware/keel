@@ -56,12 +56,6 @@ ROUTES = (
 )
 
 
-#: Routes in `api.API_ROUTES` that are being DELETED in a parallel change (the console's removal
-#: of the Balances and Plans reads). Kept out of the sweep so this file does not have to change
-#: in lockstep with that one. **Delete this constant, and its use below, once those two routes
-#: are gone from `api.API_ROUTES`** -- an exclusion that outlives its routes is a hole.
-_ROUTES_BEING_REMOVED = frozenset({"/api/balances", "/api/plans"})
-
 #: GETs under `/api/` that are NOT swept, each for a stated reason.
 #: `EVENTS_PATH` is a server-sent-event stream: it holds the connection open by design, so a
 #: request/response sweep would block on it, and what it emits is a change notice, not a document.
@@ -75,7 +69,7 @@ def test_routes_is_every_get_that_carries_deployment_data() -> None:
     is deliberately not an `ApiRoute` (the CSV export), minus the named exclusions above."""
     from keel.web import api
 
-    expected = (set(api.API_ROUTES) - _ROUTES_BEING_REMOVED) | {api.CSV_EXPORT_PATH}
+    expected = set(api.API_ROUTES) | {api.CSV_EXPORT_PATH}
     assert expected.isdisjoint(_ROUTES_NOT_SWEPT)
     assert sorted(ROUTES) == sorted(expected)
     assert len(ROUTES) == len(set(ROUTES)), "a route listed twice"
