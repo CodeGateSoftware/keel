@@ -110,7 +110,15 @@ from typing import TYPE_CHECKING, Any, TypedDict
 # candle -- `keel/commands/insights.py` reaches into `status.py` for `_human_age` the same way,
 # for the same reason. `keel.commands.*` is the SERVICE layer, which this layer is allowed to
 # read; the compute trees (`keel.strategy`, `keel.execution.*`, `keel.analysis`) are not.
-from keel.commands.status import _human_age, _human_remaining
+from keel.commands.status import (
+    BRACKET_MISSING,
+    BRACKETED,
+    NO_STOP_BY_DESIGN,
+    PAPER_STOP,
+    _human_age,
+    _human_remaining,
+    bracket_verdict,
+)
 
 # A real import, not `TYPE_CHECKING`-only: `_readiness_payload` reads the ENUM MEMBERS at
 # runtime to build `_READINESS_STATE`, not just the type. `keel.venue_readiness` is the #233
@@ -811,35 +819,36 @@ def _session_payload(session: MarketSessionStatus) -> dict[str, Any]:
     }
 
 
-def _bracket_field(has_bracket: bool, initial_stop: Decimal | None, mode: str) -> Field:
-    """The `bracket` column for one open position (#641).
+def _bracket_field(
+    has_bracket: bool, initial_stop: Decimal | None, rule_kind: str, mode: str
+) -> Field:
+    """The `bracket` column for one open position: `status.bracket_verdict`'s reading (#641,
+    #961), in the console's words and tones. Nothing is judged here.
 
-    Takes the two facts it judges on rather than a row, so Pulse's `OpenPositionStatus` and
-    Holdings' tranche (`HoldingRow`) are judged by this one function and cannot disagree.
+    Takes the facts the verdict judges on rather than a row, so Pulse's `OpenPositionStatus` and
+    Holdings' tranche (`HoldingRow`) go through this one function -- and through the same
+    `bracket_verdict` `keel status` reads -- and cannot disagree.
 
-    Live's meaning is untouched and load-bearing: `NO bracket` there names a real venue-order
-    gap -- exactly the state `reconcile_unbracketed_positions` and the `unbracketed:` crash
-    ledger (#519, #502) exist to heal, so it stays WARN, unchanged, for every non-paper mode
-    regardless of `has_bracket`.
-
-    Paper never places a venue order, so `has_bracket` is False on every paper position by
-    construction; WARNing on that reports the MODE, not a hazard, and desensitises the reader to
-    the live case that matters. Paper is not unprotected, though -- `PaperTrader.on_candle`
-    resolves the setup's stop/target against each candle's range -- so a paper row without a
-    bracket names the protection that mechanism actually enforces: the stop the tranche was sized
-    against, when the row recorded one (`initial_stop`, since 0.12.2 / #520). A tranche that
-    predates that migration, or a DCA leg that never got one, has no number to show and says so
-    (NEUTRAL, not WARN) rather than asserting one it does not have.
+    `BRACKET_MISSING` is the only WARN: a live tranche that should rest a bracket and does not
+    (#519, #502). `NO_STOP_BY_DESIGN` is NEUTRAL -- a kind that never brackets (DCA) is not
+    missing anything. Paper's readings are NEUTRAL and name the protection
+    `PaperTrader.on_candle` actually enforces: the recorded stop, or that there is none.
     """
-    if has_bracket or mode != "paper":
+    verdict = bracket_verdict(
+        has_bracket=has_bracket, initial_stop=initial_stop, rule_kind=rule_kind, mode=mode
+    )
+    if verdict in (BRACKETED, BRACKET_MISSING):
+        # A `flag`, as before #961: the live wire for these two readings is byte-identical.
         return flag(
-            has_bracket,
+            verdict == BRACKETED,
             on="bracketed",
             off="NO bracket",
             on_state=GOOD,
             off_state=WARN,
         )
-    if initial_stop is not None:
+    if verdict == NO_STOP_BY_DESIGN:
+        return label(verdict, display="no stop by design", state=NEUTRAL)
+    if verdict == PAPER_STOP:
         stop = money(initial_stop)
         return label(stop["value"], display=f"paper stop {stop['display']}", state=NEUTRAL)
     return label("n/a", display="n/a -- paper resolves stop/target on candle touch", state=NEUTRAL)
@@ -897,7 +906,9 @@ def _position_payload(position: OpenPositionStatus, mode: str) -> dict[str, Any]
         "qty": quantity(position.qty),
         "entry_price": money(position.entry_price),
         "opened_at": moment(position.opened_at),
-        "bracket": _bracket_field(position.has_bracket, position.initial_stop, mode),
+        "bracket": _bracket_field(
+            position.has_bracket, position.initial_stop, position.rule_name, mode
+        ),
     }
 
 
@@ -1718,7 +1729,7 @@ def _holding_row_payload(row: HoldingRow, mode: str) -> dict[str, Any]:
         "entry_fee": money(p.entry_fee),
         "cost": money(row.cost),
         "stop": money(p.initial_stop),
-        "bracket": _bracket_field(row.has_bracket, p.initial_stop, mode),
+        "bracket": _bracket_field(row.has_bracket, p.initial_stop, p.rule_name, mode),
         "freshness": _readiness_field(p.ready, p.ready_reason),
         "attestation": _attestation_chip(p),
         "attest_due_at": moment(p.attest_due_ts),

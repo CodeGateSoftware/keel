@@ -79,6 +79,10 @@ class Dca(Rule):
     #: Accumulation, not round trips: the edge report gives it an accumulation row (buys, cost,
     #: mark-to-market) instead of a backtest, and keeps it out of the pooled G2 sample (#821).
     accumulates = True
+    #: No stop, so no bracket: the executor routes this rule's setup as the DCA order class
+    #: (`_is_dca_setup`) and rests nothing behind the buy. Declared so the bracket column reads
+    #: "no stop by design" for its tranches rather than WARNing on every one (#961).
+    places_bracket = False
 
     def __init__(
         self,

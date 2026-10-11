@@ -2760,8 +2760,9 @@ def run_once(
                         now_ts,
                         # #520: the stop the position was SIZED against, captured at open
                         # because nothing else preserves it -- `open_stop:<product>` starts
-                        # here and then ratchets away from it. `None` for DCA, which has no
-                        # stop by design.
+                        # here and then ratchets away from it. For DCA, which has no stop by
+                        # design, this is `Dca.detect`'s `stop=0` sentinel, not `None`
+                        # (`status._recorded_a_stop` reads zero as no stop, #961).
                         initial_stop=signal.setup.stop if signal.setup is not None else None,
                     )
 

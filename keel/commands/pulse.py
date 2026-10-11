@@ -29,7 +29,13 @@ from decimal import Decimal
 
 from keel.commands.activity import ActivityFeed
 from keel.commands.dca_plan import ExistingDcaRule, existing_dca_rules
-from keel.commands.status import OpenPositionStatus, StatusReport, gather_status
+from keel.commands.status import (
+    BRACKET_MISSING,
+    OpenPositionStatus,
+    StatusReport,
+    bracket_verdict,
+    gather_status,
+)
 from keel.commands.trading import KILL_ENGAGED_LINE
 from keel.config import Config
 from keel.data.repository import Repository
@@ -114,8 +120,10 @@ class PulseReport:
     why_not: tuple[str, ...]
     #: LIVE `dca` rules only, in rule-id order.
     next_dca: tuple[NextDcaBuy, ...]
-    #: Live-mode tranches whose bracket order is absent. Empty in paper, which never has one by
-    #: construction (the judgement `payload._bracket_field` already makes).
+    #: Tranches `status.bracket_verdict` reads as `BRACKET_MISSING` -- the same judgement the
+    #: bracket cells and `keel status` show. Empty in paper, which never has a bracket by
+    #: construction, and never holding a stop-less tranche of a kind that never brackets (DCA,
+    #: #961).
     unbracketed: tuple[OpenPositionStatus, ...]
     #: `len(unbracketed)`, taken HERE: `payload.py` never counts (its Rule 6e).
     unbracketed_count: int
@@ -223,10 +231,19 @@ def build_pulse(
     now_ts: int,
 ) -> PulseReport:
     """`gather_pulse`'s composition over inputs already in hand. PURE."""
-    unbracketed = (
-        ()
-        if status.mode == "paper"
-        else tuple(p for p in status.open_positions if not p.has_bracket)
+    # `bracket_verdict` decides, as it does for `keel status` and the bracket cells: paper never
+    # reads `BRACKET_MISSING`, and neither does a stop-less tranche of a kind that never
+    # brackets (DCA, #961) -- so neither is counted here.
+    unbracketed = tuple(
+        p
+        for p in status.open_positions
+        if bracket_verdict(
+            has_bracket=p.has_bracket,
+            initial_stop=p.initial_stop,
+            rule_kind=p.rule_name,
+            mode=status.mode,
+        )
+        == BRACKET_MISSING
     )
     basis = _today_basis(feed)
     return PulseReport(
