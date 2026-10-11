@@ -1,4 +1,4 @@
-"""`keel serve` -- open the read-only view in a browser (#435, D2).
+"""`keel serve` -- open the operator console in a browser (#435, D2).
 
 This is the front-end half of the local web UI: it resolves where state lives, mints a session
 token, binds loopback, and optionally opens a browser. Everything it serves comes from

@@ -109,6 +109,17 @@ def test_a_loopback_bind_does_not_warn(monkeypatch: pytest.MonkeyPatch, tmp_path
     assert "http://127.0.0.1:8765/?token=" in output
 
 
+def test_the_startup_line_does_not_call_the_console_read_only(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The console halts the engine (Pulse) and runs setup steps (Audit & Setup), so the line an
+    operator reads at startup must not promise a read-only view."""
+    lines = _run(monkeypatch, tmp_path, "127.0.0.1")
+
+    assert lines[0] == "keel is serving its console at:\n\n    " + lines[0].split("    ")[-1]
+    assert "read-only" not in "\n".join(lines)
+
+
 def test_an_unopenable_database_is_a_message_not_a_traceback(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

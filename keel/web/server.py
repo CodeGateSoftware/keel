@@ -1168,7 +1168,7 @@ def serve(cfg: ServeConfig, *, echo: Callable[[str], None] = print) -> int:
         echo("  Anyone who can reach this address can read your positions, equity and history.")
         echo("  The session token is the only thing in the way, and it travels in cleartext.")
         echo("")
-    echo(f"keel is serving a read-only view at:\n\n    {running.url()}\n")
+    echo(f"keel is serving its console at:\n\n    {running.url()}\n")
     echo("This link contains a one-time token for this session. Press Ctrl-C to stop.")
     # #634: the browser keeps this session across a restart of its own, which is what makes the
     # installed console usable at all -- and which means closing the browser has stopped being a
