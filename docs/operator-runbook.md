@@ -865,7 +865,8 @@ button (below).
 (`dca · BTC-USD · rule 6`), with tranches that carry no rule id last, one table per kind:
 per-tranche cost (what the tranche paid to
 open, entry fee included), the entry-gate verdict, the asset attestation, the bracket, the stop
-only when a tranche carries one, and the entry order's placement and expected-vs-actual fill. The
+(a column of that table only when one of ITS tranches carries a stop; a DCA table, whose legs
+record none, has none), and the entry order's placement and expected-vs-actual fill. The
 entry order is found by the fill price the tranche copied from it; when no order matches, the
 placement and the fill figures read "unknown", never zero. Below it, keel's recent orders, with
 the same scope and status tabs the Orders view had. There is no close and no cancel: `keel orders

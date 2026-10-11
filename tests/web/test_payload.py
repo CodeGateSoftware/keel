@@ -2092,7 +2092,6 @@ _HOLDINGS_TOP_KEYS = [
     "mode",
     "open_count",
     "groups",
-    "stop_rows_present",
     "rows",
 ]
 
@@ -2117,9 +2116,12 @@ def test_the_holdings_top_level_reads_the_report() -> None:
     assert document["mode"] == "confirm"
     assert document["open_count"]["value"] == "1"
     assert document["groups"] == [
-        {"key": "unattributed-1", "heading": "turtle_breakout · unattributed"}
+        {
+            "key": "unattributed-1",
+            "heading": "turtle_breakout · unattributed",
+            "stop_rows_present": [document["rows"][0]["id"]],
+        }
     ]
-    assert document["stop_rows_present"] == [document["rows"][0]["id"]]
 
 
 def test_the_holdings_groups_and_each_rows_group_are_the_reports() -> None:
@@ -2130,7 +2132,9 @@ def test_the_holdings_groups_and_each_rows_group_are_the_reports() -> None:
         extra_tranche={"rule_name": "dca", "rule_id": 8, "product_id": "ETH-USD"},
     )
     document = payload.holdings_payload(report)
-    assert document["groups"] == [{"key": g.key, "heading": g.heading} for g in report.groups]
+    assert [(g["key"], g["heading"]) for g in document["groups"]] == [
+        (g.key, g.heading) for g in report.groups
+    ]
     assert [g["key"] for g in document["groups"]] == ["rule-6", "rule-8"]
     assert [row["group"] for row in document["rows"]] == ["rule-6", "rule-8"]
 
@@ -2177,7 +2181,7 @@ def test_a_stop_is_absent_not_zero_when_none_was_recorded() -> None:
     (row,) = document["rows"]
     assert row["stop"]["state"] == "unknown" and row["stop"]["value"] == ""
     assert row["stop"]["display"] != "$0.00"
-    assert document["stop_rows_present"] == []
+    assert [g["stop_rows_present"] for g in document["groups"]] == [[]]
 
 
 def test_the_dca_stop_sentinel_crosses_as_absent_not_zero() -> None:
@@ -2189,7 +2193,7 @@ def test_the_dca_stop_sentinel_crosses_as_absent_not_zero() -> None:
     (row,) = document["rows"]
     assert row["stop"]["state"] == "unknown" and row["stop"]["value"] == ""
     assert row["bracket"]["display"] == "no stop by design"
-    assert document["stop_rows_present"] == []
+    assert [g["stop_rows_present"] for g in document["groups"]] == [[]]
 
 
 def test_a_paper_dca_tranches_zero_stop_is_shown_as_origin_main_showed_it() -> None:
@@ -2197,14 +2201,12 @@ def test_a_paper_dca_tranches_zero_stop_is_shown_as_origin_main_showed_it() -> N
     against ("paper stop $0.00" for a recorded 0), so the stop cell and the stop list say the same
     thing rather than "—" beside it. Live reads the same 0 as the sentinel (the test above)."""
     document = payload.holdings_payload(
-        _holdings_report(
-            tranche={"rule_name": "dca", "initial_stop": Decimal("0")}, mode="paper"
-        )
+        _holdings_report(tranche={"rule_name": "dca", "initial_stop": Decimal("0")}, mode="paper")
     )
     (row,) = document["rows"]
     assert row["bracket"]["display"] == "paper stop $0.00"
     assert row["stop"]["display"] == "$0.00" and row["stop"]["value"] == "0"
-    assert document["stop_rows_present"] == [row["id"]]
+    assert [g["stop_rows_present"] for g in document["groups"]] == [[row["id"]]]
 
 
 def test_cost_crosses_as_the_services_figure() -> None:

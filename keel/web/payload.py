@@ -1752,11 +1752,12 @@ def _holding_row_payload(row: HoldingRow, mode: str, group: str) -> dict[str, An
 def holdings_payload(report: HoldingsReport) -> dict[str, Any]:
     """`gather_holdings`'s `HoldingsReport`, as JSON.
 
-    `open_count`, `groups` and `stop_rows_present` are READ from the report (Rule 6e bans `len()`
-    here). `groups` is one table per rule ROW (#960), in the report's own order, each with the
-    heading the service wrote; every row carries the `group` key it is drawn under, so the view
-    filters on a key and composes no heading. `stop_rows_present` lists the tranche ids that carry
-    a stop, so the view draws its stop column on that list being non-empty and never by reading a
+    `open_count` and `groups` are READ from the report (Rule 6e bans `len()` here). `groups` is
+    one table per rule ROW (#960), in the report's own order, each with the heading the service
+    wrote; every row carries the `group` key it is drawn under, so the view filters on a key and
+    composes no heading. Each group's `stop_rows_present` lists the ids of ITS tranches that carry
+    a stop, so the view draws that table's stop column on the list being non-empty -- a table
+    with no stop draws none, whatever the table beside it holds -- and never by reading a
     `display` or `value`.
     """
     return {
@@ -1764,8 +1765,14 @@ def holdings_payload(report: HoldingsReport) -> dict[str, Any]:
         "generated_at": moment(report.now_ts),
         "mode": report.mode,
         "open_count": count(report.open_count),
-        "groups": [{"key": g.key, "heading": g.heading} for g in report.groups],
-        "stop_rows_present": [str(i) for i in report.stop_row_ids],
+        "groups": [
+            {
+                "key": g.key,
+                "heading": g.heading,
+                "stop_rows_present": [str(i) for i in g.stop_row_ids],
+            }
+            for g in report.groups
+        ],
         "rows": [
             _holding_row_payload(row, report.mode, report.group_key(row)) for row in report.rows
         ],

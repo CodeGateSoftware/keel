@@ -84,6 +84,10 @@ class HoldingGroup:
 
     key: str
     heading: str
+    #: The ids of this table's tranches that carry a stop (`status.shown_stop`), so the view draws
+    #: the stop column PER TABLE, only where one exists. A live DCA table lists none (its recorded
+    #: `0` is `Dca.detect`'s sentinel) even when the PAXG turtle table beside it lists one.
+    stop_row_ids: tuple[int, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -118,11 +122,13 @@ class HoldingsReport:
                 attributed[row.rule_id] = HoldingGroup(
                     key=f"rule-{row.rule_id}",
                     heading=f"{kind} · {row.position.product_id} · rule {row.rule_id}",
+                    stop_row_ids=self._stop_row_ids(f"rule-{row.rule_id}"),
                 )
         unattributed = tuple(
             HoldingGroup(
                 key=f"unattributed-{n}",
                 heading=f"{kind} · unattributed" if kind else "unattributed",
+                stop_row_ids=self._stop_row_ids(f"unattributed-{n}"),
             )
             for n, kind in enumerate(self._unattributed_kinds(), start=1)
         )
@@ -143,15 +149,14 @@ class HoldingsReport:
                 kinds.append(row.position.rule_name)
         return kinds
 
-    @property
-    def stop_row_ids(self) -> tuple[int, ...]:
-        """Tranches that carry a stop, so the view can draw the stop column only when one does.
-        A live DCA tranche's recorded `0` is `Dca.detect`'s sentinel, not a stop; paper's is
-        listed as it always was (`shown_stop`)."""
+    def _stop_row_ids(self, key: str) -> tuple[int, ...]:
+        """The tranches of group `key` that carry a stop. A live DCA tranche's recorded `0` is
+        `Dca.detect`'s sentinel, not a stop; paper's is listed as it always was (`shown_stop`)."""
         return tuple(
             r.position.id
             for r in self.rows
-            if shown_stop(r.position.initial_stop, self.mode) is not None
+            if self.group_key(r) == key
+            and shown_stop(r.position.initial_stop, self.mode) is not None
         )
 
 

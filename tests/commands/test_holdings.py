@@ -293,7 +293,8 @@ def test_group_keys_are_unique_and_safe_whatever_the_rule_name(
 def test_stop_row_ids_are_the_tranches_that_carry_a_stop(repo: Repository, config: Config) -> None:
     with_stop = _tranche(repo, initial_stop=Decimal("1"), opened_at=NOW_TS - 2 * DAY)
     _tranche(repo, initial_stop=None, opened_at=NOW_TS - DAY)
-    assert gather_holdings(repo, config, now_ts=NOW_TS).stop_row_ids == (with_stop,)
+    (group,) = gather_holdings(repo, config, now_ts=NOW_TS).groups
+    assert group.stop_row_ids == (with_stop,)
 
 
 def test_the_dca_stop_sentinel_is_not_listed_as_a_stop(repo: Repository, config: Config) -> None:
@@ -303,7 +304,29 @@ def test_the_dca_stop_sentinel_is_not_listed_as_a_stop(repo: Repository, config:
     with_stop = _tranche(repo, initial_stop=Decimal("1"), opened_at=NOW_TS - 2 * DAY)
     _tranche(repo, rule_name="dca", initial_stop=Decimal("0"), opened_at=NOW_TS - DAY)
     report = replace(gather_holdings(repo, config, now_ts=NOW_TS), mode="confirm")
-    assert report.stop_row_ids == (with_stop,)
+    assert {g.key: g.stop_row_ids for g in report.groups} == {
+        "unattributed-1": (with_stop,),
+        "unattributed-2": (),
+    }
+
+
+def test_each_group_lists_its_own_stop_carrying_tranches(repo: Repository, config: Config) -> None:
+    """The stop column is a per-TABLE decision: a PAXG-like turtle tranche with a stop and a live
+    DCA rule's tranche with the sentinel 0. The DCA group lists nothing, the turtle's lists its
+    id, so the DCA table draws no column of dashes beside the PAXG one."""
+    paxg = _tranche(
+        repo,
+        rule_name="turtle_breakout",
+        initial_stop=Decimal("4521.76"),
+        opened_at=NOW_TS - 3 * DAY,
+    )
+    dca = _tranche(
+        repo, rule_name="dca", rule_id=6, initial_stop=Decimal("0"), opened_at=NOW_TS - DAY
+    )
+    report = replace(gather_holdings(repo, config, now_ts=NOW_TS), mode="confirm")
+    by_key = {g.key: g.stop_row_ids for g in report.groups}
+    assert by_key == {"rule-6": (), "unattributed-1": (paxg,)}
+    assert dca not in by_key["rule-6"]
 
 
 def test_a_paper_tranches_zero_stop_is_listed_as_it_was_before_961(
@@ -313,8 +336,9 @@ def test_a_paper_tranches_zero_stop_is_listed_as_it_was_before_961(
     the stop list must name that tranche too (`status.shown_stop`)."""
     zero = _tranche(repo, rule_name="dca", initial_stop=Decimal("0"), opened_at=NOW_TS - DAY)
     report = replace(gather_holdings(repo, config, now_ts=NOW_TS), mode="paper")
-    assert report.stop_row_ids == (zero,)
-    assert replace(report, mode="confirm").stop_row_ids == ()  # live: the sentinel is no stop
+    assert [g.stop_row_ids for g in report.groups] == [(zero,)]
+    live = replace(report, mode="confirm")
+    assert [g.stop_row_ids for g in live.groups] == [()]  # live: the sentinel is no stop
 
 
 def test_has_bracket_follows_bracket_order_id(repo: Repository, config: Config) -> None:

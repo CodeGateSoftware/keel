@@ -768,7 +768,8 @@ function pulseState(data) {
  * The counts are summed by the service over the cycles in today's UTC day, and are ABSENT when the
  * log could not be read; `data.today.basis` says which (complete, partial from a window that began
  * after midnight, or unavailable), so a zero here is never an unread log. The bracket count is
- * the #641 hazard (a live position with no stop) and is judged `warn` when non-zero, here in the
+ * the #641 hazard (a live position whose bracket the verdict reads as missing; a DCA tranche
+ * reads "no stop by design" and is not counted) and is judged `warn` when non-zero, here in the
  * payload rather than by this file.
  *
  * @param {any} data
@@ -851,7 +852,8 @@ function pulseNextDca(data) {
 }
 
 /**
- * Open positions, with the `bracket` column: an unbracketed position is a position with no stop.
+ * Open positions, with the `bracket` column: a live position without a resting bracket reads as
+ * missing (NO bracket), except DCA, which reads "no stop by design".
  *
  * Compact on purpose -- the roll-call that keeps the bracket warning on the glance page.
  *
@@ -1916,12 +1918,14 @@ export function holdingsView(
  * one is a claim about the WORLD (what this token is, and whether the claim is in date) and the
  * other a claim about DATA, and they disagree in both directions.
  *
- * ── THE STOP COLUMN IS DRAWN ON A LIST ───────────────────────────────────────────────────────
+ * ── THE STOP COLUMN IS DRAWN ON A LIST, PER TABLE ────────────────────────────────────────────
  *
- * Spliced into the header AND the cells only when `data.stop_rows_present` -- the tranche ids that
- * carry a stop -- is non-empty. List emptiness is the sanctioned branch (this file may not read a
- * `Field`'s `display` or `value` to decide anything), and a column of "—" on a book where no
- * tranche has a stop would say nothing. One guard serves both splices so they cannot disagree.
+ * Spliced into a table's header AND its cells only when THAT group's `stop_rows_present` -- the ids
+ * of its tranches that carry a stop -- is non-empty. List emptiness is the sanctioned branch (this
+ * file may not read a `Field`'s `display` or `value` to decide anything), and a column of "—" in
+ * a table where no tranche has a stop would say nothing, so a DCA table beside a PAXG one draws
+ * none. The guard is read inside the group loop, once per table, and that one guard serves both
+ * splices so they cannot disagree.
  *
  * @param {any} data
  * @param {any} sort
@@ -1939,9 +1943,8 @@ function holdingsSection(data, sort, onSort) {
     return fragment;
   }
 
-  const withStop = (data.stop_rows_present || []).length !== 0;
-
   for (const group of data.groups || []) {
+    const withStop = (group.stop_rows_present || []).length !== 0;
     const held = rows.filter(/** @param {any} row */ (row) => row.group === group.key);
     const id = ["h-hold", group.key].join("-");
     fragment.append(heading(id, plain(group.heading)));
