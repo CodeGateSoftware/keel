@@ -768,7 +768,7 @@ def test_a_stopped_engine_still_answers_the_endpoints_that_describe_the_binary(
     with nothing set up) but, since #233 PR4, DOES attempt a best-effort read of this
     deployment's venue readiness -- `read_venues` checks `state.has_usable_database` first and
     skips the repo entirely here, where it is `False`, so the property this test actually cares
-    about (200 with data, nothing required to exist first) still holds. All three still report
+    about (200 with data, nothing required to exist first) still holds. Both still report
     `engine`, because a client showing the "keel isn't running" banner should not have to fetch a
     different endpoint to know whether to show it."""
     for path in ("/api/config", "/api/venues"):

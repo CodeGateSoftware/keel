@@ -2,11 +2,11 @@
 
 Four surfaces, and the split is the whole of this module's job: the rendered HTML pages in
 `ROUTES`, the static assets under `staticfiles.STATIC_PREFIX` (#535), the JSON read API under
-`API_PREFIX` (#534, routed by `keel/web/api.py`), and the one closed write surface under
-`SETUP_ACTION_PREFIX` (#437). Each gets its own header set, because they need different values for
-the SAME header rather than merely different extra ones.
+`API_PREFIX` (#534, routed by `keel/web/api.py`), and the closed write surface -- `API_SETUP_PREFIX`
+(#437) and `API_GATES_PREFIX` (#781). Each gets its own header set, because they need different
+values for the SAME header rather than merely different extra ones.
 
-**Why the standard library and not a web framework.** This surface is a handful of read-only pages
+**Why the standard library and not a web framework.** This surface is a handful of pages
 and endpoints served to one person on one machine. FastAPI/uvicorn would bring a dependency
 subtree (pydantic, starlette, anyio, h11, ...) into a wheel that today depends on `click` and its
 own workspace siblings -- and D5 has to freeze that tree into a signed, notarised app bundle, where
@@ -22,15 +22,19 @@ That was a clean property and it was also satisfied by a server that could not s
 which is the whole problem #437 exists to solve, because a first-run user on a machine with no
 terminal has to be able to create a deployment somehow.
 
-So `do_POST` exists, and it routes ONLY through `keel.commands.setup.ACTIONS`: three idempotent,
-non-destructive steps, every one of them declared `MECHANICAL` in the same module's step list.
-The guarantee is now that **not one of the ten capability-increasing actions in
-`keel/capabilities.py` is reachable from this package**, asserted by a test that scans this
-source rather than by inspection. "No POST" said the server could not write; this says it cannot
-arm, release or spend -- which is the property anyone actually cares about.
+So `do_POST` exists, and it routes through exactly two tables. `/api/setup/<key>` reaches only
+`keel.commands.setup.ACTIONS`: idempotent, non-destructive steps, every one of them declared
+`MECHANICAL` in the same module's step list. `/api/gates/<key>` reaches `halt` (engage the kill
+switch, ungated on purpose -- refusing a stop is the one failure it must not have) and the gated
+halt releases in `gates.TIER1_ACTIONS` (`resume`, `resume-entries`), which demand a loopback
+session on a loopback bind, the gate token and a typed phrase. The guarantee is that **eight of the
+ten capability-increasing actions in `keel/capabilities.py` are unreachable from this package and
+the other two only as that gate table declares them**, asserted by a test that scans this source
+rather than by inspection. "No POST" said the server could not write; this says it cannot arm,
+attest or spend -- which is the property anyone actually cares about.
 
-Attesting, promoting, releasing a halt and arming autonomy remain CLI-only, behind the TTY gate.
-D3 (#436) is where a browser gate for those would go, if it goes anywhere.
+Attesting, promoting, arming autonomy and the other gated actions remain CLI-only, behind the TTY
+gate. The console client draws no release control; only the halt has a button.
 
 **Each request opens its own SQLite connection.** A `ThreadingHTTPServer` hands requests to
 different threads, and a `sqlite3` connection belongs to the thread that made it. Per-request is
@@ -76,11 +80,6 @@ _REFRESH_SEC = 15
 #: primitive and there is no proxy in front of this server to impose a limit. A setup form carries
 #: an action key and a token.
 _MAX_BODY_BYTES = 8 * 1024
-
-#: How often the setup page reloads WHILE a background job runs. Shorter than the dashboards'
-#: 15s: someone watching a fetch wants to see it moving, and the page is a few kilobytes of local
-#: HTML.
-_JOB_REFRESH_SEC = 5
 
 
 @dataclass(frozen=True)
@@ -365,7 +364,8 @@ def _static_headers(content_type: str) -> tuple[tuple[str, str], ...]:
 
 
 class KeelHandler(BaseHTTPRequestHandler):
-    """GET and HEAD. No other verb is implemented, so no other verb reaches keel."""
+    """GET and HEAD read; POST is the closed write surface (`do_POST`). No other verb is
+    implemented, so no other verb reaches keel."""
 
     server_version = "keel"
     sys_version = ""

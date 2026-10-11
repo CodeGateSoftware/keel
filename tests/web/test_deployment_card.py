@@ -66,8 +66,8 @@ def test_the_disclosure_is_native_and_needs_no_handler() -> None:
     """`<details>`/`<summary>` is keyboard-operable, touch-operable and announced, with no
     listener to bind and no button to build -- which is what lets this pass the test above.
 
-    `venueCard` already uses the same element for the same reason, so this is the established
-    pattern here rather than a new one."""
+    The same element is used elsewhere in this shell for the same reason, so this is the
+    established pattern here rather than a new one."""
     assert 'id="deployment"' in _INDEX
     assert "<details" in _INDEX, "the card is not a native disclosure"
     assert "<summary" in _INDEX

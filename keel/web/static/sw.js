@@ -188,8 +188,8 @@ self.addEventListener("activate", (event) => {
 self.addEventListener("fetch", (event) => {
   const request = event.request;
 
-  // Only GET. A service worker sees no POST from this app -- `/setup/*` is a form on a rendered
-  // page outside this scope -- but responding from a cache to any non-GET is meaningless, and
+  // Only GET. The app's writes (`/api/setup/*`, `/api/gates/*`) are POSTs made by `fetch`, and
+  // responding from a cache to any non-GET is meaningless, and
   // "meaningless" and "returns the wrong thing" are the same event here.
   if (request.method !== "GET") return;
 

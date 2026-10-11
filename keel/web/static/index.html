@@ -190,8 +190,7 @@
 
       `<details>` and NOT a button with a handler: it is keyboard-operable, touch-operable and
       announced with nothing bound, which is what lets the card pass the same no-interactive-node
-      test the chip and the banner answer to (`venueCard` uses the element the same way). Nothing
-      inside it changes anything; switching mode or profile stays a terminal ceremony.
+      test the chip and the banner answer to. Nothing inside it changes anything; switching mode or profile stays a terminal ceremony.
 
       `#session-chip` and `.right` are DIVs rather than spans because `<details>` is flow content
       and a `<span>` may only hold phrasing content. Both already set their own `display` in

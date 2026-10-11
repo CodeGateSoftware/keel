@@ -2,7 +2,7 @@
   "id": "/",
   "name": "keel",
   "short_name": "keel",
-  "description": "keel's read-only console, served from this machine only.",
+  "description": "keel's console: view the engine, halt it and run setup steps, served from this machine only.",
   "start_url": "/pulse",
   "scope": "/",
   "display": "standalone",

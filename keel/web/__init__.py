@@ -1,4 +1,5 @@
-"""The local web UI (#435, D2) -- a read-only browser view over `keel/commands/*`.
+"""The local web UI (#435, D2) -- a browser console over `keel/commands/*`: it reads everything,
+halts the engine, and runs the setup steps.
 
 Why a browser and not a native window: section 3 of
 `docs/superpowers/specs/2026-08-20-desktop-distribution-prd.md`. In one line, it retires
@@ -28,8 +29,11 @@ now is stronger than the one it replaced, and it is the one anyone actually care
   Attesting, arming autonomy, rebasing the drawdown mark, declaring an out-of-band close and
   replacing the binary remain CLI-only, behind the TTY gate. The two halt releases are D3 (#436)
   arriving: a SECOND gate, never a seam in the first -- `_is_interactive` is untouched and the
-  CLI still needs a real terminal. Nothing routes to the table yet; stage 2b wires
-  `server.do_POST` to it.
+  CLI still needs a real terminal. `server.do_POST` reaches the table through `/api/gates/<key>`
+  (a loopback session on a loopback bind, the gate token and the typed phrase), and the one
+  ungated key there is `halt`, which engages the kill switch -- stopping is never slower than
+  starting. Whether the console shows the release controls is a separate question from whether
+  the server answers them; the client draws none.
 
   **Three scans, because the first one alone was hollow (#788).** It forbade this package from
   naming any `Capability.function` -- and those are the CLI COMMANDS, Click callbacks taking a
@@ -43,7 +47,10 @@ now is stronger than the one it replaced, and it is the one anyone actually care
   because four of the ten do their work through a generic `repo.set_state(...)` that no
   derivation can tell from any other write, a third scan states the posture directly: **this
   package calls none of the repository's writers.** `keel serve` reads. Everything it can change
-  goes through `keel.commands.setup.ACTIONS`, which lives outside this package.
-* The JSON API (#534, `keel/web/api.py`) is **reads only**. Every route in its table answers a GET
-  and 404s a POST, and it did not widen `API_PREFIX`'s existing `X-Keel-Client` gate by one byte.
+  goes through `keel.commands.setup.ACTIONS` (the idempotent setup steps) or `keel.web.gates` (the
+  halt and the two halt releases), which call the commands' own operations rather than a writer.
+* The JSON API's route table (#534, `keel/web/api.py`) is **reads only**. Every route in it answers
+  a GET and 404s a POST. The writes are the `/api/setup/` and `/api/gates/` prefixes, dispatched
+  by `server.do_POST`, and #534 did not widen `API_PREFIX`'s existing `X-Keel-Client` gate by one
+  byte.
 """

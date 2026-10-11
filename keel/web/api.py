@@ -8,9 +8,10 @@ one place a `Decimal` becomes text and the one place the closed `state` vocabula
 call or a format spec appearing here, because the second money renderer is never the one with
 `_plain`'s no-exponent guarantee in it.
 
-**Reads only.** Not one route below answers a POST. The write surface is still
-`keel.commands.setup.ACTIONS` reached through `SETUP_ACTION_PREFIX`, still behind
-`X-Keel-Client: 1` for anything under `API_PREFIX`, and this issue added nothing to either --
+**Reads only.** Not one route below answers a POST. The write surface is `server.do_POST`'s: the
+setup steps in `keel.commands.setup.ACTIONS` reached through `API_SETUP_PREFIX`, and the halt and
+the gated halt releases reached through `API_GATES_PREFIX`, both behind `X-Keel-Client: 1` as
+anything under `API_PREFIX` is. #534 added nothing to either --
 `test_no_api_route_answers_a_post` asserts that for every route in the table below rather than for
 a sample of them.
 
