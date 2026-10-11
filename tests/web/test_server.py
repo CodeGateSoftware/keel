@@ -36,16 +36,49 @@ from keel.web.security import SESSION_COOKIE, new_session_token, session_cookie
 #: These were the seven server-rendered PAGES until #540. They are the JSON endpoints now, which
 #: is a stronger sweep for the one test that uses it: a secret that leaked into a rendered page
 #: would also have to leak into the document that page was built from, and this reads the
-#: documents directly.
+#: documents directly. `test_routes_is_every_get_that_carries_deployment_data` holds it equal to
+#: the route table, so it cannot drift again.
 ROUTES = (
     "/api/pulse",
     "/api/setup",
     "/api/orders",
     "/api/holdings",
+    "/api/timeline",
+    "/api/timeline/export.csv",
+    "/api/research/trials",
+    "/api/research/matrix",
+    "/api/research/gauntlet",
+    "/api/research/slippage",
     "/api/rules",
+    "/api/dca-plan",
     "/api/venues",
     "/api/config",
 )
+
+
+#: Routes in `api.API_ROUTES` that are being DELETED in a parallel change (the console's removal
+#: of the Balances and Plans reads). Kept out of the sweep so this file does not have to change
+#: in lockstep with that one. **Delete this constant, and its use below, once those two routes
+#: are gone from `api.API_ROUTES`** -- an exclusion that outlives its routes is a hole.
+_ROUTES_BEING_REMOVED = frozenset({"/api/balances", "/api/plans"})
+
+#: GETs under `/api/` that are NOT swept, each for a stated reason.
+#: `EVENTS_PATH` is a server-sent-event stream: it holds the connection open by design, so a
+#: request/response sweep would block on it, and what it emits is a change notice, not a document.
+_ROUTES_NOT_SWEPT = frozenset({web_server.EVENTS_PATH})
+
+
+def test_routes_is_every_get_that_carries_deployment_data() -> None:
+    """`ROUTES` was a hand-written list, and it drifted: the timeline, the four research reads and
+    the DCA plan all shipped without joining the sweep, so a secret leaking into any of them would
+    have passed the leak test. Derived here from the route table itself, plus the one data GET that
+    is deliberately not an `ApiRoute` (the CSV export), minus the named exclusions above."""
+    from keel.web import api
+
+    expected = (set(api.API_ROUTES) - _ROUTES_BEING_REMOVED) | {api.CSV_EXPORT_PATH}
+    assert expected.isdisjoint(_ROUTES_NOT_SWEPT)
+    assert sorted(ROUTES) == sorted(expected)
+    assert len(ROUTES) == len(set(ROUTES)), "a route listed twice"
 
 
 def _request(
@@ -1213,7 +1246,10 @@ def test_looking_at_a_machine_with_nothing_on_it_creates_nothing(
     bringing a deployment into existence by being looked at. Every route, because that is how
     this was missed: the original test walked two of them."""
     for path in ROUTES:
-        _request(empty_machine, path, cookie=_session(empty_machine))
+        status, _headers, _body = _request(empty_machine, path, cookie=_session(empty_machine))
+        # Every route was actually served (the CSV export's stated 500 is the missing config),
+        # so "nothing was created" is about reads that ran, not requests that were refused.
+        assert status == (500 if path == "/api/timeline/export.csv" else 200), path
     assert not Path(empty_machine.db_path).exists()
     assert not Path(empty_machine.config_path).exists()
 
@@ -1265,10 +1301,20 @@ def test_a_submitted_secret_never_appears_in_a_response_or_a_redirect(
     assert secret not in body
     assert stored["CDP_API_SECRET"] == secret
 
+    answered: dict[str, int] = {}
     for path in ROUTES:
-        _status, _headers, document = _request(empty_machine, path, cookie=_session(empty_machine))
+        status, _headers, document = _request(empty_machine, path, cookie=_session(empty_machine))
+        answered[path] = status
         assert secret not in document, path
         assert "cdp-key-value" not in document, path
+    # Not vacuous: a 404 or a 403 body cannot carry the secret either, so a sweep over routes
+    # that did not answer would pass while reading nothing. The CSV export is the one exception
+    # to 200 on a machine with no config: it is not an `ApiRoute`, so it has no `needs_database`
+    # short-circuit and answers a stated 500 naming the missing file -- a body that is read here,
+    # and an error detail is exactly where a leaked value would surface.
+    expected = dict.fromkeys(ROUTES, 200)
+    expected["/api/timeline/export.csv"] = 500
+    assert answered == expected
 
     assert setup_mod.MARKET_DATA_SECRETS == ("CDP_API_KEY", "CDP_API_SECRET")
 
