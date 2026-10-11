@@ -316,3 +316,30 @@ def test_a_web_row_names_the_route_it_is_reached_at_and_no_button() -> None:
     assert sorted(routes) == sorted(TIER1_ACTIONS), routes
     for cap in CAPABILITIES:
         assert "button" not in cap.invocation.lower(), f"{cap.key} names a button"
+
+
+def test_no_row_or_gate_claims_a_browser_can_release_a_halt() -> None:
+    """**The browser cannot release a halt, and the inventory must not say it can (#968).**
+
+    The release routes exist on the server behind loopback + the gates token + a typed phrase, but
+    no endpoint serves that token, so no page can reach them. `keel capabilities` and the MCP tool
+    print this inventory; a row saying "reached from a browser on a loopback session" sends an
+    operator hunting for a control that does not exist. Checked on the parsed fields."""
+    claims = [BROWSER.evidence, BROWSER.fails_closed_against]
+    for cap in CAPABILITIES:
+        if cap.gate == BROWSER.name:
+            claims += [cap.invocation, cap.increases]
+    for text in claims:
+        assert "from a browser" not in text, text
+        assert "browser on a loopback" not in text, text
+        assert "loopback session" not in text, text
+
+    by_key = {cap.key: cap for cap in CAPABILITIES}
+    for cap in CAPABILITIES:
+        if cap.gate != BROWSER.name:
+            continue
+        assert cap.mirrors is not None
+        cli = by_key[cap.mirrors].invocation
+        assert cli in "\n".join(render_lines())
+        assert "terminal" in cap.increases, cap.key
+        assert "gates token" in cap.increases, cap.key

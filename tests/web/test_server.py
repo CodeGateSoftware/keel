@@ -2081,3 +2081,28 @@ def test_a_release_answers_with_the_clis_own_line(deployment) -> None:
     data = json.loads(body)["data"]
     assert data["message"]["display"] == gates.TIER1_ACTIONS["resume"].done
     assert "changed" not in data
+
+
+@pytest.mark.parametrize(
+    ("route", "command"),
+    [("resume", "keel resume"), ("resume-entries", "keel resume-entries")],
+)
+def test_the_missing_gate_token_refusal_names_that_routes_own_cli_command(
+    running, route, command
+) -> None:
+    """**One refusal sentence answers both release routes, and the remedy in it is per route.**
+
+    "Release a halt with `keel resume`" was true for `/api/gates/resume` and wrong for
+    `/api/gates/resume-entries`, whose CLI is `keel resume-entries` (#970 review). The commands
+    quoted in the refusal body must be exactly the one for the route asked."""
+    import re
+
+    from keel.web import gates
+
+    assert {"resume", "resume-entries"} == set(gates.TIER1_ACTIONS)
+    status, _headers, body = _gate_post(
+        running, f"/api/gates/{route}", phrase="X", gate="not-the-token"
+    )
+
+    assert status == 403, body
+    assert re.findall(r"`(keel [a-z-]+)`", body) == [command], body

@@ -26,9 +26,12 @@ terminal, and the browser can perform none of those.** That is not a property of
 draws -- "a client that hides a button is not a gate" -- it is a property of the server, which
 implements no verb that would reach one, asserted by scans over `keel/web/`'s own source.
 
-The other two -- releasing the kill-switch halt and clearing rail 16's -- are reachable from the
-browser since #781, behind `BROWSER` below. They appear TWICE here: once as the CLI row that has
-always existed, and once as a `web` row carrying `mirrors` back to it. That is the shape
+The other two -- releasing the kill-switch halt and clearing rail 16's -- have server routes since
+#781, behind `BROWSER` below, but since #968 NO endpoint serves the gates token those routes
+demand, so no page can reach them: the console can HALT and cannot resume, and the release path
+for a person is `keel resume` / `keel resume-entries` at a terminal. They appear TWICE here: once
+as the CLI row that has always existed, and once as a `web` row carrying `mirrors` back to it.
+That is the shape
 `mirrors` was kept for -- "it describes a shape this registry must be able to express the moment
 a second front-end gates anything again" -- and this is that moment.
 
@@ -77,8 +80,9 @@ TTY = Gate(
 BROWSER = Gate(
     name="browser",
     evidence=(
-        "an exact typed phrase from a human at a loopback session on a loopback bind, carrying "
-        "a write token derived for this surface alone"
+        "an exact typed phrase on a loopback bind from a loopback peer, carrying a gates token "
+        "derived for this surface alone -- a token no endpoint serves, so no browser page can "
+        "present it"
     ),
     fails_closed_against=(
         "everything the TTY gate refuses, plus a tunnel, a reverse proxy and a LAN bind -- "
@@ -249,7 +253,8 @@ CAPABILITIES: tuple[Capability, ...] = (
         ),
         increases=(
             "trading resumes after the kill-switch halted it -- the same increase `keel resume` "
-            "grants, reached from a browser on a loopback session instead of from a terminal"
+            "grants; the route needs the gates token, which no endpoint serves, so the console "
+            "cannot reach it and a person releases the halt with `keel resume` at a terminal"
         ),
         gate=BROWSER.name,
         mirrors=("keel.cli", "resume"),
@@ -264,7 +269,9 @@ CAPABILITIES: tuple[Capability, ...] = (
         ),
         increases=(
             "new entries resume after rail 16's consecutive-loss halt -- the same increase "
-            "`keel resume-entries` grants, reached from a browser on a loopback session"
+            "`keel resume-entries` grants; the route needs the gates token, which no endpoint "
+            "serves, so the console cannot reach it and a person clears it with `keel "
+            "resume-entries` at a terminal"
         ),
         gate=BROWSER.name,
         mirrors=("keel.cli", "resume_entries"),

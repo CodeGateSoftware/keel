@@ -7,7 +7,7 @@ displaying, and -- through DNS rebinding -- any site that can point its own host
 water mark, open positions, every closed trade. So loopback is where the model starts, not what it
 is.
 
-Four independent layers, none of which is sufficient alone:
+Five independent layers, none of which is sufficient alone:
 
 1. **Loopback bind** removes the network. It says nothing about this machine.
 

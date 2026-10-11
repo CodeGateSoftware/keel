@@ -1228,9 +1228,9 @@ function feedNotes(data) {
 // ── PARITY IS ON THE INFORMATION, NEVER ON THE MARKUP ──────────────────────────────────────────
 //
 // Each view below is judged against two records, and neither of them is the HTML's source:
-// `keel/web/render.py`'s rendered pages, which are what an operator sees today, and
-// `tests/commands/test_tui.py`, which is the specification of what the curses screens show and is
-// what #541 deletes against. Where those two disagree, or where one of them is WRONG, the
+// `keel/web/render.py`'s server-rendered pages (deleted at #540; this JS shell is the console now)
+// and `tests/commands/test_tui.py`, which was the specification of what the curses screens show and
+// is what #541 deleted against. Where those two disagree, or where one of them is WRONG, the
 // divergence is written into the view's own docstring rather than reproduced.
 //
 // The wrongness is not hypothetical. `render.py` reads report fields through

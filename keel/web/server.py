@@ -238,9 +238,13 @@ HALT_KEY = "halt"
 #: refusal is how a reader comes to think they are two different failures. It no longer says
 #: "reload the page": no page carries the gate token (#968), so the remedy is the terminal.
 _NO_GATE_TOKEN = (
-    "That request did not carry this session's gate token, which no page is given. Release a "
-    "halt with `keel resume` at a terminal."
+    "That request did not carry this session's gate token, which no page is given. Release it "
+    "with `{command}` at a terminal."
 )
+
+#: The CLI command that releases each Tier 1 route, because the refusal above answers both and
+#: `keel resume` is the wrong remedy for `resume-entries`. Keyed like `gates.TIER1_ACTIONS`.
+_RELEASE_COMMAND = {"resume": "keel resume", "resume-entries": "keel resume-entries"}
 
 #: The halt's refusal, for `_NO_GATE_TOKEN`'s reason: the halt checks a different token in a
 #: different header (#968), and a refusal that named the wrong one would send the reader looking
@@ -895,7 +899,7 @@ class KeelHandler(BaseHTTPRequestHandler):
             return
 
         if not tokens_match(self.headers.get(GATES_HEADER), gates_token(self.cfg.token)):
-            self._refuse(403, "Refused", _NO_GATE_TOKEN)
+            self._refuse(403, "Refused", _NO_GATE_TOKEN.format(command=_RELEASE_COMMAND[key]))
             return
 
         values = self._read_json_object()
