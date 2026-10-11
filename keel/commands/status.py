@@ -489,12 +489,13 @@ def _kind_never_brackets(rule_kind: str) -> bool:
     registry does not know (an empty `rule_name`, a retired kind) is NOT excused: its missing
     bracket stays a warning, the reading that cannot hide a real gap.
 
-    `rule_kind` is `positions.rule_name`, which is `rule.name`. `keel rules add` and seed store
-    `rule.describe()["params"]`, and every shipped kind keeps `name` beside `params`, not in it,
-    so a `name` in `--params` is accepted by the constructor but dropped from the stored row:
-    the rebuilt rule is named its kind (the same convention as `agent.py`'s
-    `rule_name == "dca"` checks). Were a row ever to carry another name, the registry would not
-    know it and its tranches would WARN: the safe reading."""
+    `rule_kind` is `positions.rule_name`, which is `rule.name`. No shipped path stores a name:
+    seed stores `describe()["params"]`, which carries no `name` for any kind, and `keel rules
+    add` refuses a `name` in `--params` (its dropped-param refusal, or `rsi_meanrev`'s
+    constructor, which takes no `name`), so a rule rebuilt from a row is named its kind -- pinned
+    by `test_every_kind_is_named_its_kind_and_stores_no_name_param` and
+    `test_add_rule_row_refuses_a_name_param_and_writes_no_row`. A hand-written row naming
+    another kind would be judged as that kind; a name the registry does not know WARNs."""
     rule_cls = agent.RULE_REGISTRY.get(rule_kind)
     return rule_cls is not None and not rule_cls.places_bracket
 
