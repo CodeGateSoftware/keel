@@ -421,15 +421,19 @@ It prints a URL carrying a one-time token for that run and opens your browser (`
 skip). The `--config`/`--db` pair still decides which account you are looking at, and still bites
 the same way.
 
-It is **read-only**, and structurally so: the server answers `GET` and `HEAD` and implements no
-other verb, so there is no request it can answer that changes anything. Attesting, promoting a
-rule, recording a flow and arming autonomy stay CLI commands behind the interactive-terminal gate.
+It **reads with `GET` and `HEAD`, and its writes are a closed set of `POST`s** under `/api/`:
+`/api/gates/halt` engages the kill-switch (a gate token, nothing more — stopping must never be
+slower than starting); `/api/gates/resume` and `/api/gates/resume-entries` release a halt only
+from a loopback session on a loopback bind, with a gate token and a typed phrase (the console
+offers neither — release a halt with `keel resume` at a terminal); and `/api/setup/<step>` runs
+one of `keel setup`'s idempotent mechanical steps. Attesting, promoting a rule, recording a flow
+and arming autonomy stay CLI commands behind the interactive-terminal gate.
 
 Four things stand between that page and the rest of the machine: it binds `127.0.0.1`; it checks
 the `Host:` header, so a hostname rebound to loopback is refused even though its packets arrive
 on loopback; it requires the session token, which is minted per run and never written to disk; and
-it serves no write verb. `--host` will bind anywhere you ask, and says plainly what that costs —
-on a non-loopback address your positions, equity and full trade history are readable by anyone who
+every write also needs the console's own request headers and a token derived from that session.
+`--host` will bind anywhere you ask, and says plainly what that costs — on a non-loopback address your positions, equity and full trade history are readable by anyone who
 can reach the port, with a cleartext token as the only obstacle.
 
 **Placing an order is gated differently.** Paper places freely against synthetic cash — nothing is
