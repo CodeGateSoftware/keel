@@ -422,10 +422,11 @@ skip). The `--config`/`--db` pair still decides which account you are looking at
 the same way.
 
 It **reads with `GET` and `HEAD`, and its writes are a closed set of `POST`s** under `/api/`:
-`/api/gates/halt` engages the kill-switch (a gate token, nothing more — stopping must never be
+`/api/gates/halt` engages the kill-switch (a halt token, nothing more — stopping must never be
 slower than starting); `/api/gates/resume` and `/api/gates/resume-entries` release a halt only
-from a loopback session on a loopback bind, with a gate token and a typed phrase (the console
-offers neither — release a halt with `keel resume` at a terminal); and `/api/setup/<step>` runs
+from a loopback session on a loopback bind, with a separate gate token that no page is ever given
+and a typed phrase (the console offers neither — release a halt with `keel resume` at a
+terminal); and `/api/setup/<step>` runs
 one of `keel setup`'s idempotent mechanical steps. Attesting, promoting a rule, recording a flow
 and arming autonomy stay CLI commands behind the interactive-terminal gate.
 
@@ -893,9 +894,11 @@ The Balances and Plans views are gone; their old addresses open Pulse.
 
 **Halting from the browser.** Pulse carries a HALT button. It engages the kill switch through the
 same operation `keel kill` performs (`POST /api/gates/halt`), after one confirm dialog and nothing
-else: stopping must never be slower than starting. It needs the console session and the gate token
+else: stopping must never be slower than starting. It needs the console session and the halt token
 Pulse hands the page, and it works from a tunnel as well as from loopback. There is no browser
-resume: once halted, Pulse shows a HALTED line, and resuming is `keel resume` at a terminal.
+resume: the halt token opens the halt and nothing else, the release routes take a different token
+that no page is given, and once halted Pulse shows a HALTED line — resuming is `keel resume` at a
+terminal.
 
 **Whether that token touches disk depends on who is watching (#756).** Started from a terminal --
 the command above -- nothing is written, and the URL exists only in your scrollback. Started

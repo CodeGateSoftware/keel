@@ -33,8 +33,10 @@ now is stronger than the one it replaced, and it is the one anyone actually care
   CLI still needs a real terminal. `server.do_POST` reaches the table through `/api/gates/<key>`
   (a loopback session on a loopback bind, the gate token and the typed phrase), and the one
   ungated key there is `halt`, which engages the kill switch -- stopping is never slower than
-  starting. Whether the console shows the release controls is a separate question from whether
-  the server answers them; the client draws none.
+  starting. The halt takes its own token, the one `/api/pulse` serves; the gate token is served
+  by no endpoint, so the page that can stop keel holds nothing that restarts it (#968). Whether
+  the console shows the release controls is a separate question from whether the server answers
+  them; the client draws none.
 
   **Three scans, because the first one alone was hollow (#788).** It forbade this package from
   naming any `Capability.function` -- and those are the CLI COMMANDS, Click callbacks taking a

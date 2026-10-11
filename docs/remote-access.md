@@ -88,9 +88,11 @@ gesture in both postures.
 ## Capability-increasing actions are refused unless the bind is loopback
 
 `keel serve` serves a read surface plus a small write surface: the setup steps, the HALT button
-(`/api/gates/halt`, which engages the kill switch and is deliberately allowed from a tunnel -- a
-stop must never be slower than a start), and two gated releases behind a second gate (#781) --
-releasing the kill-switch halt and clearing rail 16's consecutive-loss halt. The other
+(`/api/gates/halt`, which engages the kill switch on its own halt token and is deliberately
+allowed from a tunnel -- a stop must never be slower than a start), and two gated releases behind
+a second gate (#781) -- releasing the kill-switch halt and clearing rail 16's consecutive-loss
+halt. The releases take a different token from the halt's, and no endpoint serves it (#968): the
+token the page holds to stop keel cannot restart it. The other
 capability-increasing actions in `keel/capabilities.py` have no route at all.
 `keel.web.security.gated_action_permitted` decides the two releases, and it requires **three**
 things:

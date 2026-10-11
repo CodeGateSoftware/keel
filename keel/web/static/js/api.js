@@ -303,19 +303,23 @@ export async function runAction(key, values, csrf) {
  * Engage the kill switch (console PR1). The one write that is not a setup step, and the only
  * other path this client POSTs to.
  *
- * `server._gated_action` wants the session, `X-Keel-Client` and `X-Keel-Gate`, and nothing else:
+ * `server._gated_action` wants the session, `X-Keel-Client` and `X-Keel-Halt`, and nothing else:
  * no typed phrase, no locality check, because "stopping must never be slower than starting"
  * (`keel/web/gates.py`). The way back -- `keel resume` -- is deliberately not a call this module
  * can make: there is no function here that names it, and `test_pulse_view.py` pins that.
  *
  * Never rejects, exactly like `read`: a failure is a `Reading` the view can show.
  *
- * @param {string} gate  `/api/pulse`'s `data.gate` for this session.
+ * The header is `security.HALT_HEADER`, not the release routes' `X-Keel-Gate`: the halt token
+ * opens the halt and nothing else (#968), and it rides a field of its own so no route can read
+ * it where another route's token is expected.
+ *
+ * @param {string} haltToken  `/api/pulse`'s `data.halt_token` for this session.
  * @returns {Promise<Reading>}
  */
-export async function runHalt(gate) {
+export async function runHalt(haltToken) {
   const url = new URL(API_PREFIX + "gates/halt", window.location.origin);
-  return post(url, { "X-Keel-Gate": gate });
+  return post(url, { "X-Keel-Halt": haltToken });
 }
 
 /**

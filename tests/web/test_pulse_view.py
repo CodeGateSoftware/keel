@@ -19,7 +19,7 @@ from __future__ import annotations
 import json
 import re
 
-from keel.web import gates, staticfiles
+from keel.web import gates, security, staticfiles
 from tests.web.test_client_assets import (
     _INDEX,
     _MODULES,
@@ -124,16 +124,32 @@ def test_main_confirms_once_before_the_halt_and_never_elsewhere() -> None:
     assert declared == ["Halt keel? Resuming requires `keel resume` at a terminal."]
 
 
-def test_the_gate_token_lives_only_in_the_write_boundary() -> None:
-    assert "let gate" in _code_only(_source("actions.js"))
-    assert "headers" not in _code_only(_source("actions.js")).lower()
+def test_the_halt_token_lives_only_in_the_write_boundary() -> None:
+    """**#968, at the client.** The halt token is held in `actions.js`, read off `data.halt_token`
+    there and nowhere else, and sent by `api.js` alone. The release header (`GATES_HEADER`) is
+    named by no client module at all: the browser never holds the release token, so no code here
+    has anything to put in it. Counts per module, not a substring of one file, so a second
+    sender or a second holder fails rather than hiding behind the first."""
+    actions = _code_only(_source("actions.js"))
+    declared = re.findall(r'^let haltToken = "";$', _comments_stripped(_source("actions.js")), re.M)
+    assert len(declared) == 1
+    assert "headers" not in actions.lower()
     transport = _code_only(_source("api.js"))
-    assert "let gate" not in transport and "const gate" not in transport
+    assert not re.search(r"\b(let|const) haltToken\b", transport)
 
-    senders = [name for name in _MODULES if "X-Keel-Gate" in _comments_stripped(_source(name))]
-    assert senders == ["api.js"]
-    holders = [name for name in _MODULES if "data.gate" in _code_only(_source(name))]
-    assert holders == ["actions.js"]
+    halt_senders = {
+        name: _comments_stripped(_source(name)).count(f'"{security.HALT_HEADER}"')
+        for name in _MODULES
+    }
+    assert {name: n for name, n in halt_senders.items() if n} == {"api.js": 1}
+    gate_senders = {
+        name: _comments_stripped(_source(name)).count(security.GATES_HEADER)
+        for name in (*_MODULES, "../sw.js")
+    }
+    assert sum(gate_senders.values()) == 0, gate_senders
+    holders = {name: _code_only(_source(name)).count("data.halt_token") for name in _MODULES}
+    assert {name: n for name, n in holders.items() if n} == {"actions.js": 2}
+    assert not any(re.search(r"\bdata\.gate\b", _code_only(_source(n))) for n in _MODULES)
 
 
 def test_api_js_posts_to_exactly_two_paths() -> None:
@@ -167,7 +183,10 @@ def test_the_halt_sends_no_body_because_its_route_reads_none() -> None:
     api = _source("api.js")
     halt = _async_function(api, "runHalt")
     assert halt.count("post(") == 1
-    assert re.search(r'return post\(url, \{ "X-Keel-Gate": gate \}\);', halt), halt
+    # The halt token rides `security.HALT_HEADER` -- the server's own constant, read here rather
+    # than restated, so a header renamed on one side only fails this pin.
+    sent = re.findall(r'return post\(url, \{ "([^"]+)": haltToken \}\);', halt)
+    assert sent == [security.HALT_HEADER], halt
 
     run_action = _async_function(api, "runAction")
     assert re.search(r'return post\(url, \{ "X-Keel-CSRF": csrf \}, values\);', run_action)

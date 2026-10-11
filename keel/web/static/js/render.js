@@ -1228,9 +1228,9 @@ function feedNotes(data) {
 // ── PARITY IS ON THE INFORMATION, NEVER ON THE MARKUP ──────────────────────────────────────────
 //
 // Each view below is judged against two records, and neither of them is the HTML's source:
-// `keel/web/render.py`'s rendered pages, which are what an operator sees today, and
-// `tests/commands/test_tui.py`, which is the specification of what the curses screens show and is
-// what #541 deletes against. Where those two disagree, or where one of them is WRONG, the
+// `keel/web/render.py`'s server-rendered pages (deleted at #540; this JS shell is the console now)
+// and `tests/commands/test_tui.py`, which was the specification of what the curses screens show and
+// is what #541 deleted against. Where those two disagree, or where one of them is WRONG, the
 // divergence is written into the view's own docstring rather than reproduced.
 //
 // The wrongness is not hypothetical. `render.py` reads report fields through
@@ -3441,9 +3441,9 @@ export function paperBanner(node, config) {
  * The attestation banner (#793) -- what is about to halt keel, or has already.
  *
  * Rail 17 expired on 2026-09-08 and live placed nothing for three days. The state was on the
- * Status page (now Pulse) the whole time, in a card, below the fold, on one page of eleven. So this is
- * carried by the ENVELOPE and drawn from the shell, above `#view`: it is on whatever page the
- * operator is actually reading.
+ * Status page (now Pulse) the whole time, in a card, below the fold, on what was then one page
+ * of eleven. So this is carried by the ENVELOPE and drawn from the shell, above `#view`: it is
+ * on whatever page the operator is actually reading.
  *
  * **Renders `alerts` and judges nothing.** The server sends only the rows that need someone
  * (`payload.attestation_alerts`), already toned, so "is there a banner" is answered in one place

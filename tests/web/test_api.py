@@ -46,7 +46,13 @@ from keel.data.db import connect, migrate
 from keel.web import api as web_api
 from keel.web import payload
 from keel.web import server as web_server
-from keel.web.security import SESSION_COOKIE, csrf_token, gates_token, new_session_token
+from keel.web.security import (
+    SESSION_COOKIE,
+    csrf_token,
+    gates_token,
+    halt_token,
+    new_session_token,
+)
 from tests.conftest import VALID_CONFIG_YAML
 
 #: Every read the HTML routes perform, as its JSON counterpart. `/glossary` is absent on purpose
@@ -884,29 +890,90 @@ def test_setup_carries_the_csrf_token_and_only_setup_does(
         assert csrf_token(empty_machine.token) not in json.dumps(other), path
 
 
-def test_pulse_carries_the_gate_token_and_only_pulse_does(
+def _strings(node: Any) -> Iterator[str]:
+    """Every key and every string leaf of a JSON document, walked rather than serialised.
+
+    A walk, not `token in json.dumps(document)`: the dumped text escapes, reorders and joins
+    values, so a substring test over it answers a question about the serialisation. This yields
+    each string the client could actually read -- every key and every leaf -- so the caller can
+    assert on each one."""
+    if isinstance(node, dict):
+        for key, value in node.items():
+            yield str(key)
+            yield from _strings(value)
+    elif isinstance(node, list):
+        for value in node:
+            yield from _strings(value)
+    elif isinstance(node, str):
+        yield node
+
+
+def _served_strings(cfg: web_server.ServeConfig) -> dict[str, list[str]]:
+    """What a session-holding client can read off every GET endpoint the API has: each JSON
+    route's keys and string leaves, the CSV export's cells, and every response header value."""
+    import csv
+    import io
+
+    served: dict[str, list[str]] = {}
+    for path in [*web_api.API_ROUTES, web_api.CSV_EXPORT_PATH]:
+        _status, headers, body = _get(cfg, path, cookie=_session(cfg))
+        # By what the server says it sent, not by path: the export answers a JSON error document
+        # when there is nothing to export, and that document is served too.
+        if headers.get("Content-Type", "").startswith("text/csv"):
+            cells = [cell for row in csv.reader(io.StringIO(body)) for cell in row]
+        else:
+            cells = list(_strings(json.loads(body)))
+        served[path] = cells + list(headers.values())
+    return served
+
+
+@pytest.mark.parametrize("machine", ["running", "empty_machine"])
+def test_no_endpoint_serves_the_gates_token(machine: str, request: pytest.FixtureRequest) -> None:
+    """**#968: the release token is served by NO endpoint, which is what keeps resume terminal-
+    only.** The release routes need loopback, a typed phrase and `gates_token`; the phrases are
+    public literals, so the token is the one factor a browser session cannot produce -- for
+    exactly as long as nothing serves it. Console PR1 served it on `/api/pulse`, and a cookie-only
+    session resumed trading.
+
+    Every route in `API_ROUTES`, plus the CSV export, on a deployment and on an empty machine;
+    no served string may be or contain the token. The route count is asserted so a table that
+    shrank to nothing cannot pass this by vacuum."""
+    cfg: web_server.ServeConfig = request.getfixturevalue(machine)
+    forbidden = gates_token(cfg.token)
+
+    served = _served_strings(cfg)
+
+    assert len(served) == len(web_api.API_ROUTES) + 1 >= 14
+    assert all(served.values()), "every endpoint answered with something to scan"
+    if machine == "running":
+        # On a deployment the pulse document is a real one -- the endpoint that USED to leak the
+        # token -- so the scan covers the body it would be in, not an empty `data: null`.
+        assert "halt_token" in served["/api/pulse"]
+    leaks = sorted(path for path, cells in served.items() if any(forbidden in c for c in cells))
+    assert leaks == []
+
+
+def test_pulse_carries_the_halt_token_and_only_pulse_does(
     running: web_server.ServeConfig,
 ) -> None:
     """The HALT button's token rides `/api/pulse`'s body exactly as the CSRF token rides
     `/api/setup`'s (`payload.setup_payload` carries the argument: it authorises nothing without
-    the session cookie, and `/api/*` is `no-store`). The scope is what is asserted: the gate token
-    appears on the one endpoint whose view halts, and on no other -- in particular not on
-    `/api/setup`, whose own token is the CSRF one, derived apart so that neither surface's token
-    unlocks the other (`security.gates_token`)."""
-    _status, _headers, document = _json(running, "/api/pulse")
-    assert document["data"]["gate"] == gates_token(running.token)
-    assert gates_token(running.token) != csrf_token(running.token)
+    the session cookie, and `/api/*` is `no-store`). Since #968 it is `security.halt_token`, which
+    opens the halt and nothing else; the scope is what is asserted -- the halt token appears on
+    the one endpoint whose view halts and on no other, and that endpoint carries neither of the
+    other two write tokens."""
+    halt = halt_token(running.token)
+    served = _served_strings(running)
 
-    for path in API_ROUTES:
-        if path == "/api/pulse":
-            continue
-        _status, _headers, other = _json(running, path)
-        assert gates_token(running.token) not in json.dumps(other), path
-    # The other direction, on a deployment that actually HAS a pulse body (`empty_machine`
-    # answers `data: null`, which holds no token whatever the payload builder does): the CSRF
-    # token must not ride the endpoint that carries the gate token (review F6).
-    assert document["data"] is not None
-    assert csrf_token(running.token) not in json.dumps(document)
+    pulse = [cell for cell in served["/api/pulse"] if halt in cell]
+    assert pulse == [halt], "exactly one string on /api/pulse is the halt token, and it is bare"
+    _status, _headers, document = _json(running, "/api/pulse")
+    assert document["data"]["halt_token"] == halt
+    assert "gate" not in document["data"], "the old key is gone, not left beside the new one"
+    holders = sorted(path for path, cells in served.items() if any(halt in c for c in cells))
+    assert holders == ["/api/pulse"]
+    for other in (csrf_token(running.token), gates_token(running.token)):
+        assert not any(other in cell for cell in served["/api/pulse"])
 
 
 def test_pulse_answers_data_null_when_nothing_is_set_up(

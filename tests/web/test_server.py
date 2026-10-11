@@ -86,6 +86,7 @@ def _request(
     raw_body: str | None = None,
     csrf: str | None = None,
     gate: str | None = None,
+    halt: str | None = None,
     client_header: str | None = "1",
     sec_fetch_site: str | None = None,
     origin: str | None = None,
@@ -114,6 +115,8 @@ def _request(
         headers["X-Keel-Client"] = client_header
     if gate is not None:
         headers[security.GATES_HEADER] = gate
+    if halt is not None:
+        headers[security.HALT_HEADER] = halt
     if sec_fetch_site is not None:
         headers["Sec-Fetch-Site"] = sec_fetch_site
     if origin is not None:
@@ -1895,11 +1898,10 @@ def test_the_halt_is_reachable_from_a_remote_deployment_and_engages(deployment) 
     The release above is refused on a tunnelled deployment. The halt is not: an operator whose
     keel is behind a tunnel must be able to stop it from the tunnel, and a stop refused for
     being remote is the one failure this surface must not have. It still needs the session and
-    the gate token, because it is a write.
+    the halt token, because it is a write.
 
     Also pins that `halt` has a branch of its own: removed, the key falls through to the Tier 1
     lookup and 404s -- a halt button that does nothing, which no other test here would see."""
-    import json as _json
 
     from keel.data.db import connect
     from keel.data.repository import Repository
@@ -1912,8 +1914,7 @@ def test_the_halt_is_reachable_from_a_remote_deployment_and_engages(deployment) 
             "/api/gates/halt",
             method="POST",
             cookie=f"{SESSION_COOKIE}={tunnelled.token}",
-            gate=security.gates_token(tunnelled.token),
-            raw_body=_json.dumps({}),
+            halt=security.halt_token(tunnelled.token),
         )
 
     assert status == 200, body
@@ -1924,9 +1925,49 @@ def test_the_halt_is_reachable_from_a_remote_deployment_and_engages(deployment) 
         conn.close()
 
 
-def test_the_halt_still_needs_the_gate_token(deployment) -> None:
+def test_a_remote_deployment_serves_the_halt_token_and_it_halts_but_releases_nothing(
+    deployment,
+) -> None:
+    """**The halt must be reachable from a tunnel, and that starts with the page being handed its
+    token there.** The test above mints the token itself, so it cannot see a `/api/pulse` that
+    withholds `halt_token` from a remote deployment -- which would leave the HALT button with
+    nothing to send exactly where stopping matters most. This one reads the token the way the
+    console does, from the document, and uses that value and no other.
+
+    Then the other half of the contract, on the same deployment: the served value halts, and
+    presented to either release in either header it releases nothing."""
+
+    db_path, _config_path = deployment
+    remote = frozenset({"keel.example.com"})
+    with _serving(deployment, external_hosts=remote) as tunnelled:
+        _status, _headers, pulse = _request(tunnelled, "/api/pulse", cookie=_session(tunnelled))
+        served = json.loads(pulse)["data"]["halt_token"]
+        assert served, "a remote deployment must still be served a halt token"
+        assert served == security.halt_token(tunnelled.token)
+
+        status, _headers, body = _halt(tunnelled, halt=served)
+        assert status == 200, body
+        assert _kill_switch(db_path) is True
+
+        for route, phrase in (
+            ("/api/gates/resume", "RESUME TRADING"),
+            ("/api/gates/resume-entries", "CLEAR STREAK HALT"),
+        ):
+            for header in ("halt", "gate"):
+                status, _headers, body = _request(
+                    tunnelled,
+                    route,
+                    method="POST",
+                    cookie=_session(tunnelled),
+                    **{header: served},
+                    raw_body=json.dumps({"phrase": phrase}),
+                )
+                assert status == 403, (route, header, body)
+                assert _kill_switch(db_path) is True, (route, header)
+
+
+def test_the_halt_still_needs_the_halt_token(deployment) -> None:
     """Ungated means no PHRASE and no locality check. It does not mean no authentication."""
-    import json as _json
 
     with _serving(deployment) as running_local:
         status, _headers, _body = _request(
@@ -1934,7 +1975,175 @@ def test_the_halt_still_needs_the_gate_token(deployment) -> None:
             "/api/gates/halt",
             method="POST",
             cookie=f"{SESSION_COOKIE}={running_local.token}",
-            gate="not-the-token",
-            raw_body=_json.dumps({}),
+            halt="not-the-token",
         )
     assert status == 403
+
+
+# -- the halt token is not a release token (#968) --------------------------------------------------
+
+
+def _kill_switch(db_path: str) -> object:
+    from keel.data.db import connect
+    from keel.data.repository import Repository
+
+    conn = connect(db_path)
+    try:
+        return Repository(conn).get_state("kill_switch", default=None)
+    finally:
+        conn.close()
+
+
+def _halt(cfg, *, halt=None, gate=None):
+    """A halt POST carrying the session and exactly the tokens named -- no body, as the client
+    sends it (`test_pulse_view.test_the_halt_sends_no_body_because_its_route_reads_none`)."""
+    return _request(
+        cfg, "/api/gates/halt", method="POST", cookie=_session(cfg), halt=halt, gate=gate
+    )
+
+
+@pytest.mark.parametrize(
+    ("route", "phrase"),
+    [("/api/gates/resume", "RESUME TRADING"), ("/api/gates/resume-entries", "CLEAR STREAK HALT")],
+)
+@pytest.mark.parametrize("header", ["halt", "gate"])
+def test_the_token_pulse_serves_cannot_release_a_halt(deployment, route, phrase, header) -> None:
+    """**#968, reproduced and refused.** The review's repro: read the token `/api/pulse` serves,
+    halt, then POST a release with that token and the public phrase -- 200, kill switch released,
+    no terminal involved. The halt token must open neither release, whichever header it rides
+    in, and the kill switch must still be engaged afterwards: a 403 that had already written
+    would be no refusal at all.
+
+    The two Tier 1 phrases are the real ones, so the ONLY thing missing from a request that
+    would otherwise succeed is the gates token -- the refusal is about the token and nothing
+    else."""
+    with _serving(deployment) as cfg:
+        _status, _headers, pulse = _request(cfg, "/api/pulse", cookie=_session(cfg))
+        served = json.loads(pulse)["data"]["halt_token"]
+        assert served == security.halt_token(cfg.token), "the fixture reached the reader"
+        status, _headers, body = _halt(cfg, halt=served)
+        assert status == 200, body
+        assert _kill_switch(deployment[0]) is True
+
+        status, _headers, body = _request(
+            cfg,
+            route,
+            method="POST",
+            cookie=_session(cfg),
+            **{header: served},
+            raw_body=json.dumps({"phrase": phrase}),
+        )
+
+        assert status == 403, body
+        assert _kill_switch(deployment[0]) is True, "the refusal must not have released anything"
+        # The control: the same request carrying the gates token -- served by no endpoint --
+        # still releases, so the 403 above is the token's doing and not a broken route.
+        status, _headers, body = _request(
+            cfg,
+            route,
+            method="POST",
+            cookie=_session(cfg),
+            gate=security.gates_token(cfg.token),
+            raw_body=json.dumps({"phrase": phrase}),
+        )
+        assert status == 200, body
+
+
+def test_the_halt_engages_with_the_halt_token(deployment) -> None:
+    with _serving(deployment) as cfg:
+        assert _kill_switch(deployment[0]) in (None, False)
+        status, _headers, body = _halt(cfg, halt=security.halt_token(cfg.token))
+
+    assert status == 200, body
+    assert _kill_switch(deployment[0]) is True
+
+
+@pytest.mark.parametrize(
+    "tokens",
+    [
+        {},
+        {"gate": "GATES"},
+        {"halt": "GATES"},
+        {"halt": "CSRF"},
+        {"gate": "HALT"},
+    ],
+    ids=["none", "gates-in-gate-header", "gates-in-halt-header", "csrf", "halt-in-gate-header"],
+)
+def test_the_halt_is_refused_without_the_halt_token_in_its_own_header(deployment, tokens) -> None:
+    """The halt accepts ONLY the halt token, in `HALT_HEADER`. The gates token is refused here as
+    firmly as any other value: the two branches read two different headers for two different
+    tokens, and neither branch's token stands in for the other's (`security.GATES_HEADER`)."""
+    with _serving(deployment) as cfg:
+        values = {
+            "GATES": security.gates_token(cfg.token),
+            "CSRF": security.csrf_token(cfg.token),
+            "HALT": security.halt_token(cfg.token),
+        }
+        status, _headers, body = _halt(cfg, **{k: values[v] for k, v in tokens.items()})
+
+    assert status == 403, body
+    assert _kill_switch(deployment[0]) in (None, False), "a refused halt wrote nothing"
+
+
+def test_the_halt_answers_with_the_engines_own_line(deployment) -> None:
+    """**#969 item 2.** `run_halt` returns `KILL_ENGAGED_LINE`, a `str`, and the route used to hand
+    it to `api.action_document`, which reads `changed`/`message` attributes off a setup result --
+    so a successful halt reported "already done — nothing to change" and an empty message. The
+    response must carry the engine's line as the message, and claim nothing about `changed`,
+    which the gated operations do not report."""
+    from keel.commands.trading import KILL_ENGAGED_LINE
+
+    with _serving(deployment) as cfg:
+        status, _headers, body = _halt(cfg, halt=security.halt_token(cfg.token))
+
+    assert status == 200, body
+    data = json.loads(body)["data"]
+    assert data["message"]["display"] == KILL_ENGAGED_LINE
+    assert "changed" not in data
+    assert "nothing to change" not in body
+
+
+def test_a_release_answers_with_the_clis_own_line(deployment) -> None:
+    """The resume routes go through the same document, so they carry their own line too."""
+    from keel.web import gates
+
+    with _serving(deployment) as cfg:
+        _halt(cfg, halt=security.halt_token(cfg.token))
+        status, _headers, body = _request(
+            cfg,
+            "/api/gates/resume",
+            method="POST",
+            cookie=_session(cfg),
+            gate=security.gates_token(cfg.token),
+            raw_body=json.dumps({"phrase": "RESUME TRADING"}),
+        )
+
+    assert status == 200, body
+    data = json.loads(body)["data"]
+    assert data["message"]["display"] == gates.TIER1_ACTIONS["resume"].done
+    assert "changed" not in data
+
+
+@pytest.mark.parametrize(
+    ("route", "command"),
+    [("resume", "keel resume"), ("resume-entries", "keel resume-entries")],
+)
+def test_the_missing_gate_token_refusal_names_that_routes_own_cli_command(
+    running, route, command
+) -> None:
+    """**One refusal sentence answers both release routes, and the remedy in it is per route.**
+
+    "Release a halt with `keel resume`" was true for `/api/gates/resume` and wrong for
+    `/api/gates/resume-entries`, whose CLI is `keel resume-entries` (#970 review). The commands
+    quoted in the refusal body must be exactly the one for the route asked."""
+    import re
+
+    from keel.web import gates
+
+    assert {"resume", "resume-entries"} == set(gates.TIER1_ACTIONS)
+    status, _headers, body = _gate_post(
+        running, f"/api/gates/{route}", phrase="X", gate="not-the-token"
+    )
+
+    assert status == 403, body
+    assert re.findall(r"`(keel [a-z-]+)`", body) == [command], body

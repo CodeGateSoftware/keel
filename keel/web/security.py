@@ -7,7 +7,7 @@ displaying, and -- through DNS rebinding -- any site that can point its own host
 water mark, open positions, every closed trade. So loopback is where the model starts, not what it
 is.
 
-Four independent layers, none of which is sufficient alone:
+Five independent layers, none of which is sufficient alone:
 
 1. **Loopback bind** removes the network. It says nothing about this machine.
 
@@ -38,17 +38,23 @@ Four independent layers, none of which is sufficient alone:
    machine with no terminal has to be able to create a deployment somehow), and it routes through
    `keel.commands.setup.ACTIONS`, every member of which is a step declared `MECHANICAL`, is
    idempotent and is never destructive, or through the gate table (`/api/gates/*`: the halt and
-   the two Tier 1 releases, see `gates_token` below). Of the ten capability-increasing actions in
-   `keel/capabilities.py`, eight are unreachable and the other two are reachable only as that
-   table declares them, and a test asserts it. That is a narrower guarantee than "no POST at all"
-   was, and a more useful one: "no POST" would have been satisfied by a server that could not set
-   anything up, while this is satisfied only by one that cannot arm or spend anything.
+   the two Tier 1 releases, see `gates_token` and `halt_token` below). Of the ten
+   capability-increasing actions in `keel/capabilities.py`, eight are unreachable and the other
+   two are reachable only as that table declares them, and a test asserts it. That is a narrower
+   guarantee than "no POST at all" was, and a more useful one: "no POST" would have been
+   satisfied by a server that could not set anything up, while this is satisfied only by one
+   that cannot arm or spend anything.
 
 5. **A CSRF token** on every write. The `SameSite=Strict` cookie already stops a cross-site POST
    in any current browser; this is the layer that does not depend on the browser being current.
    It is derived from the session token by HMAC rather than stored, so there is no server-side
    session table to expire, and it is deliberately NOT the session token itself -- that one is
    `HttpOnly` and must never be written into the page.
+
+   One derivation per surface, never one shared: `csrf_token` for a setup step (served on
+   `/api/setup`), `halt_token` for the halt (served on `/api/pulse`), and `gates_token` for a
+   Tier 1 release -- which is served by NO endpoint (#968), so a browser session can stop keel
+   and cannot restart it. Each route checks its own token in its own header.
 
 The token comparison uses `secrets.compare_digest`; a `==` on a secret leaks its prefix through
 timing, and the fact that this is loopback traffic makes the measurement *easier*, not harder.
@@ -147,6 +153,13 @@ CSRF_HEADER = "X-Keel-CSRF"
 #: handler could check the wrong one and still see something that looked right.
 GATES_HEADER = "X-Keel-Gate"
 
+#: The header carrying `halt_token` (#968). A THIRD header, by `GATES_HEADER`'s own rule: the
+#: halt and the releases share a route prefix and a handler, so one header for both would leave
+#: each branch reading a field the other branch's token also arrives in. With two, the halt
+#: branch reads only this and the release branch only `GATES_HEADER`, and a token presented in
+#: the wrong one is simply absent where it is checked.
+HALT_HEADER = "X-Keel-Halt"
+
 #: Hostnames that mean "this machine" and are therefore acceptable in a `Host:` header when the
 #: server is bound to a loopback address. Anything else -- including a hostname that RESOLVES to
 #: 127.0.0.1 -- is rejected, which is the entire point of checking the header at all.
@@ -216,8 +229,42 @@ def gates_token(session_token: str) -> str:
     `keel.commands.setup.ACTIONS` -- idempotent, non-destructive, `MECHANICAL` steps. This guards
     actions that release a rail. Deriving both from one label would mean a single captured value
     covered both, and the two surfaces could never be revoked independently.
+
+    **Served by no endpoint, and that is load-bearing (#968).** The release routes' phrases are
+    public literals, so on a loopback deployment this token is the one factor a browser session
+    cannot produce -- for exactly as long as no document carries it. The HALT button's token is
+    `halt_token`, never this; `tests/web/test_api.py` scans every endpoint for this value.
     """
     return hmac.new(session_token.encode("utf-8"), _GATES_LABEL, hashlib.sha256).hexdigest()
+
+
+#: Domain separation for the HALT derivation (#968). A third label, for `_GATES_LABEL`'s reason
+#: applied once more: the console's HALT button needs a token in the page, and the page is
+#: readable by anything running in the operator's tab. Console PR1 served `gates_token` there,
+#: and since the release routes check that same value the token that stopped keel also restarted
+#: it -- the phrases are public literals, so on loopback the token was the only factor between a
+#: `fetch` and `keel resume`. Same secret, a third derivation, usable as neither of the others.
+_HALT_LABEL = b"keel/web/halt/v1"
+
+
+def halt_token(session_token: str) -> str:
+    """The write token for the halt, and for nothing else -- the one `/api/gates/` token a page
+    may hold.
+
+    Derived like `csrf_token` and `gates_token`, under its own label, so everything their
+    docstrings say about derivation holds: no table to keep, expire or leak, and it dies with the
+    session token, so stopping `keel serve` revokes it.
+
+    **Why the halt gets its own token rather than sharing the release one.** The two are not the
+    same risk. The halt is ungated by design -- "stopping must never be slower than starting" --
+    so a token that only engages the kill switch can sit in `/api/pulse`'s document at no cost:
+    whoever can read it can, at worst, stop keel, which the operator can do from any terminal
+    too. `gates_token` releases a rail, so it must be served by NO endpoint; the release routes
+    then stay reachable only by a client that minted it from the session token itself, which no
+    browser session can. Sharing one value would make "can stop keel" and "can restart keel" the
+    same permission, which is the inversion this tier is ordered to avoid.
+    """
+    return hmac.new(session_token.encode("utf-8"), _HALT_LABEL, hashlib.sha256).hexdigest()
 
 
 def _is_loopback_peer(peer: object) -> bool:

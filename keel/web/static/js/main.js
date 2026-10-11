@@ -32,7 +32,7 @@
  * it is worth paying.
  */
 
-import { halt, perform, recorded, remember, rememberGate } from "./actions.js";
+import { halt, perform, recorded, remember, rememberHaltToken } from "./actions.js";
 import { read } from "./api.js";
 import { indexUrl, rememberVersion } from "./docs.js";
 import { available, subscribe } from "./live.js";
@@ -122,20 +122,29 @@ const DEFAULT_ROUTE = ROUTES[0];
  *
  * `routeFor` sends any other unknown name to the home view, which is right for a view that left
  * the console (Balances, Plans, Status...) and wrong for one that only MOVED: a bookmark or a
- * habit naming `/setup` wants the checklist, and Pulse does not have it. Each name here must also
+ * habit naming `/setup` wants the checklist, and Pulse does not have it; `/positions` wants
+ * Holdings and `/insights` wants Rules for the same reason (#969). Each name here must also
  * be in `staticfiles.RETIRED_CLIENT_ROUTES`, so the server delivers the shell that does this
  * routing (`tests/web/test_audit_view.py` pins both).
  *
  * @type {Record<string, string>}
  */
-const MOVED_ROUTES = { setup: "audit", timeline: "audit", venues: "audit" };
+const MOVED_ROUTES = {
+  positions: "holdings",
+  orders: "holdings",
+  insights: "rules",
+  research: "rules",
+  setup: "audit",
+  timeline: "audit",
+  venues: "audit",
+};
 
 /**
  * How often the page re-reads, in milliseconds.
  *
- * 15 seconds, matching `server.py::_REFRESH_SEC` -- the interval the rendered pages already use
- * for their `<meta http-equiv="refresh">`. Kept identical rather than tuned so that the two
- * front-ends do not disagree about how fresh "fresh" is while both exist.
+ * 15 seconds, the TUI's own poll: fast enough that "is it running" is answered without a
+ * keypress, slow enough that a page being read does not jump under the reader. Kept equal to the
+ * TUI's rather than tuned, so the two front-ends do not disagree about how fresh "fresh" is.
  *
  * **It survives #537 rather than being replaced by the event stream, and the two do different
  * jobs.** A tick says "something was written" and is what triggers a rebuild; this poll is what
@@ -515,7 +524,7 @@ function mount(route, readings) {
     // The halt token, for the submit handler below. Read off the document that was just fetched
     // and kept in `actions.js`, exactly like the setup token above: it dies with the process that
     // minted it, and a stale one produces a 403 the view shows rather than a silent no-op.
-    rememberGate(data);
+    rememberHaltToken(data);
     return pulseView(data);
   }
   if (route.name === "holdings") {

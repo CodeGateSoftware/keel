@@ -477,3 +477,43 @@ def test_a_non_ascii_credential_is_refused_rather_than_raising() -> None:
     assert security.tokens_match("naïve", "naïve") is False, (
         "even a matching one: refuse, never raise"
     )
+
+
+# -- the halt token (#968) ------------------------------------------------------------------------
+
+
+def test_the_halt_token_is_none_of_the_other_three() -> None:
+    """**The fix for #968, at the derivation.** Console PR1 served `gates_token` on `/api/pulse`
+    for the HALT button, and the release routes check that same value -- so the token a page held
+    in order to STOP keel also restarted it. A third label makes the stop's token a value that
+    opens nothing else: not a setup step, not a release, not the session."""
+    session = security.new_session_token()
+    halt = security.halt_token(session)
+
+    assert halt not in {
+        security.gates_token(session),
+        security.csrf_token(session),
+        session,
+    }
+
+
+def test_the_halt_token_is_hmac_under_its_own_label_and_dies_with_the_session() -> None:
+    """Pinned by construction, as `gates_token` is, so a rearrangement of the input (which would
+    write the session token into the page) cannot pass; and the label is asserted distinct from
+    the other two, because sharing one is exactly the collapse #968 was."""
+    first, second = security.new_session_token(), security.new_session_token()
+    derived = security.halt_token(first)
+
+    assert (
+        derived == hmac.new(first.encode("utf-8"), b"keel/web/halt/v1", hashlib.sha256).hexdigest()
+    )
+    assert len({security._HALT_LABEL, security._GATES_LABEL, security._CSRF_LABEL}) == 3
+    assert security.halt_token(first) == derived, "stable within a session"
+    assert security.halt_token(second) != derived, "and not across sessions"
+
+
+def test_the_halt_token_rides_a_header_of_its_own() -> None:
+    """`GATES_HEADER`'s rule, applied: two tokens derived apart are presented through two fields,
+    so the halt branch and the release branch each read a header the other never looks at."""
+    assert security.HALT_HEADER == "X-Keel-Halt"
+    assert len({security.HALT_HEADER, security.GATES_HEADER, security.CSRF_HEADER}) == 3

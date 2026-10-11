@@ -383,7 +383,7 @@ def _every_payload() -> dict[str, Any]:
     no-custom-encoder check by being listed once, rather than by its author remembering three
     separate guards."""
     return {
-        "pulse": payload.pulse_payload(_pulse_report(), gate="gate-token"),
+        "pulse": payload.pulse_payload(_pulse_report(), halt_token="halt-token"),
         "holdings": payload.holdings_payload(_holdings_report()),
         "activity": payload.activity_payload(_activity_feed()),
         "config": payload.config_payload(
@@ -1174,7 +1174,7 @@ def test_a_ready_row_carries_an_empty_next_step_not_null() -> None:
 
 
 def test_the_pulse_payload_carries_no_json_number() -> None:
-    document = json.loads(json.dumps(payload.pulse_payload(_pulse_report(), gate="g")))
+    document = json.loads(json.dumps(payload.pulse_payload(_pulse_report(), halt_token="h")))
     assert _json_numbers(document) == []
     # the walk saw the sections it is meant to guard, not an empty shell
     assert document["today"]["cycles"]["value"] == "3"
@@ -1196,16 +1196,21 @@ def test_the_halt_block_names_the_resume_command_only_when_engaged() -> None:
     assert clear["halt"]["resume_command"] == ""
 
 
-def test_the_gate_is_a_bare_string_and_never_a_field() -> None:
-    carried = payload.pulse_payload(_pulse_report(), gate="tok-123")
-    assert carried["gate"] == "tok-123"
-    assert isinstance(carried["gate"], str)
+def test_the_halt_token_is_a_bare_string_and_never_a_field() -> None:
+    """Since #968 the key is `halt_token`, not `gate`: the value is `security.halt_token`, which
+    opens the halt route and nothing else, and a key named after the release token would invite
+    the next reader to serve that one here again."""
+    carried = payload.pulse_payload(_pulse_report(), halt_token="tok-123")
+    assert carried["halt_token"] == "tok-123"
+    assert isinstance(carried["halt_token"], str)
+    assert "gate" not in carried
     # absent unless given: the default is the empty string, not a missing key or a Field
-    assert payload.pulse_payload(_pulse_report())["gate"] == ""
+    assert payload.pulse_payload(_pulse_report())["halt_token"] == ""
     # and it appears on this payload alone -- no other builder names it
     others = {k: v for k, v in _every_payload().items() if k != "pulse"}
     assert others  # the sweep reached other payloads
     for name, built in others.items():
+        assert "halt_token" not in built, name
         assert "gate" not in built, name
 
 
@@ -1394,7 +1399,7 @@ def test_every_payload_is_json_serialisable_without_a_custom_encoder(builder: st
     if builder == "pulse_payload":
         # Its own required `PulseReport` plus the optional gate: spelled out, like
         # `rules_payload`'s `records`, so no default ever stands in for either.
-        json.dumps(payload.pulse_payload(_pulse_report(), gate="gate-token"))
+        json.dumps(payload.pulse_payload(_pulse_report(), halt_token="halt-token"))
         return
 
     if builder == "holdings_payload":

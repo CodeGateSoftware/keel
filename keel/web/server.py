@@ -27,7 +27,8 @@ So `do_POST` exists, and it routes through exactly two tables. `/api/setup/<key>
 `MECHANICAL` in the same module's step list. `/api/gates/<key>` reaches `halt` (engage the kill
 switch, ungated on purpose -- refusing a stop is the one failure it must not have) and the gated
 halt releases in `gates.TIER1_ACTIONS` (`resume`, `resume-entries`), which demand a loopback
-session on a loopback bind, the gate token and a typed phrase. The guarantee is that **eight of the
+session on a loopback bind, the gate token (which no endpoint serves, #968) and a typed phrase;
+the halt takes a halt token of its own. The guarantee is that **eight of the
 ten capability-increasing actions in `keel/capabilities.py` are unreachable from this package and
 the other two only as that gate table declares them**, asserted by a test that scans this source
 rather than by inspection. "No POST" said the server could not write; this says it cannot arm,
@@ -60,12 +61,14 @@ from keel.web import api, events, runtime, staticfiles
 from keel.web.security import (
     CSRF_HEADER,
     GATES_HEADER,
+    HALT_HEADER,
     REMOTE_SESSION_MAX_AGE_SECONDS,
     SESSION_COOKIE,
     HostPolicy,
     csrf_token,
     gated_action_permitted,
     gates_token,
+    halt_token,
     parse_cookie_header,
     session_cookie,
     tokens_match,
@@ -232,8 +235,21 @@ API_GATES_PREFIX = "/api/gates/"
 HALT_KEY = "halt"
 
 #: One sentence for the missing-gate-token refusal, in one place, because two spellings of one
-#: refusal is how a reader comes to think they are two different failures.
-_NO_GATE_TOKEN = "That request did not carry this session's gate token. Reload the page."
+#: refusal is how a reader comes to think they are two different failures. It no longer says
+#: "reload the page": no page carries the gate token (#968), so the remedy is the terminal.
+_NO_GATE_TOKEN = (
+    "That request did not carry this session's gate token, which no page is given. Release it "
+    "with `{command}` at a terminal."
+)
+
+#: The CLI command that releases each Tier 1 route, because the refusal above answers both and
+#: `keel resume` is the wrong remedy for `resume-entries`. Keyed like `gates.TIER1_ACTIONS`.
+_RELEASE_COMMAND = {"resume": "keel resume", "resume-entries": "keel resume-entries"}
+
+#: The halt's refusal, for `_NO_GATE_TOKEN`'s reason: the halt checks a different token in a
+#: different header (#968), and a refusal that named the wrong one would send the reader looking
+#: for the wrong failure.
+_NO_HALT_TOKEN = "That request did not carry this session's halt token. Reload the page."
 
 
 def run_setup_action(cfg: ServeConfig, key: str, form: dict[str, str]) -> Any:
@@ -748,15 +764,16 @@ class KeelHandler(BaseHTTPRequestHandler):
 
         Four checks apply to every write, in this order -- admission (`_admitted`),
         `Sec-Fetch-Site`, the `/api/` prefix and the `X-Keel-Client` header -- and then the path
-        splits. A setup
-        action must also carry the session's CSRF write token; a gated action is `_gated_action`'s,
-        which checks the gate token (and, for a release, locality and the typed phrase) instead and
-        reads its own docstring for why. That every write now passes the `X-Keel-Client` gate is
-        the change #540 brought. While the write surface was an HTML form at `/setup/*`, the
-        `X-Keel-Client` gate could not cover it (a form cannot set a header) and the two paths had
-        to differ; `_api_client_header_ok`'s docstring called that "the fix for one" defect and
-        said the widening was to happen "once, and only once, the forms it replaces are gone".
-        They are gone.
+        splits. A setup action must also carry the session's CSRF write token; a gated action is
+        `_gated_action`'s: the halt carries `halt_token` in `HALT_HEADER` and nothing more, and a
+        release carries `gates_token` in `GATES_HEADER` plus locality and the typed phrase --
+        three tokens, three headers, no route accepting another's (#968). Read its own docstring
+        for why. That every write now passes the `X-Keel-Client` gate is the change #540 brought.
+        While the write surface was an HTML form at `/setup/*`, the `X-Keel-Client` gate could
+        not cover it (a form cannot set a header) and the two paths had to differ;
+        `_api_client_header_ok`'s docstring called that "the fix for one" defect and said the
+        widening was to happen "once, and only once, the forms it replaces are gone". They are
+        gone.
 
         There is no dynamic dispatch here and no getattr on a user-supplied name. A write reaches
         keel through exactly two tables: `keel.commands.setup.ACTIONS` -- which contains only
@@ -832,16 +849,20 @@ class KeelHandler(BaseHTTPRequestHandler):
            because a ceremony in front of the stop makes the stop slower than the start, and the
            same argument refuses to add a LOCALITY condition to it: an operator whose deployment
            is behind a tunnel must be able to halt from the tunnel. It still needs the session
-           and the gate token, because it is a write; it needs nothing else, because refusing a
-           stop is the one failure mode this surface must not have.
+           and `halt_token` in `HALT_HEADER`, because it is a write; it needs nothing else,
+           because refusing a stop is the one failure mode this surface must not have. The halt
+           token is the one `/api/pulse` serves, and it is checked HERE ONLY: it opens no release
+           (#968).
 
         2. **Locality, for a release.** `gated_action_permitted` wants a loopback peer, a
            loopback bind and no declared remote origin -- see its own docstring for why the peer
            alone is not enough (a tunnel forwards to loopback) and why the bind is read too (a
            declaration is something an operator types, and two ordinary deployments never do).
 
-        3. **The gate token**, derived apart from the setup one so a value captured from
-           `/api/setup`'s document cannot release a rail.
+        3. **The gate token** in `GATES_HEADER`, derived apart from the setup token and from the
+           halt token, so a value captured from `/api/setup`'s or `/api/pulse`'s document cannot
+           release a rail. No endpoint serves it, so a browser session cannot produce it -- which
+           is what makes "no browser resume" a property of the server and not only of the client.
 
         4. **The typed phrase**, checked in `gates.run_gated_action`, which opens no database
            until it matches.
@@ -853,10 +874,10 @@ class KeelHandler(BaseHTTPRequestHandler):
         from keel.web import gates
 
         if key == HALT_KEY:
-            if not tokens_match(self.headers.get(GATES_HEADER), gates_token(self.cfg.token)):
-                self._refuse(403, "Refused", _NO_GATE_TOKEN)
+            if not tokens_match(self.headers.get(HALT_HEADER), halt_token(self.cfg.token)):
+                self._refuse(403, "Refused", _NO_HALT_TOKEN)
                 return
-            self._send_json(200, api.action_document(gates.run_halt(self.cfg)))
+            self._send_json(200, api.gate_document(HALT_KEY, gates.run_halt(self.cfg)))
             return
 
         if key not in gates.TIER1_ACTIONS:
@@ -878,7 +899,7 @@ class KeelHandler(BaseHTTPRequestHandler):
             return
 
         if not tokens_match(self.headers.get(GATES_HEADER), gates_token(self.cfg.token)):
-            self._refuse(403, "Refused", _NO_GATE_TOKEN)
+            self._refuse(403, "Refused", _NO_GATE_TOKEN.format(command=_RELEASE_COMMAND[key]))
             return
 
         values = self._read_json_object()
@@ -890,7 +911,7 @@ class KeelHandler(BaseHTTPRequestHandler):
         if done is None:
             self._refuse(403, "Refused", "That was not the phrase this action asks for.")
             return
-        self._send_json(200, api.action_document(done))
+        self._send_json(200, api.gate_document(key, done))
 
     def _read_json_object(self) -> dict[str, str] | None:
         """The JSON request body as `{field: string}`, or `None` for anything else.

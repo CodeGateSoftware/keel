@@ -90,12 +90,13 @@ def serve_cmd(
 
     Pages and the JSON API answer GET and HEAD. The write surface is a closed set of POSTs, each
     needing this run's session token and the console's own request header:
-    `POST /api/gates/halt` engages the kill-switch on a gate token alone -- no phrase, no
+    `POST /api/gates/halt` engages the kill-switch on a halt token alone -- no phrase, no
     locality check, because stopping must never be slower than starting;
     `POST /api/gates/resume` and `POST /api/gates/resume-entries` release a halt only from a
-    loopback session on a loopback bind, with a gate token and a typed phrase (the console offers
-    neither; `keel resume` at a terminal is the release path); `POST /api/setup/<step>` runs one
-    of `keel setup`'s idempotent mechanical steps, with a write token.
+    loopback session on a loopback bind, with a separate gate token no page is given and a typed
+    phrase (the console offers neither; `keel resume` at a terminal is the release path);
+    `POST /api/setup/<step>` runs one of `keel setup`'s idempotent mechanical steps, with a write
+    token.
 
     Everything else stays a CLI command behind the interactive-terminal gate: attesting,
     promoting a rule, recording a flow, turning autonomy on.

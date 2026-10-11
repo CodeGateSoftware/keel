@@ -44,7 +44,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from keel.web import payload, runtime
-from keel.web.security import csrf_token, gates_token, local_deployment
+from keel.web.security import csrf_token, halt_token, local_deployment
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from keel.web.server import ServeConfig
@@ -297,9 +297,11 @@ def read_pulse(cfg: ServeConfig, _query: Query, _state: Any, now_ts: int) -> dic
     this endpoint's to interpret. A read that failed and a window that held nothing are different
     facts, so a non-ok window keeps its own status and detail rather than flattening to "empty".
 
-    `gate` is `security.gates_token(cfg.token)`, on this endpoint only, for the HALT button: see
-    `payload.setup_payload` for why a derived write token may ride a GET body, and
-    `server._gated_action` for why the halt needs nothing else."""
+    `halt_token` is `security.halt_token(cfg.token)`, on this endpoint only, for the HALT button:
+    see `payload.setup_payload` for why a derived write token may ride a GET body, and
+    `server._gated_action` for why the halt needs nothing else. Never `gates_token`, which no
+    endpoint serves (#968): it releases a halt, and the page that stops keel must not hold the
+    value that restarts it."""
     from keel.commands.activity import (
         ActivityFeed,
         apply_scope,
@@ -325,7 +327,7 @@ def read_pulse(cfg: ServeConfig, _query: Query, _state: Any, now_ts: int) -> dic
         report = gather_pulse(repo, config, feed, now_ts=now_ts)
     finally:
         close_repo(repo)
-    return payload.pulse_payload(report, gate=gates_token(cfg.token))
+    return payload.pulse_payload(report, halt_token=halt_token(cfg.token))
 
 
 def read_orders(cfg: ServeConfig, query: Query, _state: Any, now_ts: int) -> dict[str, Any]:
@@ -887,7 +889,7 @@ class ApiRoute:
 #: keeltrading.com link in #539 and `render_glossary` is deleted in #540, so an `/api/glossary`
 #: would be a surface built in order to be removed -- and any client written against it would break
 #: on the release that removes it. `/api/pulse` carries the landing route (`/pulse`, the client's
-#: default): the glance page, and the one whose body holds the halt's gate token.
+#: default): the glance page, and the one whose body holds the halt token (never the gate token).
 API_ROUTES: dict[str, ApiRoute] = {
     "/api/config": ApiRoute(html_route="", read=read_config, needs_database=False),
     "/api/pulse": ApiRoute(
@@ -1313,6 +1315,28 @@ def action_document(result: Any) -> dict[str, Any]:
             ),
             "message": payload.label(str(getattr(result, "message", ""))),
         },
+    )
+
+
+def gate_document(key: str, done: str) -> dict[str, Any]:
+    """One completed gated action -- the halt or a Tier 1 release -- as JSON (#969).
+
+    Not `action_document`, whose input is a setup `ActionResult`: `gates.run_halt` and
+    `gates.run_gated_action` return the CLI's own line as a plain `str`, and reading `changed`
+    and `message` attributes off a `str` made every successful halt report "already done —
+    nothing to change" with an empty message. The line IS the message here, verbatim, so the
+    console shows `KILL_ENGAGED_LINE` exactly as `keel kill` prints it.
+
+    **No `changed` key, deliberately.** The gated operations do not report whether the state
+    moved (`engage_kill_switch` on an engaged switch returns the same line), so any value here
+    would be a claim the server cannot back. `actions.describe` treats a missing `changed` as
+    nothing to append.
+    """
+    return payload.envelope(
+        int(time.time()),
+        # As in `action_document`: built only after the action ran in this process.
+        running=True,
+        data={"step_key": str(key), "message": payload.label(str(done))},
     )
 
 

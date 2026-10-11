@@ -114,16 +114,34 @@ def test_the_stopped_view_lands_on_audit() -> None:
     assert code.count("stoppedView(primary, pathFor(SETUP_ROUTE))") == 1
 
 
-def test_the_views_whose_content_moved_here_route_here() -> None:
+def test_the_views_whose_content_moved_route_where_it_lives() -> None:
     """A bookmark, a runbook line or an operator's habit naming `/setup`, `/timeline` or
     `/venues` lands on Audit & Setup, where that content now lives -- not on Pulse, where it does
-    not. Balances and Plans moved nowhere, so they keep landing on the home view."""
+    not. The same rule for the earlier PRs' moves (#969): `/positions` and `/orders` became
+    Holdings, `/insights` and `/research` became Rules. Balances, Plans, Status, Activity and
+    Gates moved nowhere (Pulse replaced the last three), so they keep landing on the home view."""
     code = _comments_only(_source("main.js"))
     block = re.search(r"const MOVED_ROUTES = \{(.*?)\};", code, re.S)
     assert block is not None, "main.js names no moved routes"
     moved = dict(re.findall(r'(\w+): "(\w+)"', block.group(1)))
 
-    assert moved == {"setup": "audit", "timeline": "audit", "venues": "audit"}
+    assert moved == {
+        "positions": "holdings",
+        "orders": "holdings",
+        "insights": "rules",
+        "research": "rules",
+        "setup": "audit",
+        "timeline": "audit",
+        "venues": "audit",
+    }
+    # Every retired name is either moved or deliberately left to land home -- no third case.
+    assert set(staticfiles.RETIRED_CLIENT_ROUTES) - set(moved) == {
+        "status",
+        "activity",
+        "gates",
+        "balances",
+        "plans",
+    }
     assert set(moved) <= set(staticfiles.RETIRED_CLIENT_ROUTES), "the server must serve the shell"
     assert set(moved.values()) <= set(staticfiles.CLIENT_ROUTES)
     # The lookup and its use, whole: a lookup whose result is discarded (`? asked : asked`) or a

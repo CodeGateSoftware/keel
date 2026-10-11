@@ -1,4 +1,4 @@
-"""The browser gate: two of the ten capability-increasing actions, and what releases them.
+"""The browser gate: two Tier 1 releases, their phrase ceremony, and the ungated halt.
 
 `keel/capabilities.py` has said since it was written that "#436's browser gate would be a second
 `Gate` here and a second value in `Capability.gate` -- which is the point of writing the
@@ -17,9 +17,13 @@ seven are refused here as firmly as they are refused to cron.
 **Not the whole gate either.** The typed phrase proves intent, not locality, and on its own it is
 the weakest of the three checks a request must pass. `security.gated_action_permitted` decides
 whether a request may attempt an action at all -- loopback peer, loopback bind, no declared
-remote origin -- and `security.gates_token` proves it came from a page this session served.
-Stage 2b wires all three into `server.do_POST`; **until it does, nothing in this package routes
-here, and `keel/web/__init__.py`'s invariant is unchanged.** This module is a declaration.
+remote origin -- and `security.gates_token` proves the caller holds this session's secret. No
+endpoint serves that token (#968): the console's HALT button holds `security.halt_token`, which
+opens the halt and no release, so a browser session can stop keel and cannot restart it.
+`server._gated_action` routes here: the console's HALT reaches `run_halt` through
+`/api/gates/halt` with the halt token, and the two releases are routed too
+(`/api/gates/resume`, `/api/gates/resume-entries`) but need the gates token, so no browser can
+complete one. `keel resume` and `keel resume-entries` at a terminal are the release path.
 
 ── WHY THESE TWO ─────────────────────────────────────────────────────────────────────────────
 
@@ -43,9 +47,9 @@ anywhere, which is the property that bounds it.
 
 **Stopping must never be slower than starting.** `keel kill` is ungated by design -- its own
 docstring says "Always allowed (safe action)" and it is absent from `CAPABILITIES`. The browser
-has no halt today, so a release route that shipped before one would mean an operator could start
-from a phone and not stop from it. Stage 2b ships the ungated one-click halt in the same change
-as the first release route, not after it.
+has the same one-click halt (`HALT`, below), shipped in the same change as the first release
+route so that an operator could never start from a phone and not stop from it. Today the
+asymmetry runs the safe way round: the browser can stop, and only a terminal can start.
 
 ── WHAT THE OPERATOR IS TOLD ─────────────────────────────────────────────────────────────────
 
@@ -81,7 +85,7 @@ from keel.data.repository import Repository
 
 @dataclass(frozen=True)
 class Tier1Action:
-    """One action the browser may release, and the sentence that releases it."""
+    """One Tier 1 release and the sentence that authorises it (routed, but token-gated: #968)."""
 
     #: The OPERATION ITSELF -- the state service from `keel.commands.trading`, imported and held
     #: as a reference. Never the `click.Command` of the same name: `getattr(keel.cli, "resume")()`
@@ -111,7 +115,7 @@ class Tier1Action:
 
 #: The two, and only these two (#781, #790). A read-only mapping, because the closure is the
 #: safety property and a plain `dict` let any importer add `autonomy-on` in one line -- while
-#: stage 2b's dispatch reads this table at request time.
+#: `server._gated_action` reads this table at request time.
 TIER1_ACTIONS: Mapping[str, Tier1Action] = MappingProxyType(
     {
         "resume": Tier1Action(
@@ -188,9 +192,10 @@ class UngatedAction:
 #: from `CAPABILITIES` -- because a ceremony in front of the stop makes the stop slower than the
 #: start. The browser inherits that exactly: one click, no typed phrase, no modal.
 #:
-#: It ships in the same change as the first release route. A release route landing first would
-#: mean an operator could start trading from a phone and not stop from it, which is the inversion
-#: this tier is ordered to avoid (#790).
+#: It shipped in the same change as the first release route. A release route landing first would
+#: have meant an operator could start trading from a phone and not stop from it, which is the
+#: inversion this tier is ordered to avoid (#790). The console's HALT reaches `run_halt` through
+#: `/api/gates/halt`, carrying `security.halt_token`.
 HALT = UngatedAction(operation=engage_kill_switch, done=KILL_ENGAGED_LINE)
 
 
@@ -199,8 +204,8 @@ def run_gated_action(cfg: Any, action_key: str, presented: object) -> str | None
 
     **`None` is the only refusal, and it is indistinguishable between causes.** An unknown key
     and a wrong phrase come back the same way, so a caller cannot use this to enumerate which
-    actions exist -- the table is public in the page that renders it, but that is a decision made
-    once, in the view, rather than leaked by every refusal here.
+    actions exist -- the table is public in source, but that is a decision made once
+    rather than leaked by every refusal here.
 
     **Nothing is opened before the phrase is checked.** The database connection happens after
     `phrase_matches`, so a wrong answer costs the deployment nothing -- not a write, not a read,
@@ -210,8 +215,8 @@ def run_gated_action(cfg: Any, action_key: str, presented: object) -> str | None
 
     This is the LAST of four checks, not the only one. `server.do_POST` runs the admission gate,
     the client-header gate, `security.gated_action_permitted` (loopback peer, loopback bind, no
-    declared remote origin) and `security.gates_token` before anything reaches here. The phrase
-    proves intent; those prove locality and provenance.
+    declared remote origin) and `security.gates_token` -- never the halt token -- before anything
+    reaches here. The phrase proves intent; those prove locality and provenance.
     """
     action = TIER1_ACTIONS.get(action_key) if isinstance(action_key, str) else None
     if action is None or not phrase_matches(action_key, presented):

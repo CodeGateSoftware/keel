@@ -30,6 +30,7 @@ from tests.web.test_client_assets import (
     _balanced_block,
     _code_only,
     _comments_only,
+    _comments_stripped,
     _function_body,
 )
 from tests.web.test_holdings_view import _split_top_level
@@ -465,14 +466,23 @@ def test_mount_hands_each_research_reading_to_the_parameter_named_for_its_endpoi
 
 
 @pytest.mark.parametrize("name", ["insights", "research"])
-def test_the_absorbed_views_are_routed_nowhere_and_land_on_pulse(name: str) -> None:
-    """Retired, not deleted from the server's knowledge: the shell still answers the old path so a
-    bookmark lands on Pulse through `routeFor`, and nothing in the client names the old view."""
-    main = _code_only(_source("main.js"))
+def test_the_absorbed_views_are_routed_nowhere_and_land_on_rules(name: str) -> None:
+    """Retired, not deleted from the server's knowledge: the shell still answers the old path, and
+    `routeFor` sends a bookmark to Rules -- where that content now lives (#969) -- through
+    `MOVED_ROUTES`. Nothing in the client names the old view."""
+    # Comments stripped, strings KEPT: `_code_only` blanks every literal, so a scan for
+    # `name: "insights"` over it can never match anything and passes whatever main.js says.
+    main = _comments_stripped(_source("main.js"))
+    block = re.search(r"const MOVED_ROUTES = \{(.*?)\};", main, re.S)
+    assert block is not None
+    moved = dict(re.findall(r'(\w+): "(\w+)"', block.group(1)))
+    routes = main[main.index("const ROUTES = [") : main.index("];", main.index("const ROUTES"))]
 
+    assert moved[name] == "rules"
+    assert routes.count('name: "rules"') == 1, "the scan reads string literals"
     assert name not in staticfiles.CLIENT_ROUTES
     assert name in staticfiles.RETIRED_CLIENT_ROUTES
-    assert f'name: "{name}"' not in main
+    assert f'name: "{name}"' not in routes
     assert f'route.name === "{name}"' not in main
     assert f"export function {name}View(" not in _source("render.js")
 

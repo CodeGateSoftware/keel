@@ -154,8 +154,10 @@ CLIENT_ENTRY = "index.html"
 #: `start_url: "/status"`, or a `/status?token=...` redirect, whenever no service worker answers.
 #: **Closed, like `CLIENT_ROUTES`**, for the same reason: it is names, never a wildcard. Console
 #: PR3 added Insights and Research (folded into Rules); PR4 added Setup, Timeline and Venues
-#: (folded into Audit & Setup -- `main.js`'s `MOVED_ROUTES` sends those three there rather than
-#: home) and Balances and Plans. Disjoint from `CLIENT_ROUTES`.
+#: (folded into Audit & Setup) and Balances and Plans. `main.js`'s `MOVED_ROUTES` sends every
+#: name whose content moved -- positions and orders to Holdings, insights and research to Rules,
+#: setup, timeline and venues to Audit & Setup -- where it now lives rather than home (#969).
+#: Disjoint from `CLIENT_ROUTES`.
 RETIRED_CLIENT_ROUTES: tuple[str, ...] = (
     "status",
     "activity",

@@ -262,9 +262,13 @@ def test_the_nav_runs_pulse_then_holdings() -> None:
 
 @pytest.mark.parametrize("name", ["orders", "positions"])
 def test_the_two_retired_views_are_gone_from_every_table(name: str) -> None:
-    """Retired, not removed: the name still serves the shell (so a bookmark lands on Pulse) but is
-    in no live table, and the view functions that drew them are declared nowhere."""
+    """Retired, not removed: the name still serves the shell, and `MOVED_ROUTES` sends a bookmark
+    to Holdings, where that content now lives (#969). It is in no live table, and the view
+    functions that drew them are declared nowhere."""
     main = _comments_only(_source("main.js"))
+    block = re.search(r"const MOVED_ROUTES = \{(.*?)\};", main, re.S)
+    assert block is not None
+    assert dict(re.findall(r'(\w+): "(\w+)"', block.group(1)))[name] == "holdings"
     routes = main[main.index("const ROUTES = [") : main.index("];", main.index("const ROUTES"))]
     hrefs = re.findall(r'<li><a href="([^"]+)">', _INDEX.read_text(encoding="utf-8"))
 
