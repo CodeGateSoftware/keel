@@ -34,14 +34,15 @@ Four independent layers, none of which is sufficient alone:
    so the BROWSER stops throwing away a token that is still valid; `SESSION_COOKIE_MAX_AGE_SECONDS`
    carries the whole argument for why that extends convenience and not authority.
 
-4. **A closed set of setup actions** is the whole write surface. `POST` exists now (#437 -- a
-   first-run user on a machine with no terminal has to be able to create a deployment somehow),
-   but it routes ONLY through `keel.commands.setup.ACTIONS`, every member of which is a step
-   declared `MECHANICAL`, is idempotent and is never destructive. Not one of the ten
-   capability-increasing actions in `keel/capabilities.py` is reachable, and a test asserts the
-   two sets are disjoint. That is a narrower guarantee than "no POST at all" was, and a more
-   useful one: "no POST" would have been satisfied by a server that could not set anything up,
-   while this is satisfied only by one that cannot arm, release or spend anything.
+4. **Two closed tables** are the write surface. `POST` exists now (#437 -- a first-run user on a
+   machine with no terminal has to be able to create a deployment somehow), and it routes through
+   `keel.commands.setup.ACTIONS`, every member of which is a step declared `MECHANICAL`, is
+   idempotent and is never destructive, or through the gate table (`/api/gates/*`: the halt and
+   the two Tier 1 releases, see `gates_token` below). Of the ten capability-increasing actions in
+   `keel/capabilities.py`, eight are unreachable and the other two are reachable only as that
+   table declares them, and a test asserts it. That is a narrower guarantee than "no POST at all"
+   was, and a more useful one: "no POST" would have been satisfied by a server that could not set
+   anything up, while this is satisfied only by one that cannot arm or spend anything.
 
 5. **A CSRF token** on every write. The `SameSite=Strict` cookie already stops a cross-site POST
    in any current browser; this is the layer that does not depend on the browser being current.

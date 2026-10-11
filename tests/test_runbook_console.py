@@ -107,6 +107,54 @@ def test_the_section_says_what_the_browser_cannot_do() -> None:
     assert "server implements no verb" not in section
 
 
+def _sentences(text: str) -> list[str]:
+    return [part.strip() for part in re.split(r"(?<=[.!?])\s+(?=[A-Z`*])", text) if part.strip()]
+
+
+def test_the_gated_releases_are_one_sentence_with_their_gate() -> None:
+    """**Pairings, not presence.** `"/api/gates/" in section` passed a paragraph that said the
+    routes "cannot release anything"; the safety fact is that the SAME sentence that names the
+    routes says what they release and under what condition, and the sentence naming the HALT
+    button says what it does."""
+    sentences = _sentences(_section())
+
+    # `/api/gates/halt` is named in an earlier sentence about the HALT route; the releases' sentence
+    # is the one that names the routes in general and says "release".
+    gates = [s for s in sentences if "/api/gates/" in s and "release" in s.lower()]
+    assert len(gates) == 1, gates
+    gate = gates[0].lower()
+    for phrase in (
+        "can also release the kill-switch",
+        "clear the consecutive-loss halt",
+        "loopback session on a loopback bind",
+        "typed phrase",
+    ):
+        assert phrase in gate, f"the /api/gates/ sentence lost {phrase!r}: {gates[0]}"
+    assert "cannot" not in gate and "only answer" not in gate
+
+    # Other sentences mention the button in passing; the exception clause is the claim.
+    halts = [
+        sentence
+        for sentence in sentences
+        if "halt button" in sentence.lower() and "exception" in sentence.lower()
+    ]
+    assert len(halts) == 1, halts
+    assert "engages the kill-switch" in halts[0].lower()
+
+
+def test_the_runbook_states_the_capability_count_the_registry_declares() -> None:
+    """The paragraph says how many actions `keel capabilities` lists. A literal here would only
+    move the drift, so the count comes from the registry: distinct actions are the rows that
+    mirror nothing, the same rule the `keel/web` prose is held to."""
+    from keel.capabilities import CAPABILITIES
+
+    words = ["zero", "one", "two", "three", "four", "five", "six", "seven", "eight", "nine", "ten"]
+    stated = re.findall(r"`keel capabilities` lists all (\w+)", _section())
+    assert len(stated) == 1, stated
+    assert stated[0] in words, stated
+    assert words.index(stated[0]) == len([c for c in CAPABILITIES if c.mirrors is None])
+
+
 def test_the_section_answers_the_headless_case() -> None:
     """ "But SSH" is the first objection to deleting a terminal UI, and the runbook must answer it
     where an operator will be standing when they ask."""

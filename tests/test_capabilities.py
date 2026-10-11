@@ -290,3 +290,29 @@ def test_every_row_says_what_it_grants(cap: Capability) -> None:
     assert len(cap.increases) > 30
     assert cap.invocation
     assert len({c.increases for c in CAPABILITIES}) == len(CAPABILITIES)
+
+
+def test_a_web_row_names_the_route_it_is_reached_at_and_no_button() -> None:
+    """**The `invocation` of a `web` row reaches operators through `keel capabilities` and the MCP
+    tool, so it may only name something that exists.** The console draws one write control, HALT;
+    the two releases are POST routes answered on a loopback session and drawn nowhere, which
+    `keel/web/server.py` says in as many words. Rows once read "the Resume trading button" and
+    "the Clear streak halt button" -- controls no page has ever drawn (#954 round 2).
+
+    So each web row must name `POST /api/gates/<key>` for a key that is really in the gate table,
+    one row per key, and the word "button" may not appear in any row's invocation."""
+    import re
+
+    from keel.web.gates import TIER1_ACTIONS
+    from keel.web.server import API_GATES_PREFIX
+
+    web = [cap for cap in CAPABILITIES if cap.surface == "web"]
+    assert len(web) == len(TIER1_ACTIONS), "a web row without a gate-table key, or the reverse"
+    routes = []
+    for cap in web:
+        match = re.match(rf"POST {re.escape(API_GATES_PREFIX)}([a-z-]+)\b", cap.invocation)
+        assert match, f"{cap.key}: invocation {cap.invocation!r} names no POST route"
+        routes.append(match.group(1))
+    assert sorted(routes) == sorted(TIER1_ACTIONS), routes
+    for cap in CAPABILITIES:
+        assert "button" not in cap.invocation.lower(), f"{cap.key} names a button"

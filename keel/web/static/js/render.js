@@ -1302,8 +1302,8 @@ export function auditView(
  * Every action keel offers is listed with its title, its detail and the inputs it asks for, and
  * each MECHANICAL one is a form that performs it (`actionCard`): `/api/setup` is the one document
  * that carries this session's CSRF write token, and `main.js` keeps it off this reading. Refusal
- * stays the server's job regardless: `server.do_POST` routes only through
- * `keel.commands.setup.ACTIONS` and refuses anything else whatever any front-end draws.
+ * stays the server's job regardless: a `/api/setup/*` POST reaches only
+ * `keel.commands.setup.ACTIONS` and the server refuses anything else whatever any front-end draws.
  *
  * The kind note for an `operator_input` step is carried on the payload (`_STEP_KIND_NOTES` has
  * all four kinds), so the step that asks for a credential explains itself.

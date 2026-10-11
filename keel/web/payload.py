@@ -1916,7 +1916,7 @@ def timeline_payload(report: TimelineReport) -> dict[str, Any]:
         "chain_errors": [str(error) for error in report.chain_errors],
         # How reading the engine's log went, so the page can say why `system` rows are absent: the
         # keel-only default is mostly those rows, and a silent missing log would empty it.
-        "engine_log": _timeline_log_payload(report.log_status),
+        "engine_log": _timeline_log_payload(report),
         "rows": [_timeline_row_payload(row) for row in report.rows],
     }
 
@@ -1931,20 +1931,21 @@ _TIMELINE_LOG_NOTES: Mapping[str, str] = {
 }
 
 
-def _timeline_log_payload(status: str) -> Field | None:
+def _timeline_log_payload(report: TimelineReport) -> Field | None:
     """The engine-log status as a field, or `None` when the log was read.
 
-    Nothing to say then, and the client may not judge a value itself, so it tests presence.
-    `missing` and `empty` are ordinary states (a deployment that has not cycled yet), so they read
-    UNKNOWN; a log that is there and did not reach the report is the one that warns -- the same
-    split `TimelineReport.log_gap` draws."""
+    Nothing to say then, and the client may not judge a value itself, so it tests presence. The
+    state is `TimelineReport.log_gap` and nothing of its own, so the page agrees with the CSV's
+    NOTE line about the same log: `missing` is an ordinary state (a deployment that has not cycled
+    yet) and reads UNKNOWN; every other non-`ok` status -- `empty` included -- is a log that is
+    there and did not reach the report, and warns."""
+    status = report.log_status
     if status == "ok":
         return None
-    state = UNKNOWN if status in ("missing", "empty") else WARN
     return label(
         status,
         display=_TIMELINE_LOG_NOTES.get(status, _TIMELINE_LOG_NOTES["unreadable"]),
-        state=state,
+        state=WARN if report.log_gap else UNKNOWN,
     )
 
 

@@ -1473,22 +1473,32 @@ def test_not_recorded_is_shown_whole_because_it_is_a_sentence() -> None:
 def test_the_engine_log_status_rides_the_timeline_wire() -> None:
     """`system` rows come from the engine log. When it did not reach the report the page has to be
     able to say why those rows are absent, so the status crosses the wire with a sentence (and as
-    `None` when the log was read)."""
+    `None` when the log was read).
+
+    Each status is pinned to its exact sentence AND state, not to a word in it: a note that said
+    "so system rows are shown" would still contain "system". The state follows
+    `TimelineReport.log_gap`, the rule the CSV's NOTE line uses, so the page and the export tell
+    the same story: `missing` is ordinary (UNKNOWN); every other non-`ok` status is a gap (WARN),
+    `empty` included."""
     assert payload.timeline_payload(_timeline_report())["engine_log"] is None
 
-    for status in ("missing", "empty", "oversized", "unreadable"):
-        field = payload.timeline_payload(_timeline_report(log_status=status))["engine_log"]
-        assert field["value"] == status
-        assert field["display"] != status, f"{status} has no sentence beside it"
-        assert "system" in field["display"], status
-    assert (
-        payload.timeline_payload(_timeline_report(log_status="unreadable"))["engine_log"]["state"]
-        == "warn"
-    )
-    assert (
-        payload.timeline_payload(_timeline_report(log_status="missing"))["engine_log"]["state"]
-        == "unknown"
-    )
+    expected = {
+        "missing": ("no engine log was found, so no system rows (cycles) are shown", "unknown"),
+        "empty": ("the engine log is empty, so no system rows (cycles) are shown", "warn"),
+        "oversized": (
+            "the engine log is too large to read, so no system rows (cycles) are shown",
+            "warn",
+        ),
+        "unreadable": (
+            "the engine log could not be read, so no system rows (cycles) are shown",
+            "warn",
+        ),
+    }
+    for status, (sentence, state) in expected.items():
+        report = _timeline_report(log_status=status)
+        field = payload.timeline_payload(report)["engine_log"]
+        assert (field["value"], field["display"], field["state"]) == (status, sentence, state)
+        assert (field["state"] == "warn") == report.log_gap, f"{status}: page and CSV disagree"
 
 
 def test_a_row_past_a_break_is_bad_even_though_it_has_a_hash() -> None:

@@ -15,10 +15,11 @@ nothing else" -- stopped being true at #437 and is corrected rather than deleted
 `server.do_POST` still points a reader at this file for the rule it must not break. The guarantee
 now is stronger than the one it replaced, and it is the one anyone actually cares about:
 
-* `do_POST` exists, and it routes ONLY through `keel.commands.setup.ACTIONS` -- idempotent,
-  non-destructive steps -- so a first-run user on a machine with no terminal can create a
-  deployment. "No POST at all" was a clean property that was also satisfied by a server which
-  could not set anything up.
+* `do_POST` exists, and it has exactly two routes: `/api/setup/*` through
+  `keel.commands.setup.ACTIONS` -- idempotent, non-destructive steps -- so a first-run user on a
+  machine with no terminal can create a deployment, and `/api/gates/*` through the gate table
+  (the halt and the two releases below). "No POST at all" was a clean property that was also
+  satisfied by a server which could not set anything up.
 * **Eight of the ten capability-increasing actions in `keel/capabilities.py` are unreachable
   from this package, and the other two are reachable only as the gate table declares them**,
   asserted by tests that scan this source rather than by inspection. The server cannot arm or

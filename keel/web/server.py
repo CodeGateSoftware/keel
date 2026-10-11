@@ -746,17 +746,22 @@ class KeelHandler(BaseHTTPRequestHandler):
         """The ENTIRE write surface (#437, moved under `/api/` at #540). Read
         `keel/web/__init__.py` before extending it.
 
-        Five checks, in this order, and every one of them applies to every write now -- which is
+        Four checks apply to every write, in this order -- admission (`_admitted`),
+        `Sec-Fetch-Site`, the `/api/` prefix and the `X-Keel-Client` header -- and then the path
+        splits. A setup
+        action must also carry the session's CSRF write token; a gated action is `_gated_action`'s,
+        which checks the gate token (and, for a release, locality and the typed phrase) instead and
+        reads its own docstring for why. That every write now passes the `X-Keel-Client` gate is
         the change #540 brought. While the write surface was an HTML form at `/setup/*`, the
         `X-Keel-Client` gate could not cover it (a form cannot set a header) and the two paths had
         to differ; `_api_client_header_ok`'s docstring called that "the fix for one" defect and
         said the widening was to happen "once, and only once, the forms it replaces are gone".
         They are gone.
 
-        There is no dynamic dispatch here, no getattr on a user-supplied name, and no path that
-        reaches keel other than `keel.commands.setup.ACTIONS` -- which contains only idempotent,
-        non-destructive, `MECHANICAL` steps and cannot contain anything else without failing a
-        test."""
+        There is no dynamic dispatch here and no getattr on a user-supplied name. A write reaches
+        keel through exactly two tables: `keel.commands.setup.ACTIONS` -- which contains only
+        idempotent, non-destructive, `MECHANICAL` steps and cannot contain anything else without
+        failing a test -- or `gates.TIER1_ACTIONS` plus the halt, behind `_gated_action`."""
         self.body_consumed = False
         parsed = urlsplit(self.path)
         if not self._admitted():

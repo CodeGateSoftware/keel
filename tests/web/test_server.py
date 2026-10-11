@@ -455,6 +455,40 @@ def test_the_disjointness_comments_state_the_actual_capability_count() -> None:
         )
 
 
+def test_no_source_says_do_post_routes_only_through_setup_actions() -> None:
+    """`do_POST` also reaches the gate table (`/api/gates/*`: the halt and the two Tier 1
+    releases), so any sentence that calls `setup.ACTIONS` its only route, or says one set of checks
+    "applies to every write", is false -- and five such sentences outlived the fix that made the
+    first one false (#954 round 2). Scans every source for the phrases, across line wraps."""
+    import re
+
+    root = Path(__file__).resolve().parent.parent.parent / "keel"
+    sources = sorted(root.rglob("*.py")) + sorted((root / "web" / "static" / "js").glob("*.js"))
+    assert len(sources) > 100, "the scan found too few sources, which would make it vacuous"
+    # A comment marker (`#`, `#:`, ` *`) and indentation may sit between any two words.
+    gap = r"[\s#:*]+"
+    phrases = {
+        "routes only through setup.ACTIONS": (
+            rf"routes?{gap}ONLY{gap}through{gap}.keel\.commands\.setup\.ACTIONS"
+        ),
+        "only surface do_POST routes to": rf"only{gap}surface{gap}.server\.do_POST.",
+        "whole write surface": rf"whole{gap}write{gap}surface",
+        "no path other than ACTIONS": (
+            rf"no{gap}path{gap}that{gap}reaches{gap}keel{gap}other{gap}than"
+        ),
+        "five checks apply to every write": (
+            rf"Five{gap}checks.{{0,400}}applies{gap}to{gap}every{gap}write"
+        ),
+    }
+    hits = [
+        f"{path.relative_to(root)}: {name}"
+        for path in sources
+        for name, pattern in phrases.items()
+        if re.search(pattern, path.read_text(encoding="utf-8"), re.IGNORECASE | re.DOTALL)
+    ]
+    assert hits == [], f"stale claims about the write surface: {hits}"
+
+
 # -- CSRF -------------------------------------------------------------------------------------
 
 

@@ -1018,9 +1018,10 @@ covers the rest from a plain shell.
 
 **What the browser cannot do, and that is deliberate.** Every capability-increasing action --
 arming autonomy, releasing the kill-switch, clearing a consecutive-loss halt, re-seeding the
-drawdown high-water mark, declaring a deposit or withdrawal, attesting withdrawal capability, and
-replacing the binary -- is a CLI command behind a typed confirmation at an interactive terminal.
-`keel capabilities` lists all seven with the gate covering each. The one exception is the console's
+drawdown high-water mark, declaring a deposit or withdrawal, attesting withdrawal capability, scope
+or posture, declaring an out-of-band close, and replacing the binary -- is a CLI command behind a
+typed confirmation at an interactive terminal. `keel capabilities` lists all ten with the gate
+covering each. The one exception is the console's
 HALT button, which engages the kill-switch (stopping is never gated). The server's gated routes
 under `/api/gates/` can also release the kill-switch and clear the consecutive-loss halt, but only
 for a loopback session on a loopback bind with the typed phrase, and the page draws no control for

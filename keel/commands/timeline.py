@@ -192,7 +192,8 @@ class TimelineReport:
     rows: tuple[TimelineRow, ...]
 
     #: Every kind present in the SCOPED set, in `TIMELINE_KINDS` order, led by `KEEL_KIND` when
-    #: either of `KEEL_KINDS` is present -- what a chip bar is
+    #: either of `KEEL_KINDS` is present or when `keel` is the applied filter (the console's
+    #: default, so the filter that emptied the table stays visible) -- what a chip bar is
     #: built from. STORED rather than derived from `rows`, because `rows` is what the chip and
     #: the cap left: derived from those, selecting Flows would delete the Trades chip and leave
     #: no way back, and a kind whose only rows fell past the limit would vanish from the bar

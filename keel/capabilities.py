@@ -244,7 +244,9 @@ CAPABILITIES: tuple[Capability, ...] = (
         module="keel.web.gates",
         function="run_gated_action",
         surface="web",
-        invocation="the Resume trading button, with its typed phrase",
+        invocation=(
+            "POST /api/gates/resume with its typed phrase (loopback; the console draws no control)"
+        ),
         increases=(
             "trading resumes after the kill-switch halted it -- the same increase `keel resume` "
             "grants, reached from a browser on a loopback session instead of from a terminal"
@@ -256,7 +258,10 @@ CAPABILITIES: tuple[Capability, ...] = (
         module="keel.web.gates",
         function="run_gated_action",
         surface="web",
-        invocation="the Clear streak halt button, with its typed phrase",
+        invocation=(
+            "POST /api/gates/resume-entries with its typed phrase (loopback; the console draws "
+            "no control)"
+        ),
         increases=(
             "new entries resume after rail 16's consecutive-loss halt -- the same increase "
             "`keel resume-entries` grants, reached from a browser on a loopback session"
