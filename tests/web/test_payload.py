@@ -159,7 +159,7 @@ def _insights_report(**overrides: Any) -> InsightsReport:
                 status="paper",
                 promotion_class="trend",
                 n_trades=12,
-                win_rate=41.5,
+                win_rate=0.415,
                 avg_win=Decimal("31.20"),
                 avg_loss=Decimal("-14.05"),
                 realized_rr=Decimal("2.22"),
@@ -173,8 +173,8 @@ def _insights_report(**overrides: Any) -> InsightsReport:
                     n_trades=12,
                     min_trades=30,
                     trades_remaining=18,
-                    win_rate=41.5,
-                    min_win_rate=40.0,
+                    win_rate=0.415,
+                    min_win_rate=0.4,
                     realized_rr=Decimal("2.22"),
                     min_rr=Decimal("2.0"),
                     expectancy=Decimal("0.8410"),
@@ -770,14 +770,18 @@ def test_a_drawdown_fraction_is_not_rescaled_into_a_percentage() -> None:
     assert built["drawdown"]["max_total"]["value"] == "0.20"
 
 
-def test_a_win_rate_float_is_re_encoded_not_recomputed() -> None:
-    """`RuleTrackRecord.win_rate` is a `float` upstream -- a statistic, never money. It reaches the
-    wire through its own shortest round-trip repr, so the figure on the wire is the figure the
-    report held and nothing was recomputed on the way."""
-    built = payload.rules_payload(_rule_rows(), records=_insights_report())
+def test_a_win_rate_fraction_is_shown_as_the_reports_own_percentage() -> None:
+    """`RuleTrackRecord.win_rate` is a 0..1 `float` upstream -- a statistic, never money. The
+    REPORT carries it in percent units (`win_rate_pct`), so the payload only suffixes: 0.415 is
+    "41.5%" on the wire, not "0.4%", and nothing was multiplied here."""
+    report = _insights_report()
+    built = payload.rules_payload(_rule_rows(), records=report)
+    record = report.rules[0]
 
-    assert built["records"][0]["win_rate"]["value"] == "41.5"
+    assert built["records"][0]["win_rate"]["value"] == str(record.win_rate_pct) == "41.5"
     assert built["records"][0]["win_rate"]["display"] == "41.5%"
+    assert built["records"][0]["gate"]["win_rate"]["display"] == "41.5%"
+    assert built["records"][0]["gate"]["min_win_rate"]["display"] == "40.0%"
 
 
 # -- Rule 3: semantic state is a field, never an inference ----------------------------------------

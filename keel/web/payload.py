@@ -207,7 +207,8 @@ def _plain(value: Decimal) -> str:
 def _decimalise(value: Decimal | float | None) -> Decimal | None:
     """A finite `Decimal`, or `None` for anything that cannot honestly become one.
 
-    A `float` arrives only from a non-monetary statistic (`RuleTrackRecord.win_rate`); money is
+    A `float` arrives only from a non-monetary statistic (`RuleTrackRecord.win_rate`, before the
+    report converts it); money is
     `Decimal` end to end and never takes this path. `repr()` gives the shortest string that
     round-trips the float, so the figure on the wire is the figure the report held -- re-encoded,
     not recomputed. NaN/Inf (from a corrupt log timestamp, or a `Decimal("NaN")` sentinel) become
@@ -1104,7 +1105,14 @@ def pulse_payload(report: PulseReport, *, gate: str = "") -> dict[str, Any]:
 
 def _gate_payload(gate: GateDistance) -> dict[str, Any]:
     """The promotion gate's distance. `passing` is the engine's verdict, copied; the floors are
-    the config's own values, copied. Nothing here re-runs `check_floors`."""
+    the config's own values, copied. Nothing here re-runs `check_floors`.
+
+    The win rate and its floor are 0..1 fractions upstream; the report carries them in percent
+    units (`win_rate_pct`) so `percent` only suffixes. The rule's OWN figures (win rate,
+    expectancy) are unknown at zero trades -- `BacktestResult` returns 0 for an empty sample, and
+    serialising that as data shows unknown as zero. The floors, the counts and the distance
+    remaining are known at zero trades and stay numbers."""
+    traded = gate.n_trades != 0
     return {
         "rule_name": gate.rule_name,
         "promotion_class": gate.promotion_class,
@@ -1113,11 +1121,11 @@ def _gate_payload(gate: GateDistance) -> dict[str, Any]:
         "trades_remaining": count(
             gate.trades_remaining, state=GOOD if gate.trades_remaining == 0 else WARN
         ),
-        "win_rate": percent(gate.win_rate, places=1),
-        "min_win_rate": percent(gate.min_win_rate, places=1),
+        "win_rate": percent(gate.win_rate_pct, places=1) if traded else absent(),
+        "min_win_rate": percent(gate.min_win_rate_pct, places=1),
         "realized_rr": ratio(gate.realized_rr),
         "min_rr": ratio(gate.min_rr),
-        "expectancy": money(gate.expectancy, places=4, signed=True),
+        "expectancy": money(gate.expectancy, places=4, signed=True) if traded else absent(),
         "min_expectancy": money(gate.min_expectancy, places=4),
         "passing": flag(gate.passing, on="passing", off="blocked", on_state=GOOD, off_state=WARN),
         "blocking_reasons": list(gate.blocking_reasons),
@@ -1125,18 +1133,23 @@ def _gate_payload(gate: GateDistance) -> dict[str, Any]:
 
 
 def _track_record_payload(record: RuleTrackRecord) -> dict[str, Any]:
+    """One rule's track record. At zero closed trades every statistic is UNKNOWN, not zero: the
+    sample is empty, so there is no win rate to be 0% and no average to be $0.00 (the report holds
+    0 because `BacktestResult` does; serialising that as data would assert a measurement). The
+    trade count stays a real number. Win rate is in percent units (see `_gate_payload`)."""
+    traded = record.n_trades != 0
     return {
         "rule_name": record.rule_name,
         "status": label(record.status),
         "promotion_class": record.promotion_class,
         "n_trades": count(record.n_trades),
-        "win_rate": percent(record.win_rate, places=1),
-        "avg_win": money(record.avg_win),
-        "avg_loss": money(record.avg_loss),
+        "win_rate": percent(record.win_rate_pct, places=1) if traded else absent(),
+        "avg_win": money(record.avg_win) if traded else absent(),
+        "avg_loss": money(record.avg_loss) if traded else absent(),
         "realized_rr": ratio(record.realized_rr),
-        "expectancy": money(record.expectancy, places=4, signed=True),
-        "profit_factor": ratio(record.profit_factor),
-        "max_drawdown": money(record.max_drawdown),
+        "expectancy": money(record.expectancy, places=4, signed=True) if traded else absent(),
+        "profit_factor": ratio(record.profit_factor) if traded else absent(),
+        "max_drawdown": money(record.max_drawdown) if traded else absent(),
         # `significant` is `n_trades >= 30`, computed by the report. Below that floor a win rate
         # is not distinguishable from random entry, so the payload SAYS so rather than leaving the
         # number to speak for itself -- the same choice `render_summary` makes at the terminal.

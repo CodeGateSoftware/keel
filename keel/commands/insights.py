@@ -563,6 +563,18 @@ def _plot_x(index: int, total: int) -> Decimal:
     return (PLOT_WIDTH * Decimal(index) / Decimal(total - 1)).quantize(_COORD)
 
 
+def _percent_units(fraction: float) -> Decimal:
+    """A 0..1 fraction in percent units (`0.415` -> `41.5`), with the multiply's scale artifact
+    removed.
+
+    The conversion lives HERE, in the report, for the reason `commands/slippage.py::_bp` gives:
+    `payload.percent` takes a figure already in percent units and the serialiser must not
+    rescale -- that would be "the serialiser computing a figure the report never held". The
+    shortest round-trip repr goes in, so `0.3` is `30` and not `30.000000000000004`.
+    """
+    return (Decimal(repr(fraction)) * 100).normalize()
+
+
 @dataclass(frozen=True)
 class GateDistance:
     rule_name: str
@@ -578,6 +590,16 @@ class GateDistance:
     min_expectancy: Decimal
     passing: bool
     blocking_reasons: list[str]
+
+    @property
+    def win_rate_pct(self) -> Decimal:
+        """`win_rate` in percent units, for the web page. The CLI keeps printing the fraction."""
+        return _percent_units(self.win_rate)
+
+    @property
+    def min_win_rate_pct(self) -> Decimal:
+        """`min_win_rate` in percent units, for the web page."""
+        return _percent_units(self.min_win_rate)
 
 
 @dataclass(frozen=True)
@@ -600,6 +622,11 @@ class RuleTrackRecord:
     gate: GateDistance | None
     """`None` for any status other than `paper` -- a `candidate` hasn't backtested yet and a
     `live`/`disabled` rule has already cleared (or been pulled from) the gate this measures."""
+
+    @property
+    def win_rate_pct(self) -> Decimal:
+        """`win_rate` in percent units, for the web page. The CLI keeps printing the fraction."""
+        return _percent_units(self.win_rate)
 
 
 @dataclass(frozen=True)

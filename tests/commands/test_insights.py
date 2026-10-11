@@ -408,6 +408,99 @@ def test_insights_report_counts_closed_trades(repo: Repository) -> None:
     assert report.closed_trade_count == 2
 
 
+# -- the Rules page's reading of a real report (#953 F4, F5) -------------------------------------
+
+_TRADED = ("win_rate", "avg_win", "avg_loss", "expectancy", "profit_factor", "max_drawdown")
+
+
+def _rules_records(repo: Repository) -> list[dict[str, Any]]:
+    from keel.web import payload
+
+    config = _config()
+    status_report = gather_status(repo, config, now_ts=NOW_TS)
+    report = build_insights_report(repo, config, status_report, NOW_TS)
+    return payload.rules_payload([], records=report)["records"]
+
+
+def test_a_real_records_win_rate_is_displayed_as_the_clis_percentage(repo: Repository) -> None:
+    """`win_rate` is a 0..1 fraction (`wins / n`); `percent()` takes percent units, so the page
+    once showed 40% as "0.4%". Drive a REAL report through `rules_payload` and compare with the
+    CLI's own `f"{win_rate:.1%}"` -- for the record, the gate's figure and the gate's floor."""
+    repo.insert_rule("turtle_breakout", {"product_id": "BTC-USD"}, status="paper")
+    for i in range(2):
+        _seed_paper_trade(repo, "turtle_breakout", entry_ts=1000 + i, exit_ts=1100 + i)
+    for i in range(3):
+        _seed_paper_trade(
+            repo,
+            "turtle_breakout",
+            exit_price="90",
+            pnl="-10",
+            r_multiple="-1.0",
+            outcome="loss",
+            entry_ts=2000 + i,
+            exit_ts=2100 + i,
+        )
+    config = _config()
+    report = build_insights_report(repo, config, gather_status(repo, config, now_ts=NOW_TS), NOW_TS)
+    record = report.rules[0]
+    assert record.gate is not None and record.win_rate == 0.4
+
+    shown = _rules_records(repo)[0]
+
+    assert shown["win_rate"]["display"] == f"{record.win_rate:.1%}" == "40.0%"
+    assert shown["gate"]["win_rate"]["display"] == f"{record.gate.win_rate:.1%}"
+    assert shown["gate"]["min_win_rate"]["display"] == f"{record.gate.min_win_rate:.1%}" == "30.0%"
+
+
+def test_the_cli_summary_still_prints_the_fraction_as_it_always_did(repo: Repository) -> None:
+    """The percent-unit value is carried beside the fraction; the CLI line and the gate floor
+    figures are untouched."""
+    repo.insert_rule("turtle_breakout", {"product_id": "BTC-USD"}, status="paper")
+    for i in range(2):
+        _seed_paper_trade(repo, "turtle_breakout", entry_ts=1000 + i, exit_ts=1100 + i)
+    config = _config()
+    report = build_insights_report(repo, config, gather_status(repo, config, now_ts=NOW_TS), NOW_TS)
+
+    joined = "\n".join(render_summary(report))
+
+    assert "win_rate=100.0%" in joined
+    assert "win_rate>=0.3," in joined
+
+
+def test_a_rule_with_no_closed_trades_shows_its_statistics_as_unknown_not_zero(
+    repo: Repository,
+) -> None:
+    """Unknown shown as zero: 0 trades is "nothing to measure", not "0% win rate, $0.00 average".
+    Trade counts and gate distances stay real numbers -- those ARE known."""
+    repo.insert_rule("turtle_breakout", {"product_id": "BTC-USD"}, status="paper")
+
+    shown = _rules_records(repo)[0]
+
+    assert shown["n_trades"]["display"] == "0"
+    for key in _TRADED:
+        assert shown[key]["display"] == "—" and shown[key]["state"] == "unknown", key
+    gate = shown["gate"]
+    for key in ("win_rate", "expectancy"):
+        assert gate[key]["display"] == "—" and gate[key]["state"] == "unknown", key
+    assert gate["n_trades"]["display"] == "0"
+    assert gate["trades_remaining"]["display"] == "100"
+    assert gate["min_win_rate"]["display"] == "30.0%"
+    assert gate["min_trades"]["display"] == "100"
+
+
+def test_a_rule_with_one_closed_trade_still_shows_numbers(repo: Repository) -> None:
+    repo.insert_rule("turtle_breakout", {"product_id": "BTC-USD"}, status="paper")
+    _seed_paper_trade(repo, "turtle_breakout")
+
+    shown = _rules_records(repo)[0]
+
+    assert shown["n_trades"]["display"] == "1"
+    assert shown["win_rate"]["display"] == "100.0%"
+    for key in ("win_rate", "avg_win", "expectancy", "max_drawdown"):
+        assert shown[key]["display"] != "—", key
+    assert shown["gate"]["win_rate"]["display"] == "100.0%"
+
+
 # -- build_journal_report -----------------------------------------------------------------------
 
 
