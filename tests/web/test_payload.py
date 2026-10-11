@@ -582,8 +582,9 @@ def _report_figures(node: Any, seen: set[int] | None = None) -> set[Decimal]:
     if isinstance(node, Decimal):
         return {node}
     if isinstance(node, float):
-        # A statistic (`RuleTrackRecord.win_rate`), never money. Its shortest round-trip repr is
-        # the figure the report holds, and that is what `payload._plain` re-encodes it as.
+        # A statistic (`RuleTrackRecord.win_rate`, a fraction), never money. The wire carries the
+        # report's own `win_rate_pct` (a Decimal) rather than this float, so this branch only
+        # adds the float's shortest round-trip repr to the figures the report is known to hold.
         return {Decimal(repr(node))}
     if isinstance(node, int):
         return {Decimal(node)}
@@ -638,9 +639,9 @@ def test_the_serialiser_computes_nothing_every_wire_figure_came_from_the_report(
     nowhere on the report -- and would fail here, by name and path.
 
     `PulseReport` and the Rules pair (ledger rows plus `InsightsReport`) are used. The track
-    records carry `float` win rates, which `_report_figures` reads through their shortest
-    round-trip repr -- the exact string the serialiser writes -- and which have their own test
-    below.
+    records carry `float` win-rate fractions, which `_report_figures` reads through their shortest
+    round-trip repr; the wire shows the report's own `win_rate_pct` (a `Decimal`), which has its
+    own test below.
     """
     for name, reports, built in (
         ("pulse", (_pulse_report(),), payload.pulse_payload(_pulse_report())),

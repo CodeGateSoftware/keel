@@ -461,10 +461,17 @@ def test_the_cli_summary_still_prints_the_fraction_as_it_always_did(repo: Reposi
     config = _config()
     report = build_insights_report(repo, config, gather_status(repo, config, now_ts=NOW_TS), NOW_TS)
 
-    joined = "\n".join(render_summary(report))
+    lines = render_summary(report)
+    record = [line for line in lines if line.startswith("  [turtle_breakout]")]
+    gate = [line for line in lines if line.startswith("    gate:")]
 
-    assert "win_rate=100.0%" in joined
-    assert "win_rate>=0.3," in joined
+    assert record == [
+        "  [turtle_breakout] status=paper class=trend_follow n=2 win_rate=100.0% avg_win=10.00 "
+        "avg_loss=0.00 rr=n/a (no losses yet) expectancy=10.00 profit_factor=Infinity max_dd=0.00"
+    ]
+    assert gate == [
+        "    gate: blocked -- trades_remaining=98 (n>=100, win_rate>=0.3, rr>=1.5, expectancy>0)"
+    ]
 
 
 def test_a_rule_with_no_closed_trades_shows_its_statistics_as_unknown_not_zero(

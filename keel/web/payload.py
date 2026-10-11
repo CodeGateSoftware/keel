@@ -207,12 +207,12 @@ def _plain(value: Decimal) -> str:
 def _decimalise(value: Decimal | float | None) -> Decimal | None:
     """A finite `Decimal`, or `None` for anything that cannot honestly become one.
 
-    A `float` arrives only from a non-monetary statistic (`RuleTrackRecord.win_rate`, before the
-    report converts it); money is
-    `Decimal` end to end and never takes this path. `repr()` gives the shortest string that
-    round-trips the float, so the figure on the wire is the figure the report held -- re-encoded,
-    not recomputed. NaN/Inf (from a corrupt log timestamp, or a `Decimal("NaN")` sentinel) become
-    `None` and render as absent: a payload is a worse place to raise than a cell is to be empty.
+    The signature still admits a `float`, but the report no longer hands one over: the win rate
+    reaches the serialiser as `win_rate_pct`, a `Decimal` in percent units. Money is `Decimal`
+    end to end and never takes the float path. `repr()` gives the shortest string that
+    round-trips a float, so a float that does arrive is re-encoded, not recomputed. NaN/Inf (from
+    a corrupt log timestamp, or a `Decimal("NaN")` sentinel) become `None` and render as
+    absent: a payload is a worse place to raise than a cell is to be empty.
     """
     if value is None:
         return None
