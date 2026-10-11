@@ -2466,14 +2466,9 @@ export function rulesView(data, sort, onSort, plan, planError, trials, gauntlet,
   fragment.append(recordsSection(data));
   fragment.append(dcaPlanCard(plan || null, planError || null));
 
+  // The intro sentence is `trialsSection`'s, printed only once the trials were read: said here it
+  // would claim a record the page could not read.
   fragment.append(heading("h-research", "Research record"));
-  fragment.append(
-    note(
-      "Every trial keel has run, in the order it ran them — the rejected ones beside the ".concat(
-        "selected ones. A record showing only its selections would be a highlight reel.",
-      ),
-    ),
-  );
   fragment.append(trialsSection(trials));
   fragment.append(matrixSection(matrix));
   fragment.append(gauntletSection(gauntlet));

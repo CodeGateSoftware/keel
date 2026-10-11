@@ -329,6 +329,77 @@ def test_a_research_read_that_failed_is_said_so_in_its_own_section(
     assert "could not be read" in branch, section
 
 
+@pytest.mark.parametrize(("section", "reading"), _RESEARCH)
+def test_a_failed_research_read_returns_before_reading_any_key(section: str, reading: str) -> None:
+    """The guard block is exactly `{ <append the sentence>; return fragment; }`.
+
+    The test above bounds its slice at the NEXT `return fragment;`, which after a deleted guard
+    `return` is the function's final one -- so the sentence is still "in" the branch while the
+    function carries on into `<reading>.state` on `null`, throws, and takes the whole Rules view
+    (ledger, records, DCA card) down with it. Here the block is cut by its own braces: it ends in
+    its own `return fragment;`, has only one, and reads no key of the missing reading."""
+    body = _builder(section)
+    guard = f"if (!{reading})"
+    assert body.count(guard) == 1, section
+
+    block, _ = _balanced_block(body, body.index("{", body.index(guard)))
+
+    assert block.rstrip().rstrip("}").rstrip().endswith("return fragment;"), section
+    assert block.count("return fragment;") == 1, section
+    assert "could not be read" in block, section
+    assert re.search(rf"\b{reading}\.\w+", block) is None, section
+
+
+#: The sentence that opens the research record: it claims a record that exists and was read.
+_RESEARCH_INTRO = "Every trial keel has run"
+
+#: Every builder of the Rules view, ledger to DCA card to research record.
+_RULES_BUILDERS = (
+    "rulesView",
+    "recordsSection",
+    "samplePill",
+    "gateCard",
+    "paramsCard",
+    "dcaPlanCard",
+    "trialsSection",
+    "matrixSection",
+    "gauntletSection",
+    "slippageSection",
+)
+
+
+def test_the_research_intro_is_placed_once_and_only_after_a_successful_read() -> None:
+    """One copy, in the section that has the record in hand. `rulesView` once printed it too, so
+    the reader saw it twice, and a failed trials read sat under a claim about a record that could
+    not be read."""
+    bodies = {name: _builder(name) for name in _RULES_BUILDERS}
+
+    assert sum(body.count(_RESEARCH_INTRO) for body in bodies.values()) == 1
+    assert bodies["rulesView"].count(_RESEARCH_INTRO) == 0
+    trials = bodies["trialsSection"]
+    assert trials.count(_RESEARCH_INTRO) == 1
+    assert trials.index("return fragment;") < trials.index(_RESEARCH_INTRO)
+
+
+def test_the_rules_view_offers_no_action_outside_the_ledger_sort() -> None:
+    """Read-only, over EVERY Rules builder -- not only the research sections and the DCA card.
+
+    A "promote this rule" button beside a gate card that says "passing" is the most natural
+    request this page will draw, and promotion happens in the CLI. The ledger's sort headers are
+    drawn inside `table()` (outside these bodies), so the builders own no button at all."""
+    bodies = {name: _builder(name) for name in _RULES_BUILDERS}
+    assert len(bodies) == len(_RULES_BUILDERS) and all(len(b) > 100 for b in bodies.values())
+    assert sum(len(re.findall(r"\bel\(", b)) for b in bodies.values()) >= 20, "the scan is vacuous"
+
+    for name, body in bodies.items():
+        code = _code_only(body)
+        tags = set(re.findall(r'\bel\("([a-z0-9]+)"', body))
+        assert not tags & {"button", "form", "input", "select", "textarea", "a"}, (name, tags)
+        for token in ("addEventListener", "onclick", "onsubmit", "fetch(", "perform(", "submit"):
+            assert token not in code, f"{name} builds something interactive: {token}"
+        assert "button" not in body.lower(), name
+
+
 def test_the_trials_section_reads_through_its_own_parameter_only() -> None:
     """Moved off `researchView(data, ...)`: in the Rules region `data` is `/api/rules`, so a stray
     `data.` read here would be checked against the wrong endpoint and pass or fail by accident."""
