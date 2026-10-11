@@ -47,6 +47,10 @@ CASES = [
     # `Setup` sentinel 0 (`Dca.detect`: "stop=0 ... no stop-loss"). Both are by design.
     ("confirm", "dca", False, None, NO_STOP_BY_DESIGN),
     ("confirm", "dca", False, Decimal("0"), NO_STOP_BY_DESIGN),
+    # A negative stop is no stop either (`recorded_stop` is `> 0`): by design for DCA, still a
+    # warning for every other kind.
+    ("confirm", "dca", False, Decimal("-1"), NO_STOP_BY_DESIGN),
+    ("confirm", "turtle_breakout", False, Decimal("-1"), BRACKET_MISSING),
     # A DCA tranche that RECORDED a real stop and has no bracket is not the designed case.
     ("confirm", "dca", False, Decimal("5"), BRACKET_MISSING),
     ("confirm", "dca", True, None, BRACKETED),
