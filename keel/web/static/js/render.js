@@ -768,9 +768,9 @@ function pulseState(data) {
  * The counts are summed by the service over the cycles in today's UTC day, and are ABSENT when the
  * log could not be read; `data.today.basis` says which (complete, partial from a window that began
  * after midnight, or unavailable), so a zero here is never an unread log. The bracket count is
- * the #641 hazard (a live position whose bracket the verdict reads as missing; a DCA tranche
- * that recorded no stop reads "no stop by design" and is not counted) and is judged `warn` when non-zero, here in the
- * payload rather than by this file.
+ * the #641 hazard (a live position whose bracket the verdict reads as missing; in live mode a DCA
+ * tranche that recorded no stop reads "no stop by design" and is not counted; paper counts none)
+ * and is judged `warn` when non-zero, here in the payload rather than by this file.
  *
  * @param {any} data
  * @returns {DocumentFragment}
