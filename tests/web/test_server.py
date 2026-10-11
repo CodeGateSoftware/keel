@@ -1925,6 +1925,47 @@ def test_the_halt_is_reachable_from_a_remote_deployment_and_engages(deployment) 
         conn.close()
 
 
+def test_a_remote_deployment_serves_the_halt_token_and_it_halts_but_releases_nothing(
+    deployment,
+) -> None:
+    """**The halt must be reachable from a tunnel, and that starts with the page being handed its
+    token there.** The test above mints the token itself, so it cannot see a `/api/pulse` that
+    withholds `halt_token` from a remote deployment -- which would leave the HALT button with
+    nothing to send exactly where stopping matters most. This one reads the token the way the
+    console does, from the document, and uses that value and no other.
+
+    Then the other half of the contract, on the same deployment: the served value halts, and
+    presented to either release in either header it releases nothing."""
+
+    db_path, _config_path = deployment
+    remote = frozenset({"keel.example.com"})
+    with _serving(deployment, external_hosts=remote) as tunnelled:
+        _status, _headers, pulse = _request(tunnelled, "/api/pulse", cookie=_session(tunnelled))
+        served = json.loads(pulse)["data"]["halt_token"]
+        assert served, "a remote deployment must still be served a halt token"
+        assert served == security.halt_token(tunnelled.token)
+
+        status, _headers, body = _halt(tunnelled, halt=served)
+        assert status == 200, body
+        assert _kill_switch(db_path) is True
+
+        for route, phrase in (
+            ("/api/gates/resume", "RESUME TRADING"),
+            ("/api/gates/resume-entries", "CLEAR STREAK HALT"),
+        ):
+            for header in ("halt", "gate"):
+                status, _headers, body = _request(
+                    tunnelled,
+                    route,
+                    method="POST",
+                    cookie=_session(tunnelled),
+                    **{header: served},
+                    raw_body=json.dumps({"phrase": phrase}),
+                )
+                assert status == 403, (route, header, body)
+                assert _kill_switch(db_path) is True, (route, header)
+
+
 def test_the_halt_still_needs_the_halt_token(deployment) -> None:
     """Ungated means no PHRASE and no locality check. It does not mean no authentication."""
 
