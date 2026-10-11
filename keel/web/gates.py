@@ -158,7 +158,11 @@ def phrase_matches(action_key: str, presented: object) -> bool:
     it was fixed (#790) and carries the stronger guard now.
 
     `compare_digest` because it costs one call and removes the timing question. The phrase is
-    public -- the modal prints it -- so this is belt-and-braces rather than load-bearing.
+    public -- a string literal in `TIER1_ACTIONS` above, in source every deployment ships -- so
+    this is belt-and-braces rather than load-bearing. No page prints it: the console has no
+    browser resume (only the HALT on Pulse), and the release paths an operator uses are
+    `keel resume` and `keel resume-entries` at a terminal, whose ceremony is the TTY gate
+    (`_require_interactive_confirmation`), not this phrase.
     """
     action = TIER1_ACTIONS.get(action_key) if isinstance(action_key, str) else None
     if action is None:
