@@ -376,6 +376,7 @@ def test_tranche_rows_carry_the_columns_the_view_exists_for() -> None:
         assert banned not in labels, (banned, labels)
     # The ledger's own order, so the verdict columns sit together at the end of the row.
     assert labels == [
+        "tranche",
         "opened (UTC)",
         "product",
         "qty",
@@ -395,12 +396,130 @@ def test_tranche_rows_carry_the_columns_the_view_exists_for() -> None:
 
 def test_the_tranche_table_is_seen_by_the_header_cell_pairing_scan() -> None:
     """`test_every_table_emits_one_cell_per_declared_header` pairs headers with cells by position;
-    that only protects this table if the scan FINDS it. Fourteen headers, fourteen cells."""
+    that only protects this table if the scan FINDS it. Fifteen headers, fifteen cells."""
     pairs = _table_calls(_code_only(_builder("holdingsSection")))
 
-    assert pairs == [(14, 14)]
+    assert pairs == [(15, 15)]
     orders = _table_calls(_code_only(_builder("recentOrdersSection")))
     assert orders == [(9, 9)]
+
+
+def _split_top_level(block: str) -> list[str]:
+    """The items of an array literal's body, split on commas at depth zero (strings respected)."""
+    inner = block.strip()[1:-1]
+    items: list[str] = []
+    depth = 0
+    quote = ""
+    current = ""
+    for char in inner:
+        if quote:
+            current += char
+            if char == quote:
+                quote = ""
+            continue
+        if char in "\"'`":
+            quote = char
+        elif char in "([{":
+            depth += 1
+        elif char in ")]}":
+            depth -= 1
+        elif char == "," and depth == 0:
+            items.append(current.strip())
+            current = ""
+            continue
+        current += char
+    if current.strip():
+        items.append(current.strip())
+    return items
+
+
+def _flatten_splice(item: str) -> str:
+    """`...(withStop ? [X] : [])` -> `X`; any other item is returned unchanged."""
+    match = re.fullmatch(r"\.\.\.\(withStop \? \[(.*)\] : \[\]\)", item, re.S)
+    return match.group(1).strip() if match else item
+
+
+def _paired(body: str) -> list[tuple[str, str]]:
+    """`(header label, cell expression)` for the FIRST `table(` call in `body`, by position, with
+    the `withStop` header splice and its cell splice flattened (both must sit at the same index)."""
+    at = body.index("table(")
+    columns, after = _balanced_block(body, body.index("[", at))
+    cells_at = body.index("[", body.index(".map(", after))
+    cells, _ = _balanced_block(body, cells_at)
+    header_items = _split_top_level(columns)
+    cell_items = _split_top_level(cells)
+    assert [i.startswith("...") for i in header_items] == [
+        i.startswith("...") for i in cell_items
+    ], "the header splice and the cell splice must sit at the same index"
+    labels = [re.search(r'label:\s*"([^"]+)"', _flatten_splice(h)).group(1) for h in header_items]  # type: ignore[union-attr]
+    return list(zip(labels, (_flatten_splice(c) for c in cell_items), strict=True))
+
+
+def _reads_own_field(cell: str, field: str) -> bool:
+    """The cell reads `row.<field>` and no other `row.` field."""
+    return re.findall(r"row\.(\w+)", cell) == [field]
+
+
+_TRANCHE_PAIRS = (
+    ("tranche", "id"),
+    ("opened (UTC)", "opened_at"),
+    ("product", "product_id"),
+    ("qty", "qty"),
+    ("entry", "entry_fill"),
+    ("fee", "entry_fee"),
+    ("cost", "cost"),
+    ("stop", "stop"),
+    ("bracket", "bracket"),
+    ("entry gate", "freshness"),
+    ("attestation", "attestation"),
+    ("placement", "placement"),
+    ("expected", "expected_fill"),
+    ("actual", "actual_fill"),
+    ("slippage", "fill_divergence"),
+)
+
+_ORDER_PAIRS = (
+    ("placement", "placement"),
+    ("rule", "rule_name"),
+    ("side", "side"),
+    ("product", "product_id"),
+    ("status", "status"),
+    ("expected", "expected_fill"),
+    ("actual", "actual_fill"),
+    ("slippage", "fill_divergence"),
+    ("placed (UTC)", "created_at"),
+)
+
+
+def test_each_tranche_header_sits_over_its_own_cell() -> None:
+    """Counts match is not pairing: swapping `row.expected_fill` and `row.actual_fill` kept 14/14
+    and drew a favourable fill as adverse beside the server's slippage verdict."""
+    pairs = _paired(_builder("holdingsSection"))
+
+    assert [label for label, _ in pairs] == [label for label, _ in _TRANCHE_PAIRS]
+    for (label, cell), (_, field) in zip(pairs, _TRANCHE_PAIRS, strict=True):
+        assert _reads_own_field(cell, field), (label, cell, field)
+
+
+def test_each_recent_orders_header_sits_over_its_own_cell() -> None:
+    pairs = _paired(_builder("recentOrdersSection"))
+
+    assert [label for label, _ in pairs] == [label for label, _ in _ORDER_PAIRS]
+    for (label, cell), (_, field) in zip(pairs, _ORDER_PAIRS, strict=True):
+        assert _reads_own_field(cell, field), (label, cell, field)
+
+
+def test_the_realized_legs_summary_names_the_tranche_and_its_product() -> None:
+    """The disclosures sit after a table that may hold several products (every DCA rule is named
+    "dca"), so "tranche N" alone cannot be tied to a row: the summary appends id AND product."""
+    section = _builder("holdingsSection")
+    at = section.index('summary.append(')
+    call, _ = _balanced_block(section, section.index("(", at))
+    parts = _split_top_level("[" + call[1:-1] + "]")
+
+    assert sum("row.id" in part for part in parts) == 1, parts
+    assert sum("row.product_id" in part for part in parts) == 1, parts
+    assert any("realized legs" in part for part in parts), parts
 
 
 def test_the_tranche_sort_keys_are_ones_the_endpoint_declares() -> None:

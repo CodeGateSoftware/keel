@@ -339,8 +339,8 @@ def positions_close(ctx: click.Context, position_id: int, price: Decimal, fee: D
 
     For a sale made on the venue by hand. It places NO order: it writes the SELL keel never saw,
     books the tranche's outcome, and closes it, so rails 4/5/6 stop counting inventory that is
-    gone. Take the tranche id from the console's Holdings view (each tranche's realized-legs
-    line) or `keel doctor`.
+    gone. Take the tranche id from the console's Holdings view (the tranche column of each
+    rule's table) or `keel doctor`.
     """
     repo = _open_repo(ctx)
     config = _load_cfg(ctx)

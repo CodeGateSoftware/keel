@@ -2405,6 +2405,8 @@ function holdingsSection(data, sort, onSort) {
       table(
         id,
         [
+          // The id `keel positions close` takes, paired with its own row.
+          { label: "tranche", numeric: false },
           { label: "opened (UTC)", numeric: false, key: "opened_at" },
           { label: "product", numeric: false, key: "product_id" },
           { label: "qty", numeric: true, key: "qty" },
@@ -2424,6 +2426,7 @@ function holdingsSection(data, sort, onSort) {
           { label: "slippage", numeric: true, key: "fill_divergence" },
         ],
         held.map(/** @param {any} row */ (row) => [
+          row.id,
           row.opened_at,
           plain(row.product_id) || "—",
           row.qty,
@@ -2451,7 +2454,7 @@ function holdingsSection(data, sort, onSort) {
       // "marked at" here because there is no mark.
       const node = el("details", "row");
       const summary = el("summary");
-      summary.append("tranche ", plain(row.id), " · realized legs");
+      summary.append("tranche ", plain(row.id), " · ", plain(row.product_id) || "—", " · realized legs");
       node.append(summary);
       node.append(
         gridCard([
