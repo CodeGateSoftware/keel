@@ -358,6 +358,18 @@ def test_dca_is_the_one_kind_that_never_brackets() -> None:
     assert stopless == ["dca"]
 
 
+@pytest.mark.parametrize("kind", sorted(RULE_REGISTRY))
+def test_every_kind_is_named_its_kind_and_stores_no_name_param(kind: str) -> None:
+    """#961's safety argument: a tranche's `rule_name` is `rule.name`, and
+    `status.bracket_verdict` excuses a missing bracket by that name. So a rule rebuilt from a
+    stored row must be named its kind, and `describe()["params"]` (what seed and `keel rules
+    add` store) must never carry a `name` that could rename it: a turtle named "dca" would read
+    "no stop by design"."""
+    rule = build_rule_from_params(kind, minimal_params(kind))
+    assert rule.name == kind
+    assert "name" not in rule.describe()["params"]
+
+
 def test_the_declaration_agrees_with_how_the_executor_routes_a_dca_entry() -> None:
     """The flag is only true if the executor really skips the bracket: `Dca.detect` must emit a
     setup the executor routes as the no-stop DCA order class (`_is_dca_setup`)."""
