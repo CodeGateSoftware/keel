@@ -1691,8 +1691,9 @@ def matrix_payload(report: MatrixReport) -> dict[str, Any]:
     """The Evidence Matrix (#708 view 2).
 
     `invocation` is composed HERE and placed by the client, the same rule #707's cancel modal
-    follows: a client concatenating `keel trials pbo --session ` and a name could print a command
-    that does not exist, and the session it names has to be one that ACTUALLY HAS COLUMNS --
+    followed (the modal is gone; the rule stands): a client concatenating
+    `keel trials pbo --session ` and a name could print a command that does not exist, and the
+    session it names has to be one that ACTUALLY HAS COLUMNS --
     `--session all` would filter to a session literally named "all" and refuse.
     """
     from keel.commands.evidence_matrix import MATRIX_INVOCATION

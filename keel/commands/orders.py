@@ -317,10 +317,11 @@ class OrderRow:
     updated_at: int | None
     #: What cancelling this order would be, and what it would take (#707).
     #:
-    #: On the ROW rather than looked up by a front-end, because both front-ends need it and the
-    #: classification is the feature: the console renders a modal from it and the CLI gates on it,
-    #: and a console that classified for itself could describe an order as a frictionless entry
-    #: while the terminal demanded the typed phrase for it.
+    #: On the ROW so `gather_orders` can hand it over with the rest of the order. Only
+    #: `gather_orders`' default (`classify_cancels=True`, i.e. `keel orders`) fills it, and
+    #: nothing in production reads it back today: `render_orders` ignores it, the console reads
+    #: with `classify_cancels=False`, and `keel orders cancel` calls `classify_cancel` itself.
+    #: Tests pin it.
     #:
     #: Defaulted and LAST, so every existing `OrderRow(...)` construction in this module and its
     #: tests is untouched -- a dataclass cannot carry a default ahead of a required field.
@@ -598,7 +599,7 @@ def gather_orders(
     `classify_cancels=False` skips `classify_cancel` for every row: each `OrderRow.cancel` then
     carries the unresolved placeholder rather than a verdict. `/api/orders` passes it, because
     the console renders no cancel classification and a per-row verdict thrown away is a query's
-    worth of work. `keel orders` keeps the default.
+    worth of work. `keel orders` keeps the default (its renderer does not read the verdict either).
 
     `repo.get_orders()` is still called with NO arguments: no `mode`, no `product_id`, no
     `status`. That is the load-bearing choice in this function, and the reason is about MODE --
@@ -875,8 +876,8 @@ CANCELLABLE_STATUSES = RESTING_STATUSES
 #: stop that stands under a live tranche.
 CANCEL_KINDS: tuple[str, ...] = ("entry", "exit", "protective", "unknown")
 
-#: The command that cancels one order. Composed in Python and placed by the client, so the console
-#: cannot come to print a command that does not exist.
+#: The command that cancels one order, composed in one place. It fills `CancelDecision.invocation`,
+#: which no production code reads today (`keel orders cancel` does not echo it); tests pin it.
 CANCEL_INVOCATION = "keel orders cancel {order_id}"
 
 
@@ -897,11 +898,12 @@ WEB_READ_ONLY_NOTE = (
     "Orders are cancelled with `keel orders cancel` at a terminal."
 )
 
-#: What each kind of cancel IS, as `keel orders cancel` headlines it: the CLI is the only reader.
-#: The web console once drew a modal from this vocabulary and no longer does.
-#: Checked at import: a kind with no headline would print an empty one, and a table that has
-#: drifted from the vocabulary is exactly the thing nobody notices until a reader sees the gap.
-#: This is what `CANCEL_KINDS` is FOR -- declared and never read, it was decoration.
+#: A headline per kind of cancel. It is composed into `CancelDecision.headline` and NOTHING renders
+#: it today: `keel orders cancel` prints only "order N: kind on product", and the console's cancel
+#: modal, its former reader, is gone. Kept (not removed here) so a front-end that wants a heading
+#: has one; until then, editing this wording changes no output.
+#: Checked at import: the assert below keeps the table closed over `CANCEL_KINDS`, so a kind added
+#: to the vocabulary without a headline fails at import rather than at `classify_cancel`.
 CANCEL_HEADLINES: Mapping[str, str] = {
     "entry": "Entry order #{order_id} — resting",
     "exit": "⚠️ Exit order #{order_id} — live liquidation",
@@ -909,8 +911,8 @@ CANCEL_HEADLINES: Mapping[str, str] = {
     "unknown": "⚠️ Order #{order_id} — unclassified",
 }
 
-# The vocabulary and its table, checked here rather than hoped about. `CANCEL_KINDS` existed and
-# nothing read it; now a kind added to the set without a headline fails at import.
+# The vocabulary and its table, checked here rather than hoped about: a kind added to the set
+# without a headline fails at import.
 assert set(CANCEL_HEADLINES) == set(CANCEL_KINDS), "CANCEL_HEADLINES does not cover CANCEL_KINDS"
 
 
@@ -918,9 +920,9 @@ assert set(CANCEL_HEADLINES) == set(CANCEL_KINDS), "CANCEL_HEADLINES does not co
 class CancelDecision:
     """What this order is, and therefore what it takes to cancel it.
 
-    ONE classification, read by both front-ends. The CLI turns `typed` into a phrase prompt and the
-    console turns it into a 403; if each decided for itself, the console could one-click something
-    the terminal makes you type.
+    ONE classification, read by `keel orders cancel`: it turns `cancellable` into a named refusal,
+    `typed` into the phrase prompt and `clears_bracket` into the bracket handling. `headline` and
+    `invocation` are composed here but nothing reads them today. The console has no cancel path.
     """
 
     order_id: int
@@ -947,15 +949,15 @@ class CancelDecision:
     #: prevent. The remainder is cancelled; the protection stays.
     clears_bracket: bool = False
     product_id: str = ""
-    #: The exact terminal command, composed HERE (Rule 2) so the console places it rather than
-    #: building it. `""` when the order cannot be cancelled: handing an operator a command that
-    #: would be refused is worse than handing them nothing -- they run it, it fails, and they
-    #: learn the console does not know what it is looking at.
+    #: The exact terminal command, composed HERE (Rule 2) so any front-end that shows it prints
+    #: the real command rather than building one. Nothing shows it today. `""` when the order
+    #: cannot be cancelled: handing an operator a command that would be refused is worse than
+    #: handing them nothing.
     invocation: str = ""
-    #: The modal's heading, composed HERE because it is a judgement about what the reader is
-    #: looking at -- "Entry order #42" and "Protective bracket #43 — live protection" are two
-    #: different warnings, and choosing between them is Rule 2's territory. It also keeps the
-    #: client from having to read `Field.value` to find the id, which `render.js` may not do.
+    #: A heading, composed HERE because it is a judgement about what the reader is looking at --
+    #: "Entry order #42" and "Protective bracket #43 — live protection" are two different
+    #: warnings, and choosing between them is Rule 2's territory. Nothing renders it today
+    #: (see `CANCEL_HEADLINES`).
     headline: str = ""
 
 
@@ -969,13 +971,13 @@ def classify_cancel(
     """What cancelling `order_id` would be, and what it therefore takes.
 
     Reads only. It decides nothing about whether the operator may proceed -- that is the caller's
-    gate -- and it never touches a broker. The CLI is its only caller (`keel orders cancel`, and
-    `gather_orders` for `keel orders`): the web console once classified every row for a cancel
-    modal and no longer does -- `/api/orders` reads with `classify_cancels=False`. `keel serve`
-    holds no venue credential and no broker handle, and #707 settled that it never will.
+    gate -- and it never touches a broker. It is reached only from the CLI: `keel orders cancel`,
+    and `gather_orders` with its default `classify_cancels=True` (`keel orders`). The console has no
+    cancel modal and `/api/orders` reads with `classify_cancels=False`. `keel serve` holds no
+    venue credential and no broker handle, and #707 settled that it never will.
 
-    ONE function, so the CLI's headline, its phrase prompt (`typed`) and its re-check under the
-    lock all read the same decision rather than each classifying for itself.
+    ONE function, so `keel orders cancel`'s phrase prompt (`typed`) and its re-check under the
+    lock read the same decision rather than each classifying for itself.
 
     `row` and `bracket_ids` are the BATCH form, for a caller classifying a whole page: the row is
     already in hand and `repo.open_bracket_order_ids()` answers every protective link in one query
