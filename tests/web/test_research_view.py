@@ -12,6 +12,10 @@ about a file nothing had read.
 columns", none at all -- and no research column carries a sort key. The Strathern rail is
 enforced at the endpoint rather than only in the renderer, because a `?sort=profit_factor` that
 merely rendered no header would still order the rows for anything that asked.
+
+Since console PR3 the record is drawn on the Rules view rather than a view of its own. The four
+endpoints, their empty sort surface and every pin below are unchanged; only the client's wiring
+moved (see `test_rules_view.py`).
 """
 
 from __future__ import annotations
@@ -289,20 +293,43 @@ def _code(name: str) -> str:
     return _comments_only(_source(name))
 
 
+#: The research record's four sections. They were `researchView` and its helpers until console
+#: PR3 folded the Research view into Rules; each kept its own function, so these pins can name it.
+_RESEARCH_SECTIONS = ("trialsSection", "matrixSection", "gauntletSection", "slippageSection")
+
+
 def _view_body() -> str:
-    after = _code("render.js").split("export function researchView")[1]
-    end = after.find("export function ")
-    return after if end == -1 else after[:end]
+    """The whole research record as one text: the four section bodies, each bounded at the next
+    top-level function (`test_client_assets._function_body`). Built from the names rather than
+    sliced from a position in the file, so moving a section cannot shrink what these pins scan."""
+    from tests.web.test_client_assets import _function_body
+
+    source = _source("render.js")
+    return "\n".join(_function_body(source, name) for name in _RESEARCH_SECTIONS)
 
 
-def test_the_research_view_is_wired_into_the_client_router() -> None:
+def test_the_research_record_is_wired_into_the_rules_view() -> None:
+    """Folded into Rules (console PR3): no route, view or branch of its own, and the Rules route
+    reads all four research endpoints. Each section is placed once -- pinned in
+    `test_rules_view.py`, with the order and the reading each is handed."""
+    import re
+
     from keel.web import staticfiles
 
-    assert "research" in staticfiles.CLIENT_ROUTES
+    assert "research" not in staticfiles.CLIENT_ROUTES
     main_code = _code("main.js")
-    assert "researchView" in main_code
-    assert 'route.name === "research"' in main_code
-    assert "export function researchView" in _code("render.js")
+    assert "researchView" not in main_code
+    assert 'route.name === "research"' not in main_code
+    assert "export function researchView" not in _code("render.js")
+    entry = re.search(r'\{ name: "rules", label: "Rules", endpoints: \[([^\]]*)\] \}', main_code)
+    assert entry is not None
+    endpoints = [part.strip().strip('"') for part in entry.group(1).split(",")]
+    assert [name for name in endpoints if name.startswith("research/")] == [
+        "research/trials",
+        "research/gauntlet",
+        "research/slippage",
+        "research/matrix",
+    ]
 
 
 def test_the_view_shows_the_chain_verdict_and_the_breaks() -> None:
@@ -314,13 +341,13 @@ def test_the_view_shows_the_chain_verdict_and_the_breaks() -> None:
     assert "chain_errors" in body
 
 
-def test_the_research_view_offers_no_action_of_any_kind() -> None:
+def test_the_research_record_offers_no_action_of_any_kind() -> None:
     """A research record is read. A "promote this trial" control on a page whose whole argument
     is that selection happened under a discipline would put the selection in a button."""
     body = _view_body().lower()
 
     for banned in ("promote", "button", "addeventlistener", "onclick"):
-        assert banned not in body, f"the research view must offer no {banned}"
+        assert banned not in body, f"the research record must offer no {banned}"
 
 
 # -- the empty ledger, which is the case the badge got wrong ---------------------------------------
@@ -586,7 +613,7 @@ def test_the_floor_count_is_reported_against_the_products_actually_priced(
 
 
 def test_the_slippage_endpoint_declares_no_sortable_column_either(tmp_path: Path) -> None:
-    """The rail across the whole `/research` surface, not just its first view. A cost table
+    """The rail across the whole research record, not just its first table. A cost table
     ordered cheapest-first reads as a shortlist of what to trade."""
     from keel.web import api as web_api
 
@@ -596,18 +623,14 @@ def test_the_slippage_endpoint_declares_no_sortable_column_either(tmp_path: Path
     assert route.collection == ""
 
 
-def test_the_slippage_section_is_wired_into_the_research_view() -> None:
-    main_code = _code("main.js")
-
-    assert '"research/slippage"' in main_code
-    assert "function slippageSection" in _code("render.js")
-    assert "export function researchView(data, gauntlet, slippage, matrix)" in _code("render.js")
+def test_the_slippage_section_is_a_research_section() -> None:
+    assert "slippageSection" in _RESEARCH_SECTIONS
+    assert _code("render.js").count("function slippageSection(slippage)") == 1
 
 
 def test_the_slippage_section_states_the_basis_and_declares_no_sort_key() -> None:
     """Both rails at once: the assumption notice is rendered, and the cost table carries no
-    sort control -- `researchView`'s own body is already scanned for `key:`, and this section
-    lives inside it."""
+    sort control -- `_view_body()` is already scanned for `key:`, and this section is in it."""
     after = _code("render.js").split("function slippageSection")[1]
     end = after.find("export function ")
     body = after if end == -1 else after[:end]
@@ -809,12 +832,9 @@ def test_the_gauntlet_endpoint_declares_no_sortable_column_either() -> None:
     assert route.collection == ""
 
 
-def test_the_gauntlet_section_is_wired_into_the_research_view() -> None:
-    main_code = _code("main.js")
-
-    assert '"research/gauntlet"' in main_code
-    assert "function gauntletSection" in _code("render.js")
-    assert "export function researchView(data, gauntlet, slippage, matrix)" in _code("render.js")
+def test_the_gauntlet_section_is_a_research_section() -> None:
+    assert "gauntletSection" in _RESEARCH_SECTIONS
+    assert _code("render.js").count("function gauntletSection(gauntlet)") == 1
 
 
 def test_the_gauntlet_section_shows_the_seed_and_both_expectancies() -> None:
@@ -855,12 +875,9 @@ def _section_body(name: str) -> str:
 # -- the evidence matrix (#708 view 2) -------------------------------------------------------------
 
 
-def test_the_matrix_section_is_wired_into_the_research_view() -> None:
-    source = _code("render.js")
-    start = source.index("export function researchView(")
-    end = source.index("\nfunction ", start)
-    view = source[start:end]
-    assert "matrixSection(matrix)" in view
+def test_the_matrix_section_is_a_research_section() -> None:
+    assert "matrixSection" in _RESEARCH_SECTIONS
+    assert _code("render.js").count("function matrixSection(matrix)") == 1
 
 
 def test_the_matrix_section_offers_no_sort_control() -> None:

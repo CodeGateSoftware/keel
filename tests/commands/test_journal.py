@@ -184,17 +184,18 @@ def test_the_report_marks_every_entry_self_reported(deployment) -> None:
 # -- the acceptance round trip ------------------------------------------------------------------
 
 
-def test_cli_add_then_web_view_then_csv_export_all_carry_the_marker(deployment, monkeypatch):
+def test_cli_add_then_csv_export_both_carry_the_marker(deployment, monkeypatch):
     """The issue's acceptance criterion, end to end and in one test.
 
-    Three surfaces read this record and each could lose the provenance separately: the CLI that
-    wrote it, the console that renders it, and the CSV an operator hands to someone else. The
-    export is the one that leaves the machine, so it is the one where a self-assessment sitting
-    unmarked beside venue-reported fills would do real harm.
+    The surfaces that read this record could each lose the provenance separately: the CLI that
+    wrote it and the CSV an operator hands to someone else. The export is the one that leaves the
+    machine, so it is the one where a self-assessment sitting unmarked beside venue-reported fills
+    would do real harm. (The console's own section went with the Insights view in console PR3; in
+    the browser the entries are Timeline `attestation` rows, which the export below is built
+    from.)
     """
     from keel.commands.journal import SELF_REPORTED
     from keel.commands.timeline import export_rows, to_csv
-    from keel.web import payload
 
     monkeypatch.setattr(journal_mod.time, "time", lambda: NOW)
     written = _run(deployment, ["journal", "add"], stdin="2\nn\nchased it\n-42.50\nthin\n\n")
@@ -209,20 +210,7 @@ def test_cli_add_then_web_view_then_csv_export_all_carry_the_marker(deployment, 
     assert SELF_REPORTED in listed.output
     assert "NO" in listed.output, "a broken rule must be legible, not merely stored"
 
-    # 2. The web payload carries the marker and grades the CLAIM rather than the operator.
-    #
-    # `_discretionary_journal_payload` directly rather than the whole `journal_payload`: the
-    # closed-trade half needs a full `StatusReport` this test has no business building, and that
-    # the two halves are composed onto one route is pinned by `test_client_assets.py`'s parity
-    # scan over `/api/journal`'s `notes.entries`.
-    notes = payload._discretionary_journal_payload(journal_mod.gather_journal(repo, now_ts=NOW))
-    assert notes["marker"] == SELF_REPORTED
-    (row,) = notes["entries"]
-    assert row["dollar_impact"]["state"] == "warn", "a self-reported figure must not read as a fill"
-    assert row["rules_followed"]["state"] == "warn"
-    assert "BROKE" in row["rules_followed"]["display"]
-
-    # 3. The export names it as self-reported beside the venue-reported rows.
+    # 2. The export names it as self-reported beside the venue-reported rows.
     text = to_csv(export_rows(repo, now_ts=NOW + 10))
     lines = [line for line in text.splitlines() if "journal" in line]
     assert len(lines) == 1

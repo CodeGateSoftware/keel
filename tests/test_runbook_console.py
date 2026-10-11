@@ -116,3 +116,15 @@ def test_the_section_is_honest_about_what_was_deleted() -> None:
     assert "keel tui" in section
     assert "curses" in section
     assert "#541" in section
+
+
+def test_the_section_says_where_the_folded_views_went() -> None:
+    """Console PR3 folded Insights and Research into Rules and took the charts and both journals
+    off the console. An operator who used either view needs the runbook to say where each piece
+    lives now -- the Rules view, or the terminal command that still prints it."""
+    section = _section()
+    assert "**Rules.**" in section
+    for command in ("`keel insights journal`", "`keel journal list`", "`keel dca plan`"):
+        assert command in section, command
+    listed = section.split("**Rules.**")[0]
+    assert "Insights" not in listed and "Research" not in listed, "a retired view is still listed"

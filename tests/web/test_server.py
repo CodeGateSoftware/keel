@@ -42,8 +42,6 @@ ROUTES = (
     "/api/setup",
     "/api/orders",
     "/api/holdings",
-    "/api/insights",
-    "/api/journal",
     "/api/rules",
     "/api/venues",
     "/api/config",
@@ -160,7 +158,7 @@ def test_post_is_refused_everywhere_except_the_setup_actions(
 ) -> None:
     """The write surface is one prefix. A POST anywhere else is not "method not allowed" -- there
     is no write surface at that path at all."""
-    for path in ("/", "/insights", "/pulse", "/setup"):
+    for path in ("/", "/rules", "/pulse", "/setup"):
         status, _headers, body = _request(
             running, path, method="POST", cookie=_session(running), form={}, csrf=_csrf(running)
         )

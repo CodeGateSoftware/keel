@@ -60,8 +60,6 @@ API_ROUTES = (
     "/api/holdings",
     "/api/balances",
     "/api/timeline",
-    "/api/insights",
-    "/api/journal",
     "/api/research/trials",
     "/api/research/slippage",
     "/api/research/gauntlet",
@@ -357,8 +355,9 @@ def test_the_api_routes_cover_every_html_route_that_reads(
     survives: `staticfiles.CLIENT_ROUTES` is the client's own list of views, and every one of them
     must be covered by an endpoint whose `html_route` names it.
 
-    `/insights` is named by two endpoints (`/api/insights` and `/api/journal`) and that is the
-    server's own decision, recorded in `api.API_ROUTES`; a set comparison absorbs it."""
+    `/rules` is named by six endpoints (`/api/rules`, `/api/dca-plan` and the four research
+    reads, console PR3) and that is the server's own decision, recorded in `api.API_ROUTES`; a
+    set comparison absorbs it."""
     from keel.web import staticfiles
 
     views = {"/" + name for name in staticfiles.CLIENT_ROUTES}
@@ -1089,7 +1088,7 @@ def test_a_navigation_still_refuses_in_something_a_person_can_read(
     taken from where it is being read, because the old text's only instruction was to open the
     address keel printed, which is an instruction a window with no address bar cannot follow.
     That was the whole of #634's complaint about this page."""
-    status, headers, body = _get(running, "/insights")
+    status, headers, body = _get(running, "/rules")
 
     assert status == 403
     assert headers["Content-Type"].startswith("text/plain")
@@ -1367,33 +1366,6 @@ def test_close_repo_actually_closes_the_connection(tmp_path: Path) -> None:
     close_repo(repo)
     with pytest.raises(sqlite3.ProgrammingError):
         conn.execute("SELECT 1")
-
-
-def test_the_trade_limit_does_not_truncate_the_operators_journal(tmp_path: Path) -> None:
-    """#705. `?limit=` is the closed-trade table's page control, and the two records share a route
-    only by arrangement. Passing it through meant narrowing to one trade silently hid 300 of an
-    operator's 301 notes -- one record's page control truncating a different record."""
-    from keel.data.db import connect, migrate
-    from keel.data.repository import Repository
-    from keel.web.api import read_journal
-
-    db_path = tmp_path / "keel.db"
-    conn = connect(str(db_path))
-    migrate(conn)
-    repo = Repository(conn)
-    for index in range(5):
-        repo.append_journal_entry(ts=1_000 + index, chart_note=f"note {index}")
-    conn.close()
-
-    config_path = tmp_path / "config.yaml"
-    config_path.write_text(VALID_CONFIG_YAML)
-    cfg = _serve_config(str(db_path), str(config_path))
-
-    body = read_journal(cfg, {"limit": ["1"]}, None, 2_000)
-    notes = body["notes"]
-    assert notes["shown_count"]["value"] == "5", "the trades' limit reached the journal"
-    assert notes["total_count"]["value"] == "5"
-    assert notes["window"]["value"] == "all"
 
 
 # -- every reader answers on the clock it was handed (#779) ---------------------------------------
@@ -1695,7 +1667,7 @@ def test_the_reader_scan_sees_every_reader_there_is() -> None:
     assert dispatched <= scanned, "the scan misses readers the server dispatches to: " + repr(
         sorted(dispatched - scanned)
     )
-    assert len(scanned) >= len(dispatched) >= 15, (
+    assert len(scanned) >= len(dispatched) >= 10, (
         "the scan found " + str(len(scanned)) + " readers, which is too few to be believable"
     )
 
@@ -1709,6 +1681,108 @@ def test_no_reader_reads_the_clock_a_second_time() -> None:
     offenders = {name: calls for name, calls in _reader_clock_calls().items() if calls}
 
     assert offenders == {}, "these readers ignore the clock they were handed: " + repr(offenders)
+
+
+# -- /api/rules carries the track records (console PR3; was /api/insights) -----------------------
+
+
+def _seed_paper_rules(db_path: str, kinds: tuple[str, ...]) -> None:
+    """Rules in `paper`, the one status `build_rule_track_record` gives a gate distance to."""
+    from keel.data.repository import Repository
+
+    conn = connect(db_path)
+    try:
+        repo = Repository(conn)
+        for kind in kinds:
+            repo.insert_rule(kind, {"product_id": "BTC-USD"}, status="paper")
+    finally:
+        conn.close()
+
+
+def test_rules_carries_the_track_records_and_their_gate_distances(
+    running: web_server.ServeConfig,
+) -> None:
+    """The track record and its distance to the promotion gate moved onto `/api/rules` when the
+    Insights view was retired: one reader, the same service (`build_insights_report`) the CLI's
+    `keel insights summary` calls."""
+    _seed_paper_rules(running.db_path, ("dca",))
+
+    status, _headers, document = _json(running, "/api/rules")
+
+    assert status == 200
+    records = document["data"]["records"]
+    assert [record["rule_name"] for record in records] == ["dca"]
+    gate = records[0]["gate"]
+    assert gate is not None, "a paper rule carries its distance to the promotion gate"
+    assert gate["n_trades"]["value"] == "0"
+    assert gate["trades_remaining"]["value"] == gate["min_trades"]["value"]
+    assert document["data"]["closed_trade_count"]["value"] == "0"
+
+
+def test_the_track_records_are_not_the_sortable_collection(
+    running: web_server.ServeConfig,
+) -> None:
+    """Ruling 10: a track-record table sorted by expectancy is the leaderboard the research rail
+    refuses one section down. `rules` stays the one sortable collection; a track-record column is
+    refused, and sorting the ledger leaves the records in the service's own order."""
+    # Seeded rsi_meanrev, dca, turtle_breakout: neither A->Z nor Z->A, so a sort of the records
+    # by name (either direction) cannot reproduce the service's order by accident.
+    seeded = ["rsi_meanrev", "dca", "turtle_breakout"]
+    _seed_paper_rules(running.db_path, tuple(seeded))
+
+    refused, _headers, _document = _json(running, "/api/rules?sort=expectancy")
+    _status, _headers, ascending = _json(running, "/api/rules?sort=kind")
+    _status, _headers, descending = _json(running, "/api/rules?sort=kind&dir=desc")
+
+    assert refused == 400
+    assert web_api.API_ROUTES["/api/rules"].collection == "rules"
+    assert [row["kind"] for row in descending["data"]["rules"]] == [
+        "turtle_breakout",
+        "rsi_meanrev",
+        "dca",
+    ]
+    assert [r["rule_name"] for r in ascending["data"]["records"]] == seeded
+    assert [r["rule_name"] for r in descending["data"]["records"]] == seeded
+
+
+def test_a_rules_report_that_cannot_be_built_is_a_500_not_an_empty_ledger(
+    running: web_server.ServeConfig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`read_rules` now builds a report, and a report that fails must not answer a 200 with the
+    ledger and no track records -- an empty `records` reads as "no rule has traded yet"."""
+    monkeypatch.setattr("keel.commands.insights.build_insights_report", _raise, raising=True)
+
+    status, _headers, document = _json(running, "/api/rules")
+
+    assert status == 500
+    assert document["data"] is None
+    assert "RuntimeError" in document["error"]["detail"]
+
+
+@pytest.mark.parametrize("path", ["/api/insights", "/api/journal"])
+def test_the_retired_insights_endpoints_are_not_served(
+    running: web_server.ServeConfig, path: str
+) -> None:
+    status, _headers, _document = _json(running, path)
+
+    assert status == 404
+
+
+def test_every_research_read_is_carried_by_the_rules_view() -> None:
+    """Ruling 9: the four research endpoints keep their readers and their empty sort surface, and
+    only their `html_route` moved -- to `/rules`, the view that now renders them."""
+    research = sorted(path for path in web_api.API_ROUTES if path.startswith("/api/research/"))
+
+    assert research == [
+        "/api/research/gauntlet",
+        "/api/research/matrix",
+        "/api/research/slippage",
+        "/api/research/trials",
+    ]
+    assert {web_api.HTML_ROUTE_FOR[path] for path in research} == {"/rules"}
+    assert all(web_api.API_ROUTES[path].sortable == () for path in research)
+    assert "/research" not in web_api.HTML_ROUTE_FOR.values()
+    assert "/insights" not in web_api.HTML_ROUTE_FOR.values()
 
 
 # -- /api/dca-plan: the read-only DCA proposal on /rules -------------------------------------------

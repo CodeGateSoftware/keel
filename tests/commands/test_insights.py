@@ -408,6 +408,106 @@ def test_insights_report_counts_closed_trades(repo: Repository) -> None:
     assert report.closed_trade_count == 2
 
 
+# -- the Rules page's reading of a real report (#953 F4, F5) -------------------------------------
+
+_TRADED = ("win_rate", "avg_win", "avg_loss", "expectancy", "profit_factor", "max_drawdown")
+
+
+def _rules_records(repo: Repository) -> list[dict[str, Any]]:
+    from keel.web import payload
+
+    config = _config()
+    status_report = gather_status(repo, config, now_ts=NOW_TS)
+    report = build_insights_report(repo, config, status_report, NOW_TS)
+    return payload.rules_payload([], records=report)["records"]
+
+
+def test_a_real_records_win_rate_is_displayed_as_the_clis_percentage(repo: Repository) -> None:
+    """`win_rate` is a 0..1 fraction (`wins / n`); `percent()` takes percent units, so the page
+    once showed 40% as "0.4%". Drive a REAL report through `rules_payload` and compare with the
+    CLI's own `f"{win_rate:.1%}"` -- for the record, the gate's figure and the gate's floor."""
+    repo.insert_rule("turtle_breakout", {"product_id": "BTC-USD"}, status="paper")
+    for i in range(2):
+        _seed_paper_trade(repo, "turtle_breakout", entry_ts=1000 + i, exit_ts=1100 + i)
+    for i in range(3):
+        _seed_paper_trade(
+            repo,
+            "turtle_breakout",
+            exit_price="90",
+            pnl="-10",
+            r_multiple="-1.0",
+            outcome="loss",
+            entry_ts=2000 + i,
+            exit_ts=2100 + i,
+        )
+    config = _config()
+    report = build_insights_report(repo, config, gather_status(repo, config, now_ts=NOW_TS), NOW_TS)
+    record = report.rules[0]
+    assert record.gate is not None and record.win_rate == 0.4
+
+    shown = _rules_records(repo)[0]
+
+    assert shown["win_rate"]["display"] == f"{record.win_rate:.1%}" == "40.0%"
+    assert shown["gate"]["win_rate"]["display"] == f"{record.gate.win_rate:.1%}"
+    assert shown["gate"]["min_win_rate"]["display"] == f"{record.gate.min_win_rate:.1%}" == "30.0%"
+
+
+def test_the_cli_summary_still_prints_the_fraction_as_it_always_did(repo: Repository) -> None:
+    """The percent-unit value is carried beside the fraction; the CLI line and the gate floor
+    figures are untouched."""
+    repo.insert_rule("turtle_breakout", {"product_id": "BTC-USD"}, status="paper")
+    for i in range(2):
+        _seed_paper_trade(repo, "turtle_breakout", entry_ts=1000 + i, exit_ts=1100 + i)
+    config = _config()
+    report = build_insights_report(repo, config, gather_status(repo, config, now_ts=NOW_TS), NOW_TS)
+
+    lines = render_summary(report)
+    record = [line for line in lines if line.startswith("  [turtle_breakout]")]
+    gate = [line for line in lines if line.startswith("    gate:")]
+
+    assert record == [
+        "  [turtle_breakout] status=paper class=trend_follow n=2 win_rate=100.0% avg_win=10.00 "
+        "avg_loss=0.00 rr=n/a (no losses yet) expectancy=10.00 profit_factor=Infinity max_dd=0.00"
+    ]
+    assert gate == [
+        "    gate: blocked -- trades_remaining=98 (n>=100, win_rate>=0.3, rr>=1.5, expectancy>0)"
+    ]
+
+
+def test_a_rule_with_no_closed_trades_shows_its_statistics_as_unknown_not_zero(
+    repo: Repository,
+) -> None:
+    """Unknown shown as zero: 0 trades is "nothing to measure", not "0% win rate, $0.00 average".
+    Trade counts and gate distances stay real numbers -- those ARE known."""
+    repo.insert_rule("turtle_breakout", {"product_id": "BTC-USD"}, status="paper")
+
+    shown = _rules_records(repo)[0]
+
+    assert shown["n_trades"]["display"] == "0"
+    for key in _TRADED:
+        assert shown[key]["display"] == "—" and shown[key]["state"] == "unknown", key
+    gate = shown["gate"]
+    for key in ("win_rate", "expectancy"):
+        assert gate[key]["display"] == "—" and gate[key]["state"] == "unknown", key
+    assert gate["n_trades"]["display"] == "0"
+    assert gate["trades_remaining"]["display"] == "100"
+    assert gate["min_win_rate"]["display"] == "30.0%"
+    assert gate["min_trades"]["display"] == "100"
+
+
+def test_a_rule_with_one_closed_trade_still_shows_numbers(repo: Repository) -> None:
+    repo.insert_rule("turtle_breakout", {"product_id": "BTC-USD"}, status="paper")
+    _seed_paper_trade(repo, "turtle_breakout")
+
+    shown = _rules_records(repo)[0]
+
+    assert shown["n_trades"]["display"] == "1"
+    assert shown["win_rate"]["display"] == "100.0%"
+    for key in ("win_rate", "avg_win", "expectancy", "max_drawdown"):
+        assert shown[key]["display"] != "—", key
+    assert shown["gate"]["win_rate"]["display"] == "100.0%"
+
+
 # -- build_journal_report -----------------------------------------------------------------------
 
 
@@ -752,9 +852,10 @@ def test_insights_journal_command_json_is_valid_no_prose(tmp_path, valid_config_
 # -- the equity curve (#537) ---------------------------------------------------------------------
 #
 # `build_equity_curve` exists because the browser's chart needed coordinates and the client is not
-# allowed to compute them -- `keel/web/static/js/chart.js` is scanned for arithmetic exactly as
-# `render.js` is. So the scaling decision lives here, and these tests are what make that decision
-# checkable rather than merely relocated.
+# allowed to compute them -- the console's `chart.js` was scanned for arithmetic exactly as
+# `render.js` is. The chart left the console in console PR3; the builder stays (that PR's ruling),
+# so the scaling decision still lives here, and these tests are what keep it checkable for any
+# chart that draws it again.
 
 
 def _entry(pnl: Decimal | None, *, closed_at: int = NOW_TS) -> JournalEntry:
@@ -845,7 +946,7 @@ def test_a_curve_of_break_even_trades_sits_on_the_baseline() -> None:
 
 
 def test_every_coordinate_stays_inside_the_box() -> None:
-    """The invariant `chart.js` relies on, since it does no arithmetic of its own.
+    """The invariant any chart drawing this relies on, since the client does no arithmetic.
 
     A coordinate outside the `viewBox` does not raise anywhere -- it draws off the edge of the
     chart, silently, which is exactly the class of failure the browser cannot report."""

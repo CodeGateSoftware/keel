@@ -302,7 +302,7 @@ def test_the_worker_is_served_from_the_scope_it_must_control() -> None:
     """**The structural half of the API rule.**
 
     A worker's default scope is its own directory. Serving it from `static/js/` would scope it to
-    `/static/js/`, where it could not answer a navigation to `/static/insights` -- the design
+    `/static/js/`, where it could not answer a navigation to `/static/rules` -- the design
     spec's file list puts `sw` among the modules, and this is the one place this implementation
     departs from it, deliberately, because the alternative is a `Service-Worker-Allowed` header
     whose removal would silently shrink the scope rather than fail.

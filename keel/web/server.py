@@ -82,10 +82,6 @@ _MAX_BODY_BYTES = 8 * 1024
 #: HTML.
 _JOB_REFRESH_SEC = 5
 
-#: Journal rows rendered on the insights page. A cap, not a paginator: the page answers "how has
-#: this been going", and the full history is what `keel insights journal` is for.
-_JOURNAL_LIMIT = 50
-
 
 @dataclass(frozen=True)
 class ServeConfig:

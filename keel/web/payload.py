@@ -125,23 +125,7 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
     from keel.commands.evidence_matrix import MatrixReport, MatrixRow
     from keel.commands.gauntlet import GauntletReport, GauntletRow
     from keel.commands.holdings import HoldingRow, HoldingsReport
-    from keel.commands.insights import (
-        AccountSummary,
-        EquityCurve,
-        EquityPoint,
-        EquitySeries,
-        EquitySeriesPoint,
-        GateDistance,
-        InsightsReport,
-        JournalEntry,
-        JournalReport,
-        RuleTrackRecord,
-    )
-
-    # #705's journal is a DIFFERENT record from `insights.JournalReport` above -- closed trades
-    # there, the operator's own account of themselves here -- and the alias says so at the import
-    # rather than leaving two `JournalReport`s in one namespace to be told apart by context.
-    from keel.commands.journal import JournalReport as DiscretionaryJournal
+    from keel.commands.insights import GateDistance, InsightsReport, RuleTrackRecord
     from keel.commands.orders import OrderRow, OrdersReport
     from keel.commands.plans import Claim, PlansReport, Tier, Trigger
     from keel.commands.positions import PositionRow
@@ -223,11 +207,13 @@ def _plain(value: Decimal) -> str:
 def _decimalise(value: Decimal | float | None) -> Decimal | None:
     """A finite `Decimal`, or `None` for anything that cannot honestly become one.
 
-    A `float` arrives only from a non-monetary statistic (`RuleTrackRecord.win_rate`); money is
-    `Decimal` end to end and never takes this path. `repr()` gives the shortest string that
-    round-trips the float, so the figure on the wire is the figure the report held -- re-encoded,
-    not recomputed. NaN/Inf (from a corrupt log timestamp, or a `Decimal("NaN")` sentinel) become
-    `None` and render as absent: a payload is a worse place to raise than a cell is to be empty.
+    A `float` arrives through `stringify`, for a number inside an open-ended activity event
+    payload; no report statistic takes that path (the win rate reaches the serialiser as
+    `win_rate_pct`, a `Decimal` in percent units, and money is `Decimal` end to end).
+    `repr()` gives the shortest string that round-trips a float, so a float is re-encoded, not
+    recomputed. NaN/Inf (from
+    a corrupt log timestamp, or a `Decimal("NaN")` sentinel) become `None` and render as
+    absent: a payload is a worse place to raise than a cell is to be empty.
     """
     if value is None:
         return None
@@ -1115,26 +1101,19 @@ def pulse_payload(report: PulseReport, *, gate: str = "") -> dict[str, Any]:
     }
 
 
-# -- insights --------------------------------------------------------------------------------------
-
-
-def _account_payload(account: AccountSummary) -> dict[str, Any]:
-    return {
-        "mode": account.mode,
-        "state_mode": label(account.equity_state_mode),
-        "high_water_mark": money(account.high_water_mark),
-        "paper_cash": money(account.paper_cash_usdc),
-        "drawdown_total": ratio(account.drawdown_total_pct),
-        "drawdown_weekly": ratio(account.drawdown_weekly_pct),
-        "max_total_dd": ratio(account.max_total_dd_pct),
-        "max_weekly_dd": ratio(account.max_weekly_dd_pct),
-        "rail11": label(account.rail11_status, state=_rail_state(account.rail11_status)),
-    }
+# -- track records (on /api/rules since console PR3) ---------------------------------------------
 
 
 def _gate_payload(gate: GateDistance) -> dict[str, Any]:
     """The promotion gate's distance. `passing` is the engine's verdict, copied; the floors are
-    the config's own values, copied. Nothing here re-runs `check_floors`."""
+    the config's own values, copied. Nothing here re-runs `check_floors`.
+
+    The win rate and its floor are 0..1 fractions upstream; the report carries them in percent
+    units (`win_rate_pct`) so `percent` only suffixes. The rule's OWN figures (win rate,
+    expectancy) are unknown at zero trades -- `BacktestResult` returns 0 for an empty sample, and
+    serialising that as data shows unknown as zero. The floors, the counts and the distance
+    remaining are known at zero trades and stay numbers."""
+    traded = gate.n_trades != 0
     return {
         "rule_name": gate.rule_name,
         "promotion_class": gate.promotion_class,
@@ -1143,11 +1122,11 @@ def _gate_payload(gate: GateDistance) -> dict[str, Any]:
         "trades_remaining": count(
             gate.trades_remaining, state=GOOD if gate.trades_remaining == 0 else WARN
         ),
-        "win_rate": percent(gate.win_rate, places=1),
-        "min_win_rate": percent(gate.min_win_rate, places=1),
+        "win_rate": percent(gate.win_rate_pct, places=1) if traded else absent(),
+        "min_win_rate": percent(gate.min_win_rate_pct, places=1),
         "realized_rr": ratio(gate.realized_rr),
         "min_rr": ratio(gate.min_rr),
-        "expectancy": money(gate.expectancy, places=4, signed=True),
+        "expectancy": money(gate.expectancy, places=4, signed=True) if traded else absent(),
         "min_expectancy": money(gate.min_expectancy, places=4),
         "passing": flag(gate.passing, on="passing", off="blocked", on_state=GOOD, off_state=WARN),
         "blocking_reasons": list(gate.blocking_reasons),
@@ -1155,21 +1134,26 @@ def _gate_payload(gate: GateDistance) -> dict[str, Any]:
 
 
 def _track_record_payload(record: RuleTrackRecord) -> dict[str, Any]:
+    """One rule's track record. At zero closed trades every statistic is UNKNOWN, not zero: the
+    sample is empty, so there is no win rate to be 0% and no average to be $0.00 (the report holds
+    0 because `BacktestResult` does; serialising that as data would assert a measurement). The
+    trade count stays a real number. Win rate is in percent units (see `_gate_payload`)."""
+    traded = record.n_trades != 0
     return {
         "rule_name": record.rule_name,
         "status": label(record.status),
         "promotion_class": record.promotion_class,
         "n_trades": count(record.n_trades),
-        "win_rate": percent(record.win_rate, places=1),
-        "avg_win": money(record.avg_win),
-        "avg_loss": money(record.avg_loss),
+        "win_rate": percent(record.win_rate_pct, places=1) if traded else absent(),
+        "avg_win": money(record.avg_win) if traded else absent(),
+        "avg_loss": money(record.avg_loss) if traded else absent(),
         "realized_rr": ratio(record.realized_rr),
-        "expectancy": money(record.expectancy, places=4, signed=True),
-        "profit_factor": ratio(record.profit_factor),
-        "max_drawdown": money(record.max_drawdown),
+        "expectancy": money(record.expectancy, places=4, signed=True) if traded else absent(),
+        "profit_factor": ratio(record.profit_factor) if traded else absent(),
+        "max_drawdown": money(record.max_drawdown) if traded else absent(),
         # `significant` is `n_trades >= 30`, computed by the report. Below that floor a win rate
         # is not distinguishable from random entry, so the payload SAYS so rather than leaving the
-        # number to speak for itself -- the same choice `render_insights` makes in HTML.
+        # number to speak for itself -- the same choice `render_summary` makes at the terminal.
         "significant": flag(
             record.significant,
             on="n≥30",
@@ -1179,410 +1163,6 @@ def _track_record_payload(record: RuleTrackRecord) -> dict[str, Any]:
         ),
         "gate": _gate_payload(record.gate) if record.gate is not None else None,
     }
-
-
-def insights_payload(report: InsightsReport, *, series: EquitySeries) -> dict[str, Any]:
-    """`build_insights_report`'s `InsightsReport`, as JSON, with the equity series beside it.
-
-    `series` is a REQUIRED keyword for the reason `journal_payload`'s `curve` is: a default would
-    quietly serve an insights view with no chart, and the caller is the one place that knows
-    which readings and which rail setting the chart is drawn from.
-
-    It rides the insights payload rather than the journal's because it describes the ACCOUNT, not
-    the closed trades. The distinction is load-bearing at the other end: the journal's curve is
-    built from `report.entries` and therefore narrows with a `?limit=`, while this series does
-    not narrow with anything the journal does. Two charts that respond differently to the same
-    query belong to two different payloads.
-    """
-    return {
-        "as_of": iso(report.now_ts),
-        "generated_at": moment(report.now_ts),
-        "account": _account_payload(report.account),
-        "closed_trade_count": count(report.closed_trade_count),
-        "equity_series": equity_series_payload(series),
-        "rules": [_track_record_payload(r) for r in report.rules],
-    }
-
-
-# -- journal ---------------------------------------------------------------------------------------
-
-
-def _journal_entry_payload(entry: JournalEntry) -> dict[str, Any]:
-    """One closed (or, with `--include-open`, one open) trade.
-
-    This is where the spec's worked `pnl` example actually lands: `pnl_net` is a figure
-    `build_journal_report` computed off the fee-honest `trade_outcomes` ledger, so it can be
-    serialised without this layer deriving anything. `None` stays absent rather than becoming
-    `0.00` -- a trade with no recorded net is not a break-even trade, which is the same
-    distinction `render_insights` protects in HTML.
-
-    `point_index` (#602) is NOT set here -- it depends on every entry BEFORE this one in the same
-    list, which a function given one entry at a time cannot see. `journal_payload` sets it once it
-    has the whole list, right beside the loop that decides it.
-    """
-    return {
-        "closed_at": moment(entry.closed_at),
-        "opened_at": moment(entry.opened_at),
-        "rule_name": entry.rule_name or "",
-        "product_id": entry.product_id,
-        "qty": quantity(entry.qty),
-        "entry_fill": money(entry.entry_fill),
-        "exit_fill": money(entry.exit_fill),
-        "pnl": money(entry.pnl_net, signed=True),
-        "fees": money(entry.fees, places=4),
-        "r_multiple": ratio(entry.r_multiple, signed=True),
-        "is_dca": flag(entry.is_dca, on="DCA", off="rule"),
-        "outcome": label(entry.outcome, state=_OUTCOME_STATES.get(entry.outcome, NEUTRAL)),
-    }
-
-
-#: `JournalEntry.outcome`'s vocabulary, judged. `dca` is neutral by design: a DCA row has no stop
-#: to measure against, so `build_journal_report` labels it `"dca"` regardless of the P&L sign and
-#: calling it a win or a loss here would invent a verdict the ledger declined to make.
-_OUTCOME_STATES: Mapping[str, str] = {"win": GOOD, "loss": BAD, "dca": NEUTRAL, "open": NEUTRAL}
-
-
-def _equity_point_payload(point: EquityPoint) -> dict[str, Any]:
-    """One point of the curve: where to draw it, and what it says.
-
-    `x` and `y` are BARE STRINGS, not `Field`s, and that is the one place in this module where a
-    figure crosses with no `display` beside it. They are not values a human reads -- there is
-    nothing to format, no judgement to carry and no unit -- they are positions inside an SVG
-    `viewBox`, decided by `keel.commands.insights.build_equity_curve` where a `Decimal` is in
-    scope and where the choice of axis can be tested. `_plain` still renders them, so a
-    coordinate cannot reach the wire in exponent notation any more than a price can.
-
-    Everything a reader is actually TOLD -- the instant, the trade's net, the running total --
-    arrives as a `Field`, and those are what the chart's text equivalent is built from.
-    """
-    return {
-        "x": _plain(point.x),
-        "y": _plain(point.y),
-        "at": moment(point.closed_at),
-        "product_id": point.product_id,
-        "rule_name": point.rule_name or "",
-        "pnl": money(point.pnl, signed=True),
-        "cumulative": money(point.cumulative, signed=True),
-    }
-
-
-def equity_curve_payload(curve: EquityCurve) -> dict[str, Any]:
-    """`build_equity_curve`'s `EquityCurve`, as JSON.
-
-    **`reading` is the chart's text equivalent, and it is written HERE rather than in the browser
-    for the same reason every other sentence on this wire is.** A chart is data made visible, so a
-    reader who cannot see it has to be told the same thing in words. Assembling that sentence in
-    JavaScript would mean the client deciding what a curve says -- a judgement -- and doing it
-    from figures `render.js` is not allowed to read. It is a `label` rather than a bare string
-    because it carries the curve's verdict in its `state`, taken from the CLOSING figure, so the
-    spoken summary and the last point can never disagree about whether this is a profitable track
-    record.
-
-    Both text equivalents ship, and neither is a fallback for the other: the sentence is what a
-    screen reader hears from the chart's `aria-label`, and the per-point rows are what someone
-    reads when they want the numbers rather than the shape.
-
-    `net` is the LAST point's cumulative rather than a sum computed here -- `build_equity_curve`
-    already ran the running total, and re-adding it in this module would be a second arithmetic
-    of the same figure in the one place that is not allowed to hold one.
-    """
-    net = money(curve.points[-1].cumulative, signed=True) if curve.points else absent()
-    low, high = money(curve.low), money(curve.high)
-    trades = count(curve.point_count)
-    if curve.points:
-        reading = (
-            f"Cumulative net profit and loss over {trades['display']} closed trades, "
-            f"ending at {net['display']}, ranging from {low['display']} to {high['display']}."
-        )
-    else:
-        # Not "the curve is flat", and not an empty string. A deployment with no closed trades has
-        # no track record at all, and which of those two a reader is looking at is the entire
-        # difference between an empty chart and a broken one.
-        reading = "No closed trades yet, so there is no curve to draw."
-    return {
-        "width": _plain(curve.width),
-        "height": _plain(curve.height),
-        "baseline_y": _plain(curve.baseline_y),
-        "point_count": trades,
-        "low": low,
-        "high": high,
-        "net": net,
-        "reading": label("curve", display=reading, state=net["state"]),
-        "points": [_equity_point_payload(point) for point in curve.points],
-    }
-
-
-def _equity_series_point_payload(point: EquitySeriesPoint) -> dict[str, Any]:
-    """One cycle's reading: where to draw it, and what it says (#698).
-
-    `x`, `y`, `hwm_y` and `dd_floor_y` are BARE STRINGS for the reason `_equity_point_payload`
-    gives -- they are positions inside a viewBox, not figures a human reads. `dd_floor_y` is
-    `null`, not `"0"`, when the rail setting is unknown: a zero coordinate is the TOP of an SVG
-    box, so it would draw a ceiling line in force above every reading rather than none at all.
-
-    `unrealized` is the one leg that carries a verdict, because it is the one that is a
-    gain-or-loss figure. `equity`, `cash` and `hwm` are magnitudes -- an account balance is not
-    good or bad on its own, and `money(signed=True)` would put a ▲ on a number that has no
-    direction. `dd_floor` is a magnitude too: it is the rail's ceiling, not a judgement about
-    how close this reading sits to it.
-    """
-    return {
-        "x": _plain(point.x),
-        "y": _plain(point.y),
-        "hwm_y": _plain(point.hwm_y),
-        "dd_floor_y": None if point.dd_floor_y is None else _plain(point.dd_floor_y),
-        "at": moment(point.ts),
-        "mode": point.mode,
-        "equity": money(point.equity),
-        "cash": money(point.cash),
-        "unrealized": money(point.unrealized, signed=True),
-        "hwm": money(point.hwm),
-        "dd_floor": money(point.dd_floor),
-    }
-
-
-def equity_series_payload(series: EquitySeries) -> dict[str, Any]:
-    """`build_equity_series`'s `EquitySeries`, as JSON (#698).
-
-    **Segments cross as segments, never as one flat list of points.** The mode partition is the
-    whole reason this shape exists: paper and live are unrelated accounts that share a database,
-    and a client handed one list would join them into a polyline showing a collapse that never
-    happened. Flattening is the one operation the wire must not make easy.
-
-    `reading` is the chart's text equivalent, written here for the reason
-    `equity_curve_payload`'s is: summarising a chart is a judgement, and a reader who cannot see
-    it must be told the same thing in words. It NAMES THE MODES, because the mode split is the
-    part a spoken summary would otherwise flatten -- a sentence saying an account went from ten
-    thousand dollars to two hundred and fifty is exactly the false continuity the segments exist
-    to prevent, and it would be no less false for being spoken.
-
-    `state` on that sentence is `neutral`, unlike the curve's. The curve closes on a cumulative
-    net P&L, which is a verdict; a series closes on an account balance, which is not one. Taking
-    the state from the last reading's sign would call an account "good" for holding money.
-    """
-    low, high = money(series.low), money(series.high)
-    cycles = count(series.point_count)
-    truncated_from = count(series.total_recorded)
-    if series.segments:
-        # `series.modes` and `series.is_partitioned`, never a mode list assembled here: Rule 6e
-        # bans `len()` in this module precisely so a count on the wire is one the report already
-        # holds, and a serialiser deriving its own answer is how two answers start to differ.
-        span = " and ".join(series.modes)
-        # "the most recent N", never a bare N, when the read was bounded. The sentence is the
-        # whole of what a reader who cannot see the chart is told about its span, so a window
-        # described as a history is a lie by omission that every individual point survives.
-        scope = "the most recent " if series.is_truncated else ""
-        reading = (
-            f"Account equity over time across {scope}{cycles['display']} cycle(s) in {span}, "
-            f"ranging from {low['display']} to {high['display']}."
-        )
-        if series.is_truncated:
-            reading += f" {truncated_from['display']} readings are recorded in total."
-        # Said only when there IS a partition. A deployment that has only ever run paper would
-        # otherwise be told about a second line that is not on the chart -- the same false
-        # continuity the segments exist to prevent, pointing the other way.
-        if series.is_partitioned:
-            reading += " Each mode is drawn as its own line; they are separate accounts."
-    else:
-        # Not "the account was flat", and not an empty string. A deployment that has not run a
-        # cycle since the series began recording has no readings at all, and telling those two
-        # apart is the whole difference between an empty chart and a broken one.
-        reading = "No equity readings recorded yet, so there is no series to draw."
-    return {
-        "width": _plain(series.width),
-        "height": _plain(series.height),
-        "point_count": cycles,
-        "total_recorded": truncated_from,
-        # A `flag`, not a bare boolean: a client must not have to compare `point_count` against
-        # `total_recorded` to learn this. That comparison is arithmetic, and the answer is a
-        # statement about how much of the record the chart is showing -- a judgement, made here.
-        "is_truncated": flag(
-            series.is_truncated, on="a window onto a longer record", off="the whole record"
-        ),
-        "low": low,
-        "high": high,
-        "reading": label("series", display=reading, state=NEUTRAL),
-        "segments": [
-            {
-                "mode": segment.mode,
-                "points": [_equity_series_point_payload(p) for p in segment.points],
-            }
-            for segment in series.segments
-        ],
-    }
-
-
-def journal_payload(
-    report: JournalReport, *, curve: EquityCurve, notes: DiscretionaryJournal
-) -> dict[str, Any]:
-    """`build_journal_report`'s `JournalReport`, as JSON.
-
-    `curve` is passed in rather than built here, and the direction is the point: `keel/web/api.py`
-    calls `build_equity_curve` on the entries THIS report carries, so the chart and the table
-    beneath it are two views of one list and cannot come to describe different trades. It is a
-    REQUIRED keyword, never a defaulted one -- a default would let every existing caller keep
-    working while quietly serving a journal with no chart, which is the shape of a suite that is
-    green because it stopped asking the question.
-
-    `total_count` is the full filtered count BEFORE `--limit` truncated `entries`, and
-    `shown_count` is how many survived; both cross, so a client showing "50 of 812" needs no
-    subtraction to know it is looking at a page.
-
-    `shown_count` is READ from the report, never measured here. It shipped in the first draft as
-    `count(len(report.entries))`, which is a figure `JournalReport` did not hold -- numerically
-    harmless, since a list length is exact, but a breach of the rule this module claims to keep,
-    and one whose guard passed only by coincidence (the fixture happened to set
-    `total_count == len(entries)`). It is now a property of the report, and Rule 6e of
-    `test_console_thinness.py` bans `len()` here so the shortcut cannot be taken again.
-
-    **`point_index` (#602) is the one place this function counts rather than copies**, and the
-    count is position bookkeeping, not a figure: `build_equity_curve` draws one point per entry
-    whose `pnl_net` is not `None`, oldest first, so the position a kept entry lands at in
-    `curve.points` is exactly how many kept entries came before it -- the SAME list, in the SAME
-    order, `equity_curve_payload` below serialises `curve.points` from. Walking `report.entries`
-    here with the same skip condition gives each entry the array index of its own point in
-    `curve.points`, or `None` for a row the curve skipped (no net recorded -- nothing to
-    highlight). This mirrors `build_equity_curve`'s skip rule rather than re-deriving a figure
-    from one, and `js/main.js` trusts the mirror rather than re-deriving it a third time: it reads
-    `curve.points[Number(entry.point_index)]` directly, with no lookup of its own.
-    """
-    entries = []
-    plotted = 0
-    for entry in report.entries:
-        built = _journal_entry_payload(entry)
-        if entry.pnl_net is None:
-            built["point_index"] = None
-        else:
-            built["point_index"] = str(plotted)
-            plotted += 1
-        entries.append(built)
-
-    return {
-        "as_of": iso(report.now_ts),
-        "generated_at": moment(report.now_ts),
-        "mode": report.mode,
-        "total_count": count(report.total_count),
-        "shown_count": count(report.shown_count),
-        # The query echoed back. Open-ended by shape (`limit` and `since_ts` are ints), so it
-        # crosses as strings -- see `stringify`.
-        "filters": {str(key): stringify(value) for key, value in sorted(report.filters.items())},
-        "entries": entries,
-        "curve": equity_curve_payload(curve),
-        # #705's DISCRETIONARY journal, beside the closed trades rather than on a page of its own:
-        # two things called a journal, and this is where a reader has to be able to tell them
-        # apart. A REQUIRED keyword like `curve`, for the same reason -- a default would let every
-        # existing caller keep working while quietly serving the page without it.
-        "notes": _discretionary_journal_payload(notes),
-    }
-
-
-def _discretionary_journal_payload(notes: DiscretionaryJournal) -> dict[str, Any]:
-    """The operator's own account of their own conduct (#705).
-
-    **Every figure here is a claim by the person reading it.** `dollar_impact` is what the
-    operator SAYS the day cost them -- not a fill, not a fee, nothing a venue reported -- so it
-    carries `WARN` and a marker rather than sitting in a money column looking like the ones above
-    it. That is the same judgement `_PROVENANCE_STATES` makes for `self-reported` in the timeline,
-    and for the same reason: a row that reads like evidence and is not is the one thing an honest
-    surface must not produce.
-
-    `rules_followed` is a THREE-valued flag. `False` is the operator confessing they broke their
-    own rules -- the most consequential thing this table can hold -- and `None` is a question they
-    skipped, so `flag()`'s two-state rendering would print the confession over the silence.
-
-    No sortable column, here or on the route. A journal reads forwards, and sorted by dollar
-    impact it becomes a ranking of the operator's own worst days: the Strathern rail, in the one
-    place where the thing being ranked is a person.
-    """
-    # The marker word is READ from the command module rather than restated here, so the CLI and
-    # the console cannot come to use two different words for the one record neither can verify.
-    from keel.commands.journal import SELF_REPORTED
-
-    return {
-        "marker": SELF_REPORTED,
-        "recorded": flag(
-            notes.any_recorded,
-            on="recorded",
-            off="no journal entries yet — `keel journal add` writes one, and only a person can",
-            on_state=NEUTRAL,
-            off_state=UNKNOWN,
-        ),
-        # BOTH counts, and a sentence that already says which is which. A journal is capped on
-        # this page, and a short list with nothing beside it reads as a complete one -- the
-        # failure `Repository.get_equity_points`' docstring names ("a caller that bounds a read is
-        # showing a WINDOW of the record and must say so"). The sentence is composed here rather
-        # than by the client, because choosing between "3 entries" and "50 of 301 (newest)" is a
-        # judgement (Rule 2) and the client may not count (Rule 6e).
-        "shown_count": count(notes.entry_count),
-        "total_count": count(notes.total_count),
-        "window": label(
-            "page" if notes.truncated else "all",
-            display=_notes_window_display(notes),
-            state=WARN if notes.truncated else NEUTRAL,
-        ),
-        "entries": [
-            {
-                "at": moment(entry.ts),
-                "reference": str(entry.id),
-                "emotion": label(
-                    entry.emotion_score,
-                    display=entry.emotion_score or None,
-                    state=NEUTRAL,
-                ),
-                # `""` and not `None` for the skipped question. `label(None)` is `absent()`,
-                # whose display is the em-dash -- fine in a numeric column and ambiguous here,
-                # where the neighbouring values read "followed their rules" and "BROKE their own
-                # rules": a dash between those two invites the reader to supply the missing one.
-                # The empty `value` still says absent to anything reading the field
-                # programmatically, and the display says which absence it is.
-                "rules_followed": label(
-                    ""
-                    if entry.rules_followed is None
-                    else ("yes" if entry.rules_followed else "no"),
-                    display=_rules_followed_display(entry.rules_followed),
-                    state=_rules_followed_state(entry.rules_followed),
-                ),
-                "errors_made": entry.errors_made or "",
-                # WARN, and named as self-reported in `amount_kind`'s spirit: this figure is the
-                # operator's estimate of their own damage, and a money column that did not say so
-                # would invite it to be added to the venue-reported ones above.
-                "dollar_impact": money(entry.dollar_impact, state=WARN),
-                "chart_note": entry.chart_note or "",
-                "screenshot_ref": entry.screenshot_ref or "",
-            }
-            for entry in notes.entries
-        ],
-    }
-
-
-def _notes_window_display(notes: DiscretionaryJournal) -> str:
-    """What the page says about how much of the journal it is showing.
-
-    `WARN` on a truncated window rather than `NEUTRAL`, because the reader is looking at an
-    incomplete record of their own conduct and the whole point of the sentence is that they
-    notice.
-    """
-    if not notes.any_recorded:
-        return "nothing recorded"
-    if notes.truncated:
-        return f"showing the {notes.entry_count} most recent of {notes.total_count}"
-    return f"showing all {notes.entry_count}"
-
-
-def _rules_followed_display(value: bool | None) -> str:
-    """Three readings for three values, spelled out. "not said" is not "no"."""
-    if value is None:
-        return "not said"
-    return "followed their rules" if value else "BROKE their own rules"
-
-
-def _rules_followed_state(value: bool | None) -> str:
-    """`UNKNOWN` for the skipped question, `WARN` for the confession, `NEUTRAL` for the ordinary
-    day. Never `GOOD`: "I followed my rules" is a self-assessment, and grading it green would have
-    the console endorsing a claim nothing verified."""
-    if value is None:
-        return UNKNOWN
-    return NEUTRAL if value else WARN
 
 
 # -- the evidence matrix (#708 view 2) -------------------------------------------------------------
@@ -2997,7 +2577,7 @@ def _gauntlet_row_payload(row: GauntletRow) -> dict[str, Any]:
             off_state=NEUTRAL,
         ),
         # `places=4`, matching every other expectancy in this file. The default 2 showed the
-        # ledger's -1.337906... as -$1.34 here and -$1.3379 on /insights -- two front-ends
+        # ledger's -1.337906... as -$1.34 here and -$1.3379 in a track record -- two front-ends
         # saying the same figure two different ways, the drift this layer exists to stop.
         "train_expectancy": money(row.train_expectancy, places=4, signed=True),
         "held_out_expectancy": money(row.held_out_expectancy, places=4, signed=True),
@@ -3699,12 +3279,25 @@ def _rule_row_payload(row: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
-def rules_payload(rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
-    """`Repository.get_rules(None)`'s rows, as JSON.
+def rules_payload(rows: Sequence[Mapping[str, Any]], *, records: InsightsReport) -> dict[str, Any]:
+    """`Repository.get_rules(None)`'s rows, and `build_insights_report`'s track records, as JSON.
 
     Read-only, and the page it mirrors says so out loud: promotion happens in the CLI, behind the
-    TTY gate, and nothing this API serves can change a rule's status."""
-    return {"rules": [_rule_row_payload(row) for row in rows]}
+    TTY gate, and nothing this API serves can change a rule's status.
+
+    `records` is a REQUIRED keyword (console PR3, when the Insights view's track records moved
+    here). A default would let a caller serve the ledger with an empty `records` list, which reads
+    as "no rule has traded yet" -- a claim about the deployment made by an argument nobody passed.
+    The report's account summary is not serialised: the drawdown and rail-11 state it holds are on
+    Pulse already, read from the same `gather_status`.
+
+    `records` crosses in the service's order and is not the route's sortable collection; see
+    `api.read_rules`."""
+    return {
+        "rules": [_rule_row_payload(row) for row in rows],
+        "closed_trade_count": count(records.closed_trade_count),
+        "records": [_track_record_payload(record) for record in records.rules],
+    }
 
 
 # -- dca plan (the read-only proposal card on /rules) ----------------------------------------------

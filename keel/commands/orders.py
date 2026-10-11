@@ -83,9 +83,9 @@ DEFAULT_ORDERS_SCOPE = "all"
 #: table, with the same reasoning, as `activity._SCOPE_DAYS`.
 _SCOPE_DAYS: dict[str, int] = {"today": 1, "7d": 7}
 
-#: Rows served when a caller names no limit. The journal's cap (`api.DEFAULT_JOURNAL_LIMIT`),
-#: for the same reason: a bounded read against a book that may grow for years, sized so the
-#: common case is never truncated at all.
+#: Rows served when a caller names no limit. The cap the console's journal used (retired in
+#: console PR3), for the same reason: a bounded read against a book that may grow for years,
+#: sized so the common case is never truncated at all.
 DEFAULT_ORDERS_LIMIT = 50
 
 #: The ceiling on a caller-supplied limit. A row count from a query string is a memory
