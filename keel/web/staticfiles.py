@@ -138,13 +138,9 @@ def resolve_static_asset(root: Path, url_path: str) -> Path | None:
 #: other fails the build rather than 404ing in a browser nobody is running in CI.
 CLIENT_ROUTES: tuple[str, ...] = (
     "pulse",
-    "setup",
     "holdings",
-    "balances",
-    "timeline",
     "rules",
-    "venues",
-    "plans",
+    "audit",
 )
 
 #: The shell every client route is served from, relative to `STATIC_ROOT`.
@@ -157,8 +153,9 @@ CLIENT_ENTRY = "index.html"
 #: a plain-text 404 for a bookmark, an installed app whose cached manifest still says
 #: `start_url: "/status"`, or a `/status?token=...` redirect, whenever no service worker answers.
 #: **Closed, like `CLIENT_ROUTES`**, for the same reason: it is names, never a wildcard. Console
-#: PR3 added Insights and Research (folded into Rules); PR4 adds its own. Disjoint from
-#: `CLIENT_ROUTES`.
+#: PR3 added Insights and Research (folded into Rules); PR4 added Setup, Timeline and Venues
+#: (folded into Audit & Setup -- `main.js`'s `MOVED_ROUTES` sends those three there rather than
+#: home) and Balances and Plans. Disjoint from `CLIENT_ROUTES`.
 RETIRED_CLIENT_ROUTES: tuple[str, ...] = (
     "status",
     "activity",
@@ -167,6 +164,11 @@ RETIRED_CLIENT_ROUTES: tuple[str, ...] = (
     "positions",
     "insights",
     "research",
+    "setup",
+    "timeline",
+    "balances",
+    "venues",
+    "plans",
 )
 
 

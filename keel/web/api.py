@@ -396,33 +396,6 @@ def read_holdings(cfg: ServeConfig, _query: Query, _state: Any, now_ts: int) -> 
     return payload.holdings_payload(report)
 
 
-def read_balances(cfg: ServeConfig, _query: Query, _state: Any, now_ts: int) -> dict[str, Any]:
-    """What the account holds, as the last cycle recorded it (#702).
-
-    **NO BROKER CALL, and this route is the one where that had to be decided on purpose.** A
-    balances page is the obvious place to read the venue live, and doing so would put credentials
-    into the process a browser talks to and hand an operator's rate limit to every tab left open
-    on a view that re-polls every 15 seconds. `keel serve` is a loopback reader over SQLite; every
-    other route here holds that line, and this one does too. `keel/commands/balances.py` carries
-    the full reasoning.
-
-    READ ONLY, with no write route on this path and no action in the payload. #702's refusal:
-    cash is a fact, not an affordance -- no buying power, no deposit, no transfer.
-
-    No `?limit=`: an account's asset list is bounded by what it holds, and a cap here would hide
-    a holding an operator is looking for.
-    """
-    from keel.commands.balances import gather_balances
-
-    repo = open_repo(cfg.db_path)
-    try:
-        config = load_config(cfg.config_path)
-        report = gather_balances(repo, config, now_ts=now_ts)
-    finally:
-        close_repo(repo)
-    return payload.balances_payload(report)
-
-
 def read_gauntlet(cfg: ServeConfig, _query: Query, _state: Any, now_ts: int) -> dict[str, Any]:
     """The gauntlet, as it was recorded (#708, view 3).
 
@@ -645,23 +618,6 @@ def read_timeline(cfg: ServeConfig, query: Query, _state: Any, now_ts: int) -> d
     rather than refused, `?scope=`'s own normalisation is reused, and both are echoed back.
     """
     return payload.timeline_payload(_timeline_report(cfg, query, now_ts))
-
-
-def read_plans(_cfg: ServeConfig, _query: Query, _state: Any, _now_ts: int) -> dict[str, Any]:
-    """The Plans page (#706) -- the one route whose subject is the PROJECT, not the deployment.
-
-    No repository, no config, no network. Every string it answers with is quoted from a document
-    in this repository and carries that document's path, so a reader can check the page against
-    the source and `tests/commands/test_plans.py` can check it on every build.
-
-    `needs_database=False` for the same reason `/api/config` and `/api/venues` carry it: this
-    answers identically on a machine with nothing set up, and a page explaining that keel is free
-    and runs entirely on the operator's own hardware would be a strange one to gate behind having
-    already installed it.
-    """
-    from keel.commands.plans import gather_plans
-
-    return payload.plans_payload(gather_plans())
 
 
 def read_rules(cfg: ServeConfig, _query: Query, _state: Any, now_ts: int) -> dict[str, Any]:
@@ -942,7 +898,7 @@ API_ROUTES: dict[str, ApiRoute] = {
         # than improve it. `/api/holdings` owns the sort of the tranches.
     ),
     "/api/setup": ApiRoute(
-        html_route="/setup",
+        html_route="/audit",
         read=read_setup,
         # No sortable collection: the steps are in RUNBOOK order, and that order is the
         # information. A checklist sorted by title is a checklist you cannot work down.
@@ -990,14 +946,8 @@ API_ROUTES: dict[str, ApiRoute] = {
             "fill_divergence",
         ),
     ),
-    "/api/balances": ApiRoute(
-        html_route="/balances",
-        read=read_balances,
-        collection="assets",
-        sortable=("product_id", "qty", "mark", "market_value"),
-    ),
     "/api/timeline": ApiRoute(
-        html_route="/timeline",
+        html_route="/audit",
         read=read_timeline,
         collection="rows",
         # `at`, not `ts`: the payload emits `at` (a `moment` field), and a `sortable` entry
@@ -1070,16 +1020,8 @@ API_ROUTES: dict[str, ApiRoute] = {
     # The DCA proposal card on /rules. GET only, like every route here, and no collection to sort:
     # the schedule is in the order the allowlist names its assets.
     "/api/dca-plan": ApiRoute(html_route="/rules", read=read_dca_plan),
-    # #706. `needs_database=False`, and NO `collection`/`sortable`: there is nothing on this page
-    # to sort. A tier table ordered by price is a shopping comparison, and the whole point of the
-    # inversion is that these four rows are not four choices.
-    "/api/plans": ApiRoute(
-        html_route="/plans",
-        read=read_plans,
-        needs_database=False,
-    ),
     "/api/venues": ApiRoute(
-        html_route="/venues",
+        html_route="/audit",
         read=read_venues,
         needs_database=False,
         collection="venues",

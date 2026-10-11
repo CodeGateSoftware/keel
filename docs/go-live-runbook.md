@@ -28,8 +28,9 @@ lists, observed rather than assumed, in three kinds:
   are **never** reported as done, because a green check that verifies nothing turns an open risk
   into a false assurance.
 
-The same checklist is the Setup page in `keel serve`, and it is what a brand-new machine's
-landing page shows instead of an empty dashboard.
+The same checklist is the Setup section of the Audit & Setup view in `keel serve`, and it is
+where a brand-new machine's "Set keel up on this machine" link lands instead of an empty
+dashboard.
 
 ## 0. Before you start
 

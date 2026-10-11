@@ -367,7 +367,7 @@ def test_one_switch_serves_the_sectioned_page_and_announces_itself_by_name() -> 
     # `SETUP_SECTIONS` list passed -- another page rendering Setup's three sections. The two
     # call lines are otherwise identical, which is what makes that the likely copy-paste when a
     # third sectioned view arrives (#776 review).
-    for view, table in (("setupView", "SETUP_SECTIONS"),):
+    for view, table in (("setupSection", "SETUP_SECTIONS"),):
         wiring = "sectioned(data, " + table + ", section, onSection, "
         assert wiring in _decl(code, view), view + " must be wired to " + table
 
@@ -511,10 +511,10 @@ def test_a_section_heading_is_the_tab_wording_and_never_a_second_copy_of_it(name
 def test_the_setup_builders_name_their_payload_so_the_parity_pin_can_see_it() -> None:
     """**Kills: renaming a Setup builder's payload parameter away from `data`.**
 
-    `_view_keys("setupView", "data")` scans this view's whole region for `data.<key>` and checks
-    each against `/api/setup`. Every builder in that region therefore has to spell its payload
-    `data` -- a `payload.<key>` read there is invisible to the pin, so a key the endpoint does
-    not send would render blank forever with nothing failing.
+    `_view_keys("setupSection", "data")` scans this section's whole region for `data.<key>` and
+    checks each against `/api/setup`. Every builder in that region therefore has to spell its
+    payload `data` -- a `payload.<key>` read there is invisible to the pin, so a key the endpoint
+    does not send would render blank forever with nothing failing.
 
     Proved as a controlled pair rather than reasoned: `payload.made_up_key` inserted into
     `setupPaper` escaped the suite; the identical `data.made_up_key` in `setupSummary` was caught
@@ -545,7 +545,7 @@ def test_the_job_panel_is_page_level_and_not_inside_any_section() -> None:
     It is page-level state, like the `<h1>`, so it renders above the switch."""
     code = _code("render.js")
 
-    view = _decl(code, "setupView")
+    view = _decl(code, "setupSection")
     # The GUARD and the ARGUMENT, not merely the name. `jobPanel` opens `plain(job.key)`, so
     # dropping `if (data.job)` throws on every deployment with no job running and renders the
     # Setup page blank; `jobPanel(data)` renders every field undefined. Both passed the whole
@@ -562,9 +562,9 @@ def test_the_job_panel_is_page_level_and_not_inside_any_section() -> None:
         )
 
 
-#: `setupView`'s payload reads. Pinned so that a section builder moved OUT of the view's region --
-#: where `_view_keys` can no longer see it -- fails here rather than quietly making the parity
-#: check in `test_client_assets` blind to a key.
+#: `setupSection`'s payload reads (the Setup part of Audit & Setup, console PR4). Pinned so that a
+#: section builder moved OUT of the section's region -- where `_view_keys` can no longer see it --
+#: fails here rather than quietly making the parity check in `test_client_assets` blind to a key.
 _SETUP_KEYS = (
     "actions",
     "config_path",
@@ -660,7 +660,7 @@ _HOLDINGS_ORDERS_KEYS = ("empty_note", "rows", "scope", "status", "statuses", "w
 @pytest.mark.parametrize(
     ("view", "root", "keys"),
     [
-        ("setupView", "data", _SETUP_KEYS),
+        ("setupSection", "data", _SETUP_KEYS),
         ("pulseView", "data", _PULSE_KEYS),
         ("holdingsView", "data", _HOLDINGS_KEYS),
         ("holdingsView", "orders", _HOLDINGS_ORDERS_KEYS),
@@ -685,9 +685,14 @@ def test_each_sectioned_route_remembers_its_own_section() -> None:
     same pair of helpers, keyed by its own route."""
     code = _code("main.js")
 
-    for view in ("setupView",):
-        call = view + "(data, sectionOf(route), onSectionFor(route))"
-        assert call in code, "the shell must mount " + view + " with its own section: " + call
+    # Audit & Setup is the one sectioned page; its Setup part takes the route's own section. The
+    # call continues with the timeline and venue readings, so the prefix is what is pinned.
+    flat = re.sub(r"\(\s+", "(", re.sub(r"\s+", " ", code))
+    for view in ("auditView",):
+        call = view + "(data, sectionOf(route), onSectionFor(route), "
+        assert flat.count(call) == 1, (
+            "the shell must mount " + view + " with its own section: " + call
+        )
 
     # The whole expression. `route.name` alone left a fallback to another route's bucket green
     # -- Setup showing whatever section Status was on (#776 review).

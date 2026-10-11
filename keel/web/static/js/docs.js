@@ -110,7 +110,6 @@ export const TERMS = {
   "rail 11": { slug: "glossary", anchor: "rail" },
   "withdrawal attestation (rail 17)": { slug: "glossary", anchor: "attestation" },
   "market session": { slug: "glossary", anchor: "market-clock" },
-  session: { slug: "glossary", anchor: "session-bound-venue" },
   "paper stage": { slug: "glossary", anchor: "paper-mode" },
 };
 

@@ -314,9 +314,7 @@ def _granularity_rank(granularity: Granularity) -> int:
     return agent_mod._GRANULARITY_ORDER.get(granularity, 0)
 
 
-def gather_positions(
-    repo: Repository, config: Config, *, now_ts: int, with_readiness: bool = True
-) -> PositionsReport:
+def gather_positions(repo: Repository, config: Config, *, now_ts: int) -> PositionsReport:
     """Every OPEN tranche, marked and judged.
 
     Open only: a closed tranche is a `trade_outcomes` row and belongs to the journal, which
@@ -326,23 +324,14 @@ def gather_positions(
     The candle cache is read ONCE PER PRODUCT rather than once per tranche -- a book can hold
     several tranches of the same product (that is what tranches are for), and a per-row read
     would be one query per tranche for one answer they all share.
-
-    `with_readiness=False` skips the entry-gate verdict entirely: no rules read, no rule built,
-    and no `entry_bar_ready` call -- which on the default three-granularity config is three of
-    the four candle reads this function makes per product. It exists for `gather_balances`
-    (#702), which renders quantity, mark and value and never shows a gate verdict, on an
-    endpoint the console re-polls every 15 seconds. Rows then carry `ready=False` with
-    `ready_reason=None`: NOT COMPUTED, and deliberately not the shape of any real verdict --
-    `entry_bar_ready` never returns `(False, None)`, so a caller that skipped the work cannot
-    have its rows mistaken for a product the gate refused.
     """
     mark_granularity = agent_mod._finest_granularity(list(config.market_data.granularities))
     # ONE read of the rules table and ONE build per rule, before the row loop -- see
     # `_gate_granularities`. A lookup per tranche would be one query and one constructor call per
     # row for an answer the rows share, and would be invisible on any fixture small enough to
-    # read. Skipped entirely when the caller does not render a verdict.
-    gates = _gate_granularities(repo, config) if with_readiness else {}
-    fallback = _fallback_granularity(config) if with_readiness else None
+    # read.
+    gates = _gate_granularities(repo, config)
+    fallback = _fallback_granularity(config)
 
     # ONE read for the whole book, not one per tranche: this page re-polls every 15 seconds, and
     # `get_asset_attestation` per row would be a query per row. Same shape as #707's
@@ -362,14 +351,11 @@ def gather_positions(
             marks[product_id] = _mark_for(repo, product_id, mark_granularity)
         # `.get(...) or fallback` collapses the two unresolvable cases onto one answer: a name
         # nothing matches, and a name two rules answer to with different granularities.
-        if with_readiness:
-            gate = gates.get(str(raw.get("rule_name") or "")) or fallback
-            key = (product_id, gate)
-            if key not in readiness:
-                readiness[key] = _readiness_for(repo, product_id, gate, config, now_ts)
-            ready, ready_reason = readiness[key]
-        else:
-            ready, ready_reason = False, None
+        gate = gates.get(str(raw.get("rule_name") or "")) or fallback
+        key = (product_id, gate)
+        if key not in readiness:
+            readiness[key] = _readiness_for(repo, product_id, gate, config, now_ts)
+        ready, ready_reason = readiness[key]
         mark, mark_ts = marks[product_id]
         attestation, attest_due = _attestation_state(
             attestations.get(_base_asset(product_id)), now_ts=now_ts

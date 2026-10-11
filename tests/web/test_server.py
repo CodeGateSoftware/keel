@@ -158,7 +158,7 @@ def test_post_is_refused_everywhere_except_the_setup_actions(
 ) -> None:
     """The write surface is one prefix. A POST anywhere else is not "method not allowed" -- there
     is no write surface at that path at all."""
-    for path in ("/", "/rules", "/pulse", "/setup"):
+    for path in ("/", "/rules", "/pulse", "/audit"):
         status, _headers, body = _request(
             running, path, method="POST", cookie=_session(running), form={}, csrf=_csrf(running)
         )
