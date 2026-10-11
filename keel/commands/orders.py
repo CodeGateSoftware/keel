@@ -899,9 +899,9 @@ WEB_READ_ONLY_NOTE = (
 )
 
 #: A headline per kind of cancel. It is composed into `CancelDecision.headline` and NOTHING renders
-#: it today: `keel orders cancel` prints only "order N: kind on product", and the console's cancel
-#: modal, its former reader, is gone. Kept (not removed here) so a front-end that wants a heading
-#: has one; until then, editing this wording changes no output.
+#: it today: `keel orders cancel` never prints it (it echoes "order N: kind on product" instead),
+#: and the console's cancel modal, its former reader, is gone. Kept (not removed here) so a
+#: front-end that wants a heading has one; until then, editing this wording changes no output.
 #: Checked at import: the assert below keeps the table closed over `CANCEL_KINDS`, so a kind added
 #: to the vocabulary without a headline fails at import rather than at `classify_cancel`.
 CANCEL_HEADLINES: Mapping[str, str] = {
@@ -976,8 +976,8 @@ def classify_cancel(
     cancel modal and `/api/orders` reads with `classify_cancels=False`. `keel serve` holds no
     venue credential and no broker handle, and #707 settled that it never will.
 
-    ONE function, so `keel orders cancel`'s phrase prompt (`typed`) and its re-check under the
-    lock read the same decision rather than each classifying for itself.
+    ONE function, so `keel orders cancel`'s phrase prompt (`typed`) and its re-check after the
+    prompt read the same decision rather than each classifying for itself.
 
     `row` and `bracket_ids` are the BATCH form, for a caller classifying a whole page: the row is
     already in hand and `repo.open_bracket_order_ids()` answers every protective link in one query
