@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 from typing import Any
 
@@ -20,6 +21,35 @@ def test_serve_is_registered_and_documents_itself() -> None:
     assert "--host" in result.output
     assert "--port" in result.output
     assert "--no-browser" in result.output
+
+
+def test_serve_help_names_the_write_surface_the_server_actually_has() -> None:
+    """`keel serve --help` said "the server implements GET and HEAD and nothing else" long after
+    `do_POST` grew the setup steps (#437) and the gate routes (#781). The routes named in the help
+    are compared against the ones `server.do_POST` dispatches, DERIVED from its own constants and
+    from `gates.TIER1_ACTIONS`, so a new gated action that the help forgets fails here."""
+    from keel.commands.serve import serve_cmd
+    from keel.web import gates
+    from keel.web.server import API_GATES_PREFIX, API_SETUP_PREFIX, HALT_KEY
+
+    assert serve_cmd.help is not None
+    paragraphs = [" ".join(p.split()) for p in serve_cmd.help.split("\n\n")]
+    assert paragraphs[0] == "Serve keel's console on localhost and open it in your browser."
+
+    writes = [p for p in paragraphs if "`POST " in p]
+    named = [route for p in writes for route in re.findall(r"`POST (/api/[^`]+)`", p)]
+    expected = {
+        API_GATES_PREFIX + HALT_KEY,
+        *(API_GATES_PREFIX + key for key in gates.TIER1_ACTIONS),
+        API_SETUP_PREFIX + "<step>",
+    }
+    assert sorted(named) == sorted(expected)
+    assert [p for p in paragraphs if "GET and HEAD and nothing else" in p] == []
+
+    # And the help a user actually sees carries the same opening line.
+    result = CliRunner().invoke(cli, ["serve", "--help"])
+    assert result.exit_code == 0
+    assert result.output.splitlines()[2].strip() == paragraphs[0]
 
 
 def test_the_default_bind_is_loopback() -> None:
@@ -77,6 +107,17 @@ def test_a_loopback_bind_does_not_warn(monkeypatch: pytest.MonkeyPatch, tmp_path
     output = "\n".join(_run(monkeypatch, tmp_path, "127.0.0.1"))
     assert "WARNING" not in output
     assert "http://127.0.0.1:8765/?token=" in output
+
+
+def test_the_startup_line_does_not_call_the_console_read_only(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The console halts the engine (Pulse) and runs setup steps (Audit & Setup), so the line an
+    operator reads at startup must not promise a read-only view."""
+    lines = _run(monkeypatch, tmp_path, "127.0.0.1")
+
+    assert lines[0] == "keel is serving its console at:\n\n    " + lines[0].split("    ")[-1]
+    assert "read-only" not in "\n".join(lines)
 
 
 def test_an_unopenable_database_is_a_message_not_a_traceback(

@@ -36,16 +36,43 @@ from keel.web.security import SESSION_COOKIE, new_session_token, session_cookie
 #: These were the seven server-rendered PAGES until #540. They are the JSON endpoints now, which
 #: is a stronger sweep for the one test that uses it: a secret that leaked into a rendered page
 #: would also have to leak into the document that page was built from, and this reads the
-#: documents directly.
+#: documents directly. `test_routes_is_every_get_that_carries_deployment_data` holds it equal to
+#: the route table, so it cannot drift again.
 ROUTES = (
     "/api/pulse",
     "/api/setup",
     "/api/orders",
     "/api/holdings",
+    "/api/timeline",
+    "/api/timeline/export.csv",
+    "/api/research/trials",
+    "/api/research/matrix",
+    "/api/research/gauntlet",
+    "/api/research/slippage",
     "/api/rules",
+    "/api/dca-plan",
     "/api/venues",
     "/api/config",
 )
+
+
+#: GETs under `/api/` that are NOT swept, each for a stated reason.
+#: `EVENTS_PATH` is a server-sent-event stream: it holds the connection open by design, so a
+#: request/response sweep would block on it, and what it emits is a change notice, not a document.
+_ROUTES_NOT_SWEPT = frozenset({web_server.EVENTS_PATH})
+
+
+def test_routes_is_every_get_that_carries_deployment_data() -> None:
+    """`ROUTES` was a hand-written list, and it drifted: the timeline, the four research reads and
+    the DCA plan all shipped without joining the sweep, so a secret leaking into any of them would
+    have passed the leak test. Derived here from the route table itself, plus the one data GET that
+    is deliberately not an `ApiRoute` (the CSV export), minus the named exclusions above."""
+    from keel.web import api
+
+    expected = set(api.API_ROUTES) | {api.CSV_EXPORT_PATH}
+    assert expected.isdisjoint(_ROUTES_NOT_SWEPT)
+    assert sorted(ROUTES) == sorted(expected)
+    assert len(ROUTES) == len(set(ROUTES)), "a route listed twice"
 
 
 def _request(
@@ -158,7 +185,7 @@ def test_post_is_refused_everywhere_except_the_setup_actions(
 ) -> None:
     """The write surface is one prefix. A POST anywhere else is not "method not allowed" -- there
     is no write surface at that path at all."""
-    for path in ("/", "/rules", "/pulse", "/setup"):
+    for path in ("/", "/rules", "/pulse", "/audit"):
         status, _headers, body = _request(
             running, path, method="POST", cookie=_session(running), form={}, csrf=_csrf(running)
         )
@@ -426,6 +453,40 @@ def test_the_disjointness_comments_state_the_actual_capability_count() -> None:
             f"{rel} says {word!r} ({number_words[word]}) capability-increasing actions, but "
             f"keel/capabilities.py declares {len(actions)} distinct ones -- prose is stale"
         )
+
+
+def test_no_source_says_do_post_routes_only_through_setup_actions() -> None:
+    """`do_POST` also reaches the gate table (`/api/gates/*`: the halt and the two Tier 1
+    releases), so any sentence that calls `setup.ACTIONS` its only route, or says one set of checks
+    "applies to every write", is false -- and five such sentences outlived the fix that made the
+    first one false (#954 round 2). Scans every source for the phrases, across line wraps."""
+    import re
+
+    root = Path(__file__).resolve().parent.parent.parent / "keel"
+    sources = sorted(root.rglob("*.py")) + sorted((root / "web" / "static" / "js").glob("*.js"))
+    assert len(sources) > 100, "the scan found too few sources, which would make it vacuous"
+    # A comment marker (`#`, `#:`, ` *`) and indentation may sit between any two words.
+    gap = r"[\s#:*]+"
+    phrases = {
+        "routes only through setup.ACTIONS": (
+            rf"routes?{gap}ONLY{gap}through{gap}.keel\.commands\.setup\.ACTIONS"
+        ),
+        "only surface do_POST routes to": rf"only{gap}surface{gap}.server\.do_POST.",
+        "whole write surface": rf"whole{gap}write{gap}surface",
+        "no path other than ACTIONS": (
+            rf"no{gap}path{gap}that{gap}reaches{gap}keel{gap}other{gap}than"
+        ),
+        "five checks apply to every write": (
+            rf"Five{gap}checks.{{0,400}}applies{gap}to{gap}every{gap}write"
+        ),
+    }
+    hits = [
+        f"{path.relative_to(root)}: {name}"
+        for path in sources
+        for name, pattern in phrases.items()
+        if re.search(pattern, path.read_text(encoding="utf-8"), re.IGNORECASE | re.DOTALL)
+    ]
+    assert hits == [], f"stale claims about the write surface: {hits}"
 
 
 # -- CSRF -------------------------------------------------------------------------------------
@@ -1213,7 +1274,10 @@ def test_looking_at_a_machine_with_nothing_on_it_creates_nothing(
     bringing a deployment into existence by being looked at. Every route, because that is how
     this was missed: the original test walked two of them."""
     for path in ROUTES:
-        _request(empty_machine, path, cookie=_session(empty_machine))
+        status, _headers, _body = _request(empty_machine, path, cookie=_session(empty_machine))
+        # Every route was actually served (the CSV export's stated 500 is the missing config),
+        # so "nothing was created" is about reads that ran, not requests that were refused.
+        assert status == (500 if path == "/api/timeline/export.csv" else 200), path
     assert not Path(empty_machine.db_path).exists()
     assert not Path(empty_machine.config_path).exists()
 
@@ -1265,10 +1329,20 @@ def test_a_submitted_secret_never_appears_in_a_response_or_a_redirect(
     assert secret not in body
     assert stored["CDP_API_SECRET"] == secret
 
+    answered: dict[str, int] = {}
     for path in ROUTES:
-        _status, _headers, document = _request(empty_machine, path, cookie=_session(empty_machine))
+        status, _headers, document = _request(empty_machine, path, cookie=_session(empty_machine))
+        answered[path] = status
         assert secret not in document, path
         assert "cdp-key-value" not in document, path
+    # Not vacuous: a 404 or a 403 body cannot carry the secret either, so a sweep over routes
+    # that did not answer would pass while reading nothing. The CSV export is the one exception
+    # to 200 on a machine with no config: it is not an `ApiRoute`, so it has no `needs_database`
+    # short-circuit and answers a stated 500 naming the missing file -- a body that is read here,
+    # and an error detail is exactly where a leaked value would surface.
+    expected = dict.fromkeys(ROUTES, 200)
+    expected["/api/timeline/export.csv"] = 500
+    assert answered == expected
 
     assert setup_mod.MARKET_DATA_SECRETS == ("CDP_API_KEY", "CDP_API_SECRET")
 

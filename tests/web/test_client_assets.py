@@ -676,7 +676,7 @@ def test_the_route_table_parser_actually_found_something() -> None:
     said "seven entries today" while `CLIENT_ROUTES` held thirteen, which is the failure mode of
     writing a number into prose beside a test that deliberately does not assert one."""
     names = _js_route_names()
-    assert len(names) >= 7, f"parsed {names} out of main.js -- the parser has stopped working"
+    assert len(names) >= 4, f"parsed {names} out of main.js -- the parser has stopped working"
     assert "pulse" in names
 
 
@@ -1068,7 +1068,8 @@ def test_a_path_that_is_not_a_client_route_is_still_a_404(running) -> None:  # t
 
 def test_the_retired_client_routes_are_a_closed_tuple_of_exactly_these_names() -> None:
     """Console PR1 (#951) retired three views, PR2 two more and PR3 (#953) two more -- Insights and
-    Research, folded into Rules. PR4 adds its own."""
+    Research, folded into Rules. PR4 (#954) retired five: Setup, Timeline and Venues, folded into
+    Audit & Setup, and Balances and Plans."""
     assert staticfiles.RETIRED_CLIENT_ROUTES == (
         "status",
         "activity",
@@ -1077,12 +1078,31 @@ def test_the_retired_client_routes_are_a_closed_tuple_of_exactly_these_names() -
         "positions",
         "insights",
         "research",
+        "setup",
+        "timeline",
+        "balances",
+        "venues",
+        "plans",
     )
     assert set(staticfiles.RETIRED_CLIENT_ROUTES).isdisjoint(staticfiles.CLIENT_ROUTES)
 
 
 @pytest.mark.parametrize(
-    "name", ["status", "activity", "gates", "orders", "positions", "insights", "research"]
+    "name",
+    [
+        "status",
+        "activity",
+        "gates",
+        "orders",
+        "positions",
+        "insights",
+        "research",
+        "setup",
+        "timeline",
+        "balances",
+        "venues",
+        "plans",
+    ],
 )
 def test_a_retired_route_serves_the_shell_so_the_client_can_land_on_the_home_view(
     name: str,
@@ -1229,19 +1249,22 @@ def _view_keys(view: str, root: str) -> list[str]:
 #: apart in the one region. All of them name `/rules` as their `html_route` -- which is the server
 #: saying they are one page. The DCA card is its own exported function, so it is its own entry.
 _VIEW_ENDPOINTS: tuple[tuple[str, str, str], ...] = (
-    ("setupView", "data", "/api/setup"),
+    # Audit & Setup (console PR4) reads three endpoints, and each is drawn by a section builder
+    # of its own -- an exported function, so `_view_keys` scans each region against its own
+    # endpoint under the `data` root the Setup builders were already pinned to.
+    ("setupSection", "data", "/api/setup"),
+    ("timelineSection", "data", "/api/timeline"),
+    ("readinessSection", "data", "/api/venues"),
     # Pulse (console PR1): the home view, and the one that replaced Status, Activity and Gates.
     ("pulseView", "data", "/api/pulse"),
     # #659/#701/#702's views were added to the client without being added here, so nothing
     # checked that they read keys their endpoint actually sends. Demonstrated on #702: renaming
-    # `data.hwm` to `data.high_water_mark` in `balancesView` left the whole web suite green, and
-    # the tile would have rendered blank forever with nothing in the console naming the gap.
+    # `data.hwm` to `data.high_water_mark` in the (since retired) Balances view left the whole web
+    # suite green, and the tile would have rendered blank forever with nothing naming the gap.
     ("holdingsView", "data", "/api/holdings"),
     # Holdings reads a SECOND endpoint for its recent-orders section, through a parameter named
     # `orders` -- the root that keeps the two payloads' keys apart in `_view_keys`' one region.
     ("holdingsView", "orders", "/api/orders"),
-    ("balancesView", "data", "/api/balances"),
-    ("timelineView", "data", "/api/timeline"),
     ("rulesView", "data", "/api/rules"),
     ("rulesView", "trials", "/api/research/trials"),
     ("rulesView", "gauntlet", "/api/research/gauntlet"),
@@ -1250,7 +1273,6 @@ _VIEW_ENDPOINTS: tuple[tuple[str, str, str], ...] = (
     # The DCA proposal card on /rules. Read bare, the endpoint answers its awaiting shape, which
     # carries every key the ready shape does (`payload.dca_plan_awaiting_payload`).
     ("dcaPlanCard", "plan", "/api/dca-plan"),
-    ("venuesView", "data", "/api/venues"),
 )
 
 
@@ -1302,7 +1324,9 @@ def test_the_view_key_scan_reads_every_ported_view() -> None:
     assert "records" in _view_keys("rulesView", "data")
     assert "closed_trade_count" in _view_keys("rulesView", "data")
     assert "chain_errors" in _view_keys("rulesView", "trials")
-    assert "steps" in _view_keys("setupView", "data")
+    assert "steps" in _view_keys("setupSection", "data")
+    assert "kinds" in _view_keys("timelineSection", "data")
+    assert _view_keys("readinessSection", "data") == ["readiness"]
 
 
 def test_the_pulse_key_scan_found_the_keys_it_claims_to_check() -> None:
@@ -1655,8 +1679,7 @@ _ROW_ENDPOINTS: tuple[tuple[str, str, str, str, str], ...] = (
     # placement and fill cells a row carries are the matched shape and not the "unknown" one.
     ("holdingsView", "data", "rows", "/api/holdings", "holdings"),
     ("holdingsView", "orders", "rows", "/api/orders", "orders"),
-    ("balancesView", "data", "assets", "/api/balances", "positions"),
-    ("timelineView", "data", "rows", "/api/timeline", "orders"),
+    ("timelineSection", "data", "rows", "/api/timeline", "orders"),
     ("rulesView", "data", "rules", "/api/rules", "rules"),
     # The track records (console PR3). The `rules` seeder writes a `candidate` rule, which is in
     # the promotion pipeline `build_insights_report` scopes to, so the collection has a row.
@@ -1688,12 +1711,11 @@ _ROW_ENDPOINTS_UNCOVERED: dict[tuple[str, str, str], str] = {
         "needs a cycle log file beside the deployment; the service is pinned in "
         "tests/commands/test_pulse.py and the reader in test_api.py"
     ),
-    ("setupView", "data", "not_automated"): "the checklist is config-derived, not row-seeded",
-    ("setupView", "data", "actions"): "the checklist is config-derived, not row-seeded",
+    ("setupSection", "data", "not_automated"): "the checklist is config-derived, not row-seeded",
+    ("setupSection", "data", "actions"): "the checklist is config-derived, not row-seeded",
     ("rulesView", "trials", "exploration"): "needs a trials ledger; #708 view 1 seeds one",
     ("rulesView", "trials", "rows"): "needs a trials ledger; #708 view 1's own tests seed one",
-    ("venuesView", "data", "venues"): "config-derived; no rows to seed",
-    ("venuesView", "data", "readiness"): "config-derived; no rows to seed",
+    ("readinessSection", "data", "readiness"): "config-derived; no rows to seed",
     # Nested one level down: the root is a ROW variable, not a payload root, so the check above
     # cannot address them by `(root, collection)` at all. Naming them is what stops the scan from
     # looking complete while quietly skipping every nested collection in the client.
@@ -2139,106 +2161,6 @@ def test_the_chip_separators_the_comments_describe_actually_ship() -> None:
     css = (_STATIC / "css" / "keel.css").read_text(encoding="utf-8")
     for selector in ("#session-profile:not(:empty)::after", "#session-equity:not(:empty)::before"):
         assert selector in css, f"no separator rule for {selector}"
-
-
-# -- the Plans page's refusals (#706) -------------------------------------------------------------
-#
-# The acceptance criterion is "zero interactive purchase affordances", which is a NEGATIVE -- the
-# thing that rots silently. So it is asserted structurally against the parsed function bodies,
-# with string literals KEPT (the earlier lesson: a scan that strips them cannot see `el("a")`).
-
-
-#: Text that would turn a published price into something a reader could act on.
-#:
-#: A SECOND BELT, and it is worth saying which belt is first: every string in the tier table has to
-#: appear verbatim in `docs/evolution-plan.md` (`tests/commands/test_plans.py`), so an injected
-#: call to action fails traceability before it reaches this list. That is the defence that does not
-#: depend on anyone having thought of the wording.
-#:
-#: This list exists for the strings traceability does not cover, and it carries the schemes the
-#: project ACTUALLY chose: ADR 0004 and Phase F both name self-hosted BTCPay, so `bitcoin:` and
-#: `lightning:` URIs are the single most likely real affordance here -- and the first cut of this
-#: list, built from generic e-commerce words, could not see either of them.
-_PURCHASE_AFFORDANCES: tuple[str, ...] = (
-    "http://",
-    "https://",
-    "mailto:",
-    "bitcoin:",
-    "lightning:",
-    "btcpay",
-    "lnbc",
-    "checkout",
-    "subscribe",
-    "upgrade",
-    "purchase",
-    "pay via",
-    "pay with",
-    "get started",
-    "buy ",
-    "order at",
-    "contact sales",
-)
-
-
-def test_the_plans_view_builds_nothing_a_reader_can_click() -> None:
-    """No button, no anchor, no form, no handler.
-
-    A retail Plans page is a funnel by construction: every row exists to move a reader one row
-    down. The inversion is not a matter of gentler wording -- there must be nothing on the page
-    that could take an action, so that the page cannot become a funnel by a later edit that only
-    changes copy.
-    """
-    source = _source("render.js")
-    for name in ("plansView", "claimList", "citation"):
-        body = _function_body(source, name)
-        for forbidden in _INTERACTIVE_TOKENS:
-            assert forbidden not in body, f"{name} builds something interactive: {forbidden}"
-
-
-def test_the_plans_payload_sends_no_destination_to_build_one_from() -> None:
-    """The refusal is structural rather than editorial: `render.js` cannot make a link out of a
-    payload that never sends a URL. Asserted over the SERIALISED payload, so a key added anywhere
-    beneath it is caught too."""
-    from keel.commands.plans import gather_plans
-    from keel.web import payload as payload_mod
-
-    body = json.dumps(payload_mod.plans_payload(gather_plans())).lower()
-    for affordance in _PURCHASE_AFFORDANCES:
-        assert affordance not in body, f"the plans payload carries {affordance}"
-
-
-def test_the_plans_view_cites_a_path_and_never_links_to_one() -> None:
-    """`keel serve` is a loopback SQLite reader with no document server behind it, so a link to a
-    document would 404 -- and a path a reader can open in their own checkout is the honest form.
-    It is also what keeps this page free of anchors entirely."""
-    body = _function_body(_source("render.js"), "citation")
-    assert '"code"' in body
-    assert "href" not in body
-
-
-def test_the_plans_view_shows_every_section_the_payload_sends() -> None:
-    """A page that quoted the constitution and dropped the refusal list would be a page choosing
-    which of the project's commitments a reader sees -- on the page whose subject is exactly
-    that."""
-    from keel.commands.plans import gather_plans
-    from keel.web import payload as payload_mod
-
-    # DERIVED from the payload, not a list of literals: a section added to the wire and never
-    # rendered would have passed a hardcoded list forever.
-    sections = set(payload_mod.plans_payload(gather_plans()))
-    assert sections, "the scan found no sections -- it would pass against any view"
-
-    body = _function_body(_source("render.js"), "plansView")
-    for key in sorted(sections):
-        assert "data." + key in body, f"/api/plans sends {key}; plansView never renders it"
-
-
-def test_the_plans_table_offers_no_sort_control() -> None:
-    """A tier table ordered by price is a shopping comparison. These four rows are not four
-    choices, and `table()` draws a sort control only when handed a `sort`/`onSort` pair."""
-    body = _function_body(_source("render.js"), "plansView")
-    assert "onSort" not in body
-    assert "sort:" not in body
 
 
 def _duplicate_block_declarations(code: str) -> list[str]:

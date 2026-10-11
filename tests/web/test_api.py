@@ -58,7 +58,6 @@ API_ROUTES = (
     "/api/setup",
     "/api/orders",
     "/api/holdings",
-    "/api/balances",
     "/api/timeline",
     "/api/research/trials",
     "/api/research/slippage",
@@ -67,7 +66,6 @@ API_ROUTES = (
     "/api/rules",
     "/api/dca-plan",
     "/api/venues",
-    "/api/plans",
 )
 
 
@@ -770,14 +768,10 @@ def test_a_stopped_engine_still_answers_the_endpoints_that_describe_the_binary(
     with nothing set up) but, since #233 PR4, DOES attempt a best-effort read of this
     deployment's venue readiness -- `read_venues` checks `state.has_usable_database` first and
     skips the repo entirely here, where it is `False`, so the property this test actually cares
-    about (200 with data, nothing required to exist first) still holds. All three still report
+    about (200 with data, nothing required to exist first) still holds. Both still report
     `engine`, because a client showing the "keel isn't running" banner should not have to fetch a
     different endpoint to know whether to show it."""
-    # `/api/plans` (#706) joins them and is the purest case: its subject is the PROJECT rather
-    # than the deployment, so it reads no repository at all -- and a page explaining that keel is
-    # free and runs on the operator's own hardware would be a strange one to gate behind having
-    # already installed it.
-    for path in ("/api/config", "/api/venues", "/api/plans"):
+    for path in ("/api/config", "/api/venues"):
         status, _headers, document = _json(empty_machine, path)
 
         assert status == 200, path
@@ -885,7 +879,7 @@ def test_setup_carries_the_csrf_token_and_only_setup_does(
     _status, _headers, document = _json(empty_machine, "/api/setup")
     assert document["data"]["csrf"] == csrf_token(empty_machine.token)
 
-    for path in ("/api/config", "/api/pulse", "/api/venues", "/api/plans"):
+    for path in ("/api/config", "/api/pulse", "/api/venues"):
         _status, _headers, other = _json(empty_machine, path)
         assert csrf_token(empty_machine.token) not in json.dumps(other), path
 
@@ -2305,3 +2299,34 @@ def test_holdings_sorts_by_decimal_on_cost(running: web_server.ServeConfig) -> N
     assert sorted(as_built) == sorted(WEI_APART)  # the seeded rows reached the reader
     assert ordered == [WEI_APART[2], WEI_APART[1], WEI_APART[0]]
     assert ordered != sorted(as_built, key=float)
+
+
+# -- the Audit & Setup view's three reads (console PR4) --------------------------------------------
+
+
+def test_the_audit_view_carries_setup_timeline_and_venues() -> None:
+    """Console PR4: Setup, Timeline and Venues became sections of one Audit & Setup view, so the
+    three endpoints name `/audit` as their page -- and no endpoint names a retired view."""
+    assert {
+        path: web_api.HTML_ROUTE_FOR[path]
+        for path in ("/api/setup", "/api/timeline", "/api/venues")
+    } == {"/api/setup": "/audit", "/api/timeline": "/audit", "/api/venues": "/audit"}
+    retired = {"/setup", "/timeline", "/venues", "/balances", "/plans"}
+    assert retired.isdisjoint(web_api.HTML_ROUTE_FOR.values())
+
+
+def test_the_audit_views_primary_answers_on_a_machine_with_nothing_on_it() -> None:
+    """The stopped view's "Set keel up on this machine" lands on Audit & Setup, so the endpoint
+    that view reads FIRST must answer with no deployment at all (planner ruling 14)."""
+    assert web_api.API_ROUTES["/api/setup"].needs_database is False
+    assert web_api.API_ROUTES["/api/venues"].needs_database is False
+
+
+@pytest.mark.parametrize("path", ["/api/balances", "/api/plans"])
+def test_the_retired_balances_and_plans_endpoints_are_not_served(
+    running: web_server.ServeConfig, path: str
+) -> None:
+    status, _headers, _document = _json(running, path)
+
+    assert status == 404
+    assert path not in web_api.API_ROUTES

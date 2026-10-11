@@ -38,23 +38,19 @@ import { indexUrl, rememberVersion } from "./docs.js";
 import { available, subscribe } from "./live.js";
 import {
   attestationBanner,
+  auditView,
   buildLine,
   engineBanner,
-  plansView,
   deploymentCard,
   holdingsView,
   modeBadge,
   paperBanner,
   consoleSwitcher,
   sessionChip,
-  balancesView,
-  timelineView,
   pulseView,
   refusedView,
   rulesView,
-  setupView,
   stoppedView,
-  venuesView,
 } from "./render.js";
 
 /**
@@ -97,8 +93,9 @@ const HALT_CONFIRM = "Halt keel? Resuming requires `keel resume` at a terminal."
  *
  * **`endpoints` is a list because a view can read several.** Holdings reads `/api/holdings` and
  * `/api/orders`; Rules reads `/api/rules`, `/api/dca-plan` and the four research reads (console
- * PR3 folded the Insights and Research views into it). The split is `api.py`'s own decision
- * rather than a shape this client chose: one sortable collection per endpoint keeps `?sort=`
+ * PR3 folded the Insights and Research views into it); Audit & Setup reads `/api/setup`,
+ * `/api/timeline` and `/api/venues` (console PR4 folded Setup, Timeline and Venues into it).
+ * The split is `api.py`'s own decision rather than a shape this client chose: one sortable collection per endpoint keeps `?sort=`
  * unambiguous without a `?table=` beside it, and the research record keeps its own endpoints so
  * its empty sort surface stays pinned per read. Every endpoint of a view names that view as its
  * `html_route`, which is the server saying they are one page.
@@ -112,17 +109,26 @@ const HALT_CONFIRM = "Halt keel? Resuming requires `keel resume` at a terminal."
  */
 const ROUTES = [
   { name: "pulse", label: "Pulse", endpoints: ["pulse"] },
-  { name: "setup", label: "Setup", endpoints: ["setup"] },
   { name: "holdings", label: "Holdings", endpoints: ["holdings", "orders"] },
-  { name: "balances", label: "Balances", endpoints: ["balances"] },
-  { name: "timeline", label: "Timeline", endpoints: ["timeline"] },
   { name: "rules", label: "Rules", endpoints: ["rules", "dca-plan", "research/trials", "research/gauntlet", "research/slippage", "research/matrix"] },
-  { name: "venues", label: "Venues", endpoints: ["venues"] },
-  { name: "plans", label: "Plans", endpoints: ["plans"] },
+  { name: "audit", label: "Audit & Setup", endpoints: ["setup", "timeline", "venues"] },
 ];
 
 /** Where an unrecognised path lands, and what `BASE` alone means. @type {Route} */
 const DEFAULT_ROUTE = ROUTES[0];
+
+/**
+ * Retired view names whose content now lives in another view, and that view's name.
+ *
+ * `routeFor` sends any other unknown name to the home view, which is right for a view that left
+ * the console (Balances, Plans, Status...) and wrong for one that only MOVED: a bookmark or a
+ * habit naming `/setup` wants the checklist, and Pulse does not have it. Each name here must also
+ * be in `staticfiles.RETIRED_CLIENT_ROUTES`, so the server delivers the shell that does this
+ * routing (`tests/web/test_audit_view.py` pins both).
+ *
+ * @type {Record<string, string>}
+ */
+const MOVED_ROUTES = { setup: "audit", timeline: "audit", venues: "audit" };
 
 /**
  * How often the page re-reads, in milliseconds.
@@ -199,8 +205,9 @@ function must(id) {
  */
 function routeFor(pathname) {
   if (!pathname.startsWith(BASE)) return DEFAULT_ROUTE;
-  const name = pathname.slice(BASE.length);
-  if (name === "" || name === "index.html") return DEFAULT_ROUTE;
+  const asked = pathname.slice(BASE.length);
+  if (asked === "" || asked === "index.html") return DEFAULT_ROUTE;
+  const name = Object.prototype.hasOwnProperty.call(MOVED_ROUTES, asked) ? MOVED_ROUTES[asked] : asked;
   return ROUTES.find((route) => route.name === name) ?? DEFAULT_ROUTE;
 }
 
@@ -257,21 +264,27 @@ function paramsFor(endpoint) {
 // card is read-only and has no controls, so the address is the one input it takes (R16). Copied
 // once, at load, into that endpoint's query bag only -- the rule table's own `?sort=` stays out
 // of the address, per `params`' note.
+//
+// The timeline opens on keel's own record (console PR4): `kind=keel`, the server's composite of
+// `system` and `attestation`, so the CSV link carries the same kind and the file matches the
+// screen. `all` is one chip away; the CLI and the API's own default (every kind) are untouched.
 {
   const page = new URLSearchParams(window.location.search);
   for (const name of ["budget", "buffer"]) {
     const given = page.get(name);
     if (given !== null) paramsFor("dca-plan")[name] = given;
   }
+  paramsFor("timeline").kind = "keel";
 }
 
 /**
  * Which section each sectioned view is showing (#773).
  *
- * **Keyed by `route.name`, not held once for the client.** Setup is the one sectioned page today
- * (Status was the other, until Pulse replaced it as a single scroll), and the key stays per route
- * so that a second sectioned page cannot show whichever of its sections happened to sit at
- * Setup's key -- or, for a key it does not have, fall back to its first section every time.
+ * **Keyed by `route.name`, not held once for the client.** Audit & Setup is the one sectioned page
+ * today -- its Setup part (Status was the other, until Pulse replaced it as a single scroll) --
+ * and the key stays per route so that a second sectioned page cannot show whichever of its
+ * sections happened to sit at Audit's key -- or, for a key it does not have, fall back to its
+ * first section every time.
  *
  * Not in the query string, and not in the URL: nothing is asked of the server here. `sectioned`
  * chooses which part of a document the client already holds to draw, and a `?section=` would be
@@ -472,12 +485,31 @@ function mount(route, readings) {
   const data = primary.data;
   const onSort = sorter(route, route.endpoints[0]);
 
-  if (route.name === "setup") {
+  if (route.name === "audit") {
     // The write token for this session, kept for the submit handler below. It is read off the
-    // document that was just fetched rather than stored anywhere: it dies with the process that
-    // minted it, and a stale one produces a 403 the view shows rather than a silent no-op.
+    // `/api/setup` document that was just fetched -- the primary, and the one endpoint that
+    // carries it -- rather than stored anywhere: it dies with the process that minted it, and a
+    // stale one produces a 403 the view shows rather than a silent no-op.
     remember(data);
-    return setupView(data, sectionOf(route), onSectionFor(route));
+    // The timeline and the venue readiness are SECONDARY. The timeline's chip re-asks the SERVER
+    // (#703): filtering the capped page here would present the rows that happened to arrive as
+    // "every flow this month". Its sort is its own endpoint's, like the Holdings orders section.
+    const timeline = readings[1];
+    const venues = readings[2];
+    return auditView(
+      data,
+      sectionOf(route),
+      onSectionFor(route),
+      timeline ? timeline.data : null,
+      timeline ? timeline.error : null,
+      timeline ? timeline.sort : null,
+      sorter(route, "timeline"),
+      (kind) => {
+        paramsFor("timeline").kind = kind;
+        void paint(route, true, true);
+      },
+      venues ? venues.data : null,
+    );
   }
   if (route.name === "pulse") {
     // The halt token, for the submit handler below. Read off the document that was just fetched
@@ -513,16 +545,6 @@ function mount(route, readings) {
       },
     );
   }
-  if (route.name === "balances") return balancesView(data, primary.sort, onSort);
-  if (route.name === "timeline") {
-    return timelineView(data, primary.sort, onSort, (kind) => {
-      // #703: the chip re-asks the SERVER, like the Orders status tabs. Filtering the
-      // capped page here would filter the rows that happened to arrive and present the
-      // result as "every flow this month".
-      paramsFor(route.endpoints[0]).kind = kind;
-      void paint(route, true, true);
-    });
-  }
   if (route.name === "rules") {
     // Everything after the ledger is SECONDARY. A refused DCA read (a malformed `?budget=`) leaves
     // the rule ledger standing, and the card is handed the reading's `error` so it can say why
@@ -547,8 +569,6 @@ function mount(route, readings) {
       matrix ? matrix.data : null,
     );
   }
-  if (route.name === "venues") return venuesView(data, primary.sort, onSort);
-  if (route.name === "plans") return plansView(data);
   // Unreachable while every route above is named, and the right landing if one is added without
   // a branch: the home view renders, where a missing return would hand `paint` `undefined`.
   return pulseView(data);
@@ -691,8 +711,8 @@ function reconnect(pasted) {
   return "";
 }
 
-/** Where "set keel up on this machine" points. @type {Route} */
-const SETUP_ROUTE = ROUTES.find((route) => route.name === "setup") ?? DEFAULT_ROUTE;
+/** Where "set keel up on this machine" points -- the Audit & Setup view. @type {Route} */
+const SETUP_ROUTE = ROUTES.find((route) => route.name === "audit") ?? DEFAULT_ROUTE;
 
 /**
  * Show a route: update the nav, the title, the focus, and start its poll.

@@ -251,6 +251,16 @@ def _png_rgba(payload: bytes) -> list[list[tuple[int, int, int, int]]]:
 # -- the manifest ----------------------------------------------------------------------------------
 
 
+def test_the_install_prompt_does_not_call_the_console_read_only() -> None:
+    """The manifest description is the line an operator reads in the browser's install prompt. The
+    console halts the engine (Pulse) and runs setup steps (Audit & Setup), so it may not promise a
+    read-only app."""
+    manifest = json.loads(_MANIFEST.read_text(encoding="utf-8"))
+
+    assert "read-only" not in manifest["description"].lower()
+    assert "read only" not in manifest["description"].lower()
+
+
 def test_the_manifest_start_url_and_scope_agree_with_the_client() -> None:
     """`start_url` must be inside `scope`, and `scope` must be where the client actually lives.
 

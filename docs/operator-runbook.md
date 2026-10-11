@@ -421,15 +421,19 @@ It prints a URL carrying a one-time token for that run and opens your browser (`
 skip). The `--config`/`--db` pair still decides which account you are looking at, and still bites
 the same way.
 
-It is **read-only**, and structurally so: the server answers `GET` and `HEAD` and implements no
-other verb, so there is no request it can answer that changes anything. Attesting, promoting a
-rule, recording a flow and arming autonomy stay CLI commands behind the interactive-terminal gate.
+It **reads with `GET` and `HEAD`, and its writes are a closed set of `POST`s** under `/api/`:
+`/api/gates/halt` engages the kill-switch (a gate token, nothing more — stopping must never be
+slower than starting); `/api/gates/resume` and `/api/gates/resume-entries` release a halt only
+from a loopback session on a loopback bind, with a gate token and a typed phrase (the console
+offers neither — release a halt with `keel resume` at a terminal); and `/api/setup/<step>` runs
+one of `keel setup`'s idempotent mechanical steps. Attesting, promoting a rule, recording a flow
+and arming autonomy stay CLI commands behind the interactive-terminal gate.
 
 Four things stand between that page and the rest of the machine: it binds `127.0.0.1`; it checks
 the `Host:` header, so a hostname rebound to loopback is refused even though its packets arrive
 on loopback; it requires the session token, which is minted per run and never written to disk; and
-it serves no write verb. `--host` will bind anywhere you ask, and says plainly what that costs —
-on a non-loopback address your positions, equity and full trade history are readable by anyone who
+every write also needs the console's own request headers and a token derived from that session.
+`--host` will bind anywhere you ask, and says plainly what that costs — on a non-loopback address your positions, equity and full trade history are readable by anyone who
 can reach the port, with a cleartext token as the only obstacle.
 
 **Placing an order is gated differently.** Paper places freely against synthetic cash — nothing is
@@ -836,12 +840,11 @@ Rewards item: account settings no rail can see, re-checked after any account cha
 
 ## The operator console, in a browser
 
-`keel serve` opens keel's **operator console**: a local web page showing Pulse (the home view),
-Setup, Holdings, Balances, Timeline, Rules, Venues and Plans, over the same `keel/commands/*`
-service layer the CLI commands call. It is being slimmed to four engine
-views -- Pulse, Holdings, Rules, Audit & Setup; see
-`docs/superpowers/plans/2026-10-10-console-four-views.md`. An architectural test (`tests/commands/test_console_thinness.py`) pins that thinness -- the
-front-end renders and dispatches, and every behaviour comes from the services.
+`keel serve` opens keel's **operator console**: a local web page with four engine views -- Pulse
+(the home view), Holdings, Rules and Audit & Setup -- plus a link to the documentation, over the
+same `keel/commands/*` service layer the CLI commands call. An architectural test
+(`tests/commands/test_console_thinness.py`) pins that thinness -- the front-end renders and
+dispatches, and every behaviour comes from the services.
 
 ```bash
 keel --config config.live-sandbox.yaml --db keel-live.db serve
@@ -849,6 +852,11 @@ keel --config config.live-sandbox.yaml --db keel-live.db serve
 
 It binds loopback and prints a URL carrying a one-time token for that run. Stopping the server
 invalidates it: the token is new every run.
+
+**Pulse.** The glance page: the kill switch, autonomy and its lapse, today's cycle counts
+(signals, entered, blocked, errors), why keel did not trade, the last cycle's time, the next DCA
+buy due per live DCA rule, data freshness and the market session, and any tranche missing its
+bracket. It carries the HALT button (below).
 
 **Holdings.** One table of open tranches per rule: per-tranche cost (what the tranche paid to
 open, entry fee included), the entry-gate verdict, the asset attestation, the bracket, the stop
@@ -867,9 +875,21 @@ command it shows, at a terminal), then the research record: every trial, the evi
 gauntlet and the slippage assumptions. Track records, promotion-gate distances and the research
 record used to be the Insights and Research views. The equity charts and the closed-trade table
 left the console: the closed-trade journal is `keel insights journal`, your own journal is `keel
-journal list`, and in the browser every fill is still a Timeline `trade` row and every journal
-entry a Timeline `attestation` row. A live rule's track record is `keel insights summary --mode
+journal list`, and in the browser every fill is still a `trade` row on the Audit & Setup timeline and every
+journal entry an `attestation` row there. A live rule's track record is `keel insights summary --mode
 live`.
+
+**Audit & Setup.** The tamper-evident timeline, the setup checklist and venue readiness, on one
+page. The timeline opens on keel's own record -- `kind=keel`, the engine's cycle rows (each with
+its signals, blocked, entered, exited and error counts) and the attestations -- and the `trade`
+and `flow` chips (or `all`) bring back fills and cash flows; the Export CSV link carries the same
+scope and kind, so the file holds what the screen shows, with each row's hash and chain status.
+Below it is Setup: the runbook stages as tabs, each mechanical step a button, and the job panel
+reporting a running step such as the market-data fetch. Last is venue readiness: whether a live
+entry can be placed on this deployment now, and the fix when it cannot. The adapters' declared
+capabilities are `keel brokers list`. This page is where "Set keel up on this machine" lands
+when no deployment exists yet, and the old `/setup`, `/timeline` and `/venues` addresses open it.
+The Balances and Plans views are gone; their old addresses open Pulse.
 
 **Halting from the browser.** Pulse carries a HALT button. It engages the kill switch through the
 same operation `keel kill` performs (`POST /api/gates/halt`), after one confirm dialog and nothing
@@ -998,10 +1018,15 @@ covers the rest from a plain shell.
 
 **What the browser cannot do, and that is deliberate.** Every capability-increasing action --
 arming autonomy, releasing the kill-switch, clearing a consecutive-loss halt, re-seeding the
-drawdown high-water mark, declaring a deposit or withdrawal, attesting withdrawal capability, and
-replacing the binary -- is a CLI command behind a typed confirmation at an interactive terminal.
-`keel capabilities` lists all seven with the gate covering each. The server implements no verb
-that would reach one, so this is a property of the server rather than of what the page draws.
+drawdown high-water mark, declaring a deposit or withdrawal, attesting withdrawal capability, scope
+or posture, declaring an out-of-band close, and replacing the binary -- is a CLI command behind a
+typed confirmation at an interactive terminal. `keel capabilities` lists all ten with the gate
+covering each. The one exception is the console's
+HALT button, which engages the kill-switch (stopping is never gated). The server's gated routes
+under `/api/gates/` can also release the kill-switch and clear the consecutive-loss halt, but only
+for a loopback session on a loopback bind with the typed phrase, and the page draws no control for
+either: releasing remains a terminal act in practice. Everything else in the list has no route
+at all, so that is a property of the server rather than of what the page draws.
 
 ## How much money moves
 

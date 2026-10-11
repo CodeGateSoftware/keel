@@ -122,18 +122,9 @@
   <nav aria-label="Views">
     <ul>
       <li><a href="/pulse">Pulse</a></li>
-      <li><a href="/setup">Setup</a></li>
       <li><a href="/holdings">Holdings</a></li>
-      <li><a href="/balances">Balances</a></li>
-      <li><a href="/timeline">Timeline</a></li>
       <li><a href="/rules">Rules</a></li>
-      <li><a href="/venues">Venues</a></li>
-      <!--
-        #706. Last of the views because it is the odd one out: not this deployment's state at all,
-        but what this deployment is allowed to do, and what it costs. A transparency artifact rather than a paywall matrix --
-        it lists what is free forever and why, and there is nothing on it to buy.
-      -->
-      <li><a href="/plans">Plans</a></li>
+      <li><a href="/audit">Audit &amp; Setup</a></li>
       <!--
         THE LAST NAV ENTRY IS A LINK, NOT A VIEW (#539).
 
@@ -199,8 +190,7 @@
 
       `<details>` and NOT a button with a handler: it is keyboard-operable, touch-operable and
       announced with nothing bound, which is what lets the card pass the same no-interactive-node
-      test the chip and the banner answer to (`venueCard` uses the element the same way). Nothing
-      inside it changes anything; switching mode or profile stays a terminal ceremony.
+      test the chip and the banner answer to. Nothing inside it changes anything; switching mode or profile stays a terminal ceremony.
 
       `#session-chip` and `.right` are DIVs rather than spans because `<details>` is flow content
       and a `<span>` may only hold phrasing content. Both already set their own `display` in

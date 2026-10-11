@@ -55,7 +55,7 @@ Stated plainly, because "it's encrypted" is not a threat model.
 
 The third row is the one that needs saying out loud. Cloudflare terminates TLS. In that mode
 the operator is not merely trusting Cloudflare to route traffic; they are handing it the
-readable contents of a console that displays positions, balances and attestations. That may be
+readable contents of a console that displays holdings, the timeline and attestations. That may be
 an acceptable trade for convenience. It is not a neutral one, and a document that let someone
 discover it later would have failed.
 
@@ -87,10 +87,13 @@ gesture in both postures.
 
 ## Capability-increasing actions are refused unless the bind is loopback
 
-`keel serve` serves a read surface. Three of the nine capability-increasing actions in
-`keel/capabilities.py` are being admitted to it behind a second gate (#781) -- releasing the
-kill-switch halt, clearing rail 16's consecutive-loss halt, and re-seeding rail 11's drawdown
-breaker. `keel.web.security.gated_action_permitted` decides, and it requires **three** things:
+`keel serve` serves a read surface plus a small write surface: the setup steps, the HALT button
+(`/api/gates/halt`, which engages the kill switch and is deliberately allowed from a tunnel -- a
+stop must never be slower than a start), and two gated releases behind a second gate (#781) --
+releasing the kill-switch halt and clearing rail 16's consecutive-loss halt. The other
+capability-increasing actions in `keel/capabilities.py` have no route at all.
+`keel.web.security.gated_action_permitted` decides the two releases, and it requires **three**
+things:
 a loopback peer, no `--external-host`, and a **loopback bind**.
 
 The third exists because the second is a declaration and two ordinary deployments never make it:
@@ -104,8 +107,9 @@ The third exists because the second is a declaration and two ordinary deployment
 
 A bind is observable where a declaration is not: a server reachable from off-box is one an
 operator had to bind off-box. So a tunnelled, proxied or LAN-bound deployment serves every read
-and refuses every gated action -- and says so on the page, rather than presenting a button that
-returns 403.
+and the halt, and refuses every gated release with a 403. The console draws no release control at
+all -- releasing is done at the terminal -- so there is no button on the page that returns 403;
+the refusal is what a direct request to `/api/gates/resume` gets.
 
 **`ssh -L 8765:127.0.0.1:8765` is not closed by this, and that is deliberate.** The peer is
 genuinely loopback and the bind is loopback, so the gate opens for a remote human. Ordinarily

@@ -494,8 +494,8 @@ export function stoppedView(reading, setupHref) {
     card.append(el("p", "detail", reading.error.detail || reading.error.title));
   } else {
     // No error means the server answered normally and simply has no deployment to read -- the
-    // first-run path. The link goes to the CLIENT's own setup view now that #537 has built one:
-    // `/api/setup` is declared `needs_database=False` precisely so the checklist answers on a
+    // first-run path. The link goes to the client's Audit & Setup view, whose PRIMARY reading is
+    // `/api/setup` (console PR4): it is declared `needs_database=False` precisely so the checklist answers on a
     // machine with nothing on it, which is the only machine that ever reaches this branch.
     const p = el("p");
     const link = el("a", undefined, "Set keel up on this machine");
@@ -1248,46 +1248,74 @@ function feedNotes(data) {
 // it either, which is the same principle one level up.
 
 /**
- * The setup checklist: `/api/setup`'s payload, in RUNBOOK order.
+ * Audit & Setup (console PR4): the tamper-evident timeline, the setup checklist and venue
+ * readiness, on one page. It replaced the Timeline, Setup and Venues views.
  *
- * ── THIS VIEW READS. THE WRITE SURFACE IS UNCHANGED AND STAYS WHERE IT IS ────────────────────
+ * ── `/api/setup` IS THE PRIMARY READING, AND THAT DECIDES WHAT THIS PAGE CAN SURVIVE ─────────
  *
- * The rendered `/setup` page carries a `<form method=post action="/setup/{key}">` per MECHANICAL
- * step. This view carries none, and that is neither a hidden button nor a gate:
+ * `/api/setup` is `needs_database=False`: it answers on a machine with nothing on it, which is the
+ * only machine the stopped view's "Set keel up on this machine" link is ever followed from -- and
+ * that link points here (`main.js`'s `SETUP_ROUTE`). The timeline and the venue readiness are
+ * SECONDARY reads: a timeline with no database to read arrives as `null` and its section says so,
+ * leaving the checklist that creates the database standing below it. The engine banner reports
+ * the setup reading (planner ruling 14).
  *
- *   * **`/api/setup` ships no CSRF token, deliberately.** `payload.setup_payload`'s docstring is
- *     explicit -- minting a live write credential into a GET response "would put it into every
- *     cached copy, every proxy log and every paste of 'here is what the API returned'". A client
- *     that cannot obtain the token cannot submit the form, and inventing a way to hand it one
- *     would be a change to the write surface, which this issue may not make.
+ * In page order: the timeline (opening on keel's own record, `kind=keel` -- `main.js` seeds it),
+ * then Setup (its own stage tabs and the page-level job panel), then venue readiness. Each is an
+ * exported section builder of its own, so `tests/web/test_client_assets.py::_view_keys` checks
+ * each one's reads against its own endpoint.
  *
- *   * **A client that hides a button is not a gate**, so nothing is hidden: every action keel
- *     offers is listed, with its title, its detail, and the inputs it would ask for. Only the
- *     button is elsewhere -- on the page that holds the token. Refusal stays the server's job
- *     regardless: `server.do_POST` routes only through `keel.commands.setup.ACTIONS` and would
- *     refuse anything else whatever any front-end chose to draw.
+ * @param {any} setup  `/api/setup`'s `data`, known non-null by the caller.
+ * @param {string} section  which Setup section to show -- a `SETUP_SECTIONS` key, or `""`.
+ * @param {(key: string) => void} onSection
+ * @param {any} timeline  `/api/timeline`'s `data`, or `null` when there was none to read.
+ * @param {any} timelineError  that read's `error`, or `null`.
+ * @param {any} timelineSort
+ * @param {(column: string, direction: string) => void} onTimelineSort
+ * @param {(kind: string) => void} onKind
+ * @param {any} venues  `/api/venues`'s `data`, or `null` when that read failed.
+ * @returns {DocumentFragment}
+ */
+export function auditView(
+  setup,
+  section,
+  onSection,
+  timeline,
+  timelineError,
+  timelineSort,
+  onTimelineSort,
+  onKind,
+  venues,
+) {
+  const fragment = document.createDocumentFragment();
+  fragment.append(el("h1", undefined, "Audit & Setup"));
+  fragment.append(timelineSection(timeline, timelineError, timelineSort, onTimelineSort, onKind));
+  fragment.append(setupSection(setup, section, onSection));
+  fragment.append(readinessSection(venues));
+  return fragment;
+}
+
+/**
+ * The setup checklist: `/api/setup`'s payload, in RUNBOOK order -- the Setup part of Audit &
+ * Setup.
  *
- * **The gap that leaves is real and belongs to the milestone rather than to this file.** #540
- * deletes the rendered `/setup`, and on that day the link below has nowhere to point. Closing it
- * needs a decision nobody has taken -- where a browser client gets a write token from -- and
- * taking it here, by adding a POST under `/api/*`, is precisely what this issue forbids.
+ * Every action keel offers is listed with its title, its detail and the inputs it asks for, and
+ * each MECHANICAL one is a form that performs it (`actionCard`): `/api/setup` is the one document
+ * that carries this session's CSRF write token, and `main.js` keeps it off this reading. Refusal
+ * stays the server's job regardless: a `/api/setup/*` POST reaches only
+ * `keel.commands.setup.ACTIONS` and the server refuses anything else whatever any front-end draws.
  *
- * ── DIVERGENCE FROM THE RENDERED PAGE ────────────────────────────────────────────────────────
- *
- * The kind note for an `operator_input` step is BLANK on the rendered page: `_STEP_KIND_NOTE` has
- * three entries against `StepKind`'s four, and the missing one is the kind of the real
- * `credentials` step. `payload._STEP_KIND_NOTES` now carries all four and this view shows what it
- * is sent, so the step that asks for a credential explains itself here and does not there. Same
- * shape as #548, found while porting this view.
+ * The kind note for an `operator_input` step is carried on the payload (`_STEP_KIND_NOTES` has
+ * all four kinds), so the step that asks for a credential explains itself.
  *
  * @param {any} data  `/api/setup`'s `data`, known non-null by the caller.
  * @param {string} [section]  which section to show -- a `SETUP_SECTIONS` key, or `""`.
- * @param {(key: string) => void} [onSection]  omitted, and the whole page renders. See `sectioned`.
+ * @param {(key: string) => void} [onSection]  omitted, and every section renders. See `sectioned`.
  * @returns {DocumentFragment}
  */
-export function setupView(data, section, onSection) {
+export function setupSection(data, section, onSection) {
   const fragment = document.createDocumentFragment();
-  fragment.append(el("h1", undefined, "Setup"));
+  fragment.append(heading("h-setup", "Setup"));
   fragment.append(el("p", "sub", plain(data.root)));
 
   // ABOVE the switch, and outside every section (#775). `market_data` is a `Stage.PAPER` step,
@@ -1338,10 +1366,10 @@ const SETUP_SECTIONS = [
 /**
  * Where this deployment stands, and the one thing to do next.
  *
- * No heading -- the page's `<h1>` says "Setup" and the tab bar says which section is on.
+ * No heading -- the Setup section's own heading says "Setup" and the tab bar says which is on.
  *
  * **The running job's panel is NOT here**, and the first spelling's argument for putting it here
- * was backwards -- see `setupView`. A panel inside a section reports to whoever is reading that
+ * was backwards -- see `setupSection`. A panel inside a section reports to whoever is reading that
  * section, which is never the operator who pressed the button, because every action lives in a
  * stage section and the panel did not.
  *
@@ -1636,7 +1664,8 @@ function jobPanel(job) {
 }
 
 /**
- * The Timeline view (#703): one chronology over four stores that never knew about each other.
+ * The timeline (#703), the first section of Audit & Setup: one chronology over four stores that
+ * never knew about each other.
  *
  * ── PROVENANCE IS A COLUMN, NOT A FOOTNOTE ───────────────────────────────────────────────────
  *
@@ -1661,15 +1690,26 @@ function jobPanel(job) {
  * download because the response is `Content-Disposition: attachment` and the browser's own
  * handling of that is the behaviour we want -- and because this file writes no bytes itself.
  *
- * @param {any} data  `/api/timeline`'s `data`.
+ * @param {any} data  `/api/timeline`'s `data`, or `null` when there was none to read.
+ * @param {any} error  that read's `error`, or `null`.
  * @param {any} sort
- * @param {(column: string) => void} onSort
+ * @param {(column: string, direction: string) => void} onSort
  * @param {(kind: string) => void} onKind
  * @returns {DocumentFragment}
  */
-export function timelineView(data, sort, onSort, onKind) {
+export function timelineSection(data, error, sort, onSort, onKind) {
   const fragment = document.createDocumentFragment();
-  fragment.append(el("h1", undefined, "Timeline"));
+  fragment.append(heading("h-audit-timeline", "Timeline"));
+  // A SECONDARY read. No database here is the first-run machine the stopped view sends to this
+  // page, and the checklist below is what creates one -- so this says which of the two it is and
+  // leaves the rest of the page standing.
+  if (data === null) {
+    const gap = el("p", "empty");
+    if (error) gap.append("The timeline could not be read: ", plain(error.detail || error.title));
+    else gap.append("No timeline yet: there is no database on this machine. Setup creates one.");
+    fragment.append(gap);
+    return fragment;
+  }
 
   const sub = el("p", "sub");
   sub.append(field(data.generated_at), " · ");
@@ -1709,6 +1749,14 @@ export function timelineView(data, sort, onSort, onKind) {
   const chain = el("p", "note");
   chain.append(field(data.chain));
   fragment.append(chain);
+
+  // Why `system` rows may be missing. The keel-only default is mostly those rows, and an engine
+  // log that did not reach the report would otherwise leave an emptier table with no reason.
+  if (data.engine_log) {
+    const logNote = el("p", "note");
+    logNote.append(field(data.engine_log));
+    fragment.append(logNote);
+  }
 
   fragment.append(heading("h-timeline", "What happened"));
   fragment.append(
@@ -1783,109 +1831,6 @@ function kindSwitch(current, kinds, onKind) {
     wrap.append(button);
   }
   return wrap;
-}
-
-
-/**
- * The Balances view (#702): what the account holds, as the last cycle recorded it.
- *
- * ── EVERY FIGURE IS STAMPED, BECAUSE EVERY FIGURE IS RECORDED ────────────────────────────────
- *
- * Nothing here came from a network call -- `keel serve` reads SQLite and nothing else, and
- * `keel/commands/balances.py` carries why that is the design rather than a limitation. What
- * makes that honest instead of merely quiet is the as-of stamp beside each tile: this is the
- * cash the engine sized against when it last evaluated the rails, and the page says when.
- *
- * ── NO BUYING POWER, NO DEPOSIT, NO TRANSFER, NO CTA ─────────────────────────────────────────
- *
- * #702's refusal. Cash is a fact, not an affordance. keel is cash-spot by constitution, so a
- * "buying power" tile would advertise leverage the engine refuses to take, and a deposit button
- * would be this page's version of the close button the Holdings view also does not have.
- * Pinned by `tests/web/test_balances_view.py`.
- *
- * ── THE SETTLED SPLIT IS NAMED AS MISSING WHEN IT IS, NOT OMITTED ────────────────────────────
- *
- * `settled_breakdown` says whether `cycle_balances` (#719) has recorded the pair for this
- * mode/currency yet -- it renders "unrecorded" until a live cycle has, and the venue's actual
- * settled/total figures once one has. Leaving the tiles out before that would let a reader
- * assume the available figure IS the settled one; saying so is the only rendering that cannot
- * be misread either way.
- *
- * @param {any} data  `/api/balances`'s `data`.
- * @param {any} sort
- * @param {(column: string) => void} onSort
- * @returns {DocumentFragment}
- */
-export function balancesView(data, sort, onSort) {
-  const fragment = document.createDocumentFragment();
-  fragment.append(el("h1", undefined, "Balances"));
-
-  const sub = el("p", "sub");
-  sub.append(field(data.generated_at), " · ", field(data.recorded));
-  // #702. Every tile on this page is a recorded figure with a stamp, and a stamp only separates a
-  // current reading from a stale one if somebody does the subtraction. The payload does it, judged
-  // against the cadence this deployment actually cycles at, and this places the verdict.
-  if (data.freshness) sub.append(" · ", field(data.freshness));
-  fragment.append(sub);
-
-  fragment.append(
-    gridCard([
-      kv("mode", plain(data.mode) || "unstamped"),
-      kv("available cash", data.cash),
-      kv("as of", data.cash_as_of),
-      kv("equity", data.equity),
-      kv("unrealized", data.unrealized),
-      kv("high water mark", data.hwm),
-    ]),
-  );
-
-  fragment.append(heading("h-settled", "Settled and unsettled"));
-  const settled = el("p", "note");
-  settled.append(field(data.settled_breakdown));
-  fragment.append(settled);
-  fragment.append(
-    gridCard([
-      kv("settled", data.settled_cash),
-      kv("total", data.total_cash),
-      kv("as of", data.settled_as_of),
-    ]),
-  );
-
-  if (plain(data.mode) === "paper") {
-    fragment.append(heading("h-paper", "Synthetic account"));
-    const note = el("p", "note");
-    note.append("The paper account's cash right now, beside the cycle's recorded reading above.");
-    fragment.append(note);
-    fragment.append(gridCard([kv("paper cash", data.paper_cash)]));
-  }
-
-  fragment.append(heading("h-assets", "Held assets"));
-  const assets = data.assets || [];
-  fragment.append(
-    table(
-      "h-assets",
-      [
-        { label: "product", numeric: false, key: "product_id" },
-        { label: "qty held", numeric: true, key: "qty" },
-        { label: "mark", numeric: true, key: "mark" },
-        // No `key`: `/api/balances` does not declare `mark_as_of` sortable, and a key the
-        // server will not order by renders a header that looks clickable and is not.
-        { label: "marked at", numeric: false },
-        { label: "value", numeric: true, key: "market_value" },
-      ],
-      assets.map(/** @param {any} row */ (row) => [
-        plain(row.product_id) || "—",
-        row.qty,
-        row.mark,
-        row.mark_as_of,
-        row.market_value,
-      ]),
-      "No held assets. keel is holding nothing right now.",
-      { sort: sort, onSort: onSort },
-    ),
-  );
-
-  return fragment;
 }
 
 
@@ -2327,7 +2272,7 @@ const SCOPES = ["today", "7d", "all"];
  * it came from. Naming the parameter something else makes that mistake unspellable.
  *
  * The same rename applied to `setupPaper`/`setupLive` was an own-goal and is reverted (#776
- * review): those two sit INSIDE `setupView`'s region, where `data.` is exactly what the parity
+ * review): those two sit INSIDE `setupSection`'s region, where `data.` is exactly what the parity
  * pin scans for, so `payload` there would hide a wrong key rather than expose one. Proved with a
  * controlled pair -- `payload.made_up_key` in `setupPaper` escaped the suite; the identical
  * `data.made_up_key` in `setupSummary` was caught. The rule is regional, not global.
@@ -3217,81 +3162,30 @@ function dcaPlanList(title, items, empty) {
 }
 
 /**
- * Venues: `/api/venues`'s payload.
+ * Venue readiness, the last section of Audit & Setup: `/api/venues`'s `readiness` collection --
+ * can a live entry actually be placed on THIS deployment, right now (#233, rail 20).
  *
- * **What each installed adapter DECLARES, never whether it is configured or reachable.** That
- * distinction is #233 and `_venue_payload` states it: "a row here is not a claim that the venue is
- * configured". An adapter that failed to construct still gets a row, judged `bad` -- a missing row
- * would read as "not installed", which is a different fact and a worse one to be wrong about.
+ * **Readiness only.** `/api/venues` still carries each installed adapter's capability
+ * declarations (planner ruling 16 kept the endpoint whole), but what an adapter DECLARES is
+ * `keel brokers list`'s job; the question this page answers is whether the deployment can trade.
+ * `payload._readiness_payload` keeps the two collections apart for the same reason.
  *
- * The rendered page collapses a failed adapter into a row of blanks with the error in it; this
- * shows the error in its own column and keeps the declaration columns, because an adapter that
- * failed to construct still declares what it supports and that is what someone is looking at the
- * page to find out.
- *
- * The four list-valued declarations the HTML drops -- quote currencies, data feeds, endpoints, and
- * the two capability flags -- are in a disclosure per adapter.
- *
- * @param {any} data
- * @param {any} sort
- * @param {(column: string, direction: string) => void} onSort
+ * @param {any} data  `/api/venues`'s `data`, or `null` when that read failed.
  * @returns {DocumentFragment}
  */
-export function venuesView(data, sort, onSort) {
+export function readinessSection(data) {
   const fragment = document.createDocumentFragment();
-  fragment.append(el("h1", undefined, "Venues"));
-  fragment.append(
-    el("p", "sub", "what each installed adapter declares — not whether it is configured"),
-  );
-
-  const venues = data.venues || [];
-  fragment.append(heading("h-venues", "Installed adapters"));
-  fragment.append(
-    table(
-      "h-venues",
-      [
-        { label: "adapter", numeric: false, key: "name" },
-        { label: "venue", numeric: false, key: "venue" },
-        { label: "deployment", numeric: false, key: "deployment" },
-        { label: "asset classes", numeric: false },
-        { label: "orders", numeric: false },
-        { label: "version", numeric: false, key: "package_version" },
-        { label: "constructed", numeric: false },
-      ],
-      venues.map(
-        /** @param {any} info */ (info) => [
-          plain(info.name),
-          plain(info.venue),
-          plain(info.deployment),
-          (info.asset_classes || []).join(", ") || "—",
-          (info.supported_orders || []).join(", ") || "—",
-          plain(info.package_version) || "—",
-          info.error,
-        ],
-      ),
-      "No adapters installed.",
-      { sort: sort, onSort: onSort },
-    ),
-  );
-
-  if (venues.length !== 0) {
-    fragment.append(heading("h-declared", "Full declaration"));
-    for (const info of venues) fragment.append(venueCard(info));
-  }
-
-  // A SEPARATE section, not a column added to the table above (#233). `venues` above answers
-  // "what does the adapter declare"; `readiness` answers "can a live entry actually be placed
-  // on THIS deployment, right now" -- `payload.py`'s own `_readiness_payload` docstring keeps
-  // the two collections apart for the same reason, and merging them back together here would
-  // undo it at the one layer nothing else checks.
-  const readiness = data.readiness || [];
   fragment.append(heading("h-readiness", "Venue readiness"));
-  const readinessSub = el("p", "sub");
-  readinessSub.append(
+  if (data === null) {
+    fragment.append(el("p", "empty", "Venue readiness could not be read."));
+    return fragment;
+  }
+  const sub = el("p", "sub");
+  sub.append(
     "can a live entry actually be placed on this deployment, right now — ",
     "not what the adapter merely declares",
   );
-  fragment.append(readinessSub);
+  fragment.append(sub);
   fragment.append(
     table(
       "h-readiness",
@@ -3301,7 +3195,7 @@ export function venuesView(data, sort, onSort) {
         { label: "explanation", numeric: false },
         { label: "fix", numeric: false },
       ],
-      readiness.map(
+      (data.readiness || []).map(
         /** @param {any} row */ (row) => [
           plain(row.venue),
           field(row.state),
@@ -3312,167 +3206,7 @@ export function venuesView(data, sort, onSort) {
       "No readiness rows.",
     ),
   );
-
   return fragment;
-}
-
-/**
- * One adapter's full declared capabilities.
- *
- * @param {any} info
- * @returns {HTMLElement}
- */
-function venueCard(info) {
-  const node = el("details", "venue");
-  const summary = el("summary");
-  summary.id = "h-venue-".concat(plain(info.name));
-  summary.append(plain(info.name));
-  node.append(summary);
-
-  node.append(
-    gridCard([
-      kv("preview", plain(info.preview)),
-      kv("session", info.session_bound),
-      kv("funding", info.cash_only),
-      kv("fee summary", info.supports_fee_summary),
-      kv("package version", plain(info.package_version) || "—"),
-    ]),
-  );
-
-  for (const [label, values] of [
-    ["asset classes", info.asset_classes],
-    ["supported orders", info.supported_orders],
-    ["quote currencies", info.quote_currencies],
-    ["data feeds", info.supported_data_feeds],
-    ["declared endpoints", info.declared_endpoints],
-  ]) {
-    const list = stringList(values, "declared");
-    node.append(note(label));
-    node.append(list || el("p", "muted", "—"));
-  }
-  return node;
-}
-
-/**
- * The Plans page, inverted (#706).
- *
- * A retail broker's Plans & Features page is a tier matrix with "Current plan" and "Upgrade"
- * badges: radically clear about pricing, and honest as marketing, because every row exists to
- * move a reader one row down. keel's constitution runs the other way -- "Paper is free and
- * unlimited, forever" and "The free engine is never a demo" are two of its eight numbered lines.
- *
- * So this takes the clarity and refuses the gating. **There is nothing here to click.** No
- * button, no link, no form, no price a reader can act on -- and not because this function
- * declines to draw one, but because the payload sends no destination to draw it from. A page that
- * told someone how to pay would have shipped the tier.
- *
- * Every sentence arrives quoted, with the repository path it came from, and this function places
- * both. It composes nothing: the whole value of the page is that a reader can check it against
- * the documents, and a renderer that rephrased a promise would be the first place the checking
- * stopped working.
- *
- * @param {any} data  `/api/plans`'s `data`.
- * @returns {DocumentFragment}
- */
-export function plansView(data) {
-  const fragment = document.createDocumentFragment();
-  fragment.append(el("h1", undefined, "Plans"));
-  fragment.append(
-    el("p", "sub", "what runs on this device, what it costs, and why"),
-  );
-
-  // The state of play, first and in a card of its own. On a page shaped like a price list, the
-  // one thing a reader must not have to infer is whether any of it is for sale.
-  const state = el("div", "card");
-  state.append(field(data.for_sale));
-  fragment.append(state);
-
-  fragment.append(heading("h-constitution", "What every feature has to pass"));
-  fragment.append(claimList(data.constitution));
-
-  fragment.append(heading("h-tiers", "What a tier would change, if one existed"));
-  fragment.append(
-    table(
-      "h-tiers",
-      [
-        { label: "tier", numeric: false },
-        { label: "price", numeric: false },
-        { label: "what it would buy", numeric: false },
-        { label: "the promise", numeric: false },
-        { label: "status", numeric: false },
-      ],
-      (data.tiers || []).map(/** @param {any} tier */ (tier) => [
-        plain(tier.name),
-        plain(tier.price),
-        plain(tier.buys),
-        plain(tier.promise),
-        tier.status,
-      ]),
-      "No tiers published.",
-    ),
-  );
-
-  fragment.append(heading("h-triggers", "What would have to happen first"));
-  const framing = el("p", "note");
-  framing.append(citation(data.trigger_framing));
-  fragment.append(framing);
-  fragment.append(
-    table(
-      "h-triggers",
-      [
-        { label: "#", numeric: true },
-        { label: "what fires it", numeric: false },
-        { label: "recorded in", numeric: false },
-      ],
-      (data.triggers || []).map(/** @param {any} trigger */ (trigger) => [
-        plain(trigger.number),
-        plain(trigger.text),
-        plain(trigger.source),
-      ]),
-      "No triggers recorded.",
-    ),
-  );
-
-  fragment.append(heading("h-never", "What no tier will ever gate"));
-  fragment.append(claimList(data.never_paywalled));
-
-  return fragment;
-}
-
-/**
- * A list of quoted claims, each with the file it came from (#706).
- *
- * The citation is beside the sentence rather than in a footnote, because a citation a reader has
- * to go looking for is a citation they will take on trust -- which is the one thing this page
- * cannot afford, its entire subject being what the project promises.
- *
- * @param {any[]} claims
- * @returns {HTMLElement}
- */
-function claimList(claims) {
-  const list = el("ul", "claims");
-  for (const claim of claims || []) {
-    const item = el("li");
-    item.append(el("span", undefined, plain(claim.text)), " ");
-    item.append(citation(claim));
-    list.append(item);
-  }
-  return list;
-}
-
-/**
- * One citation: the repository-relative path a sentence was quoted from.
- *
- * A `<code>` and NOT an `<a>`. There is no server here to fetch a document from -- `keel serve`
- * is a loopback SQLite reader -- and a link that 404ed would be worse than a path a reader can
- * open in their own checkout. It is also the page's one structural refusal: nothing in this view
- * builds an anchor, so nothing in it can become a destination.
- *
- * @param {any} claim
- * @returns {HTMLElement}
- */
-function citation(claim) {
-  return el("code", "muted", plain(claim.source));
 }
 
 /**
@@ -3530,7 +3264,7 @@ export function modeBadge(node, config) {
 //: What the card says where a control would be. Static copy, not payload prose: `paperBanner`'s
 //: sentence arrives from Python because that function CHOOSES between sentences on the basis of a
 //: config, which is a judgement. This one is the same words on every deployment, so it is UI copy
-//: in the class of `plansView`'s subtitle, and Rule 2 has nothing to say about it.
+//: in the class of a view's subtitle, and Rule 2 has nothing to say about it.
 //: The switcher's closed state: an instruction, never a console's name, so the header names this
 //: console in exactly one place -- the chip.
 const SWITCHER_PLACEHOLDER = "switch console\u2026";
@@ -3555,8 +3289,8 @@ const SWITCHING_NOTE = "Mode and profile switching are terminal ceremonies with 
  * funnel the chip's docstring refuses.
  *
  * The origin comes from `window.location`, not the payload -- it is a fact about where this
- * browser is, and in an installed app there is no address bar to read it from. `timelineView`
- * takes it from the same place for the same reason.
+ * browser is, and in an installed app there is no address bar to read it from.
+ * `timelineSection`'s CSV link takes it from the same place for the same reason.
  *
  * Empty when the config could not be read, matching `modeBadge`: an absent answer is not `paper`,
  * and a card naming a deployment nothing could identify would be inventing one.

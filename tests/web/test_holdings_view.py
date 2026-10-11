@@ -252,11 +252,11 @@ def test_the_holdings_view_is_wired_into_the_client_router() -> None:
     assert [part.strip() for part in entry.group(1).split(",")] == ['"holdings"', '"orders"']
 
 
-def test_the_nav_runs_pulse_setup_holdings_in_that_order() -> None:
+def test_the_nav_runs_pulse_then_holdings() -> None:
     hrefs = re.findall(r'<li><a href="([^"]+)">', _INDEX.read_text(encoding="utf-8"))
 
-    assert hrefs[:3] == ["/pulse", "/setup", "/holdings"]
-    assert staticfiles.CLIENT_ROUTES[:3] == ("pulse", "setup", "holdings")
+    assert hrefs[:2] == ["/pulse", "/holdings"]
+    assert staticfiles.CLIENT_ROUTES[:2] == ("pulse", "holdings")
     assert '<li><a href="/holdings">Holdings</a></li>' in _INDEX.read_text(encoding="utf-8")
 
 

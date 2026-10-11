@@ -88,7 +88,9 @@ def test_the_section_says_what_the_browser_cannot_do() -> None:
     """**The safety fact, and the reason this test is the sharpest one here.**
 
     Every capability-increasing action is a CLI command behind a typed confirmation at a
-    terminal; the browser can perform none of them. An operator who believes otherwise will go
+    terminal; the browser can perform none of them, bar the HALT button (stopping is never gated)
+    and the two phrase-gated halt releases the server answers but the page does not draw. An
+    operator who believes otherwise will go
     looking in the wrong place for the button that arms autonomy, and -- worse -- an operator who
     believes the browser CAN do it may leave the page open thinking it is a control surface.
     """
@@ -98,7 +100,59 @@ def test_the_section_says_what_the_browser_cannot_do() -> None:
     assert "typed confirmation" in section or "typed" in section
     # The claim must be about the SERVER, not about what the page happens to draw: "a client that
     # hides a button is not a gate" is the design spec's own sentence.
-    assert "server implements no verb" in section
+    assert "property of the server" in section
+    # ... and it names the two routes that DO write, so the sentence is not the false "no verb".
+    assert "halt button" in section
+    assert "/api/gates/" in section
+    assert "server implements no verb" not in section
+
+
+def _sentences(text: str) -> list[str]:
+    return [part.strip() for part in re.split(r"(?<=[.!?])\s+(?=[A-Z`*])", text) if part.strip()]
+
+
+def test_the_gated_releases_are_one_sentence_with_their_gate() -> None:
+    """**Pairings, not presence.** `"/api/gates/" in section` passed a paragraph that said the
+    routes "cannot release anything"; the safety fact is that the SAME sentence that names the
+    routes says what they release and under what condition, and the sentence naming the HALT
+    button says what it does."""
+    sentences = _sentences(_section())
+
+    # `/api/gates/halt` is named in an earlier sentence about the HALT route; the releases' sentence
+    # is the one that names the routes in general and says "release".
+    gates = [s for s in sentences if "/api/gates/" in s and "release" in s.lower()]
+    assert len(gates) == 1, gates
+    gate = gates[0].lower()
+    for phrase in (
+        "can also release the kill-switch",
+        "clear the consecutive-loss halt",
+        "loopback session on a loopback bind",
+        "typed phrase",
+    ):
+        assert phrase in gate, f"the /api/gates/ sentence lost {phrase!r}: {gates[0]}"
+    assert "cannot" not in gate and "only answer" not in gate
+
+    # Other sentences mention the button in passing; the exception clause is the claim.
+    halts = [
+        sentence
+        for sentence in sentences
+        if "halt button" in sentence.lower() and "exception" in sentence.lower()
+    ]
+    assert len(halts) == 1, halts
+    assert "engages the kill-switch" in halts[0].lower()
+
+
+def test_the_runbook_states_the_capability_count_the_registry_declares() -> None:
+    """The paragraph says how many actions `keel capabilities` lists. A literal here would only
+    move the drift, so the count comes from the registry: distinct actions are the rows that
+    mirror nothing, the same rule the `keel/web` prose is held to."""
+    from keel.capabilities import CAPABILITIES
+
+    words = ["zero", "one", "two", "three", "four", "five", "six", "seven", "eight", "nine", "ten"]
+    stated = re.findall(r"`keel capabilities` lists all (\w+)", _section())
+    assert len(stated) == 1, stated
+    assert stated[0] in words, stated
+    assert words.index(stated[0]) == len([c for c in CAPABILITIES if c.mirrors is None])
 
 
 def test_the_section_answers_the_headless_case() -> None:
@@ -128,3 +182,20 @@ def test_the_section_says_where_the_folded_views_went() -> None:
         assert command in section, command
     listed = section.split("**Rules.**")[0]
     assert "Insights" not in listed and "Research" not in listed, "a retired view is still listed"
+
+
+def test_the_section_describes_the_four_views_and_where_the_last_retired_ones_went() -> None:
+    """Console PR4 completed the four views. The intro names exactly those, each has a paragraph,
+    and the Audit & Setup one says what an operator of the retired Timeline, Setup, Venues,
+    Balances and Plans views finds now: the keel-only timeline default, the CSV, the checklist,
+    readiness, and the terminal command for the venue declarations."""
+    section = _section()
+    intro = section.split("**Pulse.**")[0]
+
+    for retired in ("Setup,", "Balances", "Timeline", "Venues", "Plans", "being slimmed"):
+        assert retired not in intro, retired
+    for view in ("**Pulse.**", "**Holdings.**", "**Rules.**", "**Audit & Setup.**"):
+        assert section.count(view) == 1, view
+    audit = section.split("**Audit & Setup.**")[1].split("**Halting from the browser.**")[0]
+    for needle in ("`kind=keel`", "CSV", "job panel", "readiness", "`keel brokers list`"):
+        assert needle in audit, needle

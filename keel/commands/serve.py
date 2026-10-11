@@ -1,4 +1,4 @@
-"""`keel serve` -- open the read-only view in a browser (#435, D2).
+"""`keel serve` -- open the operator console in a browser (#435, D2).
 
 This is the front-end half of the local web UI: it resolves where state lives, mints a session
 token, binds loopback, and optionally opens a browser. Everything it serves comes from
@@ -86,12 +86,19 @@ def serve_cmd(
     legacy_open_browser: bool | None,
     external_hosts: tuple[str, ...],
 ) -> None:
-    """Serve keel's read-only view on localhost and open it in your browser.
+    """Serve keel's console on localhost and open it in your browser.
 
-    Read-only, by construction: the server implements GET and HEAD and nothing else, so there is
-    no request this can answer that changes anything. Attesting, promoting a rule, recording a
-    flow and turning autonomy on all remain CLI commands behind the interactive-terminal gate --
-    the browser gets its own gate in a later change, and it will be a gate rather than a bypass.
+    Pages and the JSON API answer GET and HEAD. The write surface is a closed set of POSTs, each
+    needing this run's session token and the console's own request header:
+    `POST /api/gates/halt` engages the kill-switch on a gate token alone -- no phrase, no
+    locality check, because stopping must never be slower than starting;
+    `POST /api/gates/resume` and `POST /api/gates/resume-entries` release a halt only from a
+    loopback session on a loopback bind, with a gate token and a typed phrase (the console offers
+    neither; `keel resume` at a terminal is the release path); `POST /api/setup/<step>` runs one
+    of `keel setup`'s idempotent mechanical steps, with a write token.
+
+    Everything else stays a CLI command behind the interactive-terminal gate: attesting,
+    promoting a rule, recording a flow, turning autonomy on.
 
     The printed URL carries a one-time token for this run. It is never written to disk, so
     stopping the server invalidates it, and no other program on this machine can read the page

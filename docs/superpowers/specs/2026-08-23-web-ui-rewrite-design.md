@@ -3,6 +3,12 @@
 **Date:** 2026-08-23 · **Status:** shipped. Every step of §"Build order" landed (#533–#541, v0.12.0);
 kept unrewritten as the design record.
 
+**Note (2026-10-11):** the console is now four views -- Pulse, Holdings,
+Rules, Audit & Setup -- and its write surface also includes a gates POST surface (`/api/gates/*`,
+#781; the console's HALT button uses `halt`). Where this document names the earlier views
+(Status, Activity, Gates, Timeline, Setup, Venues, Balances, Plans) or says the write surface is
+only `setup.ACTIONS`, read it as the 2026-08 design, not the present.
+
 This document describes the browser interface keel serves from the operator's own machine: what the
 server does, what the client does, and why each decision was made the way it was. It follows the
 shape of [youperiod.app's SPECS.md](https://github.com/getify/youperiod.app/blob/main/SPECS.md) and
@@ -137,8 +143,9 @@ Subresource Integrity authorises any inline `<script>` or `<style>` block, as in
 3. **A session token**, minted per run, never written to disk, exchanged on first load for a
    `SameSite=Strict`, `HttpOnly` cookie. `Strict` rather than `Lax` is deliberate: `Lax` attaches the
    cookie to top-level navigations, so a link on a hostile page would arrive authenticated.
-4. **A closed action set.** The entire write surface routes through `keel.commands.setup.ACTIONS`,
-   every member declared `MECHANICAL`, idempotent and non-destructive, and **a test asserts that set
+4. **A closed action set.** The setup write surface (`/api/setup/*`) routes through
+   `keel.commands.setup.ACTIONS` (as of 2026-10 the gated `/api/gates/*` routes are a second,
+   separately gated surface -- see the note in the header), every member declared `MECHANICAL`, idempotent and non-destructive, and **a test asserts that set
    is disjoint from the eleven capability-increasing actions in `keel/capabilities.py`.**
 5. **A CSRF token on every write**, derived from the session token by HMAC rather than stored — "the
    layer that does not depend on the browser being current." Comparisons use

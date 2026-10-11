@@ -120,14 +120,12 @@ from keel.venue_readiness import VenueReadiness
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from keel.commands.activity import ActivityCycle, ActivityEvent, ActivityFeed
-    from keel.commands.balances import AssetBalanceRow, BalancesReport
     from keel.commands.dca_plan import BuyCap, DcaPlan
     from keel.commands.evidence_matrix import MatrixReport, MatrixRow
     from keel.commands.gauntlet import GauntletReport, GauntletRow
     from keel.commands.holdings import HoldingRow, HoldingsReport
     from keel.commands.insights import GateDistance, InsightsReport, RuleTrackRecord
     from keel.commands.orders import OrderRow, OrdersReport
-    from keel.commands.plans import Claim, PlansReport, Tier, Trigger
     from keel.commands.positions import PositionRow
     from keel.commands.pulse import PulseReport
     from keel.commands.research_record import RuleExploration, TrialRow, TrialsReport
@@ -1292,139 +1290,6 @@ def matrix_payload(report: MatrixReport) -> dict[str, Any]:
     }
 
 
-# -- plans, inverted (#706) ------------------------------------------------------------------------
-#
-# THE ONE PAGE IN THIS APPLICATION WHOSE SUBJECT IS THE PROJECT RATHER THAN THE DEPLOYMENT, and
-# the only one that reads no repository at all.
-#
-# Every string below is quoted from a document and carries the file it came from, checked by
-# `tests/commands/test_plans.py` against the file itself. Nothing here is composed, summarised or
-# softened on the way to the wire -- the whole value of the page is that a reader can check it,
-# and a payload that rephrased a promise would be the first place the checking stopped working.
-
-
-def _claim_payload(claim: Claim) -> dict[str, Any]:
-    """One quoted sentence and its citation.
-
-    `source` is a repository-relative PATH, not a title, because a reader with the repository in
-    front of them can open it -- and because the test that keeps this page honest opens it too. A
-    citation naming "the evolution plan" would look checkable and be nothing of the kind.
-    """
-    return {"text": claim.text, "source": claim.source}
-
-
-def _tier_payload(tier: Tier) -> dict[str, Any]:
-    """One row of the Phase F table, and whether it exists.
-
-    `status` is a `label` and the readings are NOT good and bad. The free tier is what the
-    reader is already running (`GOOD` -- it is the one thing on this page that is true today), and
-    every other row is `UNKNOWN`: not warned about, not promised, simply not a thing yet. `WARN`
-    would read as a caution about a product, and there is no product to caution anyone about.
-
-    `shipped` and `available_now` are separate fields on the report and collapse to one word here,
-    because a client rendering two booleans would be deciding what their combination means, which
-    is a judgement (Rule 2). The state comes off the SAME word, not off `available_now` -- the
-    first cut read `GOOD if tier.available_now else UNKNOWN`, so the day a Pro tier shipped, the
-    one row that had become real would have worn the same "not a thing yet" badge as the three
-    that had not.
-    """
-    return {
-        "name": tier.name,
-        "price": tier.price,
-        "buys": tier.buys,
-        "promise": tier.promise,
-        "source": tier.source,
-        "status": label(
-            _tier_status(tier),
-            display=_TIER_STATUS_NOTES[_tier_status(tier)],
-            state=_TIER_STATES[_tier_status(tier)],
-        ),
-    }
-
-
-#: What each tier's one-word status MEANS. The word is short enough for a table cell; the sentence
-#: is what stops a reader taking "planned" for "coming soon", which is the reading a page like this
-#: is normally built to encourage.
-_TIER_STATUS_NOTES: Mapping[str, str] = {
-    "running": "this is what you are running now, and it is the whole engine",
-    "planned": "does not exist — a published intention, gated on a trigger that has not fired",
-    # The one status a future PR will actually set, and the first cut left its display collapsed to
-    # the word itself -- so the cell would have read "shipped / shipped" on the only row where a
-    # reader most needs a sentence.
-    "shipped": "this exists and can be bought — see the decision record that superseded ADR 0004",
-}
-
-
-#: The state each status word carries. `running` and `shipped` are both things that EXIST; the
-#: difference between them is price, not reality, and a page that graded the shipped one as unknown
-#: would be contradicting its own table. `planned` is UNKNOWN and never WARN: there is no product
-#: to caution anyone about.
-_TIER_STATES: Mapping[str, str] = {
-    "running": GOOD,
-    "shipped": GOOD,
-    "planned": UNKNOWN,
-}
-
-
-def _tier_status(tier: Tier) -> str:
-    """`running` for the free tier, `planned` for the rest -- and `shipped` for whichever row a
-    future PR flips, which is the only edit this page should ever need."""
-    if tier.shipped:
-        return "shipped"
-    return "running" if tier.available_now else "planned"
-
-
-def _trigger_payload(trigger: Trigger) -> dict[str, Any]:
-    return {
-        "number": str(trigger.number),
-        "text": trigger.text,
-        "source": trigger.source,
-    }
-
-
-def plans_payload(report: PlansReport) -> dict[str, Any]:
-    """The transparency artifact (#706).
-
-    **The refusals are structural, not editorial.** There is no `cta`, no `url`, no `action` and
-    no `contact` key on this payload, and there is nothing for a client to build one out of.
-    `render.js` cannot make a button out of a page that never sends it a destination.
-
-    `for_sale` is a `flag` derived from the tier table rather than a constant, so the sentence and
-    the table cannot come to disagree: flipping one tier's `shipped` is all it takes for the page
-    to stop saying nothing is for sale.
-    """
-    from keel.commands.plans import (
-        NOTHING_FOR_SALE,
-        TRIGGER_FRAMING,
-        TRIGGER_FRAMING_SOURCE,
-    )
-    from keel.commands.plans import (
-        Claim as _Claim,
-    )
-
-    return {
-        # NO `as_of`/`generated_at`: this page describes the project rather than a deployment.
-        # Nothing on this page was
-        # OBSERVED at a moment -- it changes when a document changes -- and a stamp nobody renders
-        # is a stamp that eventually gets rendered, dating a page that has no date.
-        "for_sale": flag(
-            report.anything_for_sale,
-            on="a tier has shipped — this page is out of date",
-            off=NOTHING_FOR_SALE,
-            on_state=WARN,
-            off_state=NEUTRAL,
-        ),
-        "constitution": [_claim_payload(claim) for claim in report.constitution],
-        "tiers": [_tier_payload(tier) for tier in report.tiers],
-        # The framing rides as a CLAIM like every other sentence here -- it is quoted from ADR
-        # 0004 and is checkable against it, and a trigger measured in revenue rather than users
-        # would turn this page into a countdown.
-        "trigger_framing": _claim_payload(_Claim(TRIGGER_FRAMING, TRIGGER_FRAMING_SOURCE)),
-        "triggers": [_trigger_payload(trigger) for trigger in report.triggers],
-        "never_paywalled": [_claim_payload(claim) for claim in report.never_paywalled],
-    }
-
-
 # -- activity ------------------------------------------------------------------------------------
 
 
@@ -1825,7 +1690,7 @@ def _holding_row_payload(row: HoldingRow, mode: str) -> dict[str, Any]:
     The cost, the join and the slippage verdict are the service's (`keel/commands/holdings.py`);
     this function chooses states and symbols. NO mark, market value, unrealized P&L or stop
     distance: the view is about what each tranche cost and how it was entered, and `PositionRow`
-    keeps those figures for `keel positions` and the balances view.
+    keeps those figures for `keel positions`.
 
     When no entry order was identified the placement and the three fill figures cross as UNKNOWN
     (`_unknown_fill`), with the service's own sentence as the placement display -- never absent
@@ -1883,143 +1748,6 @@ def holdings_payload(report: HoldingsReport) -> dict[str, Any]:
         "rules": [str(rule) for rule in report.rules],
         "stop_rows_present": [str(i) for i in report.stop_row_ids],
         "rows": [_holding_row_payload(row, report.mode) for row in report.rows],
-    }
-
-
-#: What the settled/unsettled split says while no `cycle_balances` row (#719) has been recorded
-#: for this mode/currency yet (#702). A FIXED sentence, not a figure: rendering the summed
-#: `equity_points.cash` figure under a "settled" label would answer the question the page exists
-#: to ask honestly, even though a per-currency observation may simply not exist yet.
-_SETTLED_UNRECORDED = "UNRECORDED -- no cycle has read this currency's settled/total split yet"
-
-
-def _asset_balance_payload(row: AssetBalanceRow) -> dict[str, Any]:
-    """One product's holding.
-
-    `qty` without a `market_value` is a real and common row: the holding is recorded, the price
-    was not observed. It is never a zero -- a worthless holding and an unpriced one look the same
-    on a page and are not the same fact.
-    """
-    return {
-        "product_id": row.product_id,
-        "qty": quantity(row.qty),
-        "mark": money(row.mark),
-        "mark_as_of": moment(row.mark_as_of),
-        "market_value": money(row.market_value),
-    }
-
-
-def _human_span(seconds: int) -> str:
-    """A duration a reader can act on -- "3 days", "4 hours". No arithmetic in the client (Rule 2),
-    and no bare epoch difference on a page whose whole subject is when things were recorded."""
-    if seconds >= 172_800:
-        return f"{seconds // 86_400} days"
-    if seconds >= 7_200:
-        return f"{seconds // 3_600} hours"
-    if seconds >= 120:
-        return f"{seconds // 60} minutes"
-    return f"{seconds} seconds"
-
-
-def _staleness_payload(report: BalancesReport) -> Field:
-    """Whether the figures on this page describe now, and how confidently that can be said (#702).
-
-    THREE readings, and the middle one is why this is not a `flag`:
-
-    * **nothing recorded** -- a deployment before its first cycle. UNKNOWN: a reading that does
-      not exist is not an old one, and a stale badge here would be a false alarm about a
-      non-event.
-    * **behind this deployment's own cadence** -- WARN, and it names the age. A venue outage holds
-      the last row for as long as it lasts, so this is the difference between a current figure and
-      one that merely looks current.
-    * **current** -- NEUTRAL and never GOOD. A fresh reading is the ordinary state, and grading it
-      green would make the absence of green read as a fault on every page that has just started.
-
-    The JUDGEMENT is the report's (`cash_stale`), made against the cadence this deployment
-    actually cycles at rather than the one its config declares -- see `_stale_window_sec` for the
-    live profile that would otherwise be marked stale twenty-three hours a day.
-    """
-    if not report.has_recorded_cash:
-        return label(
-            "unrecorded",
-            display="no cycle has recorded a reading yet",
-            state=UNKNOWN,
-        )
-    age = report.now_ts - (report.cash_as_of or report.now_ts)
-    if report.cash_stale:
-        return label(
-            "stale",
-            display=(
-                f"STALE — the last reading is {_human_span(age)} old, past this deployment's "
-                f"own {_human_span(report.stale_window_sec)} window"
-            ),
-            state=WARN,
-        )
-    return label("current", display=f"recorded {_human_span(age)} ago", state=NEUTRAL)
-
-
-def balances_payload(report: BalancesReport) -> dict[str, Any]:
-    """`gather_balances`'s `BalancesReport`, as JSON (#702).
-
-    **Every figure here was recorded by a cycle, and every one carries when.** `keel serve` makes
-    no network call -- see `keel/commands/balances.py` for why that is the design and not a
-    limitation -- so the as-of stamps are what keep a recorded page honest rather than merely
-    stale-looking. A tile with no time on it is a claim about now that was made at some other now.
-
-    **No buying power, no deposit, no transfer, and no action of any kind.** #702's refusal:
-    cash is a fact, not an affordance, and this codebase is cash-spot by constitution
-    (`CashAccountRequired`, #372) -- a "buying power" figure would invite exactly the leverage the
-    engine refuses to take.
-
-    `settled_cash` and `total_cash` cross as ABSENT, with `settled_breakdown` saying why, when no
-    `cycle_balances` row (#719) has been recorded yet for this mode and settlement currency --
-    and as real figures once one has, `settled_breakdown` saying so instead. Always present as
-    keys either way, never omitted: a client that had to notice a missing key would be inferring
-    from payload shape, which #719 turned from a forward-looking promise into an ordinary state
-    change on a shape that was already stable.
-    """
-    return {
-        "as_of": iso(report.now_ts),
-        "generated_at": moment(report.now_ts),
-        # A bare string, like `scope` and `mode` elsewhere: an enum word with no precision hazard
-        # and no judgement of its own.
-        "mode": report.mode,
-        "cash": money(report.cash),
-        "cash_as_of": moment(report.cash_as_of),
-        "equity": money(report.equity),
-        "unrealized": money(report.unrealized, signed=True),
-        "hwm": money(report.hwm),
-        "paper_cash": money(report.paper_cash),
-        "settled_cash": money(report.settled_cash),
-        # The split's own stamp. Every other recorded figure on this page carries one and
-        # this pair shipped without, which made these the only tiles exempt from the rule
-        # stated two paragraphs up. A venue outage holds the last row for as long as it
-        # lasts, so the stamp is what separates a current split from a stale one.
-        "settled_as_of": moment(report.settled_as_of),
-        "total_cash": money(report.total_cash),
-        "settled_breakdown": flag(
-            report.settled_breakdown_recorded,
-            on="recorded by the last cycle",
-            off=_SETTLED_UNRECORDED,
-            on_state=NEUTRAL,
-            # UNKNOWN and not WARN: nothing is wrong, and nothing is late. Before the first live
-            # cycle after #719 shipped, no `cycle_balances` row exists yet for this mode/currency,
-            # which is a gap in what keel has recorded rather than a condition an operator can
-            # act on.
-            off_state=UNKNOWN,
-        ),
-        "recorded": flag(
-            report.has_recorded_cash,
-            on="as recorded by the last cycle",
-            off="no cycle has recorded a balance yet",
-            on_state=NEUTRAL,
-            off_state=UNKNOWN,
-        ),
-        "asset_count": count(report.asset_count),
-        "assets": [_asset_balance_payload(row) for row in report.assets],
-        # #702. The judgement, not the subtraction: "is 3 days old a problem" depends on how
-        # often this deployment cycles, and Rule 2 keeps that in Python.
-        "freshness": _staleness_payload(report),
     }
 
 
@@ -2186,8 +1914,39 @@ def timeline_payload(report: TimelineReport) -> dict[str, Any]:
         # has no breaks and has verified nothing, so "no errors" is never on its own a green light.
         "chain": _timeline_chain_payload(report),
         "chain_errors": [str(error) for error in report.chain_errors],
+        # How reading the engine's log went, so the page can say why `system` rows are absent: the
+        # keel-only default is mostly those rows, and a silent missing log would empty it.
+        "engine_log": _timeline_log_payload(report),
         "rows": [_timeline_row_payload(row) for row in report.rows],
     }
+
+
+#: What each `read_log_window` outcome means for the `system` rows. `ok` carries no sentence of
+#: its own because the page says nothing when the log was read.
+_TIMELINE_LOG_NOTES: Mapping[str, str] = {
+    "missing": "no engine log was found, so no system rows (cycles) are shown",
+    "empty": "the engine log is empty, so no system rows (cycles) are shown",
+    "oversized": "the engine log is too large to read, so no system rows (cycles) are shown",
+    "unreadable": "the engine log could not be read, so no system rows (cycles) are shown",
+}
+
+
+def _timeline_log_payload(report: TimelineReport) -> Field | None:
+    """The engine-log status as a field, or `None` when the log was read.
+
+    Nothing to say then, and the client may not judge a value itself, so it tests presence. The
+    state is `TimelineReport.log_gap` and nothing of its own, so the page agrees with the CSV's
+    NOTE line about the same log: `missing` is an ordinary state (a deployment that has not cycled
+    yet) and reads UNKNOWN; every other non-`ok` status -- `empty` included -- is a log that is
+    there and did not reach the report, and warns."""
+    status = report.log_status
+    if status == "ok":
+        return None
+    return label(
+        status,
+        display=_TIMELINE_LOG_NOTES.get(status, _TIMELINE_LOG_NOTES["unreadable"]),
+        state=WARN if report.log_gap else UNKNOWN,
+    )
 
 
 # -- the research record (#708) -------------------------------------------------------------------
@@ -3515,8 +3274,8 @@ def _venue_payload(info: Any) -> dict[str, Any]:
         "session_bound": flag(info.session_bound, on="session-bound", off="stateless"),
         # The #372 funding posture, beside the session one: "cash only" is the declaration
         # every first-party adapter makes, and the off word is the loud one for the day a
-        # row ever carries it -- the venueCard's funding cell mirrors `capability_facts`'s
-        # "MARGIN-CAPABLE" declaration without inheriting its shout.
+        # row ever carries it -- it mirrors `capability_facts`'s "MARGIN-CAPABLE" declaration
+        # without inheriting its shout.
         "cash_only": flag(info.cash_only, on="cash only", off="margin-capable"),
         "supports_fee_summary": flag(
             info.supports_fee_summary, on="fee summary", off="no fee summary"

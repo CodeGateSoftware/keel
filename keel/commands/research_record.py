@@ -6,7 +6,7 @@ of only a file in the repository.
 
 **Why this is a separate module from `keel/commands/research.py`.** That one is the `keel
 research` CLI group -- the front door over the thirteen evidence modules, thirteen hundred lines
-of click commands. This is a pure report in the shape `positions.py`, `balances.py` and
+of click commands. This is a pure report in the shape `positions.py`, `holdings.py` and
 `timeline.py` already established: no click, no I/O beyond one file read, one `gather_*` function
 returning frozen dataclasses for `keel/web/payload.py` to place. `keel trials list` and `keel
 trials verify` are the terminal's faces on the same file; this is the browser's.

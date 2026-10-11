@@ -277,6 +277,7 @@ def test_the_kinds_present_drive_the_chips(repo: Repository, tmp_path: Path) -> 
     _attestation(repo)
 
     assert gather_timeline(repo, now_ts=NOW_TS, scope="all").kinds_present == (
+        "keel",
         "trade",
         "attestation",
     )
@@ -292,7 +293,7 @@ def test_the_chips_survive_having_one_of_them_selected(repo: Repository, tmp_pat
 
     filtered = gather_timeline(repo, now_ts=NOW_TS, scope="all", kind="flow")
 
-    assert filtered.kinds_present == ("trade", "flow", "attestation")
+    assert filtered.kinds_present == ("keel", "trade", "flow", "attestation")
 
 
 def test_the_chips_survive_the_cap(repo: Repository, tmp_path: Path) -> None:
@@ -764,3 +765,133 @@ def test_a_hostile_journal_note_cannot_execute_in_a_spreadsheet(repo: Repository
 
     assert "'=cmd" in line
     assert ",=cmd" not in line and not line.startswith("=cmd")
+
+
+# -- console PR4: `blocked` on cycle rows, and the `keel` composite kind -----------------------
+
+
+def _cycle(**overrides: Any) -> SimpleNamespace:
+    fields: dict[str, Any] = {
+        "started_ts": NOW_TS - 60,
+        "cycle_id": "c-1",
+        "products": ("BTC-USD",),
+        "signals": 3,
+        "blocked": 2,
+        "entered": 1,
+        "exited": 0,
+        "errors": 0,
+    }
+    fields.update(overrides)
+    return SimpleNamespace(**fields)
+
+
+def test_a_system_row_names_the_blocked_count_between_signals_and_entered(repo) -> None:
+    """The Timeline omitted `blocked`, so a cycle whose every signal a guard vetoed read as a
+    cycle that simply chose not to enter. The count sits beside the signals it was taken from."""
+    report = gather_timeline(repo, now_ts=NOW_TS, cycles=[_cycle()])
+
+    assert [row.summary for row in report.rows] == [
+        "cycle: 3 signal(s), 2 blocked, 1 entered, 0 exited, 0 error(s)"
+    ]
+
+
+def test_a_cycle_that_does_not_say_what_it_blocked_is_not_reported_as_zero(repo) -> None:
+    """Unknown is never zero: a cycle object carrying no `blocked` says so in words."""
+    cycle = _cycle()
+    del cycle.blocked
+
+    report = gather_timeline(repo, now_ts=NOW_TS, cycles=[cycle])
+
+    assert [row.summary for row in report.rows] == [
+        "cycle: 3 signal(s), blocked unknown, 1 entered, 0 exited, 0 error(s)"
+    ]
+
+
+def _one_of_each_kind(repo: Repository) -> SimpleNamespace:
+    _order(repo)
+    _transaction(repo)
+    _attestation(repo)
+    return _cycle()
+
+
+def test_kind_keel_is_system_and_attestation_only_and_echoes_back_as_keel(repo) -> None:
+    cycle = _one_of_each_kind(repo)
+
+    report = gather_timeline(repo, now_ts=NOW_TS, scope="all", kind="keel", cycles=[cycle])
+
+    assert sorted(row.kind for row in report.rows) == ["attestation", "system"]
+    assert report.kind == "keel"
+    assert report.scoped_count == 4, "the window still counts every kind"
+    assert report.filtered_count == 2
+
+
+def test_kind_keel_is_spelled_case_insensitively_like_every_other_kind(repo) -> None:
+    cycle = _one_of_each_kind(repo)
+
+    report = gather_timeline(repo, now_ts=NOW_TS, scope="all", kind=" KEEL ", cycles=[cycle])
+
+    assert report.kind == "keel"
+    assert report.filtered_count == 2
+
+
+def test_the_keel_members_are_the_two_kinds_keel_itself_wrote_or_a_human_swore_to() -> None:
+    assert timeline.KEEL_KIND == "keel"
+    assert timeline.KEEL_KINDS == frozenset({"system", "attestation"})
+    assert timeline.KEEL_KIND not in TIMELINE_KINDS, "a composite, never a row's own kind"
+
+
+def test_kinds_present_lists_keel_first_when_either_member_is_present(repo) -> None:
+    _order(repo)
+    _attestation(repo)
+
+    assert gather_timeline(repo, now_ts=NOW_TS, scope="all").kinds_present == (
+        "keel",
+        "trade",
+        "attestation",
+    )
+
+
+def test_kinds_present_lists_keel_for_a_system_row_alone(repo) -> None:
+    report = gather_timeline(repo, now_ts=NOW_TS, scope="all", cycles=[_cycle()])
+
+    assert report.kinds_present == ("keel", "system")
+
+
+def test_kinds_present_omits_keel_when_neither_member_is_present(repo) -> None:
+    """A `keel` chip over a window holding only trades and flows is an empty tab."""
+    _order(repo)
+    _transaction(repo)
+
+    assert gather_timeline(repo, now_ts=NOW_TS, scope="all").kinds_present == ("trade", "flow")
+
+
+def test_the_applied_keel_chip_stays_on_the_bar_when_neither_member_is_present(repo) -> None:
+    """The default view is `kind=keel`. On a window holding only trades and flows (the engine log
+    unresolved, no attestation yet) the applied chip must still be drawn, or the page shows an
+    empty table, a filter nobody can see, and no chip marked current."""
+    _order(repo)
+    _transaction(repo)
+
+    report = gather_timeline(repo, now_ts=NOW_TS, scope="all", kind="keel")
+
+    assert report.kinds_present == ("keel", "trade", "flow")
+    assert report.filtered_count == 0
+    assert report.scoped_count == 2
+
+
+def test_export_rows_honours_kind_keel_the_same_way(repo) -> None:
+    cycle = _one_of_each_kind(repo)
+
+    report = timeline.export_rows(repo, now_ts=NOW_TS, scope="all", kind="keel", cycles=[cycle])
+
+    assert sorted(row.kind for row in report.rows) == ["attestation", "system"]
+    assert report.kind == "keel"
+
+
+def test_an_unknown_kind_still_collapses_to_every_kind(repo) -> None:
+    cycle = _one_of_each_kind(repo)
+
+    report = gather_timeline(repo, now_ts=NOW_TS, scope="all", kind="keels", cycles=[cycle])
+
+    assert report.kind == ""
+    assert report.filtered_count == 4

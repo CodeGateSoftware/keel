@@ -51,6 +51,15 @@ from keel.data.repository import Repository
 #: The type chips, and the only words `kind` ever takes.
 TIMELINE_KINDS: tuple[str, ...] = ("trade", "flow", "attestation", "system")
 
+#: A composite `kind` filter word, never a row's own kind: `KEEL_KINDS`, applied server-side like
+#: any other chip so the CSV export carrying `?kind=keel` holds exactly what the page shows.
+KEEL_KIND = "keel"
+
+#: What keel itself wrote or a human swore to, as opposed to what a venue reported (`trade`) or
+#: cash did (`flow`); the console's default filter, because an audit page opens on keel's own
+#: record first (console PR4). The CLI's default stays every kind.
+KEEL_KINDS: frozenset[str] = frozenset({"system", "attestation"})
+
 #: How a row came to be known, as a closed vocabulary. The distinction this feed exists to keep:
 #:
 #: - `venue-reported` -- a live order; the venue told us it happened.
@@ -171,7 +180,8 @@ class TimelineReport:
     now_ts: int
     scope: str
     scope_start_ts: int | None
-    #: The applied `kind` filter, echoed back, or `""` for every kind.
+    #: The applied `kind` filter, echoed back -- one of `TIMELINE_KINDS`, `KEEL_KIND`, or `""`
+    #: for every kind.
     kind: str
     #: The applied row cap, or `None` when the caller asked for no slice (the CSV export).
     limit: int | None
@@ -181,7 +191,9 @@ class TimelineReport:
     filtered_count: int
     rows: tuple[TimelineRow, ...]
 
-    #: Every kind present in the SCOPED set, in `TIMELINE_KINDS` order -- what a chip bar is
+    #: Every kind present in the SCOPED set, in `TIMELINE_KINDS` order, led by `KEEL_KIND` when
+    #: either of `KEEL_KINDS` is present or when `keel` is the applied filter (the console's
+    #: default, so the filter that emptied the table stays visible) -- what a chip bar is
     #: built from. STORED rather than derived from `rows`, because `rows` is what the chip and
     #: the cap left: derived from those, selecting Flows would delete the Trades chip and leave
     #: no way back, and a kind whose only rows fell past the limit would vanish from the bar
@@ -482,6 +494,11 @@ def _cycle_rows(cycles: Iterable[Any], since_ts: int | None) -> list[TimelineRow
         if since_ts is not None and ts < since_ts:
             continue
         products: tuple[str, ...] = tuple(getattr(cycle, "products", ()) or ())
+        # Between signals and entered, because it is taken from the signals: a cycle whose every
+        # signal a guard vetoed must not read as one that chose not to enter (console PR4). A
+        # cycle that does not say what it blocked says so -- unknown is never zero.
+        blocked = getattr(cycle, "blocked", None)
+        blocked_clause = "blocked unknown" if blocked is None else f"{blocked} blocked"
         rows.append(
             TimelineRow(
                 ts=ts,
@@ -491,6 +508,7 @@ def _cycle_rows(cycles: Iterable[Any], since_ts: int | None) -> list[TimelineRow
                 reference=str(getattr(cycle, "cycle_id", "") or getattr(cycle, "key", "")),
                 summary=(
                     f"cycle: {getattr(cycle, 'signals', 0)} signal(s), "
+                    f"{blocked_clause}, "
                     f"{getattr(cycle, 'entered', 0)} entered, "
                     f"{getattr(cycle, 'exited', 0)} exited, "
                     f"{getattr(cycle, 'errors', 0)} error(s)"
@@ -534,7 +552,9 @@ def gather_timeline(
     # That is the outcome `normalise_scope`, which this function sits beside and reuses, exists
     # to never produce. The applied value is echoed in `kind`, so the substitution is visible.
     requested_kind = (kind or "").strip().lower()
-    resolved_kind = requested_kind if requested_kind in TIMELINE_KINDS else ""
+    resolved_kind = (
+        requested_kind if requested_kind in TIMELINE_KINDS or requested_kind == KEEL_KIND else ""
+    )
     # `None` means NO SLICE, and it has to be a distinct case rather than a very large number.
     # The first attempt at an uncapped export passed `2**31` through this clamp, which is
     # `min(2**31, 2000)` -- so the "whole scope" export quietly stopped at 2000 rows, and the
@@ -565,8 +585,19 @@ def gather_timeline(
     # order across repaints rather than an arbitrary one.
     scoped.sort(key=lambda row: (row.ts, row.reference), reverse=True)
 
-    filtered = [row for row in scoped if not resolved_kind or row.kind == resolved_kind]
+    wanted: frozenset[str] | None
+    if resolved_kind == KEEL_KIND:
+        wanted = KEEL_KINDS
+    else:
+        wanted = frozenset({resolved_kind}) if resolved_kind else None
+    filtered = [row for row in scoped if wanted is None or row.kind in wanted]
     present = {row.kind for row in scoped}
+    # `keel` leads the bar when the window holds either member -- a chip over nothing is an empty
+    # tab, the same reason the declared kinds are listed only when present. It also stays when it
+    # is the APPLIED filter: the console opens on `kind=keel`, and a window holding only trades
+    # and flows would otherwise show an empty table with the filter that emptied it invisible and
+    # no chip marked current.
+    composite = (KEEL_KIND,) if present & KEEL_KINDS or resolved_kind == KEEL_KIND else ()
     return TimelineReport(
         now_ts=now_ts,
         scope=resolved_scope,
@@ -577,7 +608,7 @@ def gather_timeline(
         filtered_count=len(filtered),
         rows=tuple(filtered if resolved_limit is None else filtered[:resolved_limit]),
         log_status=log_status,
-        kinds_present=tuple(kind for kind in TIMELINE_KINDS if kind in present),
+        kinds_present=composite + tuple(kind for kind in TIMELINE_KINDS if kind in present),
         chain_recorded=chain.event_count > 0,
         chain_errors=chain.errors,
     )

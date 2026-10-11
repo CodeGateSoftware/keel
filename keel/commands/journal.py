@@ -26,7 +26,8 @@ Attestations are human-sourced or refused. `keel journal add` prompts, requires 
 accepts NO value options -- not merely "it prompts by default". A `--emotion 3` would make the
 whole entry scriptable, and the TTY gate would then be guarding a ceremony that no longer needed a
 human to supply anything. There is no web write path, and a test asserts it over
-`keel.commands.setup.ACTIONS` -- the only surface `server.do_POST` will route to, and one that
+`keel.commands.setup.ACTIONS` -- the surface `server.do_POST` routes setup writes to (its other
+route is the gate table, which holds the halt and two releases and no attestation), and one that
 already carries an attestation writer (`attest_asset`), which is precisely why a journal box is
 the plausible next addition.
 
