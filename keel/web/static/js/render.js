@@ -3441,9 +3441,9 @@ export function paperBanner(node, config) {
  * The attestation banner (#793) -- what is about to halt keel, or has already.
  *
  * Rail 17 expired on 2026-09-08 and live placed nothing for three days. The state was on the
- * Status page (now Pulse) the whole time, in a card, below the fold, on one page of eleven. So this is
- * carried by the ENVELOPE and drawn from the shell, above `#view`: it is on whatever page the
- * operator is actually reading.
+ * Status page (now Pulse) the whole time, in a card, below the fold, on what was then one page
+ * of eleven. So this is carried by the ENVELOPE and drawn from the shell, above `#view`: it is
+ * on whatever page the operator is actually reading.
  *
  * **Renders `alerts` and judges nothing.** The server sends only the rows that need someone
  * (`payload.attestation_alerts`), already toned, so "is there a banner" is answered in one place

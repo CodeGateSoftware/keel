@@ -17,7 +17,9 @@ seven are refused here as firmly as they are refused to cron.
 **Not the whole gate either.** The typed phrase proves intent, not locality, and on its own it is
 the weakest of the three checks a request must pass. `security.gated_action_permitted` decides
 whether a request may attempt an action at all -- loopback peer, loopback bind, no declared
-remote origin -- and `security.gates_token` proves it came from a page this session served.
+remote origin -- and `security.gates_token` proves the caller holds this session's secret. No
+endpoint serves that token (#968): the console's HALT button holds `security.halt_token`, which
+opens the halt and no release, so a browser session can stop keel and cannot restart it.
 Stage 2b wires all three into `server.do_POST`; **until it does, nothing in this package routes
 here, and `keel/web/__init__.py`'s invariant is unchanged.** This module is a declaration.
 
@@ -210,8 +212,8 @@ def run_gated_action(cfg: Any, action_key: str, presented: object) -> str | None
 
     This is the LAST of four checks, not the only one. `server.do_POST` runs the admission gate,
     the client-header gate, `security.gated_action_permitted` (loopback peer, loopback bind, no
-    declared remote origin) and `security.gates_token` before anything reaches here. The phrase
-    proves intent; those prove locality and provenance.
+    declared remote origin) and `security.gates_token` -- never the halt token -- before anything
+    reaches here. The phrase proves intent; those prove locality and provenance.
     """
     action = TIER1_ACTIONS.get(action_key) if isinstance(action_key, str) else None
     if action is None or not phrase_matches(action_key, presented):

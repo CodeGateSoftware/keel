@@ -1001,7 +1001,7 @@ def _today_basis_field(basis: str) -> Field:
     return label(basis, display=display, state=state)
 
 
-def pulse_payload(report: PulseReport, *, gate: str = "") -> dict[str, Any]:
+def pulse_payload(report: PulseReport, *, halt_token: str = "") -> dict[str, Any]:
     """`gather_pulse`'s `PulseReport`, as JSON -- the glance page, and the one place the console
     offers a write.
 
@@ -1026,10 +1026,11 @@ def pulse_payload(report: PulseReport, *, gate: str = "") -> dict[str, Any]:
     structure: the PRESENCE of that string is the branch, and the command itself comes from the
     service so the console names `keel resume` without ever offering to run it.
 
-    `gate` is the halt route's token as a bare string, like `setup`'s CSRF token: sent for
-    `actions.js` to hold, never displayed, and not a credential without the session cookie. It
-    is the caller's to supply (`api.read_pulse`), because only the caller holds the config's
-    secret."""
+    `halt_token` is the halt route's token (`security.halt_token`) as a bare string, like
+    `setup`'s CSRF token: sent for `actions.js` to hold, never displayed, and not a credential
+    without the session cookie. It opens the halt and nothing else -- the release token is served
+    by no endpoint (#968). It is the caller's to supply (`api.read_pulse`), because only the
+    caller holds the config's secret."""
     status = report.status
     session_defused = bool(status.market_session.defused)
     today = report.today
@@ -1040,7 +1041,7 @@ def pulse_payload(report: PulseReport, *, gate: str = "") -> dict[str, Any]:
         "as_of": iso(report.now_ts),
         "generated_at": moment(report.now_ts),
         "mode": status.mode,
-        "gate": str(gate),
+        "halt_token": str(halt_token),
         "kill_switch": flag(
             status.kill_switch_engaged,
             on="ENGAGED",

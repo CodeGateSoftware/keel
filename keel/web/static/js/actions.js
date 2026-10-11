@@ -25,11 +25,15 @@
  * to show comes from `data.message.display` on success and `error.detail` on refusal. All of
  * that is here, and none of it is in the listener.
  *
- * The halt (console PR1) is the second write and carries a SECOND token: `X-Keel-Gate`, which
+ * The halt (console PR1) is the second write and carries a SECOND token: `X-Keel-Halt`, which
  * arrives on `/api/pulse` and nowhere else. It is a second variable, not the first reused,
  * because `security.py` derives the two apart -- "two surfaces whose tokens are derived apart
  * should not be presented through one field" -- so a value read off the setup document can
  * never be the one sent to the halt, and the reverse. Neither token is displayed.
+ *
+ * The halt token opens the halt and nothing else (#968). The token that releases one --
+ * `keel resume` -- is served by no endpoint, so this client never holds it and has no field to
+ * send it in.
  *
  * ── THE MEMORY IS SESSION STATE, AND IT IS THE ONLY STATE THIS CLIENT KEEPS ─────────────────
  * Every other thing on screen is a server document re-read on a timer. "What did I just do" is
@@ -59,7 +63,7 @@ import { runAction, runHalt } from "./api.js";
 let token = "";
 
 /**
- * This session's halt token, from `/api/pulse`'s `data.gate`.
+ * This session's halt token, from `/api/pulse`'s `data.halt_token`.
  *
  * `""` until a pulse document has been read, for `token`'s reason: the only thing that can halt
  * is a form this client drew from that document. An empty gate reaches the server and is refused
@@ -68,7 +72,7 @@ let token = "";
  *
  * @type {string}
  */
-let gate = "";
+let haltToken = "";
 
 /**
  * What each action last reported, by action key.
@@ -98,8 +102,8 @@ export function remember(data) {
  *
  * @param {any} data  `/api/pulse`'s `data`, or `null`.
  */
-export function rememberGate(data) {
-  gate = data && typeof data.gate === "string" ? data.gate : "";
+export function rememberHaltToken(data) {
+  haltToken = data && typeof data.halt_token === "string" ? data.halt_token : "";
 }
 
 /**
@@ -145,7 +149,7 @@ export async function perform(key, values) {
  * @returns {Promise<string>}  the sentence to show. Never rejects.
  */
 export async function halt() {
-  const reading = await runHalt(gate);
+  const reading = await runHalt(haltToken);
   const outcome = describe(reading);
   if (reading.error) results.set("halt", outcome);
   else results.delete("halt");
