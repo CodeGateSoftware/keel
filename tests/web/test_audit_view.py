@@ -126,8 +126,17 @@ def test_the_views_whose_content_moved_here_route_here() -> None:
     assert moved == {"setup": "audit", "timeline": "audit", "venues": "audit"}
     assert set(moved) <= set(staticfiles.RETIRED_CLIENT_ROUTES), "the server must serve the shell"
     assert set(moved.values()) <= set(staticfiles.CLIENT_ROUTES)
-    route_for = _function_body(_source("main.js"), "routeFor")
-    assert route_for.count("MOVED_ROUTES") >= 1, "routeFor never consults the moved names"
+    # The lookup and its use, whole: a lookup whose result is discarded (`? asked : asked`) or a
+    # find over the raw name both leave `/setup` landing on Pulse.
+    route_for = re.sub(r"\s+", " ", _function_body(_source("main.js"), "routeFor"))
+    lookup = (
+        "const name = Object.prototype.hasOwnProperty.call(MOVED_ROUTES, asked) "
+        "? MOVED_ROUTES[asked] : asked;"
+    )
+    assert route_for.count(lookup) == 1, "routeFor does not resolve a moved name"
+    assert (
+        route_for.count("return ROUTES.find((route) => route.name === name) ?? DEFAULT_ROUTE;") == 1
+    )
 
 
 def test_the_timeline_defaults_to_keel_only() -> None:
