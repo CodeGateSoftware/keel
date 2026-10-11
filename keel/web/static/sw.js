@@ -96,7 +96,6 @@ const PRECACHE = [
   `${BASE}css/keel.css`,
   `${BASE}js/actions.js`,
   `${BASE}js/api.js`,
-  `${BASE}js/chart.js`,
   `${BASE}js/docs.js`,
   `${BASE}js/format.js`,
   `${BASE}js/live.js`,
@@ -204,7 +203,7 @@ self.addEventListener("fetch", (event) => {
 
   if (!url.pathname.startsWith(BASE)) return;
 
-  // A navigation is a request for a VIEW, not for a file: `/insights` names no asset, and
+  // A navigation is a request for a VIEW, not for a file: `/rules` names no asset, and
   // the server answers it with the shell (`staticfiles.resolve_client_route`). Matching that here
   // is what makes a deep link work with the engine stopped.
   if (request.mode === "navigate") {

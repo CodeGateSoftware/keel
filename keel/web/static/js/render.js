@@ -55,7 +55,6 @@
  * the fix is in `keel/web/payload.py`. There is nowhere in this file to put it.
  */
 
-import { equityChart, equitySeriesChart } from "./chart.js";
 import { termLink } from "./docs.js";
 import { instant } from "./format.js";
 
@@ -273,7 +272,7 @@ function headerCell(id, column, sorting) {
   // `main.js` finds its replacement and puts focus back on it -- otherwise sorting a column by
   // keyboard would sort the table and drop the reader at the top of the document. Scoped by the
   // table's id as well as the column, because two tables in one view can offer the same column
-  // name (`rule_name` is a column of both `/api/insights` and `/api/journal`).
+  // name (`product_id` is a column of both `/api/holdings` and `/api/orders` on Holdings).
   trigger.setAttribute("data-focus", [id, key].join(":"));
   if (active) trigger.append(el("span", "mark", shown.mark));
   trigger.addEventListener("click", () => sorting.onSort(key, next));
@@ -1690,7 +1689,7 @@ export function timelineView(data, sort, onSort, onKind) {
 
   // The export, carrying the page's own scope and chip so the file matches the screen.
   const actions = el("p", "note");
-  const link = el("a", "chartaction", "Export CSV");
+  const link = el("a", undefined, "Export CSV");
   // Encoded, like every other URL this client builds (`api.js` uses `searchParams`). `kind` is
   // the server's echo of caller-supplied text, and a value carrying `&` or `#` would otherwise
   // reshape the query rather than travel in it. Not reachable with hostile input today -- the
@@ -1817,407 +1816,6 @@ function kindSwitch(current, kinds, onKind) {
  * @param {(column: string) => void} onSort
  * @returns {DocumentFragment}
  */
-/**
- * The Research Hub's trials ledger (#708): every experiment keel has run, rejected ones included.
- *
- * ── NO SORT CONTROL ON THIS PAGE, ANYWHERE ───────────────────────────────────────────────────
- *
- * Note the signature: `data` and nothing else. Every other table view here takes `(data, sort,
- * onSort)`; this one takes neither, and not one of its columns declares a `key`. That is the
- * Strathern rail, and it is deliberate to the point of being awkward.
- *
- * `headerCell` draws a clickable header for any column with a `key`, and `/api/research/trials`
- * declares an empty `sortable` -- so a key here would render a control the server answers with a
- * 400. But that is the small reason. The real one is in `keel/commands/research_record.py`: a research
- * record that can be ordered best-first is a leaderboard, and a leaderboard turns a record of
- * what was TRIED into an argument for what to TRADE. The rail is held in three places (service,
- * endpoint, view) because a reader who could sort this table would stop reading it as evidence.
- *
- * ── AND NO ACTION ────────────────────────────────────────────────────────────────────────────
- *
- * No promote, no re-run, no listener of any kind, pinned by
- * `tests/web/test_research_view.py::test_the_research_view_offers_no_action_of_any_kind`. A page
- * whose entire argument is that selection happened under a discipline must not put the selection
- * behind a control on the same screen.
- *
- * @param {any} data      the `/api/research/trials` payload.
- * @param {any} gauntlet  the `/api/research/gauntlet` payload, or `null` if that read failed.
- * @param {any} slippage  the `/api/research/slippage` payload, or `null` if that read failed.
- * @returns {DocumentFragment}
- */
-export function researchView(data, gauntlet, slippage, matrix) {
-  const fragment = document.createDocumentFragment();
-  fragment.append(el("h1", undefined, "Research"));
-
-  const sub = el("p", "sub");
-  sub.append(field(data.generated_at), " · ");
-  sub.append(field(data.shown_count), " trials in the record");
-  fragment.append(sub);
-
-  fragment.append(
-    note(
-      "Every trial keel has run, in the order it ran them — the rejected ones beside the ".concat(
-        "selected ones. A record showing only its selections would be a highlight reel.",
-      ),
-    ),
-  );
-
-  fragment.append(
-    gridCard([
-      kv("ledger", data.ledger),
-      kv("tamper check", data.chain),
-      kv("trials run", data.trials_run),
-      kv("decisions", data.decisions),
-    ]),
-  );
-
-  const breaks = stringList(data.chain_errors, "breaks");
-  if (breaks) {
-    fragment.append(heading("h-breaks", "Rows that do not verify"));
-    fragment.append(
-      note(
-        "Each line names the row whose recorded hash no longer matches its content. ".concat(
-          "Every row after the first break is affected.",
-        ),
-      ),
-    );
-    fragment.append(breaks);
-  }
-
-  fragment.append(heading("h-explored", "What each rule has been tried on"));
-  fragment.append(
-    note(
-      "Trials held in this ledger, against the cells the rule declares. Two numbers and not a "
-        .concat("coverage figure: pricing a swept range against its declaration is a judgement ")
-        .concat("the research driver makes by refusing, not one a page computes."),
-    ),
-  );
-  fragment.append(
-    table(
-      "h-explored",
-      [
-        { label: "rule", numeric: false },
-        { label: "trials here", numeric: true },
-        { label: "cells declared", numeric: true },
-      ],
-      (data.exploration || []).map(/** @param {any} row */ (row) => [
-        plain(row.rule) || "—",
-        row.trials,
-        row.declared_cells,
-      ]),
-      "No trials in this ledger.",
-    ),
-  );
-
-  fragment.append(heading("h-trials", "Every trial"));
-  fragment.append(
-    table(
-      "h-trials",
-      [
-        { label: "when (UTC)", numeric: false },
-        { label: "rule", numeric: false },
-        { label: "kind", numeric: false },
-        { label: "outcome", numeric: false },
-        { label: "how the parameters were chosen", numeric: false },
-        { label: "series", numeric: false },
-        { label: "parameters", numeric: false },
-        { label: "summary", numeric: false },
-        { label: "row hash", numeric: false },
-      ],
-      (data.rows || []).map(/** @param {any} row */ (row) => [
-        row.at,
-        plain(row.rule) || "—",
-        plain(row.kind) || "—",
-        row.decision,
-        row.provenance,
-        row.series,
-        plain(row.params) || "—",
-        plain(row.summary) || "—",
-        row.row_hash,
-      ]),
-      // From the payload, never written here. There are two kinds of empty -- no ledger, and a
-      // ledger with no trials in it -- and a hard-coded sentence said the first over both, which
-      // is a false statement about a deployment that simply has not run anything yet. Choosing
-      // between them is a judgement, and judgements are made in Python (Rule 2).
-      plain(data.empty_note),
-    ),
-  );
-
-  fragment.append(matrixSection(matrix));
-  fragment.append(gauntletSection(gauntlet));
-  fragment.append(slippageSection(slippage));
-
-  return fragment;
-}
-
-/**
- * The Evidence Matrix (#708 view 2): recorded CSCV runs, never a computed one.
- *
- * **The empty state is the point of this section, and it is the state it ships in.** Building a
- * matrix costs 11.9-14.3 seconds per session on the real ledger and raises over the ledger as a
- * whole, on a page that re-polls every 15 seconds — so the console shows what an operator RAN and
- * hands them the command when they have not run one.
- *
- * That command comes off the payload and names a session that actually has columns.
- * `--session all` is the obvious thing to print and would filter to a session literally called
- * "all", find nothing, and refuse — teaching the reader that the page does not know what it is
- * talking about.
- *
- * ⛔ No sort control on any column. A matrix ordered by PBO is a leaderboard of overfitting
- * scores, and `cscv.py` forbids PBO as a ranking key in its own source.
- *
- * @param {any} matrix  `/api/research/matrix`'s `data`, or `null` if that read failed.
- * @returns {DocumentFragment}
- */
-function matrixSection(matrix) {
-  const fragment = document.createDocumentFragment();
-  fragment.append(heading("h-matrix", "Evidence matrix"));
-  if (!matrix) {
-    fragment.append(el("p", "empty", "The evidence matrix could not be read."));
-    return fragment;
-  }
-
-  const state = el("p", "sub");
-  state.append(field(matrix.state));
-  fragment.append(state);
-
-  // The command, only where there is one to give: the payload sends an empty string once a run
-  // has been recorded, and a page still telling an operator to run something they have run would
-  // be reading its own table wrong.
-  if (plain(matrix.invocation)) {
-    fragment.append(el("pre", "invocation", plain(matrix.invocation)));
-  }
-
-  fragment.append(
-    table(
-      "h-matrix",
-      [
-        { label: "when (UTC)", numeric: false },
-        { label: "session", numeric: false },
-        { label: "columns", numeric: true },
-        { label: "blocks", numeric: true },
-        { label: "combinations", numeric: true },
-        { label: "rows used", numeric: true },
-        { label: "rows dropped", numeric: true },
-        { label: "PBO", numeric: true },
-        { label: "degradation slope", numeric: true },
-        { label: "P[OOS < 0]", numeric: true },
-        { label: "1st-order dominance", numeric: false },
-        { label: "2nd-order dominance", numeric: false },
-      ],
-      (matrix.rows || []).map(/** @param {any} row */ (row) => [
-        row.at,
-        plain(row.session) || "—",
-        row.n_columns,
-        row.n_blocks,
-        row.n_combinations,
-        row.rows_used,
-        row.rows_dropped,
-        // PBO carries no state, deliberately: a high PBO beside a flat, positive OOS scatter is
-        // the GOOD outcome, so a colour here would be a verdict the number does not support.
-        row.pbo,
-        row.degradation_slope,
-        row.prob_loss,
-        row.dominance_1st,
-        row.dominance_2nd,
-      ]),
-      // From the payload: "no ledger", "no run yet" and "no session with columns" are three
-      // different sentences and choosing between them is a judgement (Rule 2).
-      plain(matrix.state.display),
-    ),
-  );
-  return fragment;
-}
-
-
-/**
- * The Promotion Gauntlet scorecard (#708, view 3) -- as RECORDED, never as computed.
- *
- * ── WHY THIS SECTION COMPUTES NOTHING ────────────────────────────────────────────────────────
- *
- * Every part of the gauntlet needs work a page cannot do, measured before this was written: DSR
- * needs a `--sharpe` the ledger does not store, CSCV costs 12-14 s per session and raises over
- * the ledger as a whole, and Monte Carlo runs a backtest. `keel/commands/gauntlet.py` carries the
- * figures; #726 is the engine issue for persisting the distributions.
- *
- * So a gauntlet run is an IMMUTABLE HISTORICAL ARTIFACT here. What is on this table is what an
- * operator's run wrote into the append-only ledger, seed included, at the moment they ran it --
- * not a fresh answer computed for this page load, and not one that changes between polls.
- *
- * ── THREE STATES ─────────────────────────────────────────────────────────────────────────────
- *
- * Ran, attempted-and-refused, and never run. The third is a COUNT rather than eighty-seven empty
- * rows: a table of blanks would present the gauntlet as having covered the whole record.
- *
- * @param {any} gauntlet  the `/api/research/gauntlet` payload, or `null`.
- * @returns {DocumentFragment}
- */
-function gauntletSection(gauntlet) {
-  const fragment = document.createDocumentFragment();
-  fragment.append(heading("h-gauntlet", "The promotion gauntlet, as it was run"));
-
-  if (!gauntlet) {
-    fragment.append(note("The gauntlet record could not be read for this deployment."));
-    return fragment;
-  }
-
-  fragment.append(
-    note(
-      "Recorded outcomes, not fresh calculations. Each row is what an operator's run wrote ".concat(
-        "into the append-only ledger at the time — seed included, so it can be repeated.",
-      ),
-    ),
-  );
-
-  fragment.append(
-    gridCard([
-      kv("trials in the record", gauntlet.trials_total),
-      kv("gauntlet attempted", gauntlet.recorded_count),
-      kv("gauntlet ran", gauntlet.available_count),
-      kv("no gauntlet record", gauntlet.not_run_count),
-      kv("passed the gate", gauntlet.gate_passed_count),
-    ]),
-  );
-
-  fragment.append(
-    table(
-      "h-gauntlet",
-      [
-        { label: "when (UTC)", numeric: false },
-        { label: "trial", numeric: false },
-        { label: "rule", numeric: false },
-        // A PBO is only defined WITHIN a session -- `build_matrix` requires synchronous
-        // columns -- so the session is context, not decoration.
-        { label: "session", numeric: false },
-        { label: "ran", numeric: false },
-        { label: "PBO", numeric: true },
-        { label: "train expectancy", numeric: true },
-        { label: "held out", numeric: true },
-        { label: "bars", numeric: true },
-        { label: "seed", numeric: true },
-        { label: "gate", numeric: false },
-      ],
-      (gauntlet.rows || []).map(/** @param {any} row */ (row) => [
-        row.at,
-        plain(row.trial_id) || "—",
-        plain(row.rule) || "—",
-        plain(row.session) || "—",
-        row.ran,
-        row.pbo,
-        row.train_expectancy,
-        row.held_out_expectancy,
-        row.bars,
-        row.seed,
-        row.gate_passed,
-      ]),
-      "No gauntlet has been run against this ledger.",
-    ),
-  );
-
-  fragment.append(
-    note(
-      "Read PBO beside the degradation slope, never alone: a high PBO over a flat, positive ".concat(
-        "out-of-sample scatter is the good outcome. The slope is not recorded yet — see #726.",
-      ),
-    ),
-  );
-
-  return fragment;
-}
-
-
-/**
- * The Slippage Universe (#708, view 4), as a section of the Research page.
- *
- * A SECTION and not a route of its own, following `insightsView`'s precedent: one client route
- * whose two endpoints are read concurrently and rendered under one page. Tabs become worth
- * building when there are four of these; two under headings is navigable and needs no sub-router
- * that `staticfiles.CLIENT_ROUTES` would then have to learn about.
- *
- * `null` when the read failed -- `mount` leaves the primary view standing when a SECONDARY
- * endpoint errors, so this says the section is missing rather than taking the trials table down
- * with it.
- *
- * ── EVERY NUMBER IN HERE IS AN ASSUMPTION ────────────────────────────────────────────────────
- *
- * The `basis` field says so and is rendered first, before any rate. keel stores no order books
- * and no realised spreads; these figures are scaled from cached candle volume. #708's own scope
- * note calls them "measured", which is the mistake this section is written not to repeat.
- *
- * @param {any} slippage  the `/api/research/slippage` payload, or `null`.
- * @returns {DocumentFragment}
- */
-function slippageSection(slippage) {
-  const fragment = document.createDocumentFragment();
-  fragment.append(heading("h-slippage", "What a fill is assumed to cost"));
-
-  if (!slippage) {
-    fragment.append(note("The slippage figures could not be read for this deployment."));
-    return fragment;
-  }
-
-  const basis = el("p", "note");
-  basis.append(field(slippage.basis));
-  fragment.append(basis);
-
-  fragment.append(
-    gridCard([
-      kv("products", slippage.product_count),
-      kv("priced from cached candles", slippage.priced_count),
-      kv("reaching the floor", slippage.at_floor_count),
-      kv("at the cap", slippage.capped_count),
-      kv("no liquidity statistic", slippage.fallback_count),
-    ]),
-  );
-
-  fragment.append(
-    note(
-      "Every experiment document in this repository prices its fills at the floor rate. ".concat(
-        "The count above is how many products actually reach it.",
-      ),
-    ),
-  );
-
-  fragment.append(
-    gridCard([
-      kv("floor", slippage.floor_bp),
-      kv("cap", slippage.cap_bp),
-      kv("anchor volume", slippage.anchor_quote_volume),
-    ]),
-  );
-
-  fragment.append(
-    table(
-      "h-slippage",
-      [
-        { label: "product", numeric: false },
-        { label: "assumed bp per leg", numeric: true },
-        { label: "vs floor", numeric: true },
-        { label: "median daily quote volume", numeric: true },
-        { label: "daily bars", numeric: true },
-        { label: "priced from", numeric: false },
-        { label: "cap", numeric: false },
-      ],
-      (slippage.rows || []).map(/** @param {any} row */ (row) => [
-        plain(row.product_id) || "—",
-        row.slippage_bp,
-        row.floor_multiple,
-        row.median_daily_quote_volume,
-        row.bars,
-        row.fallback,
-        row.capped,
-      ]),
-      // Not "an empty allowlist": `config._parse_allowlist` raises on a missing or empty one,
-      // so that sentence would describe a deployment which cannot load. The reachable emptiness
-      // is a table whose rows the report could not build.
-      "No products to price.",
-    ),
-  );
-
-  return fragment;
-}
-
-
 export function balancesView(data, sort, onSort) {
   const fragment = document.createDocumentFragment();
   fragment.append(el("h1", undefined, "Balances"));
@@ -2449,8 +2047,8 @@ function holdingsSection(data, sort, onSort) {
 
     for (const row of held) {
       // The realized side, under a disclosure: a scaled-out tranche has legs already booked, and
-      // they belong beside the running position rather than in the journal's separate account of
-      // the same trade. Collapsed because most tranches have never been scaled out. There is no
+      // they belong beside the running position rather than in the closed-trade journal's separate
+      // account of the same trade (`keel insights journal`). Collapsed because most tranches have never been scaled out. There is no
       // "marked at" here because there is no mark.
       const node = el("details", "row");
       const summary = el("summary");
@@ -2724,7 +2322,7 @@ const SCOPES = ["today", "7d", "all"];
  * shipped a runtime `TypeError`. That test's own docstring records this class of miss from #701.
  *
  * **`payload`, not `data` -- HERE, and only here.** These two helpers sit between `holdingsView`
- * and `insightsView`, so `_view_keys` counts them inside `holdingsView`'s region: any
+ * and `rulesView`, so `_view_keys` counts them inside `holdingsView`'s region: any
  * `data.<key>` written here would be checked against `/api/holdings`, which is not the endpoint
  * it came from. Naming the parameter something else makes that mistake unspellable.
  *
@@ -2793,364 +2391,9 @@ function sectionSwitch(current, sections, onSection, label) {
 }
 
 /**
- * Insights: `/api/insights` and `/api/journal`, as one view.
- *
- * Two endpoints and one view, which `api.py` planned for: `/insights` and `/journal` both name
- * `/insights` as their `html_route`, and the split exists so that "one sortable collection per
- * endpoint keeps `?sort=` unambiguous without a `?table=` beside it". The rendered page shows
- * both under one heading and so does this.
- *
- * ── WHAT THIS ADDS OVER THE RENDERED PAGE ────────────────────────────────────────────────────
- *
- *   * **The equity curve.** `chart.js` draws it from coordinates `build_equity_curve` computed;
- *     see that module for why the geometry is not computed here.
- *   * **The promotion gate, per rule.** The rendered page shows a track record and no distance to
- *     the floor; the TUI shows a `gate:` line and `test_tui.py` pins its two states (`PASSING`
- *     ok, `blocked` warn) and its blocking reasons. `_gate_payload` carries all of it, so it is a
- *     disclosure under each rule that has one -- and `GateDistance` is `None` for any status
- *     other than `paper`, which is why some rules have none.
- *   * **`avg_win` / `avg_loss` / `realized_rr`**, which the payload sends and the HTML drops.
- *
- * ── DIVERGENCE FROM THE RENDERED PAGE (SECOND #548-CLASS BUG, FOUND WHILE PORTING) ───────────
- *
- * `render.py::pct` appends a literal `%` to `drawdown_total_pct`, `drawdown_weekly_pct`,
- * `max_total_dd_pct` and `max_weekly_dd_pct` -- and those four hold FRACTIONS, not percent units.
- * `keel/templates/config.yaml` ships `max_total_dd_pct: 0.20` and `execution/guards.py` compares
- * the raw drawdown against it directly, so a 20% ceiling renders on the HTML pages as **0.20%**
- * and a 5% drawdown as 0.05% -- a hundredfold understatement of a risk limit, in green. The CLI,
- * the TUI and `payload.py` all print the bare fraction (`payload.ratio`, no suffix); `render.py`
- * is the only surface that adds the sign. This view shows the payload's value, which is the
- * correct one. `RuleTrackRecord.win_rate` really is in percent units and keeps its `%`.
- *
- * @param {any} insights  `/api/insights`'s `data`.
- * @param {any} journal   `/api/journal`'s `data`, or `null` if that read failed.
- * @param {any} sort      `/api/insights`'s `sort` echo (the rule table's).
- * @param {(column: string, direction: string) => void} onSort
- * @param {any} journalSort  `/api/journal`'s own `sort` echo. A SECOND one, because the two
- *                           tables are two endpoints with two sortable collections and each
- *                           refuses the other's columns -- see `main.js`'s `params`.
- * @param {(column: string, direction: string) => void} onJournalSort
- * @returns {DocumentFragment}
- */
-export function insightsView(insights, journal, sort, onSort, journalSort, onJournalSort) {
-  const fragment = document.createDocumentFragment();
-  fragment.append(el("h1", undefined, "Insights"));
-
-  const sub = el("p", "sub");
-  sub.append(field(insights.generated_at), " · ");
-  sub.append(field(insights.closed_trade_count), " closed trade(s)");
-  fragment.append(sub);
-
-  const account = insights.account;
-  fragment.append(
-    gridCard([
-      kv("mode", plain(account.mode)),
-      kv("equity state", account.state_mode),
-      kv("rail 11", account.rail11),
-      kv("high water mark", account.high_water_mark),
-      kv("paper cash", account.paper_cash),
-      kv("drawdown (total)", account.drawdown_total),
-      kv("drawdown (weekly)", account.drawdown_weekly),
-      kv("max total dd", account.max_total_dd),
-      kv("max weekly dd", account.max_weekly_dd),
-    ]),
-  );
-
-  fragment.append(heading("h-records", "Rule track records"));
-  const rules = insights.rules || [];
-  fragment.append(
-    table(
-      "h-records",
-      [
-        { label: "rule", numeric: false, key: "rule_name" },
-        { label: "status", numeric: false, key: "status" },
-        { label: "class", numeric: false, key: "promotion_class" },
-        { label: "trades", numeric: true, key: "n_trades" },
-        { label: "win rate", numeric: true, key: "win_rate" },
-        { label: "avg win", numeric: true, key: "avg_win" },
-        { label: "avg loss", numeric: true, key: "avg_loss" },
-        { label: "realized rr", numeric: true, key: "realized_rr" },
-        { label: "expectancy", numeric: true, key: "expectancy" },
-        { label: "profit factor", numeric: true, key: "profit_factor" },
-        { label: "max dd", numeric: true, key: "max_drawdown" },
-        { label: "sample", numeric: false },
-      ],
-      rules.map(
-        /** @param {any} rule */ (rule) => [
-          plain(rule.rule_name),
-          rule.status,
-          plain(rule.promotion_class),
-          rule.n_trades,
-          rule.win_rate,
-          rule.avg_win,
-          rule.avg_loss,
-          rule.realized_rr,
-          rule.expectancy,
-          rule.profit_factor,
-          rule.max_drawdown,
-          samplePill(rule.significant),
-        ],
-      ),
-      "No rules with a track record yet.",
-      { sort: sort, onSort: onSort },
-    ),
-  );
-  fragment.append(
-    note(
-      "Below 30 closed trades a win rate is not yet distinguishable from random entry, which is why the sample column says so rather than leaving the number to speak for itself.",
-    ),
-  );
-
-  const gated = rules.filter(/** @param {any} rule */ (rule) => Boolean(rule.gate));
-  if (gated.length !== 0) {
-    fragment.append(heading("h-gates", "Distance to the promotion gate"));
-    fragment.append(
-      note("Only rules in paper have one: a candidate has not backtested yet, and a live rule has already cleared it."),
-    );
-    for (const rule of gated) fragment.append(gateCard(rule));
-  }
-
-  fragment.append(heading("h-journal", "Journal"));
-  if (!journal) {
-    fragment.append(el("p", "empty", "The journal could not be read."));
-    return fragment;
-  }
-
-  const shown = el("p", "note");
-  shown.append(field(journal.shown_count), " of ", field(journal.total_count), " closed trade(s)");
-  fragment.append(shown);
-
-  // #698: portfolio reality above statistical expectancy. The account-equity series is what the
-  // account was WORTH each cycle; the curve below it is what the closed trades DID. Stacked
-  // rather than merged because they are different quantities on different axes -- see
-  // `chart.js::equitySeriesChart`.
-  //
-  // It comes off `/api/insights`, not `/api/journal`, so it is NOT narrowed by the journal's
-  // `?limit=`. The note below says so: a reader looking at two stacked charts would otherwise
-  // reasonably assume the row cap above applies to both.
-  const series = equitySeriesChart(insights.equity_series, "h-series");
-  if (series) {
-    // What the top chart's span actually is, in words, next to the chart. `is_truncated` is a
-    // `flag` whose `display` already says which case this is -- the client never compares
-    // `point_count` against `total_recorded` to find out, because that comparison is arithmetic
-    // and the answer is a claim about how much of the record is on screen.
-    const scope = el("p", "note");
-    scope.append(
-      field(insights.equity_series.point_count),
-      " of ",
-      field(insights.equity_series.total_recorded),
-      " recorded cycle(s) — ",
-      field(insights.equity_series.is_truncated),
-      ". Not narrowed by the journal row cap below.",
-    );
-    fragment.append(series, scope);
-  } else if (insights.equity_series) {
-    fragment.append(el("p", "empty", plain(insights.equity_series.reading.display)));
-  }
-  // No `else` for a payload with no `equity_series` at all. That is not a deployment with no
-  // readings -- it is a RESPONSE FROM BEFORE THIS FIELD EXISTED, which the service worker can
-  // still be holding after an upgrade. Reading `.reading.display` off it would throw and blank
-  // the whole insights view over a stale cache entry the next refresh fixes on its own.
-
-  const chart = equityChart(journal.curve, "h-curve");
-  if (chart) {
-    fragment.append(chart);
-    // #602: wired in `main.js`, which owns the arithmetic both actions need (resetting a
-    // `viewBox`, reading a pointer position and sizing a canvas -- see `chart.js`'s own note on
-    // why that cannot live here). `data-chart-action` is the whole interface between the two
-    // files; this one never imports `main.js`, which would be circular (`main.js` imports this
-    // module already).
-    const actions = el("div", "chartactions");
-    const reset = el("button", "chartaction", "Reset view");
-    reset.setAttribute("type", "button");
-    reset.setAttribute("data-chart-action", "reset-view");
-    const save = el("button", "chartaction", "Save as image");
-    save.setAttribute("type", "button");
-    save.setAttribute("data-chart-action", "save-image");
-    actions.append(reset, save);
-    fragment.append(actions);
-  } else {
-    fragment.append(el("p", "empty", plain(journal.curve.reading.display)));
-  }
-
-  const entries = journal.entries || [];
-  const journalTable = table(
-    "h-journal",
-    [
-      { label: "closed (UTC)", numeric: false, key: "closed_at" },
-      { label: "product", numeric: false, key: "product_id" },
-      { label: "rule", numeric: false, key: "rule_name" },
-      { label: "qty", numeric: true, key: "qty" },
-      { label: "entry", numeric: true, key: "entry_fill" },
-      { label: "exit", numeric: true, key: "exit_fill" },
-      { label: "net p&l", numeric: true, key: "pnl" },
-      { label: "fees", numeric: true, key: "fees" },
-      { label: "r", numeric: true, key: "r_multiple" },
-      { label: "outcome", numeric: false, key: "outcome" },
-    ],
-    entries.map(
-      /** @param {any} entry */ (entry) => [
-        entry.closed_at,
-        plain(entry.product_id),
-        plain(entry.rule_name) || "—",
-        entry.qty,
-        entry.entry_fill,
-        entry.exit_fill,
-        entry.pnl,
-        entry.fees,
-        entry.r_multiple,
-        entry.outcome,
-      ],
-    ),
-    "No closed trades.",
-    { sort: journalSort, onSort: onJournalSort },
-  );
-
-  // #602: a row whose trade has a point on the curve above is both hoverable and focusable, so
-  // `main.js` can highlight that point for a mouse user and a keyboard user alike --
-  // `tbody tr[data-point-index]:focus-within` in `keel.css` is the visible half.
-  // `entries()` pairs each built `<tr>` with the entry that produced it by POSITION, which is
-  // exactly the order `table()` renders them in -- it builds one `<tr>` per row, in the order
-  // `rows` (built from `entries` just above) gave them.
-  for (const [index, row] of journalTable.querySelectorAll("tbody tr").entries()) {
-    const entry = entries[index];
-    if (!entry || entry.point_index === null) continue;
-    row.setAttribute("data-point-index", entry.point_index);
-    row.setAttribute("tabindex", "0");
-  }
-  fragment.append(journalTable);
-  fragment.append(notesSection(journal.notes));
-  return fragment;
-}
-
-/**
- * The DISCRETIONARY journal (#705): what the operator wrote about themselves.
- *
- * **Below the closed trades, deliberately, and never blended into them.** Two records on one page
- * both called a journal, and this is where a reader has to be able to tell them apart: the table
- * above is what a venue reported, and nothing outside this operator's own head produced anything
- * here. So the heading carries the marker (`SELF-REPORTED`, written by the payload so the CLI and
- * this page cannot come to use two different words for it) and the impact column says so again on
- * every row.
- *
- * **No sort control, on any column.** Not an omission -- a journal reads forwards, and sorted by
- * dollar impact it becomes a ranking of the operator's own worst days. That is the Strathern rail
- * in the one place where the thing being ranked is a person, and `api.py` refuses it on the route
- * as well: these entries are not this endpoint's sortable collection.
- *
- * Every cell that carries a judgement arrives as a `Field` -- `rules_followed` is three-valued
- * (`not said` is not `no`) and `dollar_impact` warns because it is a claim rather than a fill.
- * This function places them and decides nothing.
- *
- * @param {any} notes  `/api/journal`'s `notes`, or `null`/undefined where that read failed.
- * @returns {DocumentFragment}
- */
-function notesSection(notes) {
-  const fragment = document.createDocumentFragment();
-  if (!notes) return fragment;
-
-  fragment.append(heading("h-notes", "Your own account"));
-  const sub = el("p", "sub");
-  sub.append(pill(plain(notes.marker), "warn"), " ");
-  sub.append(field(notes.recorded), " · ");
-  // How much of the journal this is. A capped list with nothing beside it reads as a complete
-  // one, and the sentence comes off the payload -- choosing between "showing all 3" and "showing
-  // the 50 most recent of 301" is a judgement, and this file may not count either.
-  sub.append(field(notes.window));
-  fragment.append(sub);
-
-  fragment.append(
-    table(
-      "h-notes",
-      [
-        { label: "when (UTC)", numeric: false },
-        { label: "emotion", numeric: false },
-        { label: "rules", numeric: false },
-        { label: "errors made", numeric: false },
-        { label: "self-reported impact", numeric: true },
-        { label: "chart note", numeric: false },
-        { label: "screenshot", numeric: false },
-      ],
-      (notes.entries || []).map(/** @param {any} entry */ (entry) => [
-        entry.at,
-        entry.emotion,
-        entry.rules_followed,
-        plain(entry.errors_made) || "—",
-        entry.dollar_impact,
-        plain(entry.chart_note) || "—",
-        plain(entry.screenshot_ref) || "—",
-      ]),
-      // From the payload, never written here: "no entries yet" and "this could not be read" are
-      // different sentences, and choosing between them is a judgement (Rule 2).
-      plain(notes.recorded.display),
-    ),
-  );
-  return fragment;
-}
-
-/**
- * The `n≥30` marker, as a pill carrying its own judgement.
- *
- * `significant` is a `flag` whose `off` wording is "below the n=30 floor" and whose `off_state` is
- * `warn` -- so the sentence AND the colour both come from `payload._track_record_payload`, and
- * this file decides neither.
- *
- * @param {any} significant
- * @returns {HTMLElement}
- */
-function samplePill(significant) {
-  return pill(plain(significant.display), toneOf(significant));
-}
-
-/**
- * One rule's distance to its promotion floor.
- *
- * Every figure here is a pair -- what the rule has, and what the floor is -- because a single
- * number answers "how is it doing" and only the pair answers "is it close". `_gate_payload` sends
- * both and computes neither: "`passing` is the engine's verdict, copied; the floors are the
- * config's own values, copied. Nothing here re-runs `check_floors`."
- *
- * @param {any} rule
- * @returns {HTMLElement}
- */
-function gateCard(rule) {
-  const gate = rule.gate;
-  const node = el("details", "gate");
-  const summary = el("summary");
-  // An id on every summary, and it is not decoration: `main.js` restores which disclosures were
-  // open across a rebuild by matching these, so a reader who expanded one does not watch it shut
-  // the moment the engine writes a row. Derived from the row it describes, so it is stable across
-  // a re-read that did not change that row.
-  summary.id = "h-gatedist-".concat(plain(gate.rule_name));
-  summary.append(plain(gate.rule_name), " · ");
-  summary.append(field(gate.passing));
-  node.append(summary);
-
-  node.append(
-    gridCard([
-      kv("class", plain(gate.promotion_class)),
-      kv("trades", gate.n_trades),
-      kv("trades needed", gate.min_trades),
-      kv("trades remaining", gate.trades_remaining),
-      kv("win rate", gate.win_rate),
-      kv("win rate floor", gate.min_win_rate),
-      kv("realized rr", gate.realized_rr),
-      kv("rr floor", gate.min_rr),
-      kv("expectancy", gate.expectancy),
-      kv("expectancy floor", gate.min_expectancy),
-    ]),
-  );
-
-  const reasons = stringList(gate.blocking_reasons, "reasons");
-  if (reasons) {
-    node.append(note("Blocked by:"));
-    node.append(reasons);
-  }
-  return node;
-}
-
-/**
- * Rules: `/api/rules`'s payload.
+ * Rules: the rule ledger, each rule's track record, the DCA proposal and the research record --
+ * one page for everything keel knows about its rules (console PR3 folded the Insights and
+ * Research views in).
  *
  * **Read-only, and the page says so out loud.** `rules_payload`'s docstring: "promotion happens in
  * the CLI, behind the TTY gate, and nothing this API serves can change a rule's status."
@@ -3160,16 +2403,24 @@ function gateCard(rule) {
  * are a disclosure of `key = value` rows instead, because `_rule_row_payload` stringifies each
  * value individually and a `repr` of a dict is a thing only a Python programmer can read.
  *
- * Below the ledger sits the DCA proposal card (`dcaPlanCard`), from the page's second endpoint.
+ * In page order: the ledger (the one sortable table), the parameters, the track records with
+ * their distance to the promotion gate (`recordsSection`, unsorted), the DCA proposal card
+ * (`dcaPlanCard`), then the research record -- trials, evidence matrix, gauntlet, slippage --
+ * each a section function of its own. Every reading after the ledger is SECONDARY: a read that
+ * failed arrives as `null` and its section says so, leaving the rest of the page standing.
  *
  * @param {any} data  `/api/rules`'s `data`.
  * @param {any} sort
  * @param {(column: string, direction: string) => void} onSort
  * @param {any} [plan]  `/api/dca-plan`'s `data`, or `null` when that read failed.
  * @param {any} [planError]  that read's `error`, or `null`.
+ * @param {any} [trials]    `/api/research/trials`'s `data`, or `null`.
+ * @param {any} [gauntlet]  `/api/research/gauntlet`'s `data`, or `null`.
+ * @param {any} [slippage]  `/api/research/slippage`'s `data`, or `null`.
+ * @param {any} [matrix]    `/api/research/matrix`'s `data`, or `null`.
  * @returns {DocumentFragment}
  */
-export function rulesView(data, sort, onSort, plan, planError) {
+export function rulesView(data, sort, onSort, plan, planError, trials, gauntlet, slippage, matrix) {
   const fragment = document.createDocumentFragment();
   fragment.append(el("h1", undefined, "Rules"));
   fragment.append(el("p", "sub", "read-only · promotion happens in the CLI"));
@@ -3212,8 +2463,170 @@ export function rulesView(data, sort, onSort, plan, planError) {
     );
     for (const row of parameterised) fragment.append(paramsCard(row));
   }
+  fragment.append(recordsSection(data));
   fragment.append(dcaPlanCard(plan || null, planError || null));
+
+  fragment.append(heading("h-research", "Research record"));
+  fragment.append(
+    note(
+      "Every trial keel has run, in the order it ran them — the rejected ones beside the ".concat(
+        "selected ones. A record showing only its selections would be a highlight reel.",
+      ),
+    ),
+  );
+  fragment.append(trialsSection(trials));
+  fragment.append(matrixSection(matrix));
+  fragment.append(gauntletSection(gauntlet));
+  fragment.append(slippageSection(slippage));
   return fragment;
+}
+
+/**
+ * Each rule's track record and its distance to the promotion gate (`/api/rules`'s `records`; the
+ * Insights view's until console PR3).
+ *
+ * **No sort control, on any column.** `records` is not the route's sortable collection, and a
+ * track record ordered by expectancy is the leaderboard the research record below refuses. The
+ * records arrive in the service's order and are drawn in it.
+ *
+ * **What the records cover.** The promotion pipeline -- `candidate` and `paper` rules -- exactly
+ * as `keel insights summary` reports by default; the empty sentence says that, because an empty
+ * list means "no rule in the pipeline", which is not "no rule has traded". A live rule's record is
+ * `keel insights summary --mode live` at a terminal.
+ *
+ * The gate cards are drawn on the PRESENCE of `gate`, which the payload sends only for a `paper`
+ * rule (a candidate has not backtested yet; a live rule has already cleared it).
+ *
+ * @param {any} data  `/api/rules`'s `data`.
+ * @returns {DocumentFragment}
+ */
+function recordsSection(data) {
+  const fragment = document.createDocumentFragment();
+  fragment.append(heading("h-records", "Rule track records"));
+
+  const sub = el("p", "sub");
+  sub.append(field(data.closed_trade_count), " closed trade(s) in the ledger");
+  fragment.append(sub);
+
+  const records = data.records || [];
+  fragment.append(
+    table(
+      "h-records",
+      [
+        { label: "rule", numeric: false },
+        { label: "status", numeric: false },
+        { label: "class", numeric: false },
+        { label: "trades", numeric: true },
+        { label: "win rate", numeric: true },
+        { label: "avg win", numeric: true },
+        { label: "avg loss", numeric: true },
+        { label: "realized rr", numeric: true },
+        { label: "expectancy", numeric: true },
+        { label: "profit factor", numeric: true },
+        { label: "max dd", numeric: true },
+        { label: "sample", numeric: false },
+      ],
+      records.map(
+        /** @param {any} row */ (row) => [
+          plain(row.rule_name),
+          row.status,
+          plain(row.promotion_class),
+          row.n_trades,
+          row.win_rate,
+          row.avg_win,
+          row.avg_loss,
+          row.realized_rr,
+          row.expectancy,
+          row.profit_factor,
+          row.max_drawdown,
+          samplePill(row.significant),
+        ],
+      ),
+      "No candidate or paper rules in the ledger, so no track record to show.",
+    ),
+  );
+  fragment.append(
+    note(
+      "Rules in the promotion pipeline (candidate and paper). Below 30 closed trades a win rate is not yet distinguishable from random entry, which is why the sample column says so rather than leaving the number to speak for itself. A live rule's record is `keel insights summary --mode live` at a terminal.",
+    ),
+  );
+
+  const gated = records.filter(/** @param {any} row */ (row) => Boolean(row.gate));
+  if (gated.length !== 0) {
+    fragment.append(heading("h-gates", "Distance to the promotion gate"));
+    fragment.append(
+      note("Only rules in paper have one: a candidate has not backtested yet, and a live rule has already cleared it."),
+    );
+    for (const [index, row] of gated.entries()) fragment.append(gateCard(row, index));
+  }
+  return fragment;
+}
+
+/**
+ * The `n≥30` marker, as a pill carrying its own judgement.
+ *
+ * `significant` is a `flag` whose `off` wording is "below the n=30 floor" and whose `off_state` is
+ * `warn` -- so the sentence AND the colour both come from `payload._track_record_payload`, and
+ * this file decides neither.
+ *
+ * @param {any} significant
+ * @returns {HTMLElement}
+ */
+function samplePill(significant) {
+  return pill(plain(significant.display), toneOf(significant));
+}
+
+/**
+ * One rule's distance to its promotion floor.
+ *
+ * Every figure here is a pair -- what the rule has, and what the floor is -- because a single
+ * number answers "how is it doing" and only the pair answers "is it close". `_gate_payload` sends
+ * both and computes neither: "`passing` is the engine's verdict, copied; the floors are the
+ * config's own values, copied. Nothing here re-runs `check_floors`."
+ *
+ * The summary's id carries the card's POSITION as well as the rule's name. A record is named by
+ * its rule KIND, and a ledger can hold several paper rules of one kind, so a name-only id repeats
+ * -- and `rebuildInto` reopens disclosures by `summary[id]`, so opening one such card reopened
+ * every card of that kind on the next poll.
+ *
+ * @param {any} rule
+ * @param {number} position  the card's place among the gated records, for its id.
+ * @returns {HTMLElement}
+ */
+function gateCard(rule, position) {
+  const gate = rule.gate;
+  const node = el("details", "gate");
+  const summary = el("summary");
+  // An id on every summary, and it is not decoration: `main.js` restores which disclosures were
+  // open across a rebuild by matching these, so a reader who expanded one does not watch it shut
+  // the moment the engine writes a row. Derived from the row it describes and its place in the
+  // service's order, so it is stable across a re-read that did not change the ledger.
+  summary.id = ["h-gatedist", plain(gate.rule_name), String(position)].join("-");
+  summary.append(plain(gate.rule_name), " · ");
+  summary.append(field(gate.passing));
+  node.append(summary);
+
+  node.append(
+    gridCard([
+      kv("class", plain(gate.promotion_class)),
+      kv("trades", gate.n_trades),
+      kv("trades needed", gate.min_trades),
+      kv("trades remaining", gate.trades_remaining),
+      kv("win rate", gate.win_rate),
+      kv("win rate floor", gate.min_win_rate),
+      kv("realized rr", gate.realized_rr),
+      kv("rr floor", gate.min_rr),
+      kv("expectancy", gate.expectancy),
+      kv("expectancy floor", gate.min_expectancy),
+    ]),
+  );
+
+  const reasons = stringList(gate.blocking_reasons, "reasons");
+  if (reasons) {
+    node.append(note("Blocked by:"));
+    node.append(reasons);
+  }
+  return node;
 }
 
 /**
@@ -3236,6 +2649,408 @@ function paramsCard(row) {
   }
   node.append(list);
   return node;
+}
+
+/**
+ * The trials ledger (#708 view 1): every experiment keel has run, rejected ones included. The
+ * first section of the research record on the Rules view (console PR3 folded the Research view in;
+ * this was `researchView`'s own body).
+ *
+ * ── NO SORT CONTROL, ANYWHERE IN THE RESEARCH RECORD ─────────────────────────────────────────
+ *
+ * Not one of these columns declares a `key`, and no section is handed a sort pair. That is the
+ * Strathern rail, and it is deliberate to the point of being awkward.
+ *
+ * `headerCell` draws a clickable header for any column with a `key`, and `/api/research/trials`
+ * declares an empty `sortable` -- so a key here would render a control the server answers with a
+ * 400. But that is the small reason. The real one is in `keel/commands/research_record.py`: a research
+ * record that can be ordered best-first is a leaderboard, and a leaderboard turns a record of
+ * what was TRIED into an argument for what to TRADE. The rail is held in three places (service,
+ * endpoint, view) because a reader who could sort this table would stop reading it as evidence.
+ *
+ * ── AND NO ACTION ────────────────────────────────────────────────────────────────────────────
+ *
+ * No promote, no re-run, no listener of any kind, pinned by
+ * `tests/web/test_research_view.py::test_the_research_record_offers_no_action_of_any_kind`. A
+ * record whose entire argument is that selection happened under a discipline must not put the
+ * selection behind a control on the same screen.
+ *
+ * `null` when the read failed: on Rules every research read is SECONDARY, so a ledger that could
+ * not be read leaves the rule ledger above it standing and says so here. The parameter is
+ * `trials`, never `data` -- in the Rules region `data` is `/api/rules`, and the key scans in
+ * `tests/web/test_client_assets.py` tell the two payloads apart by that name.
+ *
+ * @param {any} trials  `/api/research/trials`'s `data`, or `null` if that read failed.
+ * @returns {DocumentFragment}
+ */
+function trialsSection(trials) {
+  const fragment = document.createDocumentFragment();
+  if (!trials) {
+    fragment.append(el("p", "empty", "The research record could not be read."));
+    return fragment;
+  }
+
+  const sub = el("p", "sub");
+  sub.append(field(trials.generated_at), " · ");
+  sub.append(field(trials.shown_count), " trials in the record");
+  fragment.append(sub);
+
+  fragment.append(
+    note(
+      "Every trial keel has run, in the order it ran them — the rejected ones beside the ".concat(
+        "selected ones. A record showing only its selections would be a highlight reel.",
+      ),
+    ),
+  );
+
+  fragment.append(
+    gridCard([
+      kv("ledger", trials.ledger),
+      kv("tamper check", trials.chain),
+      kv("trials run", trials.trials_run),
+      kv("decisions", trials.decisions),
+    ]),
+  );
+
+  const breaks = stringList(trials.chain_errors, "breaks");
+  if (breaks) {
+    fragment.append(heading("h-breaks", "Rows that do not verify"));
+    fragment.append(
+      note(
+        "Each line names the row whose recorded hash no longer matches its content. ".concat(
+          "Every row after the first break is affected.",
+        ),
+      ),
+    );
+    fragment.append(breaks);
+  }
+
+  fragment.append(heading("h-explored", "What each rule has been tried on"));
+  fragment.append(
+    note(
+      "Trials held in this ledger, against the cells the rule declares. Two numbers and not a "
+        .concat("coverage figure: pricing a swept range against its declaration is a judgement ")
+        .concat("the research driver makes by refusing, not one a page computes."),
+    ),
+  );
+  fragment.append(
+    table(
+      "h-explored",
+      [
+        { label: "rule", numeric: false },
+        { label: "trials here", numeric: true },
+        { label: "cells declared", numeric: true },
+      ],
+      (trials.exploration || []).map(/** @param {any} row */ (row) => [
+        plain(row.rule) || "—",
+        row.trials,
+        row.declared_cells,
+      ]),
+      "No trials in this ledger.",
+    ),
+  );
+
+  fragment.append(heading("h-trials", "Every trial"));
+  fragment.append(
+    table(
+      "h-trials",
+      [
+        { label: "when (UTC)", numeric: false },
+        { label: "rule", numeric: false },
+        { label: "kind", numeric: false },
+        { label: "outcome", numeric: false },
+        { label: "how the parameters were chosen", numeric: false },
+        { label: "series", numeric: false },
+        { label: "parameters", numeric: false },
+        { label: "summary", numeric: false },
+        { label: "row hash", numeric: false },
+      ],
+      (trials.rows || []).map(/** @param {any} row */ (row) => [
+        row.at,
+        plain(row.rule) || "—",
+        plain(row.kind) || "—",
+        row.decision,
+        row.provenance,
+        row.series,
+        plain(row.params) || "—",
+        plain(row.summary) || "—",
+        row.row_hash,
+      ]),
+      // From the payload, never written here. There are two kinds of empty -- no ledger, and a
+      // ledger with no trials in it -- and a hard-coded sentence said the first over both, which
+      // is a false statement about a deployment that simply has not run anything yet. Choosing
+      // between them is a judgement, and judgements are made in Python (Rule 2).
+      plain(trials.empty_note),
+    ),
+  );
+
+  return fragment;
+}
+
+/**
+ * The Evidence Matrix (#708 view 2): recorded CSCV runs, never a computed one.
+ *
+ * **The empty state is the point of this section, and it is the state it ships in.** Building a
+ * matrix costs 11.9-14.3 seconds per session on the real ledger and raises over the ledger as a
+ * whole, on a page that re-polls every 15 seconds — so the console shows what an operator RAN and
+ * hands them the command when they have not run one.
+ *
+ * That command comes off the payload and names a session that actually has columns.
+ * `--session all` is the obvious thing to print and would filter to a session literally called
+ * "all", find nothing, and refuse — teaching the reader that the page does not know what it is
+ * talking about.
+ *
+ * ⛔ No sort control on any column. A matrix ordered by PBO is a leaderboard of overfitting
+ * scores, and `cscv.py` forbids PBO as a ranking key in its own source.
+ *
+ * @param {any} matrix  `/api/research/matrix`'s `data`, or `null` if that read failed.
+ * @returns {DocumentFragment}
+ */
+function matrixSection(matrix) {
+  const fragment = document.createDocumentFragment();
+  fragment.append(heading("h-matrix", "Evidence matrix"));
+  if (!matrix) {
+    fragment.append(el("p", "empty", "The evidence matrix could not be read."));
+    return fragment;
+  }
+
+  const state = el("p", "sub");
+  state.append(field(matrix.state));
+  fragment.append(state);
+
+  // The command, only where there is one to give: the payload sends an empty string once a run
+  // has been recorded, and a page still telling an operator to run something they have run would
+  // be reading its own table wrong.
+  if (plain(matrix.invocation)) {
+    fragment.append(el("pre", "invocation", plain(matrix.invocation)));
+  }
+
+  fragment.append(
+    table(
+      "h-matrix",
+      [
+        { label: "when (UTC)", numeric: false },
+        { label: "session", numeric: false },
+        { label: "columns", numeric: true },
+        { label: "blocks", numeric: true },
+        { label: "combinations", numeric: true },
+        { label: "rows used", numeric: true },
+        { label: "rows dropped", numeric: true },
+        { label: "PBO", numeric: true },
+        { label: "degradation slope", numeric: true },
+        { label: "P[OOS < 0]", numeric: true },
+        { label: "1st-order dominance", numeric: false },
+        { label: "2nd-order dominance", numeric: false },
+      ],
+      (matrix.rows || []).map(/** @param {any} row */ (row) => [
+        row.at,
+        plain(row.session) || "—",
+        row.n_columns,
+        row.n_blocks,
+        row.n_combinations,
+        row.rows_used,
+        row.rows_dropped,
+        // PBO carries no state, deliberately: a high PBO beside a flat, positive OOS scatter is
+        // the GOOD outcome, so a colour here would be a verdict the number does not support.
+        row.pbo,
+        row.degradation_slope,
+        row.prob_loss,
+        row.dominance_1st,
+        row.dominance_2nd,
+      ]),
+      // From the payload: "no ledger", "no run yet" and "no session with columns" are three
+      // different sentences and choosing between them is a judgement (Rule 2).
+      plain(matrix.state.display),
+    ),
+  );
+  return fragment;
+}
+
+
+/**
+ * The Promotion Gauntlet scorecard (#708, view 3) -- as RECORDED, never as computed.
+ *
+ * ── WHY THIS SECTION COMPUTES NOTHING ────────────────────────────────────────────────────────
+ *
+ * Every part of the gauntlet needs work a page cannot do, measured before this was written: DSR
+ * needs a `--sharpe` the ledger does not store, CSCV costs 12-14 s per session and raises over
+ * the ledger as a whole, and Monte Carlo runs a backtest. `keel/commands/gauntlet.py` carries the
+ * figures; #726 is the engine issue for persisting the distributions.
+ *
+ * So a gauntlet run is an IMMUTABLE HISTORICAL ARTIFACT here. What is on this table is what an
+ * operator's run wrote into the append-only ledger, seed included, at the moment they ran it --
+ * not a fresh answer computed for this page load, and not one that changes between polls.
+ *
+ * ── THREE STATES ─────────────────────────────────────────────────────────────────────────────
+ *
+ * Ran, attempted-and-refused, and never run. The third is a COUNT rather than eighty-seven empty
+ * rows: a table of blanks would present the gauntlet as having covered the whole record.
+ *
+ * @param {any} gauntlet  the `/api/research/gauntlet` payload, or `null`.
+ * @returns {DocumentFragment}
+ */
+function gauntletSection(gauntlet) {
+  const fragment = document.createDocumentFragment();
+  fragment.append(heading("h-gauntlet", "The promotion gauntlet, as it was run"));
+
+  if (!gauntlet) {
+    fragment.append(note("The gauntlet record could not be read for this deployment."));
+    return fragment;
+  }
+
+  fragment.append(
+    note(
+      "Recorded outcomes, not fresh calculations. Each row is what an operator's run wrote ".concat(
+        "into the append-only ledger at the time — seed included, so it can be repeated.",
+      ),
+    ),
+  );
+
+  fragment.append(
+    gridCard([
+      kv("trials in the record", gauntlet.trials_total),
+      kv("gauntlet attempted", gauntlet.recorded_count),
+      kv("gauntlet ran", gauntlet.available_count),
+      kv("no gauntlet record", gauntlet.not_run_count),
+      kv("passed the gate", gauntlet.gate_passed_count),
+    ]),
+  );
+
+  fragment.append(
+    table(
+      "h-gauntlet",
+      [
+        { label: "when (UTC)", numeric: false },
+        { label: "trial", numeric: false },
+        { label: "rule", numeric: false },
+        // A PBO is only defined WITHIN a session -- `build_matrix` requires synchronous
+        // columns -- so the session is context, not decoration.
+        { label: "session", numeric: false },
+        { label: "ran", numeric: false },
+        { label: "PBO", numeric: true },
+        { label: "train expectancy", numeric: true },
+        { label: "held out", numeric: true },
+        { label: "bars", numeric: true },
+        { label: "seed", numeric: true },
+        { label: "gate", numeric: false },
+      ],
+      (gauntlet.rows || []).map(/** @param {any} row */ (row) => [
+        row.at,
+        plain(row.trial_id) || "—",
+        plain(row.rule) || "—",
+        plain(row.session) || "—",
+        row.ran,
+        row.pbo,
+        row.train_expectancy,
+        row.held_out_expectancy,
+        row.bars,
+        row.seed,
+        row.gate_passed,
+      ]),
+      "No gauntlet has been run against this ledger.",
+    ),
+  );
+
+  fragment.append(
+    note(
+      "Read PBO beside the degradation slope, never alone: a high PBO over a flat, positive ".concat(
+        "out-of-sample scatter is the good outcome. The slope is not recorded yet — see #726.",
+      ),
+    ),
+  );
+
+  return fragment;
+}
+
+
+/**
+ * The Slippage Universe (#708, view 4), as a section of the research record on the Rules view.
+ *
+ * A SECTION and not a route of its own: one client route whose endpoints are read concurrently
+ * and rendered under one page, with no sub-router that `staticfiles.CLIENT_ROUTES` would then
+ * have to learn about.
+ *
+ * `null` when the read failed -- `mount` leaves the primary view standing when a SECONDARY
+ * endpoint errors, so this says the section is missing rather than taking the rule ledger down
+ * with it.
+ *
+ * ── EVERY NUMBER IN HERE IS AN ASSUMPTION ────────────────────────────────────────────────────
+ *
+ * The `basis` field says so and is rendered first, before any rate. keel stores no order books
+ * and no realised spreads; these figures are scaled from cached candle volume. #708's own scope
+ * note calls them "measured", which is the mistake this section is written not to repeat.
+ *
+ * @param {any} slippage  the `/api/research/slippage` payload, or `null`.
+ * @returns {DocumentFragment}
+ */
+function slippageSection(slippage) {
+  const fragment = document.createDocumentFragment();
+  fragment.append(heading("h-slippage", "What a fill is assumed to cost"));
+
+  if (!slippage) {
+    fragment.append(note("The slippage figures could not be read for this deployment."));
+    return fragment;
+  }
+
+  const basis = el("p", "note");
+  basis.append(field(slippage.basis));
+  fragment.append(basis);
+
+  fragment.append(
+    gridCard([
+      kv("products", slippage.product_count),
+      kv("priced from cached candles", slippage.priced_count),
+      kv("reaching the floor", slippage.at_floor_count),
+      kv("at the cap", slippage.capped_count),
+      kv("no liquidity statistic", slippage.fallback_count),
+    ]),
+  );
+
+  fragment.append(
+    note(
+      "Every experiment document in this repository prices its fills at the floor rate. ".concat(
+        "The count above is how many products actually reach it.",
+      ),
+    ),
+  );
+
+  fragment.append(
+    gridCard([
+      kv("floor", slippage.floor_bp),
+      kv("cap", slippage.cap_bp),
+      kv("anchor volume", slippage.anchor_quote_volume),
+    ]),
+  );
+
+  fragment.append(
+    table(
+      "h-slippage",
+      [
+        { label: "product", numeric: false },
+        { label: "assumed bp per leg", numeric: true },
+        { label: "vs floor", numeric: true },
+        { label: "median daily quote volume", numeric: true },
+        { label: "daily bars", numeric: true },
+        { label: "priced from", numeric: false },
+        { label: "cap", numeric: false },
+      ],
+      (slippage.rows || []).map(/** @param {any} row */ (row) => [
+        plain(row.product_id) || "—",
+        row.slippage_bp,
+        row.floor_multiple,
+        row.median_daily_quote_volume,
+        row.bars,
+        row.fallback,
+        row.capped,
+      ]),
+      // Not "an empty allowlist": `config._parse_allowlist` raises on a missing or empty one,
+      // so that sentence would describe a deployment which cannot load. The reachable emptiness
+      // is a table whose rows the report could not build.
+      "No products to price.",
+    ),
+  );
+
+  return fragment;
 }
 
 /**

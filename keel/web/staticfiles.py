@@ -142,8 +142,6 @@ CLIENT_ROUTES: tuple[str, ...] = (
     "holdings",
     "balances",
     "timeline",
-    "insights",
-    "research",
     "rules",
     "venues",
     "plans",
@@ -159,8 +157,17 @@ CLIENT_ENTRY = "index.html"
 #: a plain-text 404 for a bookmark, an installed app whose cached manifest still says
 #: `start_url: "/status"`, or a `/status?token=...` redirect, whenever no service worker answers.
 #: **Closed, like `CLIENT_ROUTES`**, for the same reason: it is names, never a wildcard. Console
-#: PRs 3-4 retire more views and each adds its names here. Disjoint from `CLIENT_ROUTES`.
-RETIRED_CLIENT_ROUTES: tuple[str, ...] = ("status", "activity", "gates", "orders", "positions")
+#: PR3 added Insights and Research (folded into Rules); PR4 adds its own. Disjoint from
+#: `CLIENT_ROUTES`.
+RETIRED_CLIENT_ROUTES: tuple[str, ...] = (
+    "status",
+    "activity",
+    "gates",
+    "orders",
+    "positions",
+    "insights",
+    "research",
+)
 
 
 def resolve_client_route(root: Path, url_path: str) -> Path | None:
@@ -172,7 +179,7 @@ def resolve_client_route(root: Path, url_path: str) -> Path | None:
     an unknown name is `None` and becomes the same 404 any other unmapped path gets.
 
     **Why the server has to know about client routes at all.** `main.js` routes with the History
-    API rather than a hash, so `pushState` puts `/static/insights` in the address bar; without
+    API rather than a hash, so `pushState` puts `/static/rules` in the address bar; without
     this function, reloading that page or opening it from a bookmark asks the server for a file
     that does not exist. Hash routing would need no server cooperation, and was rejected for
     putting a `#` in every URL an operator copies -- see `main.js`'s module docstring. This is the

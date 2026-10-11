@@ -48,32 +48,6 @@ from keel.web.security import csrf_token, gates_token, local_deployment
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from keel.web.server import ServeConfig
 
-#: Journal rows served when a caller names no `limit`. The same cap the HTML insights page uses,
-#: so the two front-ends answer "how has this been going" with the same amount of history.
-DEFAULT_JOURNAL_LIMIT = 50
-
-#: The ceiling on `?limit=`. A caller-supplied row count is a memory and time primitive against a
-#: server with no proxy in front of it, and a journal is not a bulk export -- `keel insights
-#: journal` is, and it runs in the operator's own process against their own machine's limits.
-MAX_JOURNAL_LIMIT = 1000
-
-#: How many equity readings `/api/insights` draws, newest first (#698).
-#:
-#: A fixed cap rather than a `?limit=`: this route carries no collection a caller sorts or pages,
-#: and a chart is not a bulk export -- the whole series is on disk for anyone who wants it.
-#:
-#: 1000 because the plot box is `PLOT_WIDTH` = 1000 units wide, so past one reading per unit the
-#: extra rows land on coordinates the chart has already drawn: cost with nothing on screen to
-#: show for it. Measured at 580 bytes per point in the rendered payload, this caps the response
-#: near 580 KB; the page re-polls every 15 seconds (`main.js`'s `POLL_MS`), which is what makes
-#: an unbounded read here a recurring cost rather than a one-off one. At the default
-#: `auto_trade.interval_sec` of 900 the table passes this cap in about ten days.
-#:
-#: What it would take to change: a chart the operator can pan or zoom over a range they choose.
-#: That makes the range a client concern and this builder a service the client re-asks with new
-#: bounds -- the same condition `insights.py`'s own module note already names.
-EQUITY_POINT_LIMIT = 1000
-
 #: The two directions, and no third spelling. `desc`/`descending`/`down` would all have to be
 #: accepted forever once accepted once, and a client reading `sort.direction` back off the
 #: response needs one word to compare against.
@@ -161,22 +135,6 @@ class ApiRefusal(Exception):
 
 
 # -- the readers ----------------------------------------------------------------------------------
-
-
-def _status_report(cfg: ServeConfig, now_ts: int) -> Any:
-    """`gather_status`'s frozen report, over its own connection.
-
-    A named module-level function rather than an inline call inside `read_insights` and
-    `read_journal` so a test can replace it -- pinning that a report which cannot be built
-    becomes a stated 500 rather than a 200 with an empty payload, which is the failure mode this
-    whole envelope exists to prevent."""
-    from keel.commands.status import gather_status
-
-    repo = open_repo(cfg.db_path)
-    try:
-        return gather_status(repo, load_config(cfg.config_path), now_ts=now_ts)
-    finally:
-        close_repo(repo)
 
 
 def read_config(cfg: ServeConfig, _query: Query, _state: Any, now_ts: int) -> dict[str, Any]:
@@ -689,88 +647,6 @@ def read_timeline(cfg: ServeConfig, query: Query, _state: Any, now_ts: int) -> d
     return payload.timeline_payload(_timeline_report(cfg, query, now_ts))
 
 
-def read_insights(cfg: ServeConfig, _query: Query, _state: Any, now_ts: int) -> dict[str, Any]:
-    """The per-rule track records, the promotion-gate distances, and the account-equity series.
-
-    The journal the HTML `/insights` page renders below these is `/api/journal` instead of a second
-    table here. One sortable collection per endpoint keeps `?sort=` unambiguous without a
-    `?table=` beside it, and it gives the journal somewhere to carry its own `?limit=` -- the cap
-    the HTML page apologises for in a comment ("a cap, not a paginator").
-
-    The equity series (#698) is read here rather than on `/api/journal`, next to the curve it is
-    drawn above, because it describes the ACCOUNT and not the closed trades. The journal's curve
-    narrows with that endpoint's `?limit=`; this does not narrow with anything, and two charts
-    that answer a query differently must not share one payload where a reader would assume they
-    agree.
-
-    `max_total_dd_pct` comes off the SAME loaded config `build_insights_report` reads, so the
-    drawdown floor drawn under the curve and the ceiling quoted in the account card beside it are
-    one setting rather than two reads that can disagree.
-
-    The series read is BOUNDED (`EQUITY_POINT_LIMIT`) and says so. `equity_points` is
-    append-only and grows one row per cycle forever, so an unbounded read here would be this
-    route's memory cost rising without limit for the life of the deployment -- the exact hazard
-    `MAX_JOURNAL_LIMIT`'s note names, on a route with no `?limit=` for an operator to moderate
-    it with. `count_equity_points` is passed alongside so the chart can state what it is not
-    showing rather than quietly beginning wherever the cap fell.
-    """
-    from keel.commands.insights import build_equity_series, build_insights_report
-
-    repo = open_repo(cfg.db_path)
-    try:
-        config = load_config(cfg.config_path)
-        report = build_insights_report(repo, config, _status_report(cfg, now_ts), now_ts)
-        series = build_equity_series(
-            repo.get_equity_points(limit=EQUITY_POINT_LIMIT),
-            max_total_dd_pct=config.money_mgmt.max_total_dd_pct,
-            total_recorded=repo.count_equity_points(),
-        )
-    finally:
-        close_repo(repo)
-    return payload.insights_payload(report, series=series)
-
-
-def read_journal(cfg: ServeConfig, query: Query, _state: Any, now_ts: int) -> dict[str, Any]:
-    """The trade journal, and the equity curve drawn from the SAME entries.
-
-    `build_equity_curve` is called on `report.entries` -- not on the ledger, and not on a second
-    read -- so the chart and the table under it describe one list of trades. A curve built from
-    its own query could disagree with the rows beside it after a `?limit=`, and a chart that
-    disagrees with the table below it is worse than no chart.
-
-    The curve is NOT part of `route.collection`, so `?sort=` reorders `entries` and leaves the
-    curve alone. That is deliberate: the curve's horizontal axis is trade order, and a curve
-    redrawn in `pnl` order would be a cumulative total of a sequence that never happened.
-    """
-    from keel.commands.insights import build_equity_curve, build_journal_report
-    from keel.commands.journal import DEFAULT_NOTES_LIMIT, gather_journal
-
-    limit = _journal_limit(query)
-    repo = open_repo(cfg.db_path)
-    try:
-        report = build_journal_report(repo, _status_report(cfg, now_ts), now_ts, limit=limit)
-        # #705's DISCRETIONARY journal, on this route rather than one of its own. Two things
-        # called a journal, and this is the page where the distinction has to be visible: the
-        # table above is closed trades as a venue reported them, and these are sentences the
-        # operator wrote about themselves. Putting them on separate pages would let a reader meet
-        # one without ever learning the other exists.
-        #
-        # It is NOT this route's `collection`, so `?sort=` reorders the trades and leaves these
-        # alone -- and that is a refusal, not an omission. A journal reads forwards; sorted by
-        # dollar impact it becomes a ranking of your own worst days, which is the shape this
-        # codebase refuses everywhere else it appears.
-        #
-        # ITS OWN CAP, not the trades' `?limit=`. The first cut passed `limit` through, so
-        # narrowing to one closed trade silently hid 300 of an operator's 301 notes -- one
-        # record's page control truncating a different record, by the coincidence of their
-        # sharing a route. `total_count` rides the payload either way, so the page can say what
-        # it is not showing.
-        notes = gather_journal(repo, now_ts=now_ts, limit=DEFAULT_NOTES_LIMIT)
-    finally:
-        close_repo(repo)
-    return payload.journal_payload(report, curve=build_equity_curve(report.entries), notes=notes)
-
-
 def read_plans(_cfg: ServeConfig, _query: Query, _state: Any, _now_ts: int) -> dict[str, Any]:
     """The Plans page (#706) -- the one route whose subject is the PROJECT, not the deployment.
 
@@ -788,13 +664,35 @@ def read_plans(_cfg: ServeConfig, _query: Query, _state: Any, _now_ts: int) -> d
     return payload.plans_payload(gather_plans())
 
 
-def read_rules(cfg: ServeConfig, _query: Query, _state: Any, _now_ts: int) -> dict[str, Any]:
+def read_rules(cfg: ServeConfig, _query: Query, _state: Any, now_ts: int) -> dict[str, Any]:
+    """The rule ledger and its params, and each rule's track record with its distance to the
+    promotion gate (console PR3; the records were `/api/insights` until the Insights view was
+    retired).
+
+    `records` is NOT this route's sortable collection -- `rules` is, and `?sort=` names only the
+    ledger's columns (see the route entry). A track record ordered by expectancy is the
+    leaderboard the research record on the same view refuses, so the records cross in the
+    service's own order.
+
+    ONE repository open, ONE config load, and `now_ts` is `respond`'s. The status report
+    `build_insights_report` takes is gathered on the connection already held rather than on a
+    second one, so the ledger and the records describe one read of the database. The records
+    cover the promotion pipeline (`candidate` and `paper`), exactly as `keel insights summary`
+    does by default -- a live rule's record is `keel insights summary --mode live`.
+    """
+    from keel.commands.insights import build_insights_report
+    from keel.commands.status import gather_status
+
     repo = open_repo(cfg.db_path)
     try:
         rows = repo.get_rules(None)
+        config = load_config(cfg.config_path)
+        records = build_insights_report(
+            repo, config, gather_status(repo, config, now_ts=now_ts), now_ts
+        )
     finally:
         close_repo(repo)
-    return payload.rules_payload(rows)
+    return payload.rules_payload(rows, records=records)
 
 
 #: How long one deployment's admission screen stays cached (#856). 5 minutes: short enough that
@@ -1050,42 +948,6 @@ API_ROUTES: dict[str, ApiRoute] = {
         # information. A checklist sorted by title is a checklist you cannot work down.
         needs_database=False,
     ),
-    "/api/insights": ApiRoute(
-        html_route="/insights",
-        read=read_insights,
-        collection="rules",
-        sortable=(
-            "rule_name",
-            "status",
-            "promotion_class",
-            "n_trades",
-            "win_rate",
-            "avg_win",
-            "avg_loss",
-            "realized_rr",
-            "expectancy",
-            "profit_factor",
-            "max_drawdown",
-        ),
-    ),
-    "/api/journal": ApiRoute(
-        html_route="/insights",
-        read=read_journal,
-        collection="entries",
-        sortable=(
-            "closed_at",
-            "opened_at",
-            "rule_name",
-            "product_id",
-            "qty",
-            "entry_fill",
-            "exit_fill",
-            "pnl",
-            "fees",
-            "r_multiple",
-            "outcome",
-        ),
-    ),
     # The Holdings view's second read: its recent-orders section. There is no `/orders` page.
     "/api/orders": ApiRoute(
         html_route="/holdings",
@@ -1143,8 +1005,12 @@ API_ROUTES: dict[str, ApiRoute] = {
         # does nothing -- which is the failure refusing an unknown column exists to prevent.
         sortable=("at", "kind", "provenance", "source", "product_id"),
     ),
+    # The research record (#708). Its four reads kept their own endpoints when the Research view
+    # was folded into Rules (console PR3): the ledger is a FILE that answers with no deployment on
+    # the machine (`needs_database=False`), and the Strathern rail below is pinned per endpoint.
+    # Only `html_route` moved.
     "/api/research/trials": ApiRoute(
-        html_route="/research",
+        html_route="/rules",
         read=read_trials_ledger,
         # The ledger is a FILE. A machine with no deployment on it can still carry a research
         # record, and answering "keel isn't running here" to a question about experiments would
@@ -1168,33 +1034,36 @@ API_ROUTES: dict[str, ApiRoute] = {
     # leaderboard of overfitting scores, and `cscv.py` forbids PBO as a ranking key in its own
     # source.
     "/api/research/matrix": ApiRoute(
-        html_route="/research",
+        html_route="/rules",
         read=read_matrix,
         needs_database=False,
         collection="",
         sortable=(),
     ),
     "/api/research/gauntlet": ApiRoute(
-        html_route="/research",
+        html_route="/rules",
         read=read_gauntlet,
         needs_database=False,
-        # The rail again, across the whole `/research` surface. Ordering a gauntlet table by PBO
+        # The rail again, across the whole research record. Ordering a gauntlet table by PBO
         # would be ranking by exactly the score `cscv.py`'s own source forbids as a ranking key.
         collection="",
         sortable=(),
     ),
     "/api/research/slippage": ApiRoute(
-        html_route="/research",
+        html_route="/rules",
         read=read_slippage,
         # Same empty sort surface as its sibling. A cost table ordered cheapest-first reads as a
-        # shortlist of what to trade, and `/research` is under the Strathern rail end to end --
-        # `keel/commands/slippage.py` records why alphabetical is the order.
+        # shortlist of what to trade, and the research record is under the Strathern rail end to
+        # end -- `keel/commands/slippage.py` records why alphabetical is the order.
         collection="",
         sortable=(),
     ),
     "/api/rules": ApiRoute(
         html_route="/rules",
         read=read_rules,
+        # `rules` (the ledger) and only `rules`. The payload's `records` -- the track records and
+        # gate distances -- are deliberately outside the sort surface: ordered by expectancy they
+        # are a leaderboard, the shape the research record on the same view refuses.
         collection="rules",
         sortable=("id", "kind", "status", "created_at", "promoted_at", "demoted_at"),
     ),
@@ -1237,9 +1106,14 @@ def _first(query: Query, name: str) -> str:
 def _whole_number(raw: str, ceiling: int) -> int:
     """A `?limit=` that is a whole number inside `1..ceiling`, or an `ApiRefusal`.
 
-    `_journal_limit`'s body, generalised over the ceiling when `/api/orders` arrived (#659)
-    rather than copied: two functions refusing the same input with two texts is how the API's
-    error vocabulary starts to drift one endpoint at a time."""
+    Written for the journal's `?limit=` and generalised over the ceiling when `/api/orders`
+    arrived (#659) rather than copied: two functions refusing the same input with two texts is how
+    the API's error vocabulary starts to drift one endpoint at a time. `/api/orders` is its one
+    caller since `/api/journal` was retired (console PR3).
+
+    Bounded at both ends. A zero or a negative would reach the service as a slice bound and answer
+    an empty page that looks like an empty ledger, and an unbounded upper end is a caller choosing
+    how much of this machine's memory to spend."""
     try:
         value = int(raw)
     except ValueError as exc:
@@ -1247,18 +1121,6 @@ def _whole_number(raw: str, ceiling: int) -> int:
     if value < 1 or value > ceiling:
         raise ApiRefusal(400, "Bad limit", f"limit={raw!r} is outside 1..{ceiling}.")
     return value
-
-
-def _journal_limit(query: Query) -> int:
-    """How many journal rows to build, from `?limit=`.
-
-    Bounded at both ends. A zero or a negative would reach `build_journal_report` as a slice bound
-    and answer an empty journal that looks like an empty ledger, and an unbounded upper end is a
-    caller choosing how much of this machine's memory to spend."""
-    raw = _first(query, "limit")
-    if not raw:
-        return DEFAULT_JOURNAL_LIMIT
-    return _whole_number(raw, MAX_JOURNAL_LIMIT)
 
 
 def _sort_request(path: str, route: ApiRoute, query: Query) -> tuple[str, bool]:

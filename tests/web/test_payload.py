@@ -37,7 +37,6 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from keel_core.types import EquityReading
 
 from keel.commands.activity import ActivityCycle, ActivityEvent, ActivityFeed
 from keel.commands.holdings import ENTRY_ORDER_NOT_IDENTIFIED, HoldingsReport, gather_holdings
@@ -45,11 +44,7 @@ from keel.commands.insights import (
     AccountSummary,
     GateDistance,
     InsightsReport,
-    JournalEntry,
-    JournalReport,
     RuleTrackRecord,
-    build_equity_curve,
-    build_equity_series,
 )
 from keel.commands.jobs import JobStatus
 from keel.commands.pulse import RESUME_COMMAND, NextDcaBuy, PulseReport, TodayCounts
@@ -193,86 +188,6 @@ def _insights_report(**overrides: Any) -> InsightsReport:
     )
     base.update(overrides)
     return InsightsReport(**base)
-
-
-def _journal_report(**overrides: Any) -> JournalReport:
-    base: dict[str, Any] = dict(
-        now_ts=NOW_TS,
-        mode="paper",
-        entries=[
-            JournalEntry(
-                closed_at=NOW_TS - 3600,
-                opened_at=NOW_TS - 86400,
-                rule_name="turtle_breakout",
-                product_id="BTC-USD",
-                qty=Decimal("0.01000000"),
-                entry_fill=Decimal("50000.00"),
-                exit_fill=Decimal("48766.00"),
-                pnl_net=Decimal("-12.34"),
-                fees=Decimal("0.6150"),
-                r_multiple=Decimal("-0.82"),
-                is_dca=False,
-                outcome="loss",
-            ),
-            JournalEntry(
-                closed_at=NOW_TS - 1800,
-                opened_at=NOW_TS - 90000,
-                rule_name="dca",
-                product_id="ETH-USD",
-                qty=Decimal("0.50000000"),
-                entry_fill=Decimal("2000.00"),
-                exit_fill=None,
-                pnl_net=Decimal("41.00"),
-                fees=None,
-                r_multiple=None,
-                is_dca=True,
-                outcome="dca",
-            ),
-        ],
-        # Deliberately NOT `len(entries)`. `total_count` is the pre-`--limit` count, so a real
-        # report almost always has more of them than it carries entries -- and while these two
-        # were equal, `test_the_serialiser_computes_nothing...` passed over a `shown_count` the
-        # serialiser had measured with `len()` rather than read, because `Decimal(2)` happened to
-        # be on the report already. A guard that passes on a coincidence is not a guard.
-        total_count=812,
-        filters={
-            "rule": None,
-            "asset": None,
-            "since_ts": NOW_TS - 604800,
-            "until_ts": None,
-            "limit": 50,
-            "include_open": False,
-        },
-    )
-    base.update(overrides)
-    return JournalReport(**base)
-
-
-def _empty_notes():
-    """An empty discretionary journal (#705), for the callers that are testing the closed-trade
-    half. A REQUIRED keyword on `journal_payload`, like `curve`: a default would let every one of
-    these keep passing while the page quietly lost the section."""
-    from keel.commands.journal import JournalReport
-
-    return JournalReport(now_ts=0, entries=())
-
-
-def _journal_json(**overrides: Any) -> dict[str, Any]:
-    """`journal_payload` over `_journal_report(**overrides)`, with the curve built from THOSE
-    entries.
-
-    A new helper at #537 rather than a default on `journal_payload`, and the difference is the
-    point: `curve` is a required keyword on the serialiser, so every caller has to say which
-    curve, and this one says the only thing `keel/web/api.py::read_journal` ever says -- the curve
-    of the entries this report carries. A default of `None` would have left every test here green
-    while the shipped endpoint served a journal with no chart in it.
-
-    Nothing about `_journal_report` changed, and every test that called it directly still does.
-    """
-    report = _journal_report(**overrides)
-    return payload.journal_payload(
-        report, curve=build_equity_curve(report.entries), notes=_empty_notes()
-    )
 
 
 def _activity_feed(**overrides: Any) -> ActivityFeed:
@@ -443,9 +358,24 @@ _READINESS_ROWS = [
 ]
 
 
+def _rule_rows() -> list[dict[str, Any]]:
+    """`Repository.get_rules(None)`'s shape: one ledger row with open-ended params."""
+    return [
+        {
+            "id": 1,
+            "kind": "breakout",
+            "status": "candidate",
+            "created_at": NOW_TS,
+            "promoted_at": None,
+            "demoted_at": None,
+            "params": {"product_id": "BTC-USD", "lookback": 20, "risk": Decimal("0.01")},
+        }
+    ]
+
+
 def _every_payload() -> dict[str, Any]:
     """Every payload builder at once. The guards below run over the whole surface, because a
-    contract that holds for `status` and leaks on `journal` is not a contract.
+    contract that holds for `pulse` and leaks on `rules` is not a contract.
 
     #534 added five entries here -- the endpoints behind `/api/config`, `/api/setup`, `/api/rules`,
     `/api/venues` and the former `/api/gates` -- and that is the point of the helper being shared:
@@ -455,11 +385,6 @@ def _every_payload() -> dict[str, Any]:
     return {
         "pulse": payload.pulse_payload(_pulse_report(), gate="gate-token"),
         "holdings": payload.holdings_payload(_holdings_report()),
-        "insights": payload.insights_payload(
-            _insights_report(),
-            series=build_equity_series(_equity_readings(), max_total_dd_pct=Decimal("0.20")),
-        ),
-        "journal": _journal_json(),
         "activity": payload.activity_payload(_activity_feed()),
         "config": payload.config_payload(
             _build_info(),
@@ -481,19 +406,7 @@ def _every_payload() -> dict[str, Any]:
                 error="RuntimeError: no credential",
             ),
         ),
-        "rules": payload.rules_payload(
-            [
-                {
-                    "id": 1,
-                    "kind": "breakout",
-                    "status": "candidate",
-                    "created_at": NOW_TS,
-                    "promoted_at": None,
-                    "demoted_at": None,
-                    "params": {"product_id": "BTC-USD", "lookback": 20, "risk": Decimal("0.01")},
-                }
-            ]
-        ),
+        "rules": payload.rules_payload(_rule_rows(), records=_insights_report()),
         "venues": payload.venues_payload(
             [_BrokerInfo(), _BrokerInfo(name="broken", error="ImportError: no module")],
             _READINESS_ROWS,
@@ -668,6 +581,10 @@ def _report_figures(node: Any, seen: set[int] | None = None) -> set[Decimal]:
         return set()
     if isinstance(node, Decimal):
         return {node}
+    if isinstance(node, float):
+        # A statistic (`RuleTrackRecord.win_rate`), never money. Its shortest round-trip repr is
+        # the figure the report holds, and that is what `payload._plain` re-encodes it as.
+        return {Decimal(repr(node))}
     if isinstance(node, int):
         return {Decimal(node)}
     if isinstance(node, str):
@@ -704,23 +621,12 @@ def _report_figures(node: Any, seen: set[int] | None = None) -> set[Decimal]:
     return set()
 
 
-def _journal_case() -> tuple[str, tuple[Any, ...], dict[str, Any]]:
-    """The journal case for the guard below: the report AND the curve, against the payload of both.
-
-    `EquityCurve` is a second frozen report object, produced by `keel.commands.insights` like every
-    other one, and the running totals on it appear nowhere on `JournalReport` -- so handing the
-    guard only the report would make it fail on `curve.points[*].cumulative`, correctly, for a
-    figure that IS on a report. Both go in, `_report_figures` walks dataclasses generically, and
-    the guard keeps its teeth: a cumulative total the SERIALISER invented would still be on
-    neither.
-    """
-    report = _journal_report()
-    curve = build_equity_curve(report.entries)
-    return (
-        "journal",
-        (report, curve),
-        payload.journal_payload(report, curve=curve, notes=_empty_notes()),
-    )
+def _rules_case() -> tuple[str, tuple[Any, ...], dict[str, Any]]:
+    """The Rules case for the guard below: the ledger rows AND the track-record report, against
+    the payload of both (console PR3). Both go in, and `_report_figures` walks mappings and
+    dataclasses generically, so a figure the SERIALISER invented would still be on neither."""
+    rows, records = _rule_rows(), _insights_report()
+    return ("rules", (rows, records), payload.rules_payload(rows, records=records))
 
 
 def test_the_serialiser_computes_nothing_every_wire_figure_came_from_the_report() -> None:
@@ -731,13 +637,14 @@ def test_the_serialiser_computes_nothing_every_wire_figure_came_from_the_report(
     drawdown fraction by 100 to make it read as a percentage, would produce a number that appears
     nowhere on the report -- and would fail here, by name and path.
 
-    `StatusReport` and `JournalReport` are used because every figure they carry is a `Decimal` or
-    an `int`; `InsightsReport` carries `float` win rates, which have no exact decimal form and are
-    covered by their own test below.
+    `PulseReport` and the Rules pair (ledger rows plus `InsightsReport`) are used. The track
+    records carry `float` win rates, which `_report_figures` reads through their shortest
+    round-trip repr -- the exact string the serialiser writes -- and which have their own test
+    below.
     """
     for name, reports, built in (
         ("pulse", (_pulse_report(),), payload.pulse_payload(_pulse_report())),
-        _journal_case(),
+        _rules_case(),
     ):
         available: set[Decimal] = set()
         for report in reports:
@@ -867,36 +774,41 @@ def test_a_win_rate_float_is_re_encoded_not_recomputed() -> None:
     """`RuleTrackRecord.win_rate` is a `float` upstream -- a statistic, never money. It reaches the
     wire through its own shortest round-trip repr, so the figure on the wire is the figure the
     report held and nothing was recomputed on the way."""
-    built = payload.insights_payload(
-        _insights_report(), series=build_equity_series(_equity_readings())
-    )
+    built = payload.rules_payload(_rule_rows(), records=_insights_report())
 
-    assert built["rules"][0]["win_rate"]["value"] == "41.5"
-    assert built["rules"][0]["win_rate"]["display"] == "41.5%"
+    assert built["records"][0]["win_rate"]["value"] == "41.5"
+    assert built["records"][0]["win_rate"]["display"] == "41.5%"
 
 
 # -- Rule 3: semantic state is a field, never an inference ----------------------------------------
 
 
+def _signed_records() -> list[dict[str, Any]]:
+    """Two track records, one losing and one winning, as `rules_payload` sends them."""
+    losing = replace(_insights_report().rules[0], rule_name="losing", expectancy=Decimal("-12.34"))
+    winning = replace(_insights_report().rules[0], rule_name="winning", expectancy=Decimal("41"))
+    records = _insights_report(rules=[losing, winning])
+    return payload.rules_payload([], records=records)["records"]
+
+
 def test_a_loss_is_labelled_bad_in_python_not_by_the_sign_on_the_wire() -> None:
     """Rule 3. The client must never read a minus sign and conclude "bad" -- that is arithmetic by
     another name, and it relocates a trading judgement into a browser."""
-    entries = _journal_json()["entries"]
-    loss, gain = entries[0], entries[1]
+    loss, gain = _signed_records()
 
-    assert loss["pnl"]["state"] == "bad"
-    assert loss["pnl"]["value"] == "-12.34"
-    assert gain["pnl"]["state"] == "good"
+    assert loss["expectancy"]["state"] == "bad"
+    assert loss["expectancy"]["value"] == "-12.34"
+    assert gain["expectancy"]["state"] == "good"
 
 
 def test_state_survives_without_colour() -> None:
     """#532: colour must never be the only signal. `display` carries a glyph and an explicit sign,
     so profit and loss stay distinguishable in greyscale, on e-ink, in sunlight, and to the
     roughly one man in twelve who cannot separate the palette's red from its green."""
-    entries = _journal_json()["entries"]
+    loss, gain = _signed_records()
 
-    assert entries[0]["pnl"]["display"] == "▼ −$12.34"
-    assert entries[1]["pnl"]["display"] == "▲ +$41.00"
+    assert loss["expectancy"]["display"] == "▼ −$12.3400"
+    assert gain["expectancy"]["display"] == "▲ +$41.0000"
 
 
 def test_the_displayed_sign_and_the_state_never_disagree() -> None:
@@ -951,93 +863,14 @@ def test_a_loss_too_small_to_show_keeps_its_sign_and_its_judgement() -> None:
     assert field["value"] == "-0.001"
 
 
-def test_shown_count_is_read_from_the_report_not_measured_here() -> None:
-    """The count of rows a journal page carries is `JournalReport.shown_count`, a reading the
-    report makes about itself -- not `len(entries)` measured by the serialiser.
+def test_the_closed_trade_count_is_read_from_the_report_not_measured_here() -> None:
+    """The count beside the track records is `InsightsReport.closed_trade_count`, a reading the
+    report makes -- not a `len()` of anything the serialiser holds (Rule 6e). One record over 812
+    closed trades makes a measured count impossible to pass off as the read one."""
+    built = payload.rules_payload(_rule_rows(), records=_insights_report(closed_trade_count=812))
 
-    The distinction is invisible in the number (a list length is exact) and that is exactly the
-    problem: the runtime "computes nothing" guard compares FIGURES, so it cannot tell a measured
-    length from a read one when they coincide. Rule 6e of `test_console_thinness.py` bans `len()`
-    in the serialiser for that reason, and this pins the pair a client needs to say "2 of 812"
-    without subtracting anything.
-    """
-    built = _journal_json()
-
-    assert built["total_count"]["value"] == "812"
-    assert built["total_count"]["display"] == "812"
-    assert built["shown_count"]["value"] == "2"
-
-
-def test_point_index_skips_an_entry_with_no_recorded_net_and_still_finds_its_point() -> None:
-    """#602's join key: a journal row's `point_index` must name the position its OWN trade lands
-    at in `curve.points` -- not its position in `entries`, which differs the moment a row has no
-    recorded net (`build_equity_curve` skips it; `entries` does not).
-
-    Three rows, the middle one with `pnl_net=None`: a serialiser that used the entry's own list
-    position (`str(i)`) would give the third row `"2"`, and one that counted the skipped row
-    anyway would give it `"2"` too -- both wrong, because the curve only ever drew two points.
-    The right answer, `"1"`, is reachable only by skipping exactly what `build_equity_curve`
-    skips, in the same order.
-    """
-    entries = [
-        JournalEntry(
-            closed_at=NOW_TS - 10800,
-            opened_at=NOW_TS - 96400,
-            rule_name="turtle_breakout",
-            product_id="BTC-USD",
-            qty=Decimal("0.01000000"),
-            entry_fill=Decimal("50000.00"),
-            exit_fill=Decimal("50100.00"),
-            pnl_net=Decimal("10.00"),
-            fees=Decimal("0.10"),
-            r_multiple=Decimal("0.20"),
-            is_dca=False,
-            outcome="win",
-        ),
-        JournalEntry(
-            # Still open, or otherwise never recorded a net -- `build_equity_curve` draws no
-            # point for this row, so there is nothing for a hover to highlight.
-            closed_at=None,
-            opened_at=NOW_TS - 50000,
-            rule_name="turtle_breakout",
-            product_id="ETH-USD",
-            qty=Decimal("0.50000000"),
-            entry_fill=Decimal("2000.00"),
-            exit_fill=None,
-            pnl_net=None,
-            fees=None,
-            r_multiple=None,
-            is_dca=False,
-            outcome="open",
-        ),
-        JournalEntry(
-            closed_at=NOW_TS - 1800,
-            opened_at=NOW_TS - 90000,
-            rule_name="turtle_breakout",
-            product_id="SOL-USD",
-            qty=Decimal("1.00000000"),
-            entry_fill=Decimal("100.00"),
-            exit_fill=Decimal("95.00"),
-            pnl_net=Decimal("-5.00"),
-            fees=Decimal("0.05"),
-            r_multiple=Decimal("-0.10"),
-            is_dca=False,
-            outcome="loss",
-        ),
-    ]
-    built = _journal_json(entries=entries, total_count=3)
-
-    first, skipped, third = built["entries"]
-    assert first["point_index"] == "0"
-    assert skipped["point_index"] is None
-    assert third["point_index"] == "1"
-
-    points = built["curve"]["points"]
-    assert len(points) == 2
-    # The join actually lands on the SAME trade, not merely on a plausible-looking index: cross
-    # referencing by `point_index` must recover the exact `pnl` the row itself carries.
-    assert points[int(first["point_index"])]["pnl"]["value"] == first["pnl"]["value"] == "10.00"
-    assert points[int(third["point_index"])]["pnl"]["value"] == third["pnl"]["value"] == "-5.00"
+    assert built["closed_trade_count"]["value"] == "812"
+    assert len(built["records"]) == 1
 
 
 def test_every_field_carries_all_three_keys_always() -> None:
@@ -1219,17 +1052,6 @@ def test_a_pathologically_nested_log_field_cannot_recurse_the_response_to_death(
 
     assert "(nested)" in rendered
     assert "bottom" not in rendered
-
-
-def test_the_journal_filters_cross_as_strings_too() -> None:
-    """`JournalReport.filters` holds the query that produced the report -- `limit`, `since_ts` and
-    friends, which are ints. They are echoed back for the client to show, and an echoed int is a
-    JSON number like any other."""
-    filters = _journal_json()["filters"]
-
-    assert filters["limit"] == "50"
-    assert filters["since_ts"] == str(NOW_TS - 604800)
-    assert filters["rule"] == ""
 
 
 def test_an_error_count_is_bad_and_a_quiet_cycle_is_neutral() -> None:
@@ -1532,11 +1354,9 @@ def test_every_builder_survives_a_completely_empty_report() -> None:
             )
         ),
         "holdings": payload.holdings_payload(HoldingsReport(now_ts=NOW_TS, mode="paper", rows=())),
-        "insights": payload.insights_payload(
-            _insights_report(rules=[], closed_trade_count=0),
-            series=build_equity_series([]),
+        "rules": payload.rules_payload(
+            [], records=_insights_report(rules=[], closed_trade_count=0)
         ),
-        "journal": _journal_json(entries=[], total_count=0, filters={}),
         "activity": payload.activity_payload(
             ActivityFeed(status="missing", source="/tmp/nope.log")
         ),
@@ -1551,8 +1371,7 @@ def test_every_builder_survives_a_completely_empty_report() -> None:
     [
         "pulse_payload",
         "holdings_payload",
-        "insights_payload",
-        "journal_payload",
+        "rules_payload",
         "activity_payload",
     ],
 )
@@ -1561,31 +1380,15 @@ def test_every_payload_is_json_serialisable_without_a_custom_encoder(builder: st
     matters beyond tidiness: `json.dumps(Decimal(...))` raises, and the natural fix a hurried
     author reaches for is `default=float`, which is the contract's exact failure mode installed as
     a convenience."""
-    if builder == "insights_payload":
-        # A second builder with a required keyword, for the same reason: a default
-        # `series` would serve an insights view with no chart.
-        json.dumps(
-            payload.insights_payload(
-                _insights_report(), series=build_equity_series(_equity_readings())
-            )
-        )
-        return
-
-    if builder == "journal_payload":
-        # The one builder with a second required argument. Spelled out rather than folded into
-        # the table below, because folding it in would mean a default somewhere -- and the whole
-        # reason `curve` is required is that a default serves a journal with no chart.
-        report = _journal_report()
-        json.dumps(
-            payload.journal_payload(
-                report, curve=build_equity_curve(report.entries), notes=_empty_notes()
-            )
-        )
+    if builder == "rules_payload":
+        # A required `records` keyword: a default would serve a Rules view with no track records
+        # and no way to tell that from a deployment whose rules have not traded.
+        json.dumps(payload.rules_payload(_rule_rows(), records=_insights_report()))
         return
 
     if builder == "pulse_payload":
         # Its own required `PulseReport` plus the optional gate: spelled out, like
-        # `insights_payload`'s `series`, so no default ever stands in for either.
+        # `rules_payload`'s `records`, so no default ever stands in for either.
         json.dumps(payload.pulse_payload(_pulse_report(), gate="gate-token"))
         return
 
@@ -1598,177 +1401,6 @@ def test_every_payload_is_json_serialisable_without_a_custom_encoder(builder: st
     }[builder]
 
     json.dumps(getattr(payload, builder)(other))  # no cls=, no default=
-
-
-# -- the account-equity series (#698) ---------------------------------------------------------
-#
-# Serialised beside the closed-trade curve, never instead of it: the two answer different
-# questions (what the ACCOUNT was worth, whichever cycles ran; what the closed TRADES did, in the
-# order they closed). The rules below are the ones the contract already applies to the curve --
-# money as strings, coordinates bare, judgements written here -- plus the one this chart adds:
-# a mode is a partition, and the payload must never let a client join across it.
-
-
-def _equity_readings() -> list[EquityReading]:
-    """Two modes, a rebased high-water mark, and a cycle whose split was never recorded."""
-    return [
-        EquityReading(
-            ts=NOW_TS - 3 * 86_400,
-            mode="paper",
-            equity=Decimal("10000.55"),
-            cash=Decimal("9000.25"),
-            unrealized=Decimal("-12.30"),
-            hwm=Decimal("10500.00"),
-        ),
-        EquityReading(
-            ts=NOW_TS - 2 * 86_400,
-            mode="paper",
-            equity=Decimal("10600"),
-            cash=None,
-            unrealized=None,
-            hwm=Decimal("10600"),
-        ),
-        EquityReading(
-            ts=NOW_TS,
-            mode="live",
-            equity=Decimal("250.10"),
-            cash=Decimal("250.10"),
-            unrealized=Decimal("0"),
-            hwm=Decimal("250.10"),
-        ),
-    ]
-
-
-def _series_json(max_total_dd_pct: Decimal | None = Decimal("0.20")) -> dict[str, Any]:
-    return payload.equity_series_payload(
-        build_equity_series(_equity_readings(), max_total_dd_pct=max_total_dd_pct)
-    )
-
-
-def test_the_series_crosses_as_one_run_of_points_per_mode() -> None:
-    """The partition, on the wire. Two paper cycles then a live one is two segments, and a client
-    handed one flat list would draw a line from $10,600 of paper money to $250 of real money and
-    call the drop a drawdown."""
-    modes = [segment["mode"] for segment in _series_json()["segments"]]
-    counts = [len(segment["points"]) for segment in _series_json()["segments"]]
-
-    assert modes == ["paper", "live"]
-    assert counts == [2, 1]
-
-
-def test_a_segments_mode_is_a_bare_string_not_a_field() -> None:
-    """`mode` is an identifier, like `product_id` and `rule_name`: no precision hazard, no
-    rounding, no judgement. WHAT IS NOT A FIELD, in the module docstring."""
-    assert _series_json()["segments"][0]["mode"] == "paper"
-
-
-def test_coordinates_are_bare_strings_and_the_figures_beside_them_are_fields() -> None:
-    """The same split `_equity_point_payload` documents: `x`/`y` are positions inside a viewBox,
-    with nothing to format and no judgement to carry, while everything a reader is TOLD arrives
-    as a field."""
-    point = _series_json()["segments"][0]["points"][0]
-
-    assert point["x"] == "0.00"
-    assert isinstance(point["y"], str)
-    assert point["equity"]["display"] == "$10,000.55"
-    assert point["equity"]["value"] == "10000.55"
-    assert point["at"]["value"].endswith("Z")
-
-
-def test_an_unrecorded_split_crosses_as_absent_not_as_zero() -> None:
-    """A cycle that knew its total but not its split. `$0.00` would state a flat cash balance
-    and a flat unrealized P&L, and neither was observed -- the same distinction `pnl_net` draws
-    for a trade with no recorded net."""
-    point = _series_json()["segments"][0]["points"][1]
-
-    assert point["cash"]["state"] == "unknown"
-    assert point["unrealized"]["state"] == "unknown"
-    assert point["equity"]["state"] == "neutral"
-
-
-def test_the_unrealized_leg_carries_its_own_sign_as_a_state() -> None:
-    """Rule 3: a client must never decide "this is bad" from a minus sign. Unrealized P&L is a
-    gain-or-loss figure, so it is the one leg of the split that carries a verdict."""
-    point = _series_json()["segments"][0]["points"][0]
-
-    assert point["unrealized"]["state"] == "bad"
-    assert point["unrealized"]["display"].startswith("\u25bc")
-
-
-def test_the_drawdown_floor_is_absent_rather_than_zero_when_the_rail_is_unknown() -> None:
-    """A caller that did not supply `max_total_dd_pct` has not said the ceiling is zero. The
-    coordinate goes `null` for the same reason: a `"0"` would place the line at the top of the
-    box, where it reads as a ceiling in force."""
-    point = _series_json(max_total_dd_pct=None)["segments"][0]["points"][0]
-
-    assert point["dd_floor"]["state"] == "unknown"
-    assert point["dd_floor_y"] is None
-
-
-def test_the_drawdown_floor_crosses_with_a_coordinate_when_the_rail_is_known() -> None:
-    point = _series_json()["segments"][0]["points"][0]
-
-    # 10500.00 * (1 - 0.20), exact: the payload never rounds a source Decimal.
-    assert point["dd_floor"]["value"] == "8400.0000"
-    assert point["dd_floor"]["display"] == "$8,400.00"
-    assert isinstance(point["dd_floor_y"], str)
-
-
-def test_the_reading_says_what_the_chart_shows_including_the_flip() -> None:
-    """The chart's text equivalent, written HERE for the reason every other sentence on this wire
-    is. It has to name the mode split: a reader who cannot see the two separate lines is
-    otherwise told a single account went from ten thousand dollars to two hundred."""
-    reading = _series_json()["reading"]
-
-    assert "paper" in reading["display"]
-    assert "live" in reading["display"]
-    assert reading["state"] in ("good", "warn", "bad", "neutral", "unknown")
-
-
-def test_a_single_mode_is_not_told_it_is_two_separate_accounts() -> None:
-    """The sentence explaining the split is what a reader who cannot see the chart is told about
-    the mode partition -- so it must not be said when there is no partition. A deployment that
-    has only ever run paper hears "they are separate accounts" and goes looking for a second line
-    that is not there, which is the same false continuity the segments prevent, inverted."""
-    only_paper = payload.equity_series_payload(build_equity_series(_equity_readings()[:2]))
-
-    assert "paper" in only_paper["reading"]["display"]
-    assert "separate accounts" not in only_paper["reading"]["display"]
-    # And the two-mode case still explains itself.
-    assert "separate accounts" in _series_json()["reading"]["display"]
-
-
-def test_a_truncated_series_says_how_much_it_is_not_showing() -> None:
-    """A bounded read reaches the reader as a bounded read. The sentence is the only place a
-    screen-reader user is told the chart is a window rather than the whole record -- and a
-    sighted reader gets the same words, so neither is told a span that is not there."""
-    truncated = payload.equity_series_payload(
-        build_equity_series(_equity_readings(), total_recorded=900)
-    )
-
-    assert "most recent" in truncated["reading"]["display"]
-    assert truncated["total_recorded"]["value"] == "900"
-    assert truncated["is_truncated"]["value"] == "true"
-
-
-def test_a_complete_series_makes_no_truncation_claim() -> None:
-    complete = payload.equity_series_payload(
-        build_equity_series(_equity_readings(), total_recorded=3)
-    )
-
-    assert "most recent" not in complete["reading"]["display"]
-    assert complete["is_truncated"]["value"] == "false"
-
-
-def test_an_empty_series_says_so_rather_than_describing_an_empty_chart() -> None:
-    """Not "the account was flat", and not an empty string. A deployment that has not completed a
-    cycle since the upgrade has no readings at all, and which of those two a reader is looking at
-    is the whole difference between an empty chart and a broken one."""
-    empty = payload.equity_series_payload(build_equity_series([]))
-
-    assert empty["segments"] == []
-    assert empty["point_count"]["value"] == "0"
-    assert "no" in empty["reading"]["display"].lower()
 
 
 # -- the audit chain on the wire (#721) ---------------------------------------------------------
@@ -2050,70 +1682,7 @@ def test_the_complete_set_of_banner_sentences_is_pinned() -> None:
     }
 
 
-# -- the discretionary journal (#705) ------------------------------------------------------------
-
-
-def _notes(**overrides: object):
-    from keel.commands.journal import JournalEntry, JournalReport
-
-    fields: dict[str, object] = {
-        "id": 1,
-        "ts": 1_000,
-        "emotion_score": "3",
-        "rules_followed": True,
-        "errors_made": "",
-        "dollar_impact": Decimal("-42.50"),
-        "chart_note": "",
-        "screenshot_ref": "",
-    }
-    fields.update(overrides)
-    return JournalReport(now_ts=2_000, entries=(JournalEntry(**fields),))  # type: ignore[arg-type]
-
-
-def test_a_followed_rule_is_never_graded_good() -> None:
-    """`GOOD` would be the console ENDORSING a claim nothing verified.
-
-    Every other green on this page is a fact -- a fill happened, a chain verified, an attestation
-    is in date. "I followed my rules" is the operator's opinion of the operator, and a surface
-    that reflected it back as a pass would be flattering them with their own words. Neutral is the
-    strongest thing that can honestly be said, and `WARN` on the confession is not the mirror
-    image of a `GOOD` that does not exist.
-    """
-    entry = payload._discretionary_journal_payload(_notes(rules_followed=True))["entries"][0]
-    assert entry["rules_followed"]["state"] == "neutral"
-
-    broke = payload._discretionary_journal_payload(_notes(rules_followed=False))["entries"][0]
-    assert broke["rules_followed"]["state"] == "warn"
-
-    silent = payload._discretionary_journal_payload(_notes(rules_followed=None))["entries"][0]
-    assert silent["rules_followed"]["state"] == "unknown"
-    assert silent["rules_followed"]["display"] == "not said"
-
-
-def test_no_state_on_this_section_is_ever_good() -> None:
-    """The rule above, swept rather than spot-checked: nothing an operator says about themselves
-    may come back from this codebase as a pass."""
-    for rules in (True, False, None):
-        for impact in (Decimal("10"), Decimal("-10"), None):
-            body = payload._discretionary_journal_payload(
-                _notes(rules_followed=rules, dollar_impact=impact)
-            )
-            states = [
-                value["state"]
-                for entry in body["entries"]
-                for value in entry.values()
-                if isinstance(value, dict) and "state" in value
-            ]
-            assert "good" not in states, f"rules={rules} impact={impact} graded a claim good"
-
-
-def test_a_profitable_self_reported_day_still_warns() -> None:
-    """`money()` grades a positive figure GOOD by default, which is right for a realised p&l and
-    wrong here: a self-reported gain is still a claim, and the sign of a number the operator chose
-    is not evidence about it."""
-    body = payload._discretionary_journal_payload(_notes(dollar_impact=Decimal("250")))
-    entry = body["entries"][0]
-    assert entry["dollar_impact"]["state"] == "warn"
+# -- the plans page (#706) -----------------------------------------------------------------------
 
 
 def test_a_shipped_tier_reads_as_something_that_exists() -> None:

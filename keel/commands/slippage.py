@@ -209,11 +209,11 @@ def gather_slippage(repo: Repository, config: Config, *, now_ts: int) -> Slippag
     """The configured universe, each product priced from its own cached liquidity.
 
     Rows come back ordered by PRODUCT ID -- the same order `keel simulate` already prints its
-    slippage table in. Not by cost, and that is deliberate under the Strathern rail this whole
-    `/research` surface sits under: a cost table sorted cheapest-first reads as a shortlist of
-    what to trade, and a page that ranks the universe by anything is doing selection while
-    calling itself reporting. Alphabetical is also stable, so the table does not reshuffle
-    between polls as candles arrive.
+    slippage table in. Not by cost, and that is deliberate under the Strathern rail the whole
+    research record (on the console's Rules view) sits under: a cost table sorted cheapest-first
+    reads as a shortlist of what to trade, and a page that ranks the universe by anything is
+    doing selection while calling itself reporting. Alphabetical is also stable, so the table does
+    not reshuffle between polls as candles arrive.
     """
     from keel.commands._products import _default_sim_products
     from keel.strategy import backtest as backtest_mod

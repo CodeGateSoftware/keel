@@ -57,9 +57,11 @@ _CSS = _STATIC / "css" / "keel.css"
 #: appearing under `js/` without a test author noticing fails `test_the_client_ships_exactly_the_
 #: declared_modules` rather than shipping unexamined.
 #:
-#: `chart.js` and `live.js` arrived at #537 and `docs.js` at #539, which is what the first
-#: revision of this line predicted ("a fifth module is a design decision (#537 adds `chart`,
-#: `live`, `docs`, `sw`) and should arrive with the list updated, not silently").
+#: `live.js` arrived at #537 and `docs.js` at #539, which is what the first revision of this line
+#: predicted ("a fifth module is a design decision (#537 adds `chart`, `live`, `docs`, `sw`) and
+#: should arrive with the list updated, not silently"). `chart.js` arrived with them and LEFT in
+#: console PR3, with the Insights view's equity charts -- removed from this list in the same
+#: commit, which is the same rule run the other way.
 #:
 #: `actions.js` is the write boundary, split out of `main.js` after the reference implementation's
 #: own shape: youperiod.app keeps `main.js` to "DOM manipulation and event listener attachment"
@@ -69,7 +71,7 @@ _CSS = _STATIC / "css" / "keel.css"
 #:
 #: **`sw` arrived at #538 and is deliberately NOT in this list**, because it is not under `js/`:
 #: a service worker's scope is its own directory, so `js/sw.js` would be scoped to `/static/js/`
-#: and could not answer a navigation to `/static/insights`. It sits at the static root instead,
+#: and could not answer a navigation to a view such as `/pulse`. It sits at the static root instead,
 #: and `tests/web/test_pwa.py::test_the_worker_is_served_from_the_scope_it_must_control` asserts
 #: that placement rather than leaving it to whoever next reads the spec's file list.
 #:
@@ -85,28 +87,26 @@ _MODULES = (
     "api.js",
     "actions.js",
     "render.js",
-    "chart.js",
     "live.js",
     "format.js",
     "docs.js",
     "theme.js",
 )
 
-#: The modules held to "no arithmetic, no judgement, no derived display string", and the ONLY two.
+#: The modules held to "no arithmetic, no judgement, no derived display string".
 #:
 #: `render.js` is the spec's own choice ("so that a reviewer can confirm the absence by reading one
-#: file"). `chart.js` is added at #537 rather than exempted, and the reason is that exempting it
-#: would have been the easy road and the wrong one: a chart module is exactly where "just this one
-#: subtraction, it is only a pixel" gets written, and once it is written the client is performing
-#: arithmetic over figures that were exact `Decimal`s a moment ago. The coordinates are computed in
-#: `keel.commands.insights.build_equity_curve` instead, so this scan holds over both files and the
+#: file"). `chart.js` was the second entry from #537 -- added rather than exempted, because a chart
+#: module is exactly where "just this one subtraction, it is only a pixel" gets written -- until
+#: console PR3 retired the charts and the module with them. A tuple of one, and kept a tuple: the
+#: next module that touches payload values joins it here rather than inventing its own scan. The
 #: design spec's §Dependencies claim -- "the client performs no arithmetic", the sentence that
 #: removes the need for a decimal library -- is a property of the whole client.
 #:
 #: `main.js` is NOT here and cannot be: it owns timers and route indices, which are arithmetic
 #: about the interface rather than about money. `api.js` is not either -- it reads HTTP statuses.
 #: The line is drawn at the modules that touch PAYLOAD VALUES, which is where it means something.
-_DERIVATION_FREE = ("render.js", "chart.js")
+_DERIVATION_FREE = ("render.js",)
 
 
 def _source(name: str) -> str:
@@ -276,6 +276,41 @@ def test_no_client_asset_is_a_build_artifact() -> None:
         assert "sourceMappingURL" not in _source(name), f"{name} points at a source map"
 
 
+def _named_imports(code: str) -> list[tuple[list[str], str]]:
+    """`([names], "./module.js")` for every `import { ... } from "..."` in `code`."""
+    found = []
+    for names, module in re.findall(r"import\s*\{([^}]*)\}\s*from\s*\"([^\"]+)\"", code):
+        found.append(([n.strip() for n in names.split(",") if n.strip()], module))
+    return found
+
+
+def test_every_named_import_is_an_export_of_a_module_that_ships() -> None:
+    """A browser links every ES module before it runs any of them, so ONE import naming a module
+    that is not shipped -- or a name that module does not export -- blanks the whole console with
+    a `SyntaxError` nobody in CI sees (`node --check` parses one file at a time). Console PR3
+    deleted `chart.js`; an import of it left in `main.js` or `render.js` would have been exactly
+    that, with every Python gate green."""
+    exports = {
+        name: set(
+            re.findall(
+                r"^export (?:async )?(?:function|const|let)\s+(\w+)",
+                _code_only(_source(name)),
+                re.M,
+            )
+        )
+        for name in _MODULES
+    }
+    seen = 0
+    for name in _MODULES:
+        for names, module in _named_imports(_comments_only(_source(name))):
+            target = module.removeprefix("./")
+            assert target in _MODULES, f"{name} imports {module}, which does not ship"
+            missing = set(names) - exports[target]
+            assert not missing, f"{name} imports {sorted(missing)} from {module}; not exported"
+            seen += len(names)
+    assert seen >= 30, f"the import scan saw only {seen} names; it has stopped working"
+
+
 @pytest.mark.parametrize("name", _MODULES)
 def test_every_module_declares_ts_check(name: str) -> None:
     """`// @ts-check` on the first line of every module.
@@ -309,10 +344,8 @@ def test_render_contains_no_arithmetic(name: str) -> None:
     file". Reading is the point; this is the gate that stops the property decaying between
     readings.
 
-    `chart.js` joined it at #537. A chart is the one place a client is EXPECTED to do arithmetic
-    -- scale a series, map it onto a box -- so a scan that stopped at `render.js` would have left
-    the interesting file out. See `_DERIVATION_FREE`, and `build_equity_curve` for where the
-    geometry went instead."""
+    Parametrised over `_DERIVATION_FREE` rather than written for one file, so a module that joins
+    that tuple is scanned without a second test."""
     code = _code_only(_source(name))
     found = sorted({ch for ch in _ARITHMETIC_CHARS if ch in code})
     assert not found, f"{name} contains arithmetic operators: {found}"
@@ -392,7 +425,7 @@ def test_the_arithmetic_scanner_can_fail() -> None:
     assert "+" not in _code_only('const s = "he said \\" a + b";\n')
 
 
-# -- #602: the chart gains a cursor legend, a trade highlight, and local export -----------------
+# -- a lexer that keeps string literals ----------------------------------------------------------
 
 
 def _comments_only(source: str) -> str:
@@ -401,11 +434,11 @@ def _comments_only(source: str) -> str:
     The same four-state walk `_code_only` runs, with the one difference this test needs: a string
     is copied through rather than blanked. `_code_only` exists to make the arithmetic scan
     impossible to fool with an operator quoted in a string or a comment, and blanking strings is
-    right for that job -- but it means `"data-point-index"` cannot be found in its output at all,
-    which is exactly the literal this test is checking for. Comments still have to go: the
-    `#602` comment directly above the loop this test scans NAMES both attributes in prose, and a
-    raw substring search would find that sentence instead of the code it is describing -- the
-    same trap `_markup_only` exists for on `index.html`.
+    right for that job -- but it means a literal such as `"button"` cannot be found in its output
+    at all, which is exactly what the structural pins built on this look for. Comments still have
+    to go: a docstring that NAMES the thing a function refuses to build would otherwise be found
+    instead of the code it describes -- the same trap `_markup_only` exists for on `index.html`.
+    (Written for #602's chart pins, which left with the charts in console PR3.)
     """
     out: list[str] = []
     i, n = 0, len(source)
@@ -436,100 +469,6 @@ def _comments_only(source: str) -> str:
         out.append(ch)
         i += 1
     return "".join(out)
-
-
-def _insights_view_body() -> str:
-    """`insightsView`'s code, comments stripped but string literals intact -- see `_view_keys`'s
-    own note on why a region bounded at the next top-level export is needed rather than a scan of
-    the whole file."""
-    source = _comments_only(_source("render.js"))
-    start = source.index("export function insightsView(")
-    next_export = source.find("\nexport function ", start + 1)
-    end = len(source) if next_export == -1 else next_export
-    return source[start:end]
-
-
-def test_a_journal_row_with_a_point_finds_it_before_it_is_marked_hoverable() -> None:
-    """**The shape that matters, not the mere presence of the two attributes.**
-
-    A row is only worth hovering or tabbing to if the chart has something to show for it, which
-    is exactly the property `entry.point_index === null` (#602's join -- see
-    `payload.journal_payload`'s own note on why a skipped trade gets `None`) exists to gate. A
-    pin that only checked `"data-point-index" in source` and `"tabindex" in source` would pass a
-    version that marks EVERY row hoverable regardless of whether the curve drew anything for it --
-    a real regression (a focus ring and a pointer cursor promising an interaction that does
-    nothing), caught below only because the null check is asserted to come FIRST in the loop body,
-    not merely to exist somewhere in the file.
-    """
-    body = _insights_view_body()
-
-    assert "point_index" in body
-    null_check = body.find("point_index")
-    assert null_check != -1
-
-    point_index_attr = body.find('"data-point-index"')
-    tabindex_attr = body.find('"tabindex"')
-    assert point_index_attr != -1, "insightsView never sets data-point-index on a journal row"
-    assert tabindex_attr != -1, "insightsView never makes a journal row keyboard-focusable"
-
-    # The join is CHECKED before the row is marked interactive, not after -- the ordering a
-    # `continue`-on-no-point guard relies on to skip the two calls below it.
-    assert null_check < point_index_attr, (
-        "the point_index check must come before data-point-index is set, or every row -- "
-        "including one the curve drew no point for -- is marked hoverable"
-    )
-    assert null_check < tabindex_attr, (
-        "the point_index check must come before tabindex is set, or a row with no point on the "
-        "curve is still added to the keyboard tab order"
-    )
-
-
-def test_a_losing_trade_is_marked_by_shape_and_dash_not_only_colour() -> None:
-    """#602's accessibility constraint, checked on both sides of the join: `chart.js` must pick a
-    DIFFERENT marker glyph for a loss than for a gain (not merely a different fill), and
-    `keel.css` must give a losing segment a different stroke PATTERN, not merely a different
-    `--bad`/`--good` token. Either half alone would leave colour as the only signal for a reader
-    who cannot see it -- the exact failure #532 already fixed once for the figures beside this
-    chart (`payload.py`'s ▲/▼ glyphs)."""
-    # The RAW source, not `_code_only`'s residue: the marker ids and the ternary below are string
-    # literals, which `_code_only` blanks out on purpose (see its own docstring) so the arithmetic
-    # scan cannot be fooled by an operator quoted in one. This test wants exactly what that scan
-    # throws away.
-    chart_code = _source("chart.js")
-    assert '"#mk-down"' in chart_code and '"#mk-up"' in chart_code
-    # The two markers are chosen by the trade's OWN outcome, not by which element happens to be
-    # drawn first -- a ternary keyed on `outcome`, the value `outcomeOf` derives from
-    # `point.pnl.state`.
-    assert re.search(r'outcome\s*===\s*"bad"\s*\?\s*"#mk-down"\s*:\s*"#mk-up"', chart_code), (
-        "the entry/exit markers must be chosen by the trade's outcome, not drawn identically"
-    )
-
-    css = staticfiles.STATIC_ROOT.joinpath("css", "keel.css").read_text(encoding="utf-8")
-    bad_rule = re.search(r"\.chart \.highlight \.segment\.bad\s*\{([^}]*)\}", css)
-    good_rule = re.search(r"\.chart \.highlight \.segment\.good\s*\{([^}]*)\}", css)
-    assert bad_rule is not None and good_rule is not None
-    assert "stroke-dasharray" in bad_rule.group(1), (
-        "a losing segment must be dashed, not merely --bad-coloured, so it survives greyscale"
-    )
-    assert "stroke-dasharray" not in good_rule.group(1), (
-        "a winning segment must stay solid -- if it is ALSO dashed, dash is no longer the signal "
-        "that tells the two outcomes apart without colour"
-    )
-
-
-def test_the_chart_is_keyboard_operable_not_only_pointer_operable() -> None:
-    """The wheel-zoom and drag-to-pan `main.js` owns (#602) have a keyboard equivalent, because
-    the issue's own accessibility constraint says a new control needs one: arrow keys pan,
-    `+`/`-` zoom, `0`/`Home` reset. None of it is reachable unless `chart.js` also makes
-    `svg.curve` focusable -- a keyboard listener on an element nothing can Tab to is as
-    unreachable as no listener at all, which is why this test pins both halves rather than either
-    alone."""
-    assert re.search(r'tabindex:\s*"0"', _source("chart.js")), "svg.curve must be focusable"
-
-    main_code = _source("main.js")
-    assert '"keydown"' in main_code, "no keyboard handler for the chart's pan/zoom"
-    for key in ('"ArrowLeft"', '"ArrowRight"', '"ArrowUp"', '"ArrowDown"', '"Home"'):
-        assert key in main_code, f"the chart's keyboard controls are missing {key}"
 
 
 def test_no_client_module_can_write_markup() -> None:
@@ -1107,7 +1046,7 @@ def test_every_client_route_serves_the_shell_on_a_reload(name: str, running) -> 
     """**Deep links and reloads.**
 
     This is the whole reason the server knows about client routes at all: `main.js` routes with
-    `pushState`, so `/static/insights` appears in the address bar, and without this a reload or a
+    `pushState`, so `/static/rules` appears in the address bar, and without this a reload or a
     bookmark asks for a file that does not exist. Parametrised over `CLIENT_ROUTES` itself so a
     view added there is covered without a test edit."""
     status, headers, body = _request(running, _P(name), cookie=_session(running))
@@ -1128,19 +1067,23 @@ def test_a_path_that_is_not_a_client_route_is_still_a_404(running) -> None:  # t
 
 
 def test_the_retired_client_routes_are_a_closed_tuple_of_exactly_these_names() -> None:
-    """Console PR1 (#951) retired three views and PR2 two more; PRs 3-4 add to this tuple, one
-    name each."""
+    """Console PR1 (#951) retired three views, PR2 two more and PR3 (#953) two more -- Insights and
+    Research, folded into Rules. PR4 adds its own."""
     assert staticfiles.RETIRED_CLIENT_ROUTES == (
         "status",
         "activity",
         "gates",
         "orders",
         "positions",
+        "insights",
+        "research",
     )
     assert set(staticfiles.RETIRED_CLIENT_ROUTES).isdisjoint(staticfiles.CLIENT_ROUTES)
 
 
-@pytest.mark.parametrize("name", ["status", "activity", "gates", "orders", "positions"])
+@pytest.mark.parametrize(
+    "name", ["status", "activity", "gates", "orders", "positions", "insights", "research"]
+)
 def test_a_retired_route_serves_the_shell_so_the_client_can_land_on_the_home_view(
     name: str,
     running,  # type: ignore[no-untyped-def]
@@ -1190,7 +1133,6 @@ def test_the_client_route_fallback_is_behind_the_same_admission(running) -> None
         (_P("js/main.js"), "text/javascript; charset=utf-8"),
         (_P("js/api.js"), "text/javascript; charset=utf-8"),
         (_P("js/render.js"), "text/javascript; charset=utf-8"),
-        (_P("js/chart.js"), "text/javascript; charset=utf-8"),
         (_P("js/live.js"), "text/javascript; charset=utf-8"),
         (_P("js/format.js"), "text/javascript; charset=utf-8"),
         (_P("js/theme.js"), "text/javascript; charset=utf-8"),
@@ -1233,10 +1175,11 @@ def _view_keys(view: str, root: str) -> list[str]:
 
     Generalised from the status view's own key scan at #537, when six more views needed the same
     check -- and the generalisation is a REQUIRED second argument, never a default. The views do
-    not all name their payload `data`: `insightsView` takes `insights` and `journal`, because it
-    reads two endpoints. A helper defaulting to `"data"` would have scanned nothing for that view,
-    found no keys, and passed -- over the view with the most keys in it. Every existing caller
-    passes `("pulseView", "data")` and gets exactly what it got before.
+    not all name their payload `data`: `rulesView` reads six endpoints, through `data`, `plan`,
+    `trials`, `gauntlet`, `slippage` and `matrix` (console PR3; `insightsView` took `insights` and
+    `journal` before it). A helper defaulting to `"data"` would have scanned nothing for those
+    roots, found no keys, and passed. Every existing caller passes `("pulseView", "data")` and gets
+    exactly what it got before.
 
     Row-level keys (`row.qty`, `row.product_id`) are out of scope: they live inside collections
     that are empty on a fresh deployment, so there is nothing to check them against here. They are
@@ -1281,9 +1224,10 @@ def _view_keys(view: str, root: str) -> list[str]:
 
 #: Each ported view, the parameter it reads a payload through, and the endpoint that fills it.
 #:
-#: `insightsView` appears twice because it reads two endpoints. `api.py` splits them so that "one
-#: sortable collection per endpoint keeps `?sort=` unambiguous", and both name `/insights` as
-#: their `html_route` -- which is the server saying they are one page.
+#: `rulesView` appears once per endpoint it reads (console PR3): the ledger and track records, then
+#: the four research reads, each through a parameter named for it so `_view_keys` keeps their keys
+#: apart in the one region. All of them name `/rules` as their `html_route` -- which is the server
+#: saying they are one page. The DCA card is its own exported function, so it is its own entry.
 _VIEW_ENDPOINTS: tuple[tuple[str, str, str], ...] = (
     ("setupView", "data", "/api/setup"),
     # Pulse (console PR1): the home view, and the one that replaced Status, Activity and Gates.
@@ -1298,12 +1242,11 @@ _VIEW_ENDPOINTS: tuple[tuple[str, str, str], ...] = (
     ("holdingsView", "orders", "/api/orders"),
     ("balancesView", "data", "/api/balances"),
     ("timelineView", "data", "/api/timeline"),
-    ("insightsView", "insights", "/api/insights"),
-    ("insightsView", "journal", "/api/journal"),
-    ("researchView", "data", "/api/research/trials"),
-    ("researchView", "gauntlet", "/api/research/gauntlet"),
-    ("researchView", "slippage", "/api/research/slippage"),
     ("rulesView", "data", "/api/rules"),
+    ("rulesView", "trials", "/api/research/trials"),
+    ("rulesView", "gauntlet", "/api/research/gauntlet"),
+    ("rulesView", "slippage", "/api/research/slippage"),
+    ("rulesView", "matrix", "/api/research/matrix"),
     # The DCA proposal card on /rules. Read bare, the endpoint answers its awaiting shape, which
     # carries every key the ready shape does (`payload.dca_plan_awaiting_payload`).
     ("dcaPlanCard", "plan", "/api/dca-plan"),
@@ -1348,15 +1291,17 @@ def test_the_view_key_scan_reads_every_ported_view() -> None:
     """The premise: a scan that found nothing would make the test above pass on any payload.
 
     Non-empty per view, so a parse that silently returned `[]` fails here by name. The three spot
-    checks are the keys most likely to be got wrong -- two of them are payload fields this issue
-    ADDED (`status_note`, `curve`), which is exactly the shape of key a client can start reading
-    before the server sends it."""
+    checks are the keys most likely to be got wrong -- payload fields ADDED with the view that
+    reads them (`status_note` in #537, `records` in console PR3), which is exactly the shape of key
+    a client can start reading before the server sends it."""
     for view, root, _endpoint in _VIEW_ENDPOINTS:
         assert _view_keys(view, root), f"{view} reads nothing off {root} -- the parser has broken"
 
     assert "halt.resume_command" in _view_keys("pulseView", "data")
     assert "activity.status_note" in _view_keys("pulseView", "data")
-    assert "curve" in _view_keys("insightsView", "journal")
+    assert "records" in _view_keys("rulesView", "data")
+    assert "closed_trade_count" in _view_keys("rulesView", "data")
+    assert "chain_errors" in _view_keys("rulesView", "trials")
     assert "steps" in _view_keys("setupView", "data")
 
 
@@ -1381,90 +1326,6 @@ def test_the_pulse_key_scan_found_the_keys_it_claims_to_check() -> None:
     # And the scan is bounded: `data.build` belongs to `/api/config` and is read by `buildLine`,
     # which lives BELOW `pulseView` in the same file.
     assert "build" not in keys, keys
-
-
-# -- the account-equity series, stacked above the curve (#698) ---------------------------------
-
-
-def test_paper_and_live_are_told_apart_by_dash_not_only_by_colour() -> None:
-    """The same constraint the losing segment above answers, for the other pair of lines a reader
-    has to tell apart. Paper and live are unrelated accounts drawn on one canvas, so if the only
-    difference between their lines were a hue, a reader with red-green colour deficiency -- or
-    anyone on e-ink or a greyscale printout -- would see one continuous account."""
-    css = staticfiles.STATIC_ROOT.joinpath("css", "keel.css").read_text(encoding="utf-8")
-    paper_rule = re.search(r"\.chart svg\.series \.line\.paper\s*\{([^}]*)\}", css)
-    assert paper_rule is not None, "the paper equity line has no rule of its own"
-    assert "stroke-dasharray" in paper_rule.group(1), (
-        "the paper line must be dashed so the synthetic account survives greyscale"
-    )
-    # And live must NOT be dashed, or dash stops being the thing that separates them.
-    live_rule = re.search(r"\.chart svg\.series \.line\.live\s*\{([^}]*)\}", css)
-    assert live_rule is None or "stroke-dasharray" not in live_rule.group(1), (
-        "the live line must stay solid -- if both are dashed, dash is no longer the signal"
-    )
-
-
-def test_the_series_canvas_does_not_answer_to_the_curves_selector() -> None:
-    """`main.js`'s #602 wheel-zoom, drag-to-pan and cursor legend bind to `svg.curve` and reach
-    for it with `querySelector`, which takes the FIRST match in the DOM. The series is rendered
-    ABOVE the curve, so if it also called itself `curve` every one of those gestures would
-    silently retarget onto a chart they were not written for."""
-    chart_code = _source("chart.js")
-    assert 'class: "series"' in chart_code, "the series canvas must not be class 'curve'"
-
-    render_code = _source("render.js")
-    series_at = render_code.index("equitySeriesChart(")
-    curve_at = render_code.index("equityChart(journal.curve")
-    assert series_at < curve_at, "the equity series is stacked ABOVE the closed-trade curve"
-
-
-def test_the_series_figure_does_not_intercept_the_curves_figure_lookups() -> None:
-    """The collision that `svg.series` alone does NOT fix, and that cost the journal-row
-    highlight once already.
-
-    `main.js` reaches for the chart's WRAPPER with `contentNode.querySelector("figure.chart")`
-    in two places -- `highlightJournalRow` and the chart-action handler -- and that takes the
-    first match in document order. The series figure is appended ABOVE the curve, so if it were
-    a bare `figure.chart` those lookups would land on it; `highlightTrade` would then find no
-    `.highlight` group, return early, and hovering a journal row would silently do nothing.
-    Both halves are pinned here: the class the series wears, and the selector that excludes it.
-    """
-    chart_code = _source("chart.js")
-    assert 'figure.className = "chart series"' in chart_code, (
-        "the series figure must be distinguishable from the curve's figure by class"
-    )
-
-    main_code = _source("main.js")
-    assert 'querySelector("figure.chart")' not in main_code, (
-        "a bare figure.chart lookup takes the series figure, which renders first"
-    )
-    assert main_code.count('querySelector("figure.chart:not(.series)")') == 2, (
-        "both figure lookups in main.js must exclude the series figure"
-    )
-
-
-def test_the_series_draws_each_mode_as_its_own_polyline() -> None:
-    """The one thing this chart must never do is join two accounts into one line. It is checked
-    on the source rather than a rendered DOM because a browser cannot run here: the loop over
-    `segments` IS the guarantee, and a `points` attribute built from a flattened list would be
-    the bug."""
-    chart_code = _source("chart.js")
-    assert "for (const segment of series.segments)" in chart_code, (
-        "the series must be drawn one segment at a time, never as one flat list of points"
-    )
-    assert ".flat(" not in chart_code and "concat(" not in chart_code, (
-        "flattening the segments would draw the paper/live flip as a single continuous line"
-    )
-
-
-def test_an_unknown_drawdown_ceiling_draws_no_floor_line() -> None:
-    """`dd_floor_y` is `null` when the rail setting is unknown, and a `null` coordinate must be
-    filtered out rather than drawn: SVG's zero is the TOP of the box, so a floor placed there
-    reads as a ceiling in force above every reading -- the opposite of "not known"."""
-    chart_code = _source("chart.js")
-    assert "point.dd_floor_y !== null" in chart_code, (
-        "points with no recorded drawdown floor must be filtered before the floor is drawn"
-    )
 
 
 # -- every table declares as many cells as it declares headers ---------------------------------
@@ -1673,7 +1534,7 @@ def test_every_call_resolves_to_something_the_module_has(name: str) -> None:
     over source text rather than executing it. The page would have thrown `ReferenceError` on
     first render.
 
-    Scoped to the two derivation-free modules rather than the whole client: they are the ones
+    Scoped to the derivation-free modules rather than the whole client: they are the ones
     that touch almost no browser API, so the short `_BROWSER_GLOBALS` list stays honest. Widening
     it to `main.js` would mean listing `fetch`, `setTimeout`, `URL` and friends, and a list long
     enough to cover those is long enough to hide a typo.
@@ -1797,18 +1658,17 @@ _ROW_ENDPOINTS: tuple[tuple[str, str, str, str, str], ...] = (
     ("balancesView", "data", "assets", "/api/balances", "positions"),
     ("timelineView", "data", "rows", "/api/timeline", "orders"),
     ("rulesView", "data", "rules", "/api/rules", "rules"),
+    # The track records (console PR3). The `rules` seeder writes a `candidate` rule, which is in
+    # the promotion pipeline `build_insights_report` scopes to, so the collection has a row.
+    ("rulesView", "data", "records", "/api/rules", "rules"),
     # Pulse's two row tables a seeded deployment can fill: the open tranche, and a LIVE dca rule's
     # next cadence day. Registered WITH the code that reads them.
     ("pulseView", "data", "open_positions", "/api/pulse", "positions"),
     ("pulseView", "data", "next_dca", "/api/pulse", "dca_live"),
-    ("researchView", "slippage", "rows", "/api/research/slippage", "none"),
-    ("researchView", "gauntlet", "rows", "/api/research/gauntlet", "gauntlet"),
+    ("rulesView", "slippage", "rows", "/api/research/slippage", "none"),
+    ("rulesView", "gauntlet", "rows", "/api/research/gauntlet", "gauntlet"),
     # #708 view 2. Registered WITH the code that reads it -- the rule `_ROW_ENDPOINTS` states.
-    ("researchView", "matrix", "rows", "/api/research/matrix", "matrix"),
-    # #705's discretionary journal, registered WITH the code that reads it. It hangs off
-    # `/api/journal`'s `notes`, and the seeder writes one entry through the repository because the
-    # CLI writer refuses to run without a terminal.
-    ("insightsView", "notes", "notes.entries", "/api/journal", "journal"),
+    ("rulesView", "matrix", "rows", "/api/research/matrix", "matrix"),
     # The DCA card's three collections. The endpoint is asked WITH a budget, and the `dca_plan`
     # seeder admits BTC, rejects PAXG and gives ETH an existing DCA rule -- so each collection has
     # a row, and each row the card maps is one the served payload actually built.
@@ -1830,10 +1690,8 @@ _ROW_ENDPOINTS_UNCOVERED: dict[tuple[str, str, str], str] = {
     ),
     ("setupView", "data", "not_automated"): "the checklist is config-derived, not row-seeded",
     ("setupView", "data", "actions"): "the checklist is config-derived, not row-seeded",
-    ("researchView", "data", "exploration"): "needs a trials ledger; #708 view 1 seeds one",
-    ("researchView", "data", "rows"): "needs a trials ledger; #708 view 1's own tests seed one",
-    ("insightsView", "insights", "rules"): "needs closed trades to build a track record",
-    ("insightsView", "journal", "entries"): "needs journal entries",
+    ("rulesView", "trials", "exploration"): "needs a trials ledger; #708 view 1 seeds one",
+    ("rulesView", "trials", "rows"): "needs a trials ledger; #708 view 1's own tests seed one",
     ("venuesView", "data", "venues"): "config-derived; no rows to seed",
     ("venuesView", "data", "readiness"): "config-derived; no rows to seed",
     # Nested one level down: the root is a ROW variable, not a payload root, so the check above
@@ -1948,27 +1806,6 @@ def _seed_for(kind: str, db_path: str, monkeypatch: pytest.MonkeyPatch) -> None:
                 "columns_refused": 0,
             },
         )
-    elif kind == "journal":
-        # Through the REPOSITORY, not the CLI: `keel journal add` refuses to run without a
-        # terminal (#705), which is the property that makes the record an attestation and is
-        # exactly what a test harness cannot supply.
-        from decimal import Decimal
-
-        from keel.data.db import connect, migrate
-        from keel.data.repository import Repository
-
-        conn = connect(db_path)
-        migrate(conn)
-        Repository(conn).append_journal_entry(
-            ts=1_756_000_000,
-            emotion_score="3",
-            rules_followed=False,
-            errors_made="entered before the close confirmed",
-            dollar_impact=Decimal("-42.50"),
-            chart_note="range top",
-            screenshot_ref="~/shot.png",
-        )
-        conn.close()
 
 
 @pytest.mark.parametrize(("view", "root", "collection", "endpoint", "seed"), _ROW_ENDPOINTS)
@@ -1992,10 +1829,10 @@ def test_every_row_key_a_view_reads_is_a_key_its_endpoint_sends(
     assert status == 200, endpoint
     document = json.loads(body)
     assert document["engine"]["value"] == "running", document
-    # A DOTTED PATH, because a collection is not always a top-level key: #705's discretionary
-    # journal rides `/api/journal` at `data.notes.entries`, beside the closed trades it must not
-    # be blended into. Walking the path keeps that arrangement checkable rather than forcing a
-    # route of its own for the sake of this test.
+    # A DOTTED PATH, because a collection is not always a top-level key (#705's discretionary
+    # journal rode `/api/journal` at `data.notes.entries` until console PR3). Every collection
+    # registered today is top-level; the walk keeps a nested one checkable without a route of its
+    # own for the sake of this test.
     rows = document["data"]
     for part in collection.split("."):
         assert isinstance(rows, dict), (
@@ -2006,8 +1843,8 @@ def test_every_row_key_a_view_reads_is_a_key_its_endpoint_sends(
 
     # A collection with no rows proves nothing, so an empty one is the failure rather than a pass.
     assert rows, f"{endpoint} sent no {collection} to check {view}'s row reads against"
-    # The SCAN is keyed by the last segment -- `render.js` maps `notes.entries`, so `_row_reads`
-    # sees the receiver `notes` and the collection `entries`.
+    # The SCAN is keyed by the last segment -- a view mapping `a.b.c` is seen by `_row_reads` as
+    # the receiver `b` and the collection `c`.
     reads = _row_reads(view).get((root, collection.rsplit(".", 1)[-1]), set())
     assert reads, f"the scan found no row keys in {view} -- it would pass against any payload"
 
@@ -2058,9 +1895,9 @@ def test_every_mapped_collection_is_either_checked_or_named() -> None:
     added later inherits the exact hole #725 fell into. With it, a new `.map()` over a payload
     collection fails the build until it is either checked or written down with a reason.
     """
-    # The last segment of the path, because that is what `_row_reads` sees: `render.js` maps
-    # `notes.entries`, so the scan reports the receiver `notes` and the collection `entries`,
-    # while the table above carries the payload path `notes.entries` for the walk.
+    # The last segment of the path, because that is what `_row_reads` sees: a view mapping `a.b.c`
+    # is reported as the receiver `b` and the collection `c`, while the table above carries the
+    # payload path for the walk.
     checked = {
         (view, root, collection.rsplit(".", 1)[-1])
         for view, root, collection, _e, _s in _ROW_ENDPOINTS
@@ -2134,10 +1971,11 @@ def _comments_stripped(source: str) -> str:
 def _function_body(source: str, name: str) -> str:
     """One top-level function's body, comments stripped and string literals kept.
 
-    Exported OR module-private: `notesSection` (#705) is private, and a helper that only knew how
-    to find exports raised `ValueError` on it -- which at least fails loudly, unlike the shape
-    where a scan silently finds nothing. Bounded at the next top-level function of either kind, so
-    the next function's body cannot be read as this one's.
+    Exported OR module-private: `trialsSection` is private, and a helper that only knew how to
+    find exports raised `ValueError` on one (#705's `notesSection`, retired in console PR3) --
+    which at least fails loudly, unlike the shape where a scan silently finds nothing. Bounded at
+    the next top-level function of either kind, so the next function's body cannot be read as
+    this one's.
     """
     code = _comments_stripped(source)
     for prefix in ("export function ", "function "):
@@ -2301,44 +2139,6 @@ def test_the_chip_separators_the_comments_describe_actually_ship() -> None:
     css = (_STATIC / "css" / "keel.css").read_text(encoding="utf-8")
     for selector in ("#session-profile:not(:empty)::after", "#session-equity:not(:empty)::before"):
         assert selector in css, f"no separator rule for {selector}"
-
-
-# -- the discretionary journal's own section (#705) -----------------------------------------------
-#
-# Every other pin on `notesSection` asks what it WOULD draw. None asked whether anything draws it,
-# or whether the marker survives -- so deleting the call, or the `SELF-REPORTED` pill, left the
-# whole 6,000-test suite green while the console lost the section and the acceptance criterion the
-# issue names. The parity scan cannot catch either: an uncalled function still reads the keys it
-# reads.
-
-
-def test_the_insights_view_actually_renders_the_journal_section() -> None:
-    body = _function_body(_source("render.js"), "insightsView")
-    assert "notesSection(" in body, "insightsView never draws the discretionary journal"
-
-
-def test_the_journal_section_shows_the_self_reported_marker() -> None:
-    """The issue's acceptance criterion, on the surface it names. The marker is what keeps a
-    self-assessment from being read as a venue fact, and it is one deleted line away from gone."""
-    body = _function_body(_source("render.js"), "notesSection")
-    assert "notes.marker" in body
-
-
-def test_the_journal_section_says_how_much_of_the_journal_it_is_showing() -> None:
-    """A capped list with nothing beside it reads as a complete one. The payload composes the
-    sentence; this asserts the client places it."""
-    body = _function_body(_source("render.js"), "notesSection")
-    assert "notes.window" in body
-
-
-def test_the_journal_section_offers_no_sort_control() -> None:
-    """Not an omission. A journal reads forwards, and sorted by dollar impact it becomes a ranking
-    of the operator's own worst days -- the Strathern rail where the thing ranked is a person.
-    `table()` draws a sort control only when handed a `sort`/`onSort` pair, so the refusal is the
-    absence of that argument."""
-    body = _function_body(_source("render.js"), "notesSection")
-    assert "onSort" not in body
-    assert "sort:" not in body
 
 
 # -- the Plans page's refusals (#706) -------------------------------------------------------------
@@ -2616,20 +2416,22 @@ def test_the_rules_view_reads_the_dca_plan_as_its_second_endpoint() -> None:
     start = source.index("const ROUTES = [")
     table_src = source[start : source.index("];", start)]
     rows = [line.strip() for line in table_src.splitlines() if 'name: "rules"' in line]
-    assert rows == ['{ name: "rules", label: "Rules", endpoints: ["rules", "dca-plan"] },']
+    assert len(rows) == 1, rows
+    assert rows[0].startswith('{ name: "rules", label: "Rules", endpoints: ["rules", "dca-plan", ')
 
 
 def test_mount_hands_the_rules_view_the_dca_reading_data_and_error() -> None:
     """The secondary reading's `data` AND `error` both reach the view -- `data` alone would turn
-    a 400 into a bare "could not be read" with the reason thrown away."""
+    a 400 into a bare "could not be read" with the reason thrown away. (The research readings
+    that follow it are pinned, pairing by pairing, in `test_rules_view.py`.)"""
     code = _code_only(_source("main.js"))
     calls = re.findall(r"rulesView\(([^;]*)\);", code)
     assert len(calls) == 1, calls
     args = re.sub(r"\s+", " ", calls[0]).strip().rstrip(",").strip()
-    assert args == (
+    assert args.startswith(
         "data, primary.sort, onSort, planReading ? planReading.data : null, "
-        "planReading ? planReading.error : null"
-    )
+        "planReading ? planReading.error : null, "
+    ), args
     assert code.count("const planReading = readings[1];") == 1
 
 

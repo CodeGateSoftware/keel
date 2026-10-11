@@ -752,9 +752,10 @@ def test_insights_journal_command_json_is_valid_no_prose(tmp_path, valid_config_
 # -- the equity curve (#537) ---------------------------------------------------------------------
 #
 # `build_equity_curve` exists because the browser's chart needed coordinates and the client is not
-# allowed to compute them -- `keel/web/static/js/chart.js` is scanned for arithmetic exactly as
-# `render.js` is. So the scaling decision lives here, and these tests are what make that decision
-# checkable rather than merely relocated.
+# allowed to compute them -- the console's `chart.js` was scanned for arithmetic exactly as
+# `render.js` is. The chart left the console in console PR3; the builder stays (that PR's ruling),
+# so the scaling decision still lives here, and these tests are what keep it checkable for any
+# chart that draws it again.
 
 
 def _entry(pnl: Decimal | None, *, closed_at: int = NOW_TS) -> JournalEntry:
@@ -845,7 +846,7 @@ def test_a_curve_of_break_even_trades_sits_on_the_baseline() -> None:
 
 
 def test_every_coordinate_stays_inside_the_box() -> None:
-    """The invariant `chart.js` relies on, since it does no arithmetic of its own.
+    """The invariant any chart drawing this relies on, since the client does no arithmetic.
 
     A coordinate outside the `viewBox` does not raise anywhere -- it draws off the edge of the
     chart, silently, which is exactly the class of failure the browser cannot report."""

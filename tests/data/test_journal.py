@@ -229,7 +229,7 @@ def test_an_empty_string_is_read_back_as_unsaid(repo: Repository) -> None:
 def test_a_zero_or_negative_limit_is_refused_rather_than_obeyed(repo: Repository) -> None:
     """SQLite reads a NEGATIVE `LIMIT` as unbounded, so `--limit -1` would silently print
     everything; a zero returns no rows, and an empty result is indistinguishable from an empty
-    journal on both front-ends. That is the hazard `keel/web/api.py::_journal_limit` was written
+    journal to whoever reads it. That is the hazard `keel/web/api.py::_whole_number` was written
     to name, and refusing is the only reading that cannot lie.
 
     Refused in `gather_journal` rather than only at the click option, so the guard travels with

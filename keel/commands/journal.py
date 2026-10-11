@@ -2,8 +2,10 @@
 
 The `journal` table has been in the schema from the beginning with no repository method and no
 caller -- dead schema, which is worse than no schema because a reader assumes a declared table is
-a used one. This is its wiring: a CLI that writes it, a report both front-ends read, and a place
-in the audit chain beside everything else a human swore to.
+a used one. This is its wiring: a CLI that writes it, a report `keel journal list` reads, and a
+place in the audit chain beside everything else a human swore to -- which is where the console
+shows it, as Timeline `attestation` rows (its own section left with the Insights view in console
+PR3).
 
 ── WHY THIS RECORD IS DIFFERENT FROM EVERY OTHER RECORD HERE ────────────────────────────────────
 
@@ -75,7 +77,7 @@ JOURNAL_ADD_ACTION = "write a journal entry"
 
 @dataclass(frozen=True)
 class JournalEntry:
-    """One entry, as both front-ends read it.
+    """One entry, as `keel journal list` reads it.
 
     Every field but `id`/`ts` is optional, and `None` means DID NOT SAY -- never a zero, an empty
     string, or a `False`. `rules_followed` in particular is three-valued: `False` is the operator
@@ -91,15 +93,6 @@ class JournalEntry:
     dollar_impact: Decimal | None
     chart_note: str | None
     screenshot_ref: str | None
-
-
-#: How many entries the console shows without being asked for more.
-#:
-#: The journal has its OWN cap and is deliberately not paged by `/api/journal`'s `?limit=`. That
-#: parameter is the closed-trade table's page control; applying it here was a coincidence of the
-#: two records sharing a route, and it meant narrowing to one trade silently hid 300 of an
-#: operator's 301 notes.
-DEFAULT_NOTES_LIMIT = 50
 
 
 @dataclass(frozen=True)
@@ -147,8 +140,8 @@ def gather_journal(repo: Repository, *, now_ts: int, limit: int | None = None) -
 
     A NEGATIVE OR ZERO LIMIT IS REFUSED rather than obeyed. SQLite reads a negative `LIMIT` as
     unbounded, so `--limit -1` would silently print everything; a zero returns no rows, and an
-    empty result is indistinguishable from an empty journal on both front-ends -- which is exactly
-    the hazard `keel/web/api.py::_journal_limit` was written to name. Refusing is the only reading
+    empty result is indistinguishable from an empty journal to whoever reads it -- which is exactly
+    the hazard `keel/web/api.py::_whole_number` was written to name. Refusing is the only reading
     that cannot lie.
     """
     if limit is not None and limit < 1:

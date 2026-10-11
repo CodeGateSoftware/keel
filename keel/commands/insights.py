@@ -101,18 +101,23 @@ class JournalReport:
 
         It lives HERE rather than in a front-end because `total_count` alone does not answer "am I
         looking at a page"; the pair does, and the pair is the report's statement about itself.
-        Every renderer -- the CLI's lines, the HTML, `keel/web/payload.py`'s JSON -- reads it
-        instead of measuring the list again, so none of them can disagree about how many rows the
-        same report held. `asdict()` does not include properties, so `--json`'s shape is
-        unchanged.
+        Every renderer -- the CLI's lines today, and `keel/web/payload.py`'s JSON while the console
+        served a journal (until console PR3) -- reads it instead of measuring the list again, so
+        none of them can disagree about how many rows the same report held. `asdict()` does not
+        include properties, so `--json`'s shape is unchanged.
         """
         return len(self.entries)
 
 
 # -- the equity curve (#537) --------------------------------------------------------------------
 #
-# The browser's one chart. It lives HERE, in the report layer, rather than in `keel/web/` -- and
-# the coordinates live here too, which is the part that looks misplaced and is not.
+# **No front-end draws this today.** The console drew it (and `build_equity_series` below) on its
+# Insights view until console PR3 retired the charts; the builders and their tests stay, by that
+# PR's ruling, so a chart can come back as a client module alone, with no server work. The notes
+# below describe the contract any such chart must keep.
+#
+# It lives HERE, in the report layer, rather than in `keel/web/` -- and the coordinates live here
+# too, which is the part that looks misplaced and is not.
 #
 # **Scaling a chart is a judgement about the data, not a drawing detail.** Where the vertical
 # axis starts decides what the picture says: a curve plotted between its own min and max makes a
@@ -124,10 +129,10 @@ class JournalReport:
 #
 # The second reason is arithmetic. Normalising a series means subtracting, dividing and comparing
 # it, and the client is the one place in this system where those operations happen in IEEE-754
-# doubles over values that were exact `Decimal`s a moment earlier. `keel/web/static/js/chart.js`
-# consequently contains no arithmetic at all and `tests/web/test_client_assets.py` scans it for
-# the absence, exactly as it scans `render.js` -- which is only possible because the numbers it
-# draws with arrive finished.
+# doubles over values that were exact `Decimal`s a moment earlier. The console's `chart.js`
+# (deleted in console PR3) consequently contained no arithmetic at all and was scanned for the
+# absence exactly as `render.js` still is -- which was only possible because the numbers it drew
+# with arrived finished.
 #
 # What it would take to move: a chart with a zoom or a pan control. That is interaction over a
 # range the server did not choose, and at that point the range becomes a client concern and this
