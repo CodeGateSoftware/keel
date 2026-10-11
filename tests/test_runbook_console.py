@@ -88,7 +88,9 @@ def test_the_section_says_what_the_browser_cannot_do() -> None:
     """**The safety fact, and the reason this test is the sharpest one here.**
 
     Every capability-increasing action is a CLI command behind a typed confirmation at a
-    terminal; the browser can perform none of them. An operator who believes otherwise will go
+    terminal; the browser can perform none of them, bar the HALT button (stopping is never gated)
+    and the two phrase-gated halt releases the server answers but the page does not draw. An
+    operator who believes otherwise will go
     looking in the wrong place for the button that arms autonomy, and -- worse -- an operator who
     believes the browser CAN do it may leave the page open thinking it is a control surface.
     """
@@ -98,7 +100,11 @@ def test_the_section_says_what_the_browser_cannot_do() -> None:
     assert "typed confirmation" in section or "typed" in section
     # The claim must be about the SERVER, not about what the page happens to draw: "a client that
     # hides a button is not a gate" is the design spec's own sentence.
-    assert "server implements no verb" in section
+    assert "property of the server" in section
+    # ... and it names the two routes that DO write, so the sentence is not the false "no verb".
+    assert "halt button" in section
+    assert "/api/gates/" in section
+    assert "server implements no verb" not in section
 
 
 def test_the_section_answers_the_headless_case() -> None:
