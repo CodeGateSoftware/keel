@@ -1725,7 +1725,10 @@ def test_the_track_records_are_not_the_sortable_collection(
     """Ruling 10: a track-record table sorted by expectancy is the leaderboard the research rail
     refuses one section down. `rules` stays the one sortable collection; a track-record column is
     refused, and sorting the ledger leaves the records in the service's own order."""
-    _seed_paper_rules(running.db_path, ("dca", "turtle_breakout"))
+    # Seeded rsi_meanrev, dca, turtle_breakout: neither A->Z nor Z->A, so a sort of the records
+    # by name (either direction) cannot reproduce the service's order by accident.
+    seeded = ["rsi_meanrev", "dca", "turtle_breakout"]
+    _seed_paper_rules(running.db_path, tuple(seeded))
 
     refused, _headers, _document = _json(running, "/api/rules?sort=expectancy")
     _status, _headers, ascending = _json(running, "/api/rules?sort=kind")
@@ -1733,9 +1736,13 @@ def test_the_track_records_are_not_the_sortable_collection(
 
     assert refused == 400
     assert web_api.API_ROUTES["/api/rules"].collection == "rules"
-    assert [row["kind"] for row in descending["data"]["rules"]] == ["turtle_breakout", "dca"]
-    assert [r["rule_name"] for r in ascending["data"]["records"]] == ["dca", "turtle_breakout"]
-    assert [r["rule_name"] for r in descending["data"]["records"]] == ["dca", "turtle_breakout"]
+    assert [row["kind"] for row in descending["data"]["rules"]] == [
+        "turtle_breakout",
+        "rsi_meanrev",
+        "dca",
+    ]
+    assert [r["rule_name"] for r in ascending["data"]["records"]] == seeded
+    assert [r["rule_name"] for r in descending["data"]["records"]] == seeded
 
 
 def test_a_rules_report_that_cannot_be_built_is_a_500_not_an_empty_ledger(

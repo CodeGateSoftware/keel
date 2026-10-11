@@ -207,10 +207,11 @@ def _plain(value: Decimal) -> str:
 def _decimalise(value: Decimal | float | None) -> Decimal | None:
     """A finite `Decimal`, or `None` for anything that cannot honestly become one.
 
-    The signature still admits a `float`, but the report no longer hands one over: the win rate
-    reaches the serialiser as `win_rate_pct`, a `Decimal` in percent units. Money is `Decimal`
-    end to end and never takes the float path. `repr()` gives the shortest string that
-    round-trips a float, so a float that does arrive is re-encoded, not recomputed. NaN/Inf (from
+    A `float` arrives through `stringify`, for a number inside an open-ended activity event
+    payload; no report statistic takes that path (the win rate reaches the serialiser as
+    `win_rate_pct`, a `Decimal` in percent units, and money is `Decimal` end to end).
+    `repr()` gives the shortest string that round-trips a float, so a float is re-encoded, not
+    recomputed. NaN/Inf (from
     a corrupt log timestamp, or a `Decimal("NaN")` sentinel) become `None` and render as
     absent: a payload is a worse place to raise than a cell is to be empty.
     """
