@@ -50,7 +50,7 @@ def test_pulse_is_the_first_route_in_both_tables_and_the_default() -> None:
 
 
 def test_the_retired_views_are_gone_from_every_table() -> None:
-    retired = {"status", "activity", "gates"}
+    retired = {"status", "activity", "gates", "orders", "positions"}
     index = _INDEX.read_text(encoding="utf-8")
     hrefs = re.findall(r'<li><a href="([^"]+)">', index)
     render = _code_only(_source("render.js"))
@@ -60,7 +60,7 @@ def test_the_retired_views_are_gone_from_every_table() -> None:
     assert retired.isdisjoint(staticfiles.CLIENT_ROUTES)
     assert hrefs, "the nav scan found no links; it has stopped working"
     assert retired.isdisjoint({href.rsplit("/", 1)[-1] for href in hrefs})
-    for name in ("statusView", "activityView", "gatesView"):
+    for name in ("statusView", "activityView", "gatesView", "ordersView", "positionsView"):
         assert f"export function {name}(" not in render, name
         assert name not in main, name
     assert len(re.findall(r"route\.name === \"(?:activity|gates)\"", _comments_stripped(main))) == 0

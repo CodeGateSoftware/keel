@@ -50,8 +50,9 @@ from keel.research.ledger import read_trials
 CSCV_KIND = "cscv"
 
 #: The command that would populate this page. Composed in Python and placed by the client (the
-#: rule #707's cancel modal follows), and it names a REAL session: `--session all` filters to a
-#: session literally called "all", finds nothing, and prints a refusal.
+#: rule #707's cancel modal followed; the modal is gone, the rule stands), and it names a REAL
+#: session: `--session all` filters to a session literally called "all", finds nothing, and
+#: prints a refusal.
 MATRIX_INVOCATION = "keel trials pbo --session {session}"
 
 #: How many synchronous columns a session needs before `trials pbo` can say anything about it.

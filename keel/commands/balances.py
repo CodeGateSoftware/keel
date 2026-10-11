@@ -49,7 +49,7 @@ class AssetBalanceRow:
     """One PRODUCT's holding, summed across its tranches.
 
     Per asset, because that is the question a balances page answers. The tranche breakdown is
-    the Positions view's, and both read `gather_positions` so the two cannot disagree about what
+    the Holdings view's, and both read `gather_positions` so the two cannot disagree about what
     is held.
     """
 

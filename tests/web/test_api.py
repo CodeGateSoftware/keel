@@ -57,7 +57,7 @@ API_ROUTES = (
     "/api/pulse",
     "/api/setup",
     "/api/orders",
-    "/api/positions",
+    "/api/holdings",
     "/api/balances",
     "/api/timeline",
     "/api/insights",
@@ -95,9 +95,10 @@ def test_this_module_pins_every_route_the_server_serves() -> None:
     the envelope, the no-JSON-number walk, the cache headers, the nosniff header and the
     POST refusal. A route left out of it is served with none of those checked.
 
-    That happened: `/api/positions` (#701) shipped outside the tuple, so its reader was executed
-    by no test at all while its payload builder was well covered -- and this module's own header
-    says those are not the same statement. Cross-checked here so the next one cannot.
+    That happened: `/api/positions` (#701, retired for `/api/holdings`) shipped outside the tuple,
+    so its reader was executed by no test at all while its payload builder was well covered --
+    and this module's own header says those are not the same statement. Cross-checked here so the
+    next one cannot.
     """
     from keel.web import api as web_api
 
@@ -220,6 +221,62 @@ def _seed_positions(db_path: str, rows: tuple[tuple[str, str, str], ...]) -> Non
         conn.commit()
     finally:
         conn.close()
+
+
+def _seed_holding(
+    db_path: str,
+    *,
+    qty: str = "2",
+    entry_fill: str = "100050",
+    entry_fee: str = "0",
+    opened_at: int = 1_700_000_000,
+    order_created_at: int | None = None,
+    expected_fill: str = "100000",
+    actual_fill: str | None = None,
+    rule_name: str = "turtle_breakout",
+) -> tuple[int, int | None]:
+    """One open tranche and, when `order_created_at` is given, the BUY that opened it -- written
+    through the REAL writers (`Repository.insert_order` / `open_position`), so the side spelling
+    and the decimal encoding are the ones the join will meet in production. Returns
+    `(position_id, order_id)`."""
+    from decimal import Decimal
+
+    from keel.data.repository import Repository
+    from keel.types import Side
+
+    conn = connect(db_path)
+    try:
+        repo = Repository(conn)
+        order_id = None
+        if order_created_at is not None:
+            order_id = repo.insert_order(
+                {
+                    "mode": "live",
+                    "product_id": "BTC-USD",
+                    "side": Side.BUY.value,
+                    "order_type": "market",
+                    "qty": Decimal(qty),
+                    "status": "filled",
+                    "expected_fill": Decimal(expected_fill),
+                    "actual_fill": Decimal(actual_fill or entry_fill),
+                    "filled_quantity": Decimal(qty),
+                    "confirmation": "autonomous",
+                    "created_at": order_created_at,
+                    "updated_at": order_created_at,
+                }
+            )
+        position_id = repo.open_position(
+            product_id="BTC-USD",
+            rule_name=rule_name,
+            opened_at=opened_at,
+            qty=Decimal(qty),
+            entry_fill=Decimal(entry_fill),
+            entry_fee=Decimal(entry_fee),
+            initial_stop=Decimal("90000"),
+        )
+    finally:
+        conn.close()
+    return position_id, order_id
 
 
 def _seed_orders(db_path: str, rows: tuple[tuple[str, str, str], ...]) -> None:
@@ -563,8 +620,10 @@ def test_every_declared_sort_column_is_a_column_the_rows_actually_have(
     _seed_rules(running.db_path, ("breakout",))
     _seed_orders(running.db_path, (("BTC-USD", "buy", "50000"),))
 
+    _seed_holding(running.db_path, order_created_at=1_699_000_000, opened_at=1_699_000_000)
+
     for path, collection in (
-        ("/api/positions", "rows"),
+        ("/api/holdings", "rows"),
         ("/api/rules", "rules"),
         ("/api/timeline", "rows"),
     ):
@@ -590,7 +649,7 @@ WEI_APART = (
 
 
 def test_float_and_decimal_orderings_of_the_same_column_genuinely_differ() -> None:
-    """The premise of the test below, asserted rather than assumed.
+    """The premise of `test_holdings_sorts_by_decimal_on_cost`, asserted rather than assumed.
 
     If `float` and `Decimal` agreed on these three strings, the endpoint test would be green for
     no reason -- it would prove only that sorting sorts. So this states the disagreement first:
@@ -603,32 +662,6 @@ def test_float_and_decimal_orderings_of_the_same_column_genuinely_differ() -> No
     # Ascending by float keeps the input order of the tied pair; ascending by Decimal swaps it.
     assert sorted(WEI_APART, key=float) == [WEI_APART[2], WEI_APART[0], WEI_APART[1]]
     assert sorted(WEI_APART, key=Decimal) == [WEI_APART[2], WEI_APART[1], WEI_APART[0]]
-
-
-def test_the_endpoint_orders_with_decimal_not_float(running: web_server.ServeConfig) -> None:
-    """The end-to-end half: the same three quantities through the real table, the real report
-    builder, the real serialiser and the real sort.
-
-    A float-keyed implementation would answer `[0.099, ...002, ...001]` here -- the tied pair left
-    in insertion order, because the comparison cannot tell them apart. `Decimal` answers
-    `[0.099, ...001, ...002]`. The difference is one wei on one row, which is exactly the size of
-    error that survives review and shows up in a reconciliation."""
-    _seed_positions(
-        running.db_path, tuple((f"TKN{i}-USD", qty, "50000") for i, qty in enumerate(WEI_APART))
-    )
-
-    _status, _headers, unsorted = _json(running, "/api/positions")
-    _status, _headers, document = _json(running, "/api/positions?sort=qty")
-
-    as_built = [row["qty"]["value"] for row in unsorted["data"]["rows"]]
-    ordered = [row["qty"]["value"] for row in document["data"]["rows"]]
-
-    assert ordered == [WEI_APART[2], WEI_APART[1], WEI_APART[0]]
-    # The comparison that makes this test say something: the SAME rows, in the order the report
-    # built them, keyed by `float` instead. Python's sort is stable, so the tied pair keeps its
-    # arrival order and the answer differs from the one above by one row.
-    assert sorted(as_built, key=float) == [WEI_APART[2], WEI_APART[0], WEI_APART[1]]
-    assert ordered != sorted(as_built, key=float)
 
 
 def test_a_missing_figure_sorts_last_in_both_directions() -> None:
@@ -919,7 +952,8 @@ def test_pulse_lists_the_next_cadence_day_for_live_dca_rules_only(
 
 def test_pulse_declares_no_sortable_collection() -> None:
     """Its tables are intrinsic orders (`rule_counts`, freshness in the config's product order,
-    cycles newest first); a display sort would destroy them. `/api/positions` owns the sort."""
+    cycles newest first); a display sort would destroy them. `/api/holdings` owns the tranche
+    sort."""
     route = web_api.API_ROUTES["/api/pulse"]
 
     assert route.sortable == ()
@@ -1444,6 +1478,26 @@ def test_read_orders_scopes_by_the_clock_it_was_handed(
     assert body["scope"] == "today"
     assert body["scoped_count"]["value"] == scoped, label
     assert body["total_count"]["value"] == "3", label + ": the book itself is unchanged"
+
+
+def test_read_orders_never_classifies_a_cancel(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The console renders no cancel classification, so `/api/orders` must not compute one per
+    row and throw it away. Only `keel orders cancel` calls `classify_cancel`."""
+    from keel.commands import orders as orders_mod
+    from keel.web.api import read_orders
+
+    def boom(*args: Any, **kwargs: Any) -> None:
+        raise AssertionError("classify_cancel must not run for /api/orders")
+
+    monkeypatch.setattr(orders_mod, "classify_cancel", boom)
+    cfg = _book_at(tmp_path, 1_788_998_400 + 43_200)
+
+    body = read_orders(cfg, {"scope": ["all"]}, None, 1_788_998_400 + 43_200)
+
+    assert body["total_count"]["value"] == "3"
+    assert len(body["rows"]) == 3, "the fixture must reach the reader"
 
 
 def test_respond_hands_the_reader_the_same_instant_it_stamped(
@@ -2114,3 +2168,66 @@ def test_screen_cache_is_thread_safe_under_concurrent_misses(
 
     assert calls["n"] == 1, "concurrent misses on the same key must build exactly once"
     assert results == ["report"] * 8
+
+
+# -- /api/holdings --------------------------------------------------------------------------------
+
+
+def test_holdings_rows_carry_the_entry_order_figures_when_one_matches(
+    running: web_server.ServeConfig,
+) -> None:
+    """The join end to end, through the real writers. The matched row's `entry_order_id` is the
+    seeded order's id -- the assertion that proves the seeded order reached the reader, so the
+    figures below cannot be green by vacuum. The paper-shaped gap (order stamped with the BAR's
+    ts, more than a day before the tranche) is the harder case and is the one seeded."""
+    _position_id, order_id = _seed_holding(
+        running.db_path,
+        opened_at=1_700_100_000,
+        order_created_at=1_700_000_000,
+        expected_fill="100000",
+        entry_fill="100050",
+    )
+    assert order_id is not None
+
+    _status, _headers, document = _json(running, "/api/holdings")
+    (row,) = document["data"]["rows"]
+
+    assert row["entry_order_id"] == str(order_id)
+    assert row["expected_fill"]["value"] == "100000"
+    assert row["actual_fill"]["value"] == "100050"
+    assert row["fill_divergence"]["value"] == "50"
+    assert row["fill_divergence"]["state"] == "bad"
+    assert row["placement"]["display"] == "AUTONOMOUS"
+    assert document["data"]["rules"] == ["turtle_breakout"]
+    assert document["data"]["open_count"]["value"] == "1"
+
+
+def test_holdings_rows_say_unknown_when_no_order_matches(
+    running: web_server.ServeConfig,
+) -> None:
+    _seed_holding(running.db_path, order_created_at=None)
+
+    _status, _headers, document = _json(running, "/api/holdings")
+    (row,) = document["data"]["rows"]
+
+    assert row["entry_order_id"] == ""
+    assert row["placement"]["state"] == "unknown"
+    for key in ("expected_fill", "actual_fill", "fill_divergence"):
+        assert row[key]["display"] == "unknown", key
+        assert row[key]["state"] == "unknown", key
+
+
+def test_holdings_sorts_by_decimal_on_cost(running: web_server.ServeConfig) -> None:
+    """Cost is `qty * 1 + 0` here, so the three costs are the three wei-apart quantities: the
+    pair a `float` cannot tell apart. Sorted by the server, as `Decimal`."""
+    for qty in WEI_APART:
+        _seed_holding(running.db_path, qty=qty, entry_fill="1")
+
+    _status, _headers, unsorted = _json(running, "/api/holdings")
+    _status, _headers, document = _json(running, "/api/holdings?sort=cost")
+
+    as_built = [row["cost"]["value"] for row in unsorted["data"]["rows"]]
+    ordered = [row["cost"]["value"] for row in document["data"]["rows"]]
+    assert sorted(as_built) == sorted(WEI_APART)  # the seeded rows reached the reader
+    assert ordered == [WEI_APART[2], WEI_APART[1], WEI_APART[0]]
+    assert ordered != sorted(as_built, key=float)

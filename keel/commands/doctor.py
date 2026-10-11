@@ -1573,7 +1573,7 @@ def ledger_drift_findings(
             WARN,
             f"{len(drifted)} product(s) where the ledger and the orders log disagree",
             detail + " -- a filled entry with no tranche (#799) or an unbooked sale",
-            "inspect the console's Positions view and `keel orders list`: a filled entry with no "
+            "inspect the console's Holdings view and `keel orders list`: a filled entry with no "
             "tranche needs its tranche recorded by hand (#799); a sale the orders log already "
             "holds needs booking against its tranche by hand -- not `keel positions close`, "
             "which would write a second SELL",

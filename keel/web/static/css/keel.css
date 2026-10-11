@@ -298,29 +298,12 @@ header .mode-paper { color: var(--muted); }
 header .mode-confirm,
 header .mode-live { color: var(--accent); border-color: var(--accent); }
 
-/* THE CANCEL-HELP MODAL (#707).
+/* A COMMAND IN A BLOCK (#707, #708).
  *
- * A `<dialog>`, so focus trapping, Escape and the backdrop are the browser's rather than
- * hand-built: a modal that traps focus badly is worse than none on a page an operator reaches with
- * a keyboard.
- *
- * `.linklike` is a button that does not look like a filled action, because none of these buttons
- * DOES anything to the deployment -- one opens instructions, one copies text, one closes. The
- * filled `button` rule is reserved for a control that changes something on the server, and there
- * is no such control anywhere in this console. */
-.cancelhelp {
-  max-width: 34rem;
-  border: 1px solid var(--line);
-  border-radius: 6px;
-  background: var(--card);
-  color: var(--fg);
-  padding: 1.25rem;
-}
-.cancelhelp::backdrop { background: rgba(0, 0, 0, 0.45); }
-.cancelhelp h2 { margin: 0 0 0.5rem; font-size: 1rem; }
-/* The command itself: selectable, wrapping, and monospaced, so an operator who cannot use the
- * clipboard button can still read and select it. The copy button is a convenience, never the only
- * way to get the command. */
+ * The command itself: selectable, wrapping, and monospaced, so an operator can read and select it.
+ * The research matrix wraps the `keel trials pbo` invocation in it. (The cancel-help modal that
+ * first used it is gone with the Orders view's cancel cell; so is the link-styled button
+ * that modal's three controls shared.) */
 .invocation {
   margin: 0.75rem 0;
   padding: 0.6rem 0.75rem;
@@ -332,15 +315,6 @@ header .mode-live { color: var(--accent); border-color: var(--accent); }
   white-space: pre-wrap;
   word-break: break-word;
   user-select: all;
-}
-.linklike {
-  background: none;
-  border: none;
-  padding: 0;
-  color: var(--accent);
-  font: inherit;
-  text-decoration: underline;
-  cursor: pointer;
 }
 
 /* THE PLANS PAGE's claim list (#706).

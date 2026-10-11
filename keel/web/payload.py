@@ -124,6 +124,7 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
     from keel.commands.dca_plan import BuyCap, DcaPlan
     from keel.commands.evidence_matrix import MatrixReport, MatrixRow
     from keel.commands.gauntlet import GauntletReport, GauntletRow
+    from keel.commands.holdings import HoldingRow, HoldingsReport
     from keel.commands.insights import (
         AccountSummary,
         EquityCurve,
@@ -143,7 +144,7 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
     from keel.commands.journal import JournalReport as DiscretionaryJournal
     from keel.commands.orders import OrderRow, OrdersReport
     from keel.commands.plans import Claim, PlansReport, Tier, Trigger
-    from keel.commands.positions import PositionRow, PositionsReport
+    from keel.commands.positions import PositionRow
     from keel.commands.pulse import PulseReport
     from keel.commands.research_record import RuleExploration, TrialRow, TrialsReport
     from keel.commands.slippage import SlippageReport, SlippageRow
@@ -826,8 +827,11 @@ def _session_payload(session: MarketSessionStatus) -> dict[str, Any]:
     }
 
 
-def _bracket_field(position: OpenPositionStatus, mode: str) -> Field:
+def _bracket_field(has_bracket: bool, initial_stop: Decimal | None, mode: str) -> Field:
     """The `bracket` column for one open position (#641).
+
+    Takes the two facts it judges on rather than a row, so Pulse's `OpenPositionStatus` and
+    Holdings' tranche (`HoldingRow`) are judged by this one function and cannot disagree.
 
     Live's meaning is untouched and load-bearing: `NO bracket` there names a real venue-order
     gap -- exactly the state `reconcile_unbracketed_positions` and the `unbracketed:` crash
@@ -843,16 +847,16 @@ def _bracket_field(position: OpenPositionStatus, mode: str) -> Field:
     predates that migration, or a DCA leg that never got one, has no number to show and says so
     (NEUTRAL, not WARN) rather than asserting one it does not have.
     """
-    if position.has_bracket or mode != "paper":
+    if has_bracket or mode != "paper":
         return flag(
-            position.has_bracket,
+            has_bracket,
             on="bracketed",
             off="NO bracket",
             on_state=GOOD,
             off_state=WARN,
         )
-    if position.initial_stop is not None:
-        stop = money(position.initial_stop)
+    if initial_stop is not None:
+        stop = money(initial_stop)
         return label(stop["value"], display=f"paper stop {stop['display']}", state=NEUTRAL)
     return label("n/a", display="n/a -- paper resolves stop/target on candle touch", state=NEUTRAL)
 
@@ -909,7 +913,7 @@ def _position_payload(position: OpenPositionStatus, mode: str) -> dict[str, Any]
         "qty": quantity(position.qty),
         "entry_price": money(position.entry_price),
         "opened_at": moment(position.opened_at),
-        "bracket": _bracket_field(position, mode),
+        "bracket": _bracket_field(position.has_bracket, position.initial_stop, mode),
     }
 
 
@@ -1687,8 +1691,9 @@ def matrix_payload(report: MatrixReport) -> dict[str, Any]:
     """The Evidence Matrix (#708 view 2).
 
     `invocation` is composed HERE and placed by the client, the same rule #707's cancel modal
-    follows: a client concatenating `keel trials pbo --session ` and a name could print a command
-    that does not exist, and the session it names has to be one that ACTUALLY HAS COLUMNS --
+    followed (the modal is gone; the rule stands): a client concatenating
+    `keel trials pbo --session ` and a name could print a command that does not exist, and the
+    session it names has to be one that ACTUALLY HAS COLUMNS --
     `--session all` would filter to a session literally named "all" and refuse.
     """
     from keel.commands.evidence_matrix import MATRIX_INVOCATION
@@ -2011,60 +2016,23 @@ _ORDER_STATUS_STATES: dict[str, str] = {
 }
 
 
-#: The state each cancel kind carries. `entry` is NEUTRAL and never GOOD -- cancelling one is
-#: ordinary, not an achievement -- and `protective` warns because acting on it removes a stop.
-_CANCEL_STATES: Mapping[str, str] = {
-    "entry": NEUTRAL,
-    "exit": WARN,
-    "protective": WARN,
-    "unknown": UNKNOWN,
-}
+def _divergence_state(adverse: bool | None) -> str:
+    """The state of a fill divergence, from the SERVICE's verdict (`fill_divergence_adverse`).
+
+    A negative divergence is GOOD on a sell and BAD on a buy, so `money`'s own sign-derived state
+    would be wrong on half the rows -- which is why the state is passed rather than inferred. One
+    expression, shared by the Orders rows and the Holdings tranches."""
+    return NEUTRAL if adverse is None else (BAD if adverse else GOOD)
 
 
-def _cancel_payload(decision: Any) -> dict[str, Any]:
-    """How an operator cancels this order, and what cancelling it would mean (#707).
-
-    **There is no route behind any of this, and that is the design rather than a gap.** `keel
-    serve` holds no venue credential and no broker handle; the whole console is a loopback reader
-    of a SQLite file. Cancelling reaches a venue, so it happens in a terminal invocation the
-    operator started -- and what the console does instead is CLASSIFY (a read) and hand over the
-    exact command.
-
-    The `invocation` is composed in `commands/orders.py` and placed here unread. A client building
-    the command itself could print one that does not exist; a payload that omitted it would leave
-    the operator to reconstruct an order id from a table.
-
-    `kind` carries its judgement as a state (Rule 3) because the two readings are not symmetric: an
-    entry is ordinary, and a protective leg is the one an operator should hesitate over.
-    """
-    from keel.commands.orders import CANCEL_NOTES
-
-    return {
-        "headline": decision.headline,
-        "kind": label(
-            decision.kind,
-            display=decision.kind,
-            state=_CANCEL_STATES.get(decision.kind, UNKNOWN),
-        ),
-        "note": CANCEL_NOTES.get(decision.kind, ""),
-        # A flag rather than a bare bool: "this cannot be cancelled" and "this can" are different
-        # sentences, and the reason belongs beside the second one.
-        "cancellable": flag(
-            bool(decision.cancellable),
-            on="resting — cancellable from the terminal",
-            off=decision.reason or "not cancellable",
-            on_state=NEUTRAL,
-            off_state=UNKNOWN,
-        ),
-        "typed": flag(
-            bool(decision.typed),
-            on="typed phrase required",
-            off="asks once",
-            on_state=WARN,
-            off_state=NEUTRAL,
-        ),
-        "invocation": decision.invocation,
-    }
+def _placement_field(is_autonomous: bool, confirmation: str) -> Field:
+    return flag(
+        is_autonomous,
+        on="AUTONOMOUS",
+        off=confirmation or "unrecorded",
+        on_state=WARN,
+        off_state=NEUTRAL,
+    )
 
 
 def _order_row_payload(row: OrderRow) -> dict[str, Any]:
@@ -2097,13 +2065,7 @@ def _order_row_payload(row: OrderRow) -> dict[str, Any]:
         # FIRST, and that is the layout argument rather than a JSON convention: on a deployment
         # running `autonomy: ON`, "did I approve this, or did keel place it alone" is the most
         # important thing about an order. The client renders keys in this order.
-        "placement": flag(
-            row.confirmation_is_autonomous,
-            on="AUTONOMOUS",
-            off=row.confirmation or "unrecorded",
-            on_state=WARN,
-            off_state=NEUTRAL,
-        ),
+        "placement": _placement_field(row.confirmation_is_autonomous, row.confirmation),
         "placement_note": row.confirmation_detail,
         "confirmation": label(row.confirmation or "unrecorded", state=NEUTRAL),
         "id": count(row.id),
@@ -2125,14 +2087,7 @@ def _order_row_payload(row: OrderRow) -> dict[str, Any]:
         "fill_divergence": money(
             row.fill_divergence,
             signed=True,
-            # The service decided this. A negative divergence is GOOD on a sell and BAD on a
-            # buy, so `money`'s own sign-derived state would be wrong on half the rows -- which
-            # is why the state is passed rather than inferred.
-            state=(
-                NEUTRAL
-                if row.fill_divergence_adverse is None
-                else (BAD if row.fill_divergence_adverse else GOOD)
-            ),
+            state=_divergence_state(row.fill_divergence_adverse),
         ),
         "fill_divergence_adverse": flag(
             row.fill_divergence_adverse,
@@ -2184,9 +2139,6 @@ def _order_row_payload(row: OrderRow) -> dict[str, Any]:
         "rule_id": count(row.rule_id),
         "created_at": moment(row.created_at),
         "updated_at": moment(row.updated_at),
-        # #707: how to cancel this, and what cancelling it would mean. No route behind it --
-        # see `_cancel_payload`.
-        "cancel": _cancel_payload(row.cancel),
     }
 
 
@@ -2280,73 +2232,77 @@ def _readiness_field(ready: bool, reason: str | None) -> Field:
     )
 
 
-def _position_row_payload(row: PositionRow) -> dict[str, Any]:
-    """One open tranche, placed. Nothing is decided here.
+def _unknown_fill() -> Field:
+    """A figure the join could not supply: the word "unknown", never `absent()`'s dash and never a
+    zero. A tranche whose entry order was not identified has no slippage to report, and a blank or
+    a `$0.00` there would read as "no slippage" -- a claim nobody made."""
+    return {"value": "", "display": "unknown", "state": UNKNOWN}
 
-    Every judgement was made by `keel/commands/positions.py`: what the mark is, whether there is
-    one, what the stop distance is and whether the entry gate would open. This function chooses a
-    `state` word and a symbol for each figure, which is all -- and is what makes this page and
-    `keel status` incapable of disagreeing about the same tranche.
 
-    **`unrealized` and `stop_distance` are the only two figures that carry a verdict**, because
-    they are the only two whose sign means something. A market value is a magnitude: an account
-    is not good for being worth something, and a glyph on every balance would hide the one figure
-    that matters. On `stop_distance`, negative means the tranche is trading THROUGH the
-    protection it was sized against -- keel is cash-spot and long-only (`CashAccountRequired`,
-    #372), so a stop always sits below the mark and the sign has one meaning.
+def _holding_row_payload(row: HoldingRow, mode: str) -> dict[str, Any]:
+    """One open tranche for the Holdings view, placed. Nothing is decided here.
 
-    **No notional, no cost basis, no ratio this layer computed.** Everything here is on the
-    report. `stop_distance_pct` crosses as the raw FRACTION with no `%`, the same posture `ratio`
-    documents for the drawdown scalars -- rescaling it by 100 would be arithmetic Rule 2 forbids.
+    The cost, the join and the slippage verdict are the service's (`keel/commands/holdings.py`);
+    this function chooses states and symbols. NO mark, market value, unrealized P&L or stop
+    distance: the view is about what each tranche cost and how it was entered, and `PositionRow`
+    keeps those figures for `keel positions` and the balances view.
+
+    When no entry order was identified the placement and the three fill figures cross as UNKNOWN
+    (`_unknown_fill`), with the service's own sentence as the placement display -- never absent
+    and never zero.
     """
+    p, o = row.position, row.entry_order
+    if o is None:
+        placement = label("unknown", display=row.entry_order_note, state=UNKNOWN)
+        expected, actual, divergence = _unknown_fill(), _unknown_fill(), _unknown_fill()
+    else:
+        placement = _placement_field(o.confirmation_is_autonomous, o.confirmation)
+        expected = money(o.expected_fill)
+        actual = money(o.actual_fill)
+        divergence = money(
+            o.fill_divergence, signed=True, state=_divergence_state(o.fill_divergence_adverse)
+        )
     return {
-        "id": str(row.id),
-        "product_id": row.product_id,
-        "rule_name": row.rule_name,
-        "opened_at": moment(row.opened_at),
-        "qty": quantity(row.qty),
-        "entry_fill": money(row.entry_fill),
-        "entry_fee": money(row.entry_fee),
-        "mark": money(row.mark),
-        "mark_at": moment(row.mark_ts),
-        "market_value": money(row.market_value),
-        "unrealized": money(row.unrealized_pnl, signed=True),
-        "initial_stop": money(row.initial_stop),
-        "stop_distance": money(row.stop_distance, signed=True),
-        # FOUR places, not `ratio`'s default two. At two, a tranche 0.2% through its stop and one
-        # 0.2% above it render as "-0.00" and "0.00" side by side -- illegible in exactly the
-        # range this column exists to show, since a position near its stop is the one worth
-        # finding. The paired `stop_distance` still carries the verdict.
-        "stop_distance_pct": ratio(row.stop_distance_pct, places=4),
-        "realized_qty": quantity(row.realized_qty),
-        "realized_proceeds": money(row.realized_proceeds),
-        "realized_fees": money(row.realized_fees),
-        "freshness": _readiness_field(row.ready, row.ready_reason),
-        # #701. BESIDE the freshness verdict, never merged with it: one is a claim about the
-        # WORLD (what this token is, and whether the claim is in date) and the other is a
-        # claim about DATA. They disagree in both directions, and a reader needs to know
-        # which of the two is the reason a row is flagged.
-        "attestation": _attestation_chip(row),
-        "attest_due_at": moment(row.attest_due_ts),
+        "id": str(p.id),
+        "product_id": p.product_id,
+        "rule_name": p.rule_name,
+        "opened_at": moment(p.opened_at),
+        "qty": quantity(p.qty),
+        "entry_fill": money(p.entry_fill),
+        "entry_fee": money(p.entry_fee),
+        "cost": money(row.cost),
+        "stop": money(p.initial_stop),
+        "bracket": _bracket_field(row.has_bracket, p.initial_stop, mode),
+        "freshness": _readiness_field(p.ready, p.ready_reason),
+        "attestation": _attestation_chip(p),
+        "attest_due_at": moment(p.attest_due_ts),
+        "placement": placement,
+        "expected_fill": expected,
+        "actual_fill": actual,
+        "fill_divergence": divergence,
+        "entry_order_id": "" if o is None else str(o.id),
+        "realized_qty": quantity(p.realized_qty),
+        "realized_proceeds": money(p.realized_proceeds),
+        "realized_fees": money(p.realized_fees),
     }
 
 
-def positions_payload(report: PositionsReport) -> dict[str, Any]:
-    """`gather_positions`'s `PositionsReport`, as JSON.
+def holdings_payload(report: HoldingsReport) -> dict[str, Any]:
+    """`gather_holdings`'s `HoldingsReport`, as JSON.
 
-    `open_count` and `products` are READ from the report, never measured here -- Rule 6e bans
-    `len()` in this module, and both properties exist on the report so the ban costs nothing.
-
-    `products` is the grouping key a view renders sections from. It is the report's own list, in
-    its own order, so a client cannot build a second one and reach a different answer about which
-    products this book holds.
+    `open_count`, `rules` and `stop_rows_present` are READ from the report (Rule 6e bans `len()`
+    here). `rules` is the grouping key, in the report's own order; `stop_rows_present` lists the
+    tranche ids that carry a stop, so the view draws its stop column on that list being non-empty
+    and never by reading a `display` or `value`.
     """
     return {
         "as_of": iso(report.now_ts),
         "generated_at": moment(report.now_ts),
+        "mode": report.mode,
         "open_count": count(report.open_count),
-        "products": [str(product) for product in report.products],
-        "rows": [_position_row_payload(row) for row in report.rows],
+        "rules": [str(rule) for rule in report.rules],
+        "stop_rows_present": [str(i) for i in report.stop_row_ids],
+        "rows": [_holding_row_payload(row, report.mode) for row in report.rows],
     }
 
 

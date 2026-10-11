@@ -40,6 +40,7 @@ import pytest
 from keel_core.types import EquityReading
 
 from keel.commands.activity import ActivityCycle, ActivityEvent, ActivityFeed
+from keel.commands.holdings import ENTRY_ORDER_NOT_IDENTIFIED, HoldingsReport, gather_holdings
 from keel.commands.insights import (
     AccountSummary,
     GateDistance,
@@ -63,6 +64,10 @@ from keel.commands.status import (
     SubscriptionStatusRow,
     WithdrawalAttestationStatus,
 )
+from keel.config import load_config
+from keel.data.db import connect, migrate
+from keel.data.repository import Repository
+from keel.types import Side
 from keel.venue_readiness import VenueReadiness, VenueReadinessRow
 from keel.web import payload
 
@@ -449,6 +454,7 @@ def _every_payload() -> dict[str, Any]:
     separate guards."""
     return {
         "pulse": payload.pulse_payload(_pulse_report(), gate="gate-token"),
+        "holdings": payload.holdings_payload(_holdings_report()),
         "insights": payload.insights_payload(
             _insights_report(),
             series=build_equity_series(_equity_readings(), max_total_dd_pct=Decimal("0.20")),
@@ -1525,6 +1531,7 @@ def test_every_builder_survives_a_completely_empty_report() -> None:
                 unbracketed_count=0,
             )
         ),
+        "holdings": payload.holdings_payload(HoldingsReport(now_ts=NOW_TS, mode="paper", rows=())),
         "insights": payload.insights_payload(
             _insights_report(rules=[], closed_trade_count=0),
             series=build_equity_series([]),
@@ -1541,7 +1548,13 @@ def test_every_builder_survives_a_completely_empty_report() -> None:
 
 @pytest.mark.parametrize(
     "builder",
-    ["pulse_payload", "insights_payload", "journal_payload", "activity_payload"],
+    [
+        "pulse_payload",
+        "holdings_payload",
+        "insights_payload",
+        "journal_payload",
+        "activity_payload",
+    ],
 )
 def test_every_payload_is_json_serialisable_without_a_custom_encoder(builder: str) -> None:
     """The builders return plain `dict`/`list`/`str` -- no `Decimal` reaches `json.dumps`. That
@@ -1574,6 +1587,10 @@ def test_every_payload_is_json_serialisable_without_a_custom_encoder(builder: st
         # Its own required `PulseReport` plus the optional gate: spelled out, like
         # `insights_payload`'s `series`, so no default ever stands in for either.
         json.dumps(payload.pulse_payload(_pulse_report(), gate="gate-token"))
+        return
+
+    if builder == "holdings_payload":
+        json.dumps(payload.holdings_payload(_holdings_report()))
         return
 
     other = {
@@ -2408,3 +2425,203 @@ def test_the_no_cycles_line_crosses_exactly_as_the_service_worded_it() -> None:
     line = "keel has not run yet today."
     assert payload.pulse_payload(_pulse_report(no_cycles_line=line))["no_cycles_line"] == line
     assert payload.pulse_payload(_pulse_report(no_cycles_line=""))["no_cycles_line"] == ""
+
+
+# -- holdings: the Holdings view's tranche rows -------------------------------------------------
+
+_HOLDING_FILL = Decimal("100050")
+
+
+def _holdings_report(
+    *,
+    order: dict[str, Any] | None = None,
+    tranche: dict[str, Any] | None = None,
+    mode: str | None = None,
+    extra_tranche: dict[str, Any] | None = None,
+) -> HoldingsReport:
+    """A real `gather_holdings` over a throwaway ledger, so every verdict on the wire was made by
+    the service. The order is seeded in the spelling the real writers use (`Side.BUY.value`)."""
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as tmp:
+        from tests.conftest import VALID_CONFIG_YAML
+
+        cfg_path = Path(tmp) / "config.yaml"
+        cfg_path.write_text(VALID_CONFIG_YAML, encoding="utf-8")
+        config = load_config(str(cfg_path))
+        conn = connect(str(Path(tmp) / "keel.db"))
+        migrate(conn)
+        repo = Repository(conn)
+        if order is not None:
+            row: dict[str, Any] = {
+                "mode": "live",
+                "product_id": "BTC-USD",
+                "side": Side.BUY.value,
+                "order_type": "market",
+                "qty": Decimal("2"),
+                "limit_price": None,
+                "status": "filled",
+                "fee": Decimal("1.20"),
+                "expected_fill": Decimal("100000"),
+                "actual_fill": _HOLDING_FILL,
+                "filled_quantity": Decimal("2"),
+                "raw_response": None,
+                "confirmation": "autonomous",
+                "rule_id": None,
+                "created_at": NOW_TS - 7200,
+                "updated_at": NOW_TS - 7200,
+            }
+            row.update(order)
+            repo.insert_order(row)
+        for spec in (tranche or {}, *([extra_tranche] if extra_tranche is not None else [])):
+            fields: dict[str, Any] = {
+                "product_id": "BTC-USD",
+                "rule_name": "turtle_breakout",
+                "opened_at": NOW_TS - 7200,
+                "qty": Decimal("2"),
+                "entry_fill": _HOLDING_FILL,
+                "entry_fee": Decimal("1.20"),
+                "initial_stop": Decimal("90000"),
+            }
+            fields.update(spec)
+            repo.open_position(**fields)
+        report = gather_holdings(repo, config, now_ts=NOW_TS)
+        conn.close()
+    return replace(report, mode=mode) if mode is not None else report
+
+
+_HOLDING_ROW_KEYS = [
+    "id",
+    "product_id",
+    "rule_name",
+    "opened_at",
+    "qty",
+    "entry_fill",
+    "entry_fee",
+    "cost",
+    "stop",
+    "bracket",
+    "freshness",
+    "attestation",
+    "attest_due_at",
+    "placement",
+    "expected_fill",
+    "actual_fill",
+    "fill_divergence",
+    "entry_order_id",
+    "realized_qty",
+    "realized_proceeds",
+    "realized_fees",
+]
+
+_HOLDINGS_TOP_KEYS = [
+    "as_of",
+    "generated_at",
+    "mode",
+    "open_count",
+    "rules",
+    "stop_rows_present",
+    "rows",
+]
+
+
+def test_no_wire_value_in_the_holdings_payload_is_a_json_number() -> None:
+    document = json.loads(
+        json.dumps(payload.holdings_payload(_holdings_report(order={}, tranche={})))
+    )
+    assert document["rows"]  # the fixture reached the serialiser
+    assert _json_numbers(document) == []
+
+
+def test_the_holdings_payload_and_its_rows_have_exactly_these_keys() -> None:
+    document = payload.holdings_payload(_holdings_report(order={}))
+    assert sorted(document) == sorted(_HOLDINGS_TOP_KEYS)
+    (row,) = document["rows"]
+    assert sorted(row) == sorted(_HOLDING_ROW_KEYS)
+
+
+def test_the_holdings_top_level_reads_the_report() -> None:
+    document = payload.holdings_payload(_holdings_report(order={}, mode="confirm"))
+    assert document["mode"] == "confirm"
+    assert document["open_count"]["value"] == "1"
+    assert document["rules"] == ["turtle_breakout"]
+    assert document["stop_rows_present"] == [document["rows"][0]["id"]]
+
+
+def test_a_matched_tranche_carries_its_entry_orders_figures() -> None:
+    (row,) = payload.holdings_payload(_holdings_report(order={}))["rows"]
+    assert row["entry_order_id"] != ""
+    assert row["placement"]["display"] == "AUTONOMOUS"
+    assert row["expected_fill"]["value"] == "100000"
+    assert row["actual_fill"]["value"] == "100050"
+    assert row["fill_divergence"]["value"] == "50"
+
+
+def test_a_tranche_without_an_entry_order_crosses_as_unknown_placement_and_unknown_slippage() -> (
+    None
+):
+    (row,) = payload.holdings_payload(_holdings_report(order=None))["rows"]
+    assert row["entry_order_id"] == ""
+    assert row["placement"]["display"] == ENTRY_ORDER_NOT_IDENTIFIED
+    assert row["placement"]["state"] == "unknown"
+    for key in ("expected_fill", "actual_fill", "fill_divergence"):
+        assert row[key] == {"value": "", "display": "unknown", "state": "unknown"}, key
+        assert row[key]["display"] not in ("0", "$0.00", "—")
+
+
+@pytest.mark.parametrize(
+    ("actual", "state"),
+    [("100050", "bad"), ("99950", "good")],
+)
+def test_the_holdings_slippage_state_is_the_services_verdict_not_the_sign(
+    actual: str, state: str
+) -> None:
+    """A buy that filled above its expectation is adverse (BAD); below it, favourable (GOOD)."""
+    row = payload.holdings_payload(
+        _holdings_report(
+            order={"actual_fill": Decimal(actual)}, tranche={"entry_fill": Decimal(actual)}
+        )
+    )["rows"][0]
+    assert row["fill_divergence"]["state"] == state
+
+
+def test_a_stop_is_absent_not_zero_when_none_was_recorded() -> None:
+    document = payload.holdings_payload(_holdings_report(tranche={"initial_stop": None}))
+    (row,) = document["rows"]
+    assert row["stop"]["state"] == "unknown" and row["stop"]["value"] == ""
+    assert row["stop"]["display"] != "$0.00"
+    assert document["stop_rows_present"] == []
+
+
+def test_cost_crosses_as_the_services_figure() -> None:
+    (row,) = payload.holdings_payload(_holdings_report())["rows"]
+    assert row["cost"]["value"] == "200101.20"
+
+
+def test_the_holdings_payload_drops_every_mark_derived_key() -> None:
+    (row,) = payload.holdings_payload(_holdings_report())["rows"]
+    banned = ("mark", "market_value", "unrealized", "stop_distance", "mark_at")
+    assert not [k for k in row if k.startswith(banned)]
+
+
+@pytest.mark.parametrize(
+    ("mode", "bracket", "stop", "display", "state"),
+    [
+        ("confirm", False, None, "NO bracket", "warn"),
+        ("confirm", True, None, "bracketed", "good"),
+        ("paper", False, Decimal("90000"), "paper stop", "neutral"),
+        ("paper", False, None, "candle touch", "neutral"),
+    ],
+)
+def test_the_bracket_judgement_is_unchanged_for_live_and_paper(
+    mode: str, bracket: bool, stop: Decimal | None, display: str, state: str
+) -> None:
+    """The #641 judgement, now driven from a holdings row: live `NO bracket` stays WARN, paper's
+    absent bracket is the mode and names its protection."""
+    tranche: dict[str, Any] = {"initial_stop": stop}
+    report = _holdings_report(tranche=tranche, mode=mode)
+    if bracket:
+        report = replace(report, rows=tuple(replace(r, has_bracket=True) for r in report.rows))
+    (row,) = payload.holdings_payload(report)["rows"]
+    assert display in row["bracket"]["display"]
+    assert row["bracket"]["state"] == state

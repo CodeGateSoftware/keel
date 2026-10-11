@@ -645,14 +645,34 @@ _PULSE_KEYS = (
 )
 
 
-@pytest.mark.parametrize(("view", "keys"), [("setupView", _SETUP_KEYS), ("pulseView", _PULSE_KEYS)])
+#: What `holdingsView` reads off `/api/holdings` (root `data`) and off `/api/orders` (root
+#: `orders`), pinned as EXACT sets for the same reason `_PULSE_KEYS` is: a subset pin lets a section
+#: stop reading a key -- a blank cell forever -- with the suite green. `rows` is the collection
+#: both sections draw; `rules` is the grouping key; `stop_rows_present` is the list whose
+#: emptiness decides the stop column.
+_HOLDINGS_KEYS = ("generated_at", "open_count", "rows", "rules", "stop_rows_present")
+
+#: The recent-orders section's reads. `scope`/`status`/`statuses` are the switch bars' inputs,
+#: `empty_note` the service's own sentence for an empty book, `write_posture` the badge.
+_HOLDINGS_ORDERS_KEYS = ("empty_note", "rows", "scope", "status", "statuses", "write_posture")
+
+
+@pytest.mark.parametrize(
+    ("view", "root", "keys"),
+    [
+        ("setupView", "data", _SETUP_KEYS),
+        ("pulseView", "data", _PULSE_KEYS),
+        ("holdingsView", "data", _HOLDINGS_KEYS),
+        ("holdingsView", "orders", _HOLDINGS_ORDERS_KEYS),
+    ],
+)
 def test_the_split_reads_every_payload_key_the_long_page_read(
-    view: str, keys: tuple[str, ...]
+    view: str, root: str, keys: tuple[str, ...]
 ) -> None:
     """Sectioning is a layout change and nothing else. A builder that stopped reading a key would
     render a blank tile forever with nothing in the console naming the gap -- the failure
     `_view_keys` exists for."""
-    assert sorted(_view_keys(view, "data")) == sorted(keys)
+    assert sorted(_view_keys(view, root)) == sorted(keys)
 
 
 # -- the state, in the shell -------------------------------------------------------------------

@@ -139,8 +139,7 @@ def resolve_static_asset(root: Path, url_path: str) -> Path | None:
 CLIENT_ROUTES: tuple[str, ...] = (
     "pulse",
     "setup",
-    "orders",
-    "positions",
+    "holdings",
     "balances",
     "timeline",
     "insights",
@@ -160,8 +159,8 @@ CLIENT_ENTRY = "index.html"
 #: a plain-text 404 for a bookmark, an installed app whose cached manifest still says
 #: `start_url: "/status"`, or a `/status?token=...` redirect, whenever no service worker answers.
 #: **Closed, like `CLIENT_ROUTES`**, for the same reason: it is names, never a wildcard. Console
-#: PRs 2-4 retire more views and each adds its names here. Disjoint from `CLIENT_ROUTES`.
-RETIRED_CLIENT_ROUTES: tuple[str, ...] = ("status", "activity", "gates")
+#: PRs 3-4 retire more views and each adds its names here. Disjoint from `CLIENT_ROUTES`.
+RETIRED_CLIENT_ROUTES: tuple[str, ...] = ("status", "activity", "gates", "orders", "positions")
 
 
 def resolve_client_route(root: Path, url_path: str) -> Path | None:
