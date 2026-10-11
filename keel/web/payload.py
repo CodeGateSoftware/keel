@@ -118,7 +118,7 @@ from keel.commands.status import (
     _human_age,
     _human_remaining,
     bracket_verdict,
-    recorded_stop,
+    shown_stop,
 )
 
 # A real import, not `TYPE_CHECKING`-only: `_readiness_payload` reads the ENUM MEMBERS at
@@ -1731,8 +1731,9 @@ def _holding_row_payload(row: HoldingRow, mode: str, group: str) -> dict[str, An
         "entry_fill": money(p.entry_fill),
         "entry_fee": money(p.entry_fee),
         "cost": money(row.cost),
-        # `recorded_stop`: DCA's `0` sentinel is absent here, never "$0.00" (#961).
-        "stop": money(recorded_stop(p.initial_stop)),
+        # `shown_stop`: the stop the bracket verdict names -- a live DCA tranche's `0` sentinel is
+        # absent here, never "$0.00" (#961); paper's recorded stop is shown as it always was.
+        "stop": money(shown_stop(p.initial_stop, mode)),
         "bracket": _bracket_field(row.has_bracket, p.initial_stop, p.rule_name, mode),
         "freshness": _readiness_field(p.ready, p.ready_reason),
         "attestation": _attestation_chip(p),

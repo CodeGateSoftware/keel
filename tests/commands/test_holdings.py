@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import ast
 import re
+from dataclasses import replace
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
@@ -301,7 +302,19 @@ def test_the_dca_stop_sentinel_is_not_listed_as_a_stop(repo: Repository, config:
     `status.bracket_verdict` takes (#961)."""
     with_stop = _tranche(repo, initial_stop=Decimal("1"), opened_at=NOW_TS - 2 * DAY)
     _tranche(repo, rule_name="dca", initial_stop=Decimal("0"), opened_at=NOW_TS - DAY)
-    assert gather_holdings(repo, config, now_ts=NOW_TS).stop_row_ids == (with_stop,)
+    report = replace(gather_holdings(repo, config, now_ts=NOW_TS), mode="confirm")
+    assert report.stop_row_ids == (with_stop,)
+
+
+def test_a_paper_tranches_zero_stop_is_listed_as_it_was_before_961(
+    repo: Repository, config: Config
+) -> None:
+    """Paper is unchanged by #961: its bracket cell reads "paper stop $0.00" for a recorded 0, so
+    the stop list must name that tranche too (`status.shown_stop`)."""
+    zero = _tranche(repo, rule_name="dca", initial_stop=Decimal("0"), opened_at=NOW_TS - DAY)
+    report = replace(gather_holdings(repo, config, now_ts=NOW_TS), mode="paper")
+    assert report.stop_row_ids == (zero,)
+    assert replace(report, mode="confirm").stop_row_ids == ()  # live: the sentinel is no stop
 
 
 def test_has_bracket_follows_bracket_order_id(repo: Repository, config: Config) -> None:

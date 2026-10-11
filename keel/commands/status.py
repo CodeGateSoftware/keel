@@ -487,7 +487,11 @@ PAPER_NO_STOP = "paper no stop"
 def _kind_never_brackets(rule_kind: str) -> bool:
     """Whether `rule_kind`'s rule class declares that its entries rest no bracket. A kind the
     registry does not know (an empty `rule_name`, a retired kind) is NOT excused: its missing
-    bracket stays a warning, the reading that cannot hide a real gap."""
+    bracket stays a warning, the reading that cannot hide a real gap.
+
+    `rule_kind` is `positions.rule_name`, which is `rule.name`; `name` is not persisted by
+    `keel rules add`/seed, so it is always the kind (the same convention as `agent.py`'s
+    `rule_name == "dca"` checks)."""
     rule_cls = agent.RULE_REGISTRY.get(rule_kind)
     return rule_cls is not None and not rule_cls.places_bracket
 
@@ -496,10 +500,23 @@ def recorded_stop(initial_stop: Decimal | None) -> Decimal | None:
     """The tranche's REAL recorded stop, or `None`. `None` is no stop on the row; zero (or below)
     is the `Setup` sentinel `Dca.detect` emits ("stop=0 ... there is no stop-loss"), which
     `agent._open_tranche` copies onto every attributed DCA tranche -- a stop at zero protects
-    nothing on a long, so it is not one. Read by `bracket_verdict` and by Holdings' stop column
-    (`HoldingsReport.stop_row_ids`, `payload._holding_row_payload`), so the cell that says "no
-    stop by design" never sits beside a "$0.00" stop."""
+    nothing on a long, so it is not one. Read by `bracket_verdict` for the non-paper kinds that
+    never bracket, and (through `shown_stop`) by Holdings' stop cell and column, so on a live
+    book the cell that says "no stop by design" never sits beside a "$0.00" stop. Paper does not
+    read it: see `shown_stop`."""
     return initial_stop if initial_stop is not None and initial_stop > 0 else None
+
+
+def shown_stop(initial_stop: Decimal | None, mode: str) -> Decimal | None:
+    """The stop Holdings shows for a tranche: the one its bracket verdict names.
+
+    `bracket_verdict` reads the raw `initial_stop` in paper (`PAPER_STOP` "paper stop $0.00" for a
+    recorded 0 -- the stop `PaperTrader.on_candle` resolves against, unchanged by #961) and
+    `recorded_stop` everywhere else. The stop cell and the stop-column list take the same reading,
+    decided here once, so a paper tranche never prints "—" beside "paper stop $0.00" and a live
+    DCA tranche never prints "$0.00" beside "no stop by design". Neither the payload nor the view
+    compares the mode."""
+    return initial_stop if mode == "paper" else recorded_stop(initial_stop)
 
 
 def bracket_verdict(

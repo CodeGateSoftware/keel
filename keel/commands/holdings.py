@@ -40,7 +40,7 @@ from typing import Any
 from keel.commands.orders import OrderRow
 from keel.commands.orders import _row_from_dict as _order_row_from_dict
 from keel.commands.positions import PositionRow, gather_positions
-from keel.commands.status import recorded_stop
+from keel.commands.status import shown_stop
 from keel.config import Config
 from keel.data.repository import Repository
 from keel.types import Side
@@ -146,9 +146,12 @@ class HoldingsReport:
     @property
     def stop_row_ids(self) -> tuple[int, ...]:
         """Tranches that carry a stop, so the view can draw the stop column only when one does.
-        A DCA tranche's recorded `0` is `Dca.detect`'s sentinel, not a stop (`recorded_stop`)."""
+        A live DCA tranche's recorded `0` is `Dca.detect`'s sentinel, not a stop; paper's is
+        listed as it always was (`shown_stop`)."""
         return tuple(
-            r.position.id for r in self.rows if recorded_stop(r.position.initial_stop) is not None
+            r.position.id
+            for r in self.rows
+            if shown_stop(r.position.initial_stop, self.mode) is not None
         )
 
 

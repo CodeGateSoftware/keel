@@ -2192,6 +2192,21 @@ def test_the_dca_stop_sentinel_crosses_as_absent_not_zero() -> None:
     assert document["stop_rows_present"] == []
 
 
+def test_a_paper_dca_tranches_zero_stop_is_shown_as_origin_main_showed_it() -> None:
+    """#961 must not change paper: the bracket cell of a paper tranche names the stop it was sized
+    against ("paper stop $0.00" for a recorded 0), so the stop cell and the stop list say the same
+    thing rather than "—" beside it. Live reads the same 0 as the sentinel (the test above)."""
+    document = payload.holdings_payload(
+        _holdings_report(
+            tranche={"rule_name": "dca", "initial_stop": Decimal("0")}, mode="paper"
+        )
+    )
+    (row,) = document["rows"]
+    assert row["bracket"]["display"] == "paper stop $0.00"
+    assert row["stop"]["display"] == "$0.00" and row["stop"]["value"] == "0"
+    assert document["stop_rows_present"] == [row["id"]]
+
+
 def test_cost_crosses_as_the_services_figure() -> None:
     (row,) = payload.holdings_payload(_holdings_report())["rows"]
     assert row["cost"]["value"] == "200101.20"
