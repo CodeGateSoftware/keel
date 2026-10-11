@@ -857,16 +857,16 @@ invalidates it: the token is new every run.
 **Pulse.** The glance page: the kill switch, autonomy and its lapse, today's cycle counts
 (signals, entered, blocked, errors), why keel did not trade, the last cycle's time, the next DCA
 buy due per live DCA rule, data freshness and the market session, and any tranche missing its
-bracket. A DCA tranche never has a bracket by design, so it reads "no stop by design" and is not
-counted as missing; every other tranche without one is, PAXG's included. It carries the HALT
-button (below).
+bracket. A live DCA tranche that recorded no stop reads "no stop by design" and is not counted as
+missing; a DCA tranche that did record one, and every other tranche without a bracket, is, PAXG's
+included. It carries the HALT button (below).
 
 **Holdings.** One table of open tranches per rule row, headed by its kind, product and rule id
 (`dca · BTC-USD · rule 6`), with tranches that carry no rule id last, one table per kind:
 per-tranche cost (what the tranche paid to
 open, entry fee included), the entry-gate verdict, the asset attestation, the bracket, the stop
-(a column of that table only when one of ITS tranches carries a stop; a DCA table, whose legs
-record none, has none), and the entry order's placement and expected-vs-actual fill. The
+(a column of that table only when one of ITS tranches carries a stop; a live DCA table, whose
+legs carry only the `Dca.detect` sentinel 0, has none), and the entry order's placement and expected-vs-actual fill. The
 entry order is found by the fill price the tranche copied from it; when no order matches, the
 placement and the fill figures read "unknown", never zero. Below it, keel's recent orders, with
 the same scope and status tabs the Orders view had. There is no close and no cancel: `keel orders

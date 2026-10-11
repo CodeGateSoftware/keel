@@ -769,7 +769,7 @@ function pulseState(data) {
  * log could not be read; `data.today.basis` says which (complete, partial from a window that began
  * after midnight, or unavailable), so a zero here is never an unread log. The bracket count is
  * the #641 hazard (a live position whose bracket the verdict reads as missing; a DCA tranche
- * reads "no stop by design" and is not counted) and is judged `warn` when non-zero, here in the
+ * that recorded no stop reads "no stop by design" and is not counted) and is judged `warn` when non-zero, here in the
  * payload rather than by this file.
  *
  * @param {any} data
@@ -853,7 +853,7 @@ function pulseNextDca(data) {
 
 /**
  * Open positions, with the `bracket` column: a live position without a resting bracket reads as
- * missing (NO bracket), except DCA, which reads "no stop by design".
+ * missing (NO bracket), except a DCA tranche that recorded no stop, which reads "no stop by design".
  *
  * Compact on purpose -- the roll-call that keeps the bracket warning on the glance page.
  *
