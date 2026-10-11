@@ -80,6 +80,8 @@ packages/                  the uv workspace                          (7,190)
 └── keel-broker-fake/      ⭐ adapter existing ONLY to exert design pressure on the port
 ```
 
+*Note (2026-10-11): `web/` is no longer purely read-only. The console halts the engine (the HALT button on Pulse) and runs idempotent setup steps; releasing a halt and every other capability-increasing action stays at the terminal.*
+
 **Two things to notice before we go further.**
 
 `commands/` is 23,188 lines — larger than the engine it drives. That is deliberate rather than

@@ -1,5 +1,11 @@
 # Console — four engine views (Pulse · Holdings · Rules · Audit & Setup) — Implementation Plan
 
+> **As built (correction note, 2026-10-11).** This plan is kept as written; where it differs from what shipped:
+> - **PR2 (Holdings):** the entry order is matched by product, BUY, `placed <= opened_at` and the exact fill price (nearest earlier wins), NOT by the `created_at == opened_at` timestamp join -- paper stamps orders with bar time and tranches with cycle time, so the join missed every paper tranche.
+> - **PR3 (Rules):** `rules_payload(records=...)` is a required keyword, not `None` falling back to `count(0)` (a zero nobody passed is unknown-as-zero); the CSV export link gets no class, not `.linkaction`.
+> - **PR4 (Audit & Setup):** `keel/commands/balances.py` was deleted, not kept (no `keel balances` CLI exists; the web reader was its only caller). The Audit sections are exported builders (`setupSection`, `timelineSection`, `readinessSection`), so the key-parity scan runs per section against its own endpoint rather than `_view_keys("auditView", "setup")`. `timelineSection` takes the read error as an argument: no database reads "No timeline yet: there is no database on this machine. Setup creates one.", a failed read reads "The timeline could not be read: <detail>" (not "keel isn't running here yet"). The timeline wire also carries `engine_log`, and the page says when the engine log is missing or unreadable.
+
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking. Never ask the user anything; every open question in this initiative is settled in a "Rulings" list below.
 
 **Goal:** Replace the console's thirteen screens with four engine views -- PULSE (home, with the HALT button), HOLDINGS, RULES, AUDIT & SETUP -- shipped as four sequential PRs, each leaving the console fully working and the suite green. The ledger's "Done means" (`.superpowers/orchestrate/2026-10-10-console-four-views/ledger.md`) is the acceptance list; the screen inventory with line numbers is `inventory.md` beside it. Line numbers below are at BASE_SHA `9b1db8755cf7ac6a65cb118c615dc8e630998143`.

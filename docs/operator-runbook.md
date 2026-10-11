@@ -1020,8 +1020,12 @@ covers the rest from a plain shell.
 arming autonomy, releasing the kill-switch, clearing a consecutive-loss halt, re-seeding the
 drawdown high-water mark, declaring a deposit or withdrawal, attesting withdrawal capability, and
 replacing the binary -- is a CLI command behind a typed confirmation at an interactive terminal.
-`keel capabilities` lists all seven with the gate covering each. The server implements no verb
-that would reach one, so this is a property of the server rather than of what the page draws.
+`keel capabilities` lists all seven with the gate covering each. The one exception is the console's
+HALT button, which engages the kill-switch (stopping is never gated). The server's gated routes
+under `/api/gates/` can also release the kill-switch and clear the consecutive-loss halt, but only
+for a loopback session on a loopback bind with the typed phrase, and the page draws no control for
+either: releasing remains a terminal act in practice. Everything else in the list has no route
+at all, so that is a property of the server rather than of what the page draws.
 
 ## How much money moves
 

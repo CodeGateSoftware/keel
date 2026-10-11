@@ -250,6 +250,8 @@ itself is a moat, because every competitor's UI depends on hiding what keel show
 - Feature-gating inside the engine. The Plans page ships **inverted** (#706): a
   transparency artifact stating what is free forever and why — not a paywall matrix.
 
+> **Correction (2026-10-11).** The console is now four views (Pulse, Holdings, Rules, Audit & Setup). The Venues and Plans views named above are retired: venue readiness lives on Audit & Setup, and the declared capabilities stay with `keel brokers list`. Holdings has no cancel control (cancelling stays `keel orders cancel`), so "one-click even from the web" below describes the 2026-08 design, not the present console. The console's one-tap action is HALT, on Pulse.
+
 ### What keel does beyond parity
 
 - **The cancel asymmetry** (#707): cancelling an entry is refusing risk — frictionless,
