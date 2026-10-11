@@ -865,6 +865,20 @@ def test_kinds_present_omits_keel_when_neither_member_is_present(repo) -> None:
     assert gather_timeline(repo, now_ts=NOW_TS, scope="all").kinds_present == ("trade", "flow")
 
 
+def test_the_applied_keel_chip_stays_on_the_bar_when_neither_member_is_present(repo) -> None:
+    """The default view is `kind=keel`. On a window holding only trades and flows (the engine log
+    unresolved, no attestation yet) the applied chip must still be drawn, or the page shows an
+    empty table, a filter nobody can see, and no chip marked current."""
+    _order(repo)
+    _transaction(repo)
+
+    report = gather_timeline(repo, now_ts=NOW_TS, scope="all", kind="keel")
+
+    assert report.kinds_present == ("keel", "trade", "flow")
+    assert report.filtered_count == 0
+    assert report.scoped_count == 2
+
+
 def test_export_rows_honours_kind_keel_the_same_way(repo) -> None:
     cycle = _one_of_each_kind(repo)
 

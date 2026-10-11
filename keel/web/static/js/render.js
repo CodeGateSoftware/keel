@@ -1750,6 +1750,14 @@ export function timelineSection(data, error, sort, onSort, onKind) {
   chain.append(field(data.chain));
   fragment.append(chain);
 
+  // Why `system` rows may be missing. The keel-only default is mostly those rows, and an engine
+  // log that did not reach the report would otherwise leave an emptier table with no reason.
+  if (data.engine_log) {
+    const logNote = el("p", "note");
+    logNote.append(field(data.engine_log));
+    fragment.append(logNote);
+  }
+
   fragment.append(heading("h-timeline", "What happened"));
   fragment.append(
     table(

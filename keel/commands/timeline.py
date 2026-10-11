@@ -592,8 +592,11 @@ def gather_timeline(
     filtered = [row for row in scoped if wanted is None or row.kind in wanted]
     present = {row.kind for row in scoped}
     # `keel` leads the bar when the window holds either member -- a chip over nothing is an empty
-    # tab, the same reason the declared kinds are listed only when present.
-    composite = (KEEL_KIND,) if present & KEEL_KINDS else ()
+    # tab, the same reason the declared kinds are listed only when present. It also stays when it
+    # is the APPLIED filter: the console opens on `kind=keel`, and a window holding only trades
+    # and flows would otherwise show an empty table with the filter that emptied it invisible and
+    # no chip marked current.
+    composite = (KEEL_KIND,) if present & KEEL_KINDS or resolved_kind == KEEL_KIND else ()
     return TimelineReport(
         now_ts=now_ts,
         scope=resolved_scope,

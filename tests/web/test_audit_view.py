@@ -309,6 +309,46 @@ def test_a_failed_timeline_read_says_so_and_returns_before_reading_a_key() -> No
     assert re.search(r"\bdata\.", guard) is None
 
 
+def _branches(guard: str) -> tuple[str, str]:
+    """The `if (error)` arm and the `else` arm of a guard, each as its own source text."""
+    code = _comments_only(guard)
+    match = re.search(r"if \(error\) (.*?);\s*else (.*?);", code, re.S)
+    assert match is not None, "the guard has no `if (error) ...; else ...;` pair"
+    return match.group(1), match.group(2)
+
+
+def test_a_failed_timeline_read_names_the_failure_and_a_missing_database_names_setup() -> None:
+    """The ledger ruling: a missing database is told apart from a failed read. Each branch is
+    pinned to ITS OWN output, so swapping the condition or dropping the detail changes a count."""
+    failed, absent = _branches(_guard("timelineSection", "data"))
+
+    assert failed.count("could not be read") == 1
+    assert failed.count("error.detail || error.title") == 1
+    assert "no database" not in failed
+    assert absent.count("no database") == 1
+    assert absent.count("Setup creates one") == 1
+    assert "could not be read" not in absent
+    assert "error" not in absent
+
+
+def test_the_timeline_says_when_the_engine_log_did_not_reach_it() -> None:
+    """The keel-only default is mostly `system` rows, which come from the engine log: a missing or
+    unreadable log must be said, once, beside the table, from the server's own sentence."""
+    body = _comments_only(_builder("timelineSection"))
+    gap = re.search(
+        r"if \(data\.engine_log\) \{(.*?)\n  \}",
+        body,
+        re.S,
+    )
+    assert gap is not None, "timelineSection has no engine-log status branch"
+    assert gap.group(1).count("field(data.engine_log)") == 1
+    assert gap.group(1).count("logNote.append(field(data.engine_log));") == 1
+    assert gap.group(1).count("fragment.append(logNote);") == 1
+    assert body.count("data.engine_log") == 2
+    # placed before the table, so the explanation precedes the empty-looking rows
+    assert body.index("data.engine_log") < body.index('heading("h-timeline"')
+
+
 def test_a_failed_readiness_read_says_so_and_returns_before_reading_a_key() -> None:
     guard = _guard("readinessSection", "data")
 

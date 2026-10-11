@@ -1470,6 +1470,27 @@ def test_not_recorded_is_shown_whole_because_it_is_a_sentence() -> None:
     assert cell["state"] == "unknown"
 
 
+def test_the_engine_log_status_rides_the_timeline_wire() -> None:
+    """`system` rows come from the engine log. When it did not reach the report the page has to be
+    able to say why those rows are absent, so the status crosses the wire with a sentence (and as
+    `None` when the log was read)."""
+    assert payload.timeline_payload(_timeline_report())["engine_log"] is None
+
+    for status in ("missing", "empty", "oversized", "unreadable"):
+        field = payload.timeline_payload(_timeline_report(log_status=status))["engine_log"]
+        assert field["value"] == status
+        assert field["display"] != status, f"{status} has no sentence beside it"
+        assert "system" in field["display"], status
+    assert (
+        payload.timeline_payload(_timeline_report(log_status="unreadable"))["engine_log"]["state"]
+        == "warn"
+    )
+    assert (
+        payload.timeline_payload(_timeline_report(log_status="missing"))["engine_log"]["state"]
+        == "unknown"
+    )
+
+
 def test_a_row_past_a_break_is_bad_even_though_it_has_a_hash() -> None:
     """The state must come from the CHAIN, not from whether a hash is present. A client inferring
     the verdict from a 64-character string would call an unverified row evidence."""

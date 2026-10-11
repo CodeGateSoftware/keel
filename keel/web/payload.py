@@ -1914,8 +1914,38 @@ def timeline_payload(report: TimelineReport) -> dict[str, Any]:
         # has no breaks and has verified nothing, so "no errors" is never on its own a green light.
         "chain": _timeline_chain_payload(report),
         "chain_errors": [str(error) for error in report.chain_errors],
+        # How reading the engine's log went, so the page can say why `system` rows are absent: the
+        # keel-only default is mostly those rows, and a silent missing log would empty it.
+        "engine_log": _timeline_log_payload(report.log_status),
         "rows": [_timeline_row_payload(row) for row in report.rows],
     }
+
+
+#: What each `read_log_window` outcome means for the `system` rows. `ok` carries no sentence of
+#: its own because the page says nothing when the log was read.
+_TIMELINE_LOG_NOTES: Mapping[str, str] = {
+    "missing": "no engine log was found, so no system rows (cycles) are shown",
+    "empty": "the engine log is empty, so no system rows (cycles) are shown",
+    "oversized": "the engine log is too large to read, so no system rows (cycles) are shown",
+    "unreadable": "the engine log could not be read, so no system rows (cycles) are shown",
+}
+
+
+def _timeline_log_payload(status: str) -> Field | None:
+    """The engine-log status as a field, or `None` when the log was read.
+
+    Nothing to say then, and the client may not judge a value itself, so it tests presence.
+    `missing` and `empty` are ordinary states (a deployment that has not cycled yet), so they read
+    UNKNOWN; a log that is there and did not reach the report is the one that warns -- the same
+    split `TimelineReport.log_gap` draws."""
+    if status == "ok":
+        return None
+    state = UNKNOWN if status in ("missing", "empty") else WARN
+    return label(
+        status,
+        display=_TIMELINE_LOG_NOTES.get(status, _TIMELINE_LOG_NOTES["unreadable"]),
+        state=state,
+    )
 
 
 # -- the research record (#708) -------------------------------------------------------------------
