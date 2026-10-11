@@ -403,7 +403,9 @@ def read_orders(cfg: ServeConfig, query: Query, _state: Any, now_ts: int) -> dic
     limit = DEFAULT_ORDERS_LIMIT if not raw_limit else _whole_number(raw_limit, MAX_ORDERS_LIMIT)
     repo = open_repo(cfg.db_path)
     try:
-        report = gather_orders(repo, now_ts=now_ts, scope=scope, status=status, limit=limit)
+        report = gather_orders(
+            repo, now_ts=now_ts, scope=scope, status=status, limit=limit, classify_cancels=False
+        )
     finally:
         close_repo(repo)
     return payload.orders_payload(report)

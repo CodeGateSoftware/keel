@@ -591,8 +591,14 @@ def gather_orders(
     scope: str = DEFAULT_ORDERS_SCOPE,
     status: str = "",
     limit: int | None = DEFAULT_ORDERS_LIMIT,
+    classify_cancels: bool = True,
 ) -> OrdersReport:
     """Every order in the book, newest first, scoped and capped.
+
+    `classify_cancels=False` skips `classify_cancel` for every row: each `OrderRow.cancel` then
+    carries the unresolved placeholder rather than a verdict. `/api/orders` passes it, because
+    the console renders no cancel classification and a per-row verdict thrown away is a query's
+    worth of work. `keel orders` keeps the default.
 
     `repo.get_orders()` is still called with NO arguments: no `mode`, no `product_id`, no
     `status`. That is the load-bearing choice in this function, and the reason is about MODE --
@@ -666,9 +672,11 @@ def gather_orders(
     # ONE query for every protective link on the page, not one per row (#707). `classify_cancel`
     # takes the set when it has one and falls back to the single lookup when it does not, so this
     # is the same rule applied efficiently rather than a second one.
-    bracket_ids = repo.open_bracket_order_ids()
+    bracket_ids = repo.open_bracket_order_ids() if classify_cancels else None
     shown = tuple(
-        _row_from_dict(row, rule_names, repo=repo, bracket_ids=bracket_ids)
+        _row_from_dict(
+            row, rule_names, repo=repo if classify_cancels else None, bracket_ids=bracket_ids
+        )
         for row in filtered[:resolved_limit]
     )
 
@@ -889,11 +897,11 @@ WEB_READ_ONLY_NOTE = (
     "Orders are cancelled with `keel orders cancel` at a terminal."
 )
 
-#: What each kind of cancel MEANS, for the modal that hands over the command. The word is a term of
-#: art; the sentence is what an operator decides on.
-#: Checked at import: a kind with no headline or no note would render an empty modal, and a table
-#: that has drifted from the vocabulary is exactly the thing nobody notices until a reader sees the
-#: gap. This is what `CANCEL_KINDS` is FOR -- declared and never read, it was decoration.
+#: What each kind of cancel IS, as `keel orders cancel` headlines it: the CLI is the only reader.
+#: The web console once drew a modal from this vocabulary and no longer does.
+#: Checked at import: a kind with no headline would print an empty one, and a table that has
+#: drifted from the vocabulary is exactly the thing nobody notices until a reader sees the gap.
+#: This is what `CANCEL_KINDS` is FOR -- declared and never read, it was decoration.
 CANCEL_HEADLINES: Mapping[str, str] = {
     "entry": "Entry order #{order_id} — resting",
     "exit": "⚠️ Exit order #{order_id} — live liquidation",
@@ -901,25 +909,9 @@ CANCEL_HEADLINES: Mapping[str, str] = {
     "unknown": "⚠️ Order #{order_id} — unclassified",
 }
 
-CANCEL_NOTES: Mapping[str, str] = {
-    "entry": "Cancelling a resting entry refuses risk. Nothing is protecting anything here.",
-    "exit": (
-        "This order liquidates inventory you hold. Cancelling it leaves the position open with "
-        "no exit working."
-    ),
-    "protective": (
-        "This is live downside protection — a position relies on it for its stop. Cancelling it "
-        "leaves that position with nothing beneath it, and the terminal will ask you to type a "
-        "phrase before it does."
-    ),
-    "unknown": "keel could not classify this order, so it is treated as protection.",
-}
-
-
-# The vocabulary and its tables, checked here rather than hoped about. `CANCEL_KINDS` existed and
-# nothing read it; now a kind added to the set without a headline or a note fails at import.
+# The vocabulary and its table, checked here rather than hoped about. `CANCEL_KINDS` existed and
+# nothing read it; now a kind added to the set without a headline fails at import.
 assert set(CANCEL_HEADLINES) == set(CANCEL_KINDS), "CANCEL_HEADLINES does not cover CANCEL_KINDS"
-assert set(CANCEL_NOTES) == set(CANCEL_KINDS), "CANCEL_NOTES does not cover CANCEL_KINDS"
 
 
 @dataclass(frozen=True)
@@ -977,12 +969,13 @@ def classify_cancel(
     """What cancelling `order_id` would be, and what it therefore takes.
 
     Reads only. It decides nothing about whether the operator may proceed -- that is the caller's
-    gate -- and it never touches a broker, which is why the web console can call it: `keel serve`
+    gate -- and it never touches a broker. The CLI is its only caller (`keel orders cancel`, and
+    `gather_orders` for `keel orders`): the web console once classified every row for a cancel
+    modal and no longer does -- `/api/orders` reads with `classify_cancels=False`. `keel serve`
     holds no venue credential and no broker handle, and #707 settled that it never will.
 
-    ONE function for both front-ends. The CLI turns `typed` into a phrase prompt; the console
-    turns it into a modal that hands over `invocation`. If each classified for itself, the console
-    could describe an order as a frictionless entry while the terminal demanded the phrase for it.
+    ONE function, so the CLI's headline, its phrase prompt (`typed`) and its re-check under the
+    lock all read the same decision rather than each classifying for itself.
 
     `row` and `bracket_ids` are the BATCH form, for a caller classifying a whole page: the row is
     already in hand and `repo.open_bracket_order_ids()` answers every protective link in one query

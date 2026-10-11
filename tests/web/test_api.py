@@ -1480,6 +1480,26 @@ def test_read_orders_scopes_by_the_clock_it_was_handed(
     assert body["total_count"]["value"] == "3", label + ": the book itself is unchanged"
 
 
+def test_read_orders_never_classifies_a_cancel(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The console renders no cancel classification, so `/api/orders` must not compute one per
+    row and throw it away. Only `keel orders cancel` calls `classify_cancel`."""
+    from keel.commands import orders as orders_mod
+    from keel.web.api import read_orders
+
+    def boom(*args: Any, **kwargs: Any) -> None:
+        raise AssertionError("classify_cancel must not run for /api/orders")
+
+    monkeypatch.setattr(orders_mod, "classify_cancel", boom)
+    cfg = _book_at(tmp_path, 1_788_998_400 + 43_200)
+
+    body = read_orders(cfg, {"scope": ["all"]}, None, 1_788_998_400 + 43_200)
+
+    assert body["total_count"]["value"] == "3"
+    assert len(body["rows"]) == 3, "the fixture must reach the reader"
+
+
 def test_respond_hands_the_reader_the_same_instant_it_stamped(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

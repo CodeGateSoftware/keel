@@ -513,7 +513,7 @@ def test_the_realized_legs_summary_names_the_tranche_and_its_product() -> None:
     """The disclosures sit after a table that may hold several products (every DCA rule is named
     "dca"), so "tranche N" alone cannot be tied to a row: the summary appends id AND product."""
     section = _builder("holdingsSection")
-    at = section.index('summary.append(')
+    at = section.index("summary.append(")
     call, _ = _balanced_block(section, section.index("(", at))
     parts = _split_top_level("[" + call[1:-1] + "]")
 
