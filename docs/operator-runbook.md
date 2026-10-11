@@ -837,8 +837,8 @@ Rewards item: account settings no rail can see, re-checked after any account cha
 ## The operator console, in a browser
 
 `keel serve` opens keel's **operator console**: a local web page showing Pulse (the home view),
-Setup, Holdings, Balances, Timeline, Insights, Research, Rules, Venues and Plans, over the
-same `keel/commands/*` service layer the CLI commands call. It is being slimmed to four engine
+Setup, Holdings, Balances, Timeline, Rules, Venues and Plans, over the same `keel/commands/*`
+service layer the CLI commands call. It is being slimmed to four engine
 views -- Pulse, Holdings, Rules, Audit & Setup; see
 `docs/superpowers/plans/2026-10-10-console-four-views.md`. An architectural test (`tests/commands/test_console_thinness.py`) pins that thinness -- the
 front-end renders and dispatches, and every behaviour comes from the services.
@@ -857,6 +857,19 @@ entry order is found by the fill price the tranche copied from it; when no order
 placement and the fill figures read "unknown", never zero. Below it, keel's recent orders, with
 the same scope and status tabs the Orders view had. There is no close and no cancel: `keel orders
 cancel` and the exit path stay at the terminal.
+
+**Rules.** Everything keel knows about its rules, on one page, and nothing on it is a control:
+promotion happens in the CLI. The rule ledger and each rule's parameters come first, then the
+track records of the rules in the promotion pipeline (candidate and paper) with each paper rule's
+distance to the promotion gate -- unsorted, because a sorted record is a leaderboard -- then the
+DCA plan proposal (`/rules?budget=500&buffer=0.1` fills it; it is applied by the `keel dca plan`
+command it shows, at a terminal), then the research record: every trial, the evidence matrix, the
+gauntlet and the slippage assumptions. Track records, promotion-gate distances and the research
+record used to be the Insights and Research views. The equity charts and the closed-trade table
+left the console: the closed-trade journal is `keel insights journal`, your own journal is `keel
+journal list`, and in the browser every fill is still a Timeline `trade` row and every journal
+entry a Timeline `attestation` row. A live rule's track record is `keel insights summary --mode
+live`.
 
 **Halting from the browser.** Pulse carries a HALT button. It engages the kill switch through the
 same operation `keel kill` performs (`POST /api/gates/halt`), after one confirm dialog and nothing
