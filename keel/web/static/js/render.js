@@ -1890,15 +1890,18 @@ export function holdingsView(
 }
 
 /**
- * The open tranches, one heading and table per rule, then each tranche's realized legs.
+ * The open tranches, one heading and table per rule ROW, then each tranche's realized legs.
  *
- * ── GROUPED BY THE REPORT'S OWN RULE LIST ────────────────────────────────────────────────────
+ * ── GROUPED BY THE REPORT'S OWN GROUP LIST ───────────────────────────────────────────────────
  *
- * `data.rules` rather than a set this file assembles from the rows: two answers to "which rules
- * hold tranches" is one too many, and the ordered one is already on the report. A rule holds
- * several TRANCHES -- that is what tranches are for -- so each section is a table of them rather
- * than one row pretending to be the position. Filtering the rows by that key is string equality on
- * a bare name, the same thing the Positions view did with the product; no value is judged.
+ * `data.groups` rather than a set this file assembles from the rows: two answers to "which rules
+ * hold tranches" is one too many, and the ordered one is already on the report. One group per rule
+ * ROW (#960) -- every DCA rule is named `dca`, so grouping by name drew seven rules as one table --
+ * then the unattributed tranches, last. A rule holds several TRANCHES -- that is what tranches are
+ * for -- so each section is a table of them rather than one row pretending to be the position.
+ * Filtering the rows is string equality between `row.group` and `group.key`, keys the service
+ * built from an integer or an ordinal (never a stored name, so the element id is safe); no value is
+ * judged, and the heading is the service's own words.
  *
  * ── THE COLUMNS ARE THE ENTRY'S, NOT THE MARKET'S ────────────────────────────────────────────
  *
@@ -1938,10 +1941,10 @@ function holdingsSection(data, sort, onSort) {
 
   const withStop = (data.stop_rows_present || []).length !== 0;
 
-  for (const rule of data.rules || []) {
-    const held = rows.filter(/** @param {any} row */ (row) => row.rule_name === rule);
-    const id = ["h-hold", rule].join("-");
-    fragment.append(heading(id, plain(rule) || "unattributed"));
+  for (const group of data.groups || []) {
+    const held = rows.filter(/** @param {any} row */ (row) => row.group === group.key);
+    const id = ["h-hold", group.key].join("-");
+    fragment.append(heading(id, plain(group.heading)));
     if (held.length === 0) continue;
 
     fragment.append(

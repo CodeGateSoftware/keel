@@ -2065,6 +2065,7 @@ _HOLDING_ROW_KEYS = [
     "id",
     "product_id",
     "rule_name",
+    "group",
     "opened_at",
     "qty",
     "entry_fill",
@@ -2090,7 +2091,7 @@ _HOLDINGS_TOP_KEYS = [
     "generated_at",
     "mode",
     "open_count",
-    "rules",
+    "groups",
     "stop_rows_present",
     "rows",
 ]
@@ -2115,8 +2116,23 @@ def test_the_holdings_top_level_reads_the_report() -> None:
     document = payload.holdings_payload(_holdings_report(order={}, mode="confirm"))
     assert document["mode"] == "confirm"
     assert document["open_count"]["value"] == "1"
-    assert document["rules"] == ["turtle_breakout"]
+    assert document["groups"] == [
+        {"key": "unattributed-1", "heading": "turtle_breakout · unattributed"}
+    ]
     assert document["stop_rows_present"] == [document["rows"][0]["id"]]
+
+
+def test_the_holdings_groups_and_each_rows_group_are_the_reports() -> None:
+    """#960: one group per rule row. The wire carries the report's groups in its order, and each
+    row names the group it is drawn under -- the client filters on that key and builds nothing."""
+    report = _holdings_report(
+        tranche={"rule_name": "dca", "rule_id": 6},
+        extra_tranche={"rule_name": "dca", "rule_id": 8, "product_id": "ETH-USD"},
+    )
+    document = payload.holdings_payload(report)
+    assert document["groups"] == [{"key": g.key, "heading": g.heading} for g in report.groups]
+    assert [g["key"] for g in document["groups"]] == ["rule-6", "rule-8"]
+    assert [row["group"] for row in document["rows"]] == ["rule-6", "rule-8"]
 
 
 def test_a_matched_tranche_carries_its_entry_orders_figures() -> None:
@@ -2161,6 +2177,18 @@ def test_a_stop_is_absent_not_zero_when_none_was_recorded() -> None:
     (row,) = document["rows"]
     assert row["stop"]["state"] == "unknown" and row["stop"]["value"] == ""
     assert row["stop"]["display"] != "$0.00"
+    assert document["stop_rows_present"] == []
+
+
+def test_the_dca_stop_sentinel_crosses_as_absent_not_zero() -> None:
+    """#961: a DCA tranche's recorded `0` is `Dca.detect`'s sentinel, not a stop. Beside the
+    "no stop by design" bracket cell, "$0.00" would be a figure nobody set."""
+    document = payload.holdings_payload(
+        _holdings_report(tranche={"rule_name": "dca", "initial_stop": Decimal("0")}, mode="confirm")
+    )
+    (row,) = document["rows"]
+    assert row["stop"]["state"] == "unknown" and row["stop"]["value"] == ""
+    assert row["bracket"]["display"] == "no stop by design"
     assert document["stop_rows_present"] == []
 
 

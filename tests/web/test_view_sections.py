@@ -648,9 +648,9 @@ _PULSE_KEYS = (
 #: What `holdingsView` reads off `/api/holdings` (root `data`) and off `/api/orders` (root
 #: `orders`), pinned as EXACT sets for the same reason `_PULSE_KEYS` is: a subset pin lets a section
 #: stop reading a key -- a blank cell forever -- with the suite green. `rows` is the collection
-#: both sections draw; `rules` is the grouping key; `stop_rows_present` is the list whose
-#: emptiness decides the stop column.
-_HOLDINGS_KEYS = ("generated_at", "open_count", "rows", "rules", "stop_rows_present")
+#: both sections draw; `groups` is the per-rule-row grouping (#960); `stop_rows_present` is the
+#: list whose emptiness decides the stop column.
+_HOLDINGS_KEYS = ("generated_at", "groups", "open_count", "rows", "stop_rows_present")
 
 #: The recent-orders section's reads. `scope`/`status`/`statuses` are the switch bars' inputs,
 #: `empty_note` the service's own sentence for an empty book, `write_posture` the badge.

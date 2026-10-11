@@ -9,6 +9,7 @@ order carries the BAR's ts, the tranche the cycle's) -- and the ways it must ref
 from __future__ import annotations
 
 import ast
+import re
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
@@ -231,21 +232,75 @@ def test_cost_of_a_scaled_out_tranche_counts_the_whole_entry(
     assert row.cost == Decimal("402")
 
 
-def test_rows_group_by_rule_in_first_seen_order_with_unattributed_last(
+def test_rows_group_by_rule_row_in_first_seen_order_with_unattributed_last(
     repo: Repository, config: Config
 ) -> None:
-    _tranche(repo, rule_name="", opened_at=NOW_TS - 4 * DAY)
-    _tranche(repo, rule_name="dca", opened_at=NOW_TS - 3 * DAY)
-    _tranche(repo, rule_name="turtle_breakout", opened_at=NOW_TS - 2 * DAY)
+    """#960: one group per `positions.rule_id`, not per kind. The live book's seven DCA rules all
+    carry the kind `dca`, so grouping by name drew them as one table across products."""
+    _tranche(repo, rule_name="", opened_at=NOW_TS - 6 * DAY)
+    _tranche(repo, rule_name="dca", rule_id=6, opened_at=NOW_TS - 5 * DAY)
+    _tranche(repo, rule_name="dca", rule_id=8, product_id="ETH-USD", opened_at=NOW_TS - 4 * DAY)
+    _tranche(repo, rule_name="turtle_breakout", opened_at=NOW_TS - 3 * DAY)
+    _tranche(repo, rule_name="dca", rule_id=6, opened_at=NOW_TS - 2 * DAY)
     _tranche(repo, rule_name="dca", opened_at=NOW_TS - DAY)
     report = gather_holdings(repo, config, now_ts=NOW_TS)
-    assert report.rules == ("dca", "turtle_breakout", "")
-    assert report.open_count == 4
+
+    assert [(g.key, g.heading) for g in report.groups] == [
+        ("rule-6", "dca · BTC-USD · rule 6"),
+        ("rule-8", "dca · ETH-USD · rule 8"),
+        ("unattributed-1", "unattributed"),
+        ("unattributed-2", "turtle_breakout · unattributed"),
+        ("unattributed-3", "dca · unattributed"),
+    ]
+    assert [report.group_key(r) for r in report.rows] == [
+        "unattributed-1",
+        "rule-6",
+        "rule-8",
+        "unattributed-2",
+        "rule-6",
+        "unattributed-3",
+    ]
+    assert report.open_count == 6
+
+
+def test_two_rules_of_one_kind_on_one_product_get_two_groups(
+    repo: Repository, config: Config
+) -> None:
+    """Kind and product alone do not identify a rule: two BTC DCA rules (the paper ledger holds
+    rules 19 and 20) differ only by their id and params. The id is in the heading."""
+    _tranche(repo, rule_name="dca", rule_id=19, opened_at=NOW_TS - 2 * DAY)
+    _tranche(repo, rule_name="dca", rule_id=20, opened_at=NOW_TS - DAY)
+    headings = [g.heading for g in gather_holdings(repo, config, now_ts=NOW_TS).groups]
+    assert headings == ["dca · BTC-USD · rule 19", "dca · BTC-USD · rule 20"]
+
+
+def test_group_keys_are_unique_and_safe_whatever_the_rule_name(
+    repo: Repository, config: Config
+) -> None:
+    """The view builds element ids from the key (`h-hold-<key>`), and `aria-labelledby` splits on
+    whitespace. A key is built from an integer or an ordinal only, never from a stored name."""
+    names = ["has space", 'quo"te', "<b>", "dca", "has space "]
+    for i, name in enumerate(names):
+        _tranche(repo, rule_name=name, opened_at=NOW_TS - (i + 2) * DAY)
+    _tranche(repo, rule_name="has space", rule_id=7, opened_at=NOW_TS - DAY)
+    keys = [g.key for g in gather_holdings(repo, config, now_ts=NOW_TS).groups]
+    assert len(keys) == len(names) + 1
+    assert len(set(keys)) == len(keys)
+    assert all(re.fullmatch(r"(rule|unattributed)-\d+", key) for key in keys), keys
 
 
 def test_stop_row_ids_are_the_tranches_that_carry_a_stop(repo: Repository, config: Config) -> None:
     with_stop = _tranche(repo, initial_stop=Decimal("1"), opened_at=NOW_TS - 2 * DAY)
     _tranche(repo, initial_stop=None, opened_at=NOW_TS - DAY)
+    assert gather_holdings(repo, config, now_ts=NOW_TS).stop_row_ids == (with_stop,)
+
+
+def test_the_dca_stop_sentinel_is_not_listed_as_a_stop(repo: Repository, config: Config) -> None:
+    """Every attributed DCA tranche records `Dca.detect`'s `stop=0` sentinel (the live book's
+    tranches 4-6). Zero is not a stop, so it does not draw the stop column -- the same reading
+    `status.bracket_verdict` takes (#961)."""
+    with_stop = _tranche(repo, initial_stop=Decimal("1"), opened_at=NOW_TS - 2 * DAY)
+    _tranche(repo, rule_name="dca", initial_stop=Decimal("0"), opened_at=NOW_TS - DAY)
     assert gather_holdings(repo, config, now_ts=NOW_TS).stop_row_ids == (with_stop,)
 
 

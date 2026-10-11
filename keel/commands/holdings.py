@@ -40,6 +40,7 @@ from typing import Any
 from keel.commands.orders import OrderRow
 from keel.commands.orders import _row_from_dict as _order_row_from_dict
 from keel.commands.positions import PositionRow, gather_positions
+from keel.commands.status import recorded_stop
 from keel.config import Config
 from keel.data.repository import Repository
 from keel.types import Side
@@ -65,6 +66,24 @@ class HoldingRow:
     entry_order: OrderRow | None
     #: `""` when matched, else `ENTRY_ORDER_NOT_IDENTIFIED`.
     entry_order_note: str
+    #: `positions.rule_id`, the `rules` ROW that opened the tranche (#803), or `None` for a
+    #: tranche that predates v21 or whose entry order carried no id -- unknown, never "no rule".
+    #: Defaulted so a `HoldingRow(...)` written before #960 stays valid.
+    rule_id: int | None = None
+
+
+@dataclass(frozen=True)
+class HoldingGroup:
+    """One Holdings table: the tranches of one rule ROW, or the unattributed ones of one kind.
+
+    `key` is built from an integer -- `rule-<rules.id>` -- or, for unattributed tranches, from an
+    ordinal (`unattributed-<n>`), and never from a stored name: the view makes element ids from
+    it (`h-hold-<key>`), and a rule name with a space split the `aria-labelledby` it fed (#960).
+    `heading` is the words the view prints, made here so no renderer composes them.
+    """
+
+    key: str
+    heading: str
 
 
 @dataclass(frozen=True)
@@ -81,19 +100,56 @@ class HoldingsReport:
         return len(self.rows)
 
     @property
-    def rules(self) -> tuple[str, ...]:
-        """Distinct rule names in first-seen (oldest-first) order, the unattributed `""` last --
-        what a grouped view keys on, so no renderer builds its own list."""
-        seen: list[str] = []
+    def groups(self) -> tuple[HoldingGroup, ...]:
+        """One group per rule ROW (`positions.rule_id`, #960), in first-seen (oldest-first)
+        order, then the unattributed tranches -- one group per kind, so a pre-v21 DCA leg and the
+        PAXG turtle tranche are not drawn as one table -- last. What a grouped view keys on, so
+        no renderer builds its own list.
+
+        Per row, not per kind: every DCA rule carries the kind `dca` (`Dca.name`'s default), so
+        grouping by name drew the live book's seven DCA rules as ONE table across products.
+        Kind and product do not identify a row either (two BTC DCA rules differ only by id and
+        params), so the heading names the id -- the handle the `keel rules` commands take.
+        """
+        attributed: dict[int, HoldingGroup] = {}
         for row in self.rows:
-            if row.position.rule_name not in seen:
-                seen.append(row.position.rule_name)
-        return tuple(sorted(seen, key=lambda name: name == ""))
+            if row.rule_id is not None and row.rule_id not in attributed:
+                kind = row.position.rule_name or "rule"
+                attributed[row.rule_id] = HoldingGroup(
+                    key=f"rule-{row.rule_id}",
+                    heading=f"{kind} · {row.position.product_id} · rule {row.rule_id}",
+                )
+        unattributed = tuple(
+            HoldingGroup(
+                key=f"unattributed-{n}",
+                heading=f"{kind} · unattributed" if kind else "unattributed",
+            )
+            for n, kind in enumerate(self._unattributed_kinds(), start=1)
+        )
+        return (*attributed.values(), *unattributed)
+
+    def group_key(self, row: HoldingRow) -> str:
+        """The `HoldingGroup.key` `row` is drawn under."""
+        if row.rule_id is not None:
+            return f"rule-{row.rule_id}"
+        return f"unattributed-{self._unattributed_kinds().index(row.position.rule_name) + 1}"
+
+    def _unattributed_kinds(self) -> list[str]:
+        """The kinds of the tranches with no `rule_id`, first-seen -- the ONE ordering both
+        `groups` and `group_key` number the unattributed groups by."""
+        kinds: list[str] = []
+        for row in self.rows:
+            if row.rule_id is None and row.position.rule_name not in kinds:
+                kinds.append(row.position.rule_name)
+        return kinds
 
     @property
     def stop_row_ids(self) -> tuple[int, ...]:
-        """Tranches that carry a stop, so the view can draw the stop column only when one does."""
-        return tuple(r.position.id for r in self.rows if r.position.initial_stop is not None)
+        """Tranches that carry a stop, so the view can draw the stop column only when one does.
+        A DCA tranche's recorded `0` is `Dca.detect`'s sentinel, not a stop (`recorded_stop`)."""
+        return tuple(
+            r.position.id for r in self.rows if recorded_stop(r.position.initial_stop) is not None
+        )
 
 
 def _rule_consistent(tranche_rule_id: Any, order: dict[str, Any]) -> bool:
@@ -151,6 +207,7 @@ def gather_holdings(repo: Repository, config: Config, *, now_ts: int) -> Holding
                 + position.entry_fee,
                 entry_order=None if match is None else _order_row_from_dict(match, rule_names),
                 entry_order_note="" if match is not None else ENTRY_ORDER_NOT_IDENTIFIED,
+                rule_id=None if raw.get("rule_id") is None else int(raw["rule_id"]),
             )
         )
     return HoldingsReport(now_ts=now_ts, mode=str(config.auto_trade.mode), rows=tuple(rows))

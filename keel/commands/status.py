@@ -492,12 +492,14 @@ def _kind_never_brackets(rule_kind: str) -> bool:
     return rule_cls is not None and not rule_cls.places_bracket
 
 
-def _recorded_a_stop(initial_stop: Decimal | None) -> bool:
-    """Whether the tranche recorded a REAL stop. `None` is no stop on the row; zero (or below) is
-    the `Setup` sentinel `Dca.detect` emits ("stop=0 ... there is no stop-loss"), which
+def recorded_stop(initial_stop: Decimal | None) -> Decimal | None:
+    """The tranche's REAL recorded stop, or `None`. `None` is no stop on the row; zero (or below)
+    is the `Setup` sentinel `Dca.detect` emits ("stop=0 ... there is no stop-loss"), which
     `agent._open_tranche` copies onto every attributed DCA tranche -- a stop at zero protects
-    nothing on a long, so it is not one."""
-    return initial_stop is not None and initial_stop > 0
+    nothing on a long, so it is not one. Read by `bracket_verdict` and by Holdings' stop column
+    (`HoldingsReport.stop_row_ids`, `payload._holding_row_payload`), so the cell that says "no
+    stop by design" never sits beside a "$0.00" stop."""
+    return initial_stop if initial_stop is not None and initial_stop > 0 else None
 
 
 def bracket_verdict(
@@ -528,7 +530,7 @@ def bracket_verdict(
         return BRACKETED
     if mode == "paper":
         return PAPER_STOP if initial_stop is not None else PAPER_NO_STOP
-    if _kind_never_brackets(rule_kind) and not _recorded_a_stop(initial_stop):
+    if _kind_never_brackets(rule_kind) and recorded_stop(initial_stop) is None:
         return NO_STOP_BY_DESIGN
     return BRACKET_MISSING
 

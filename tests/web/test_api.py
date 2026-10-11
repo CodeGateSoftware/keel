@@ -2333,7 +2333,7 @@ def test_holdings_rows_carry_the_entry_order_figures_when_one_matches(
     assert row["fill_divergence"]["value"] == "50"
     assert row["fill_divergence"]["state"] == "bad"
     assert row["placement"]["display"] == "AUTONOMOUS"
-    assert document["data"]["rules"] == ["turtle_breakout"]
+    assert [g["key"] for g in document["data"]["groups"]] == [row["group"]]
     assert document["data"]["open_count"]["value"] == "1"
 
 

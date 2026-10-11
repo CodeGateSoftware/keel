@@ -857,9 +857,13 @@ invalidates it: the token is new every run.
 **Pulse.** The glance page: the kill switch, autonomy and its lapse, today's cycle counts
 (signals, entered, blocked, errors), why keel did not trade, the last cycle's time, the next DCA
 buy due per live DCA rule, data freshness and the market session, and any tranche missing its
-bracket. It carries the HALT button (below).
+bracket. A DCA tranche never has a bracket by design, so it reads "no stop by design" and is not
+counted as missing; every other tranche without one is, PAXG's included. It carries the HALT
+button (below).
 
-**Holdings.** One table of open tranches per rule: per-tranche cost (what the tranche paid to
+**Holdings.** One table of open tranches per rule row, headed by its kind, product and rule id
+(`dca · BTC-USD · rule 6`), with tranches that carry no rule id last, one table per kind:
+per-tranche cost (what the tranche paid to
 open, entry fee included), the entry-gate verdict, the asset attestation, the bracket, the stop
 only when a tranche carries one, and the entry order's placement and expected-vs-actual fill. The
 entry order is found by the fill price the tranche copied from it; when no order matches, the

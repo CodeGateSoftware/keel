@@ -118,6 +118,7 @@ from keel.commands.status import (
     _human_age,
     _human_remaining,
     bracket_verdict,
+    recorded_stop,
 )
 
 # A real import, not `TYPE_CHECKING`-only: `_readiness_payload` reads the ENUM MEMBERS at
@@ -1696,7 +1697,7 @@ def _unknown_fill() -> Field:
     return {"value": "", "display": "unknown", "state": UNKNOWN}
 
 
-def _holding_row_payload(row: HoldingRow, mode: str) -> dict[str, Any]:
+def _holding_row_payload(row: HoldingRow, mode: str, group: str) -> dict[str, Any]:
     """One open tranche for the Holdings view, placed. Nothing is decided here.
 
     The cost, the join and the slippage verdict are the service's (`keel/commands/holdings.py`);
@@ -1723,12 +1724,15 @@ def _holding_row_payload(row: HoldingRow, mode: str) -> dict[str, Any]:
         "id": str(p.id),
         "product_id": p.product_id,
         "rule_name": p.rule_name,
+        # The `HoldingsReport.group_key` this tranche is drawn under -- a key, not a judgement.
+        "group": group,
         "opened_at": moment(p.opened_at),
         "qty": quantity(p.qty),
         "entry_fill": money(p.entry_fill),
         "entry_fee": money(p.entry_fee),
         "cost": money(row.cost),
-        "stop": money(p.initial_stop),
+        # `recorded_stop`: DCA's `0` sentinel is absent here, never "$0.00" (#961).
+        "stop": money(recorded_stop(p.initial_stop)),
         "bracket": _bracket_field(row.has_bracket, p.initial_stop, p.rule_name, mode),
         "freshness": _readiness_field(p.ready, p.ready_reason),
         "attestation": _attestation_chip(p),
@@ -1747,19 +1751,23 @@ def _holding_row_payload(row: HoldingRow, mode: str) -> dict[str, Any]:
 def holdings_payload(report: HoldingsReport) -> dict[str, Any]:
     """`gather_holdings`'s `HoldingsReport`, as JSON.
 
-    `open_count`, `rules` and `stop_rows_present` are READ from the report (Rule 6e bans `len()`
-    here). `rules` is the grouping key, in the report's own order; `stop_rows_present` lists the
-    tranche ids that carry a stop, so the view draws its stop column on that list being non-empty
-    and never by reading a `display` or `value`.
+    `open_count`, `groups` and `stop_rows_present` are READ from the report (Rule 6e bans `len()`
+    here). `groups` is one table per rule ROW (#960), in the report's own order, each with the
+    heading the service wrote; every row carries the `group` key it is drawn under, so the view
+    filters on a key and composes no heading. `stop_rows_present` lists the tranche ids that carry
+    a stop, so the view draws its stop column on that list being non-empty and never by reading a
+    `display` or `value`.
     """
     return {
         "as_of": iso(report.now_ts),
         "generated_at": moment(report.now_ts),
         "mode": report.mode,
         "open_count": count(report.open_count),
-        "rules": [str(rule) for rule in report.rules],
+        "groups": [{"key": g.key, "heading": g.heading} for g in report.groups],
         "stop_rows_present": [str(i) for i in report.stop_row_ids],
-        "rows": [_holding_row_payload(row, report.mode) for row in report.rows],
+        "rows": [
+            _holding_row_payload(row, report.mode, report.group_key(row)) for row in report.rows
+        ],
     }
 
 
