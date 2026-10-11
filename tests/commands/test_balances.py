@@ -292,7 +292,7 @@ def test_tranches_of_one_product_are_summed_into_one_asset_row(
     repo: Repository, tmp_path: Path
 ) -> None:
     """A balances page answers "what do I hold", which is per ASSET. The tranche breakdown is the
-    Positions view's job, and the two read the same report so they cannot disagree."""
+    Holdings view's job, and the two read the same report so they cannot disagree."""
     repo.set_state("equity_state_mode", "live")
     _tranche(repo, "BTC-USD", "2")
     _tranche(repo, "BTC-USD", "3")

@@ -301,9 +301,9 @@ class OrderRow:
     venue_order_id_detail: str
 
     #: The NAME of the rule that placed this order -- `rules.kind`, the same string
-    #: `build_rule_track_record` calls `rule_name`, so the Orders view and the track-record
-    #: table name one rule one way. `""` when there is no name to show, for either of the two
-    #: reasons `rule_name_detail` tells apart.
+    #: `build_rule_track_record` calls `rule_name`, so the console's orders table and the
+    #: track-record table name one rule one way. `""` when there is no name to show, for either
+    #: of the two reasons `rule_name_detail` tells apart.
     rule_name: str
 
     #: Why the name is absent, when it is. Two states that both render as an empty cell and are
