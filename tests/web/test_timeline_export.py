@@ -256,3 +256,66 @@ def test_the_export_names_the_chain_status_beside_the_hash(running: Any) -> None
     header = next(csv.reader(io.StringIO(body)))
 
     assert header[-2:] == ["row_hash", "chain_status"]
+
+
+def test_the_export_filters_by_the_composite_kind(tmp_path: Path) -> None:
+    """Console PR4: the Audit page opens on `kind=keel`, and its CSV link carries that kind -- so
+    the file has to hold exactly what the screen does: no `trade` and no `flow` rows."""
+    from tests.web.test_api import VALID_CONFIG_YAML, _bind
+
+    db_path = tmp_path / "keel.db"
+    conn = connect(str(db_path))
+    migrate(conn)
+    repo = Repository(conn)
+    repo.insert_order(
+        {
+            "mode": "paper",
+            "product_id": "BTC-USD",
+            "side": "buy",
+            "order_type": "market",
+            "qty": Decimal("0.01"),
+            "status": "filled",
+            "created_at": 1_700_000_000,
+            "updated_at": 1_700_000_000,
+        }
+    )
+    repo.upsert_transaction(
+        {
+            "coinbase_id": "cb-1",
+            "source": "coinbase",
+            "type": "deposit",
+            "asset": "USD",
+            "ts": 1_700_000_100,
+            "qty": Decimal("5"),
+            "total": Decimal("5"),
+            "notes": "",
+        }
+    )
+    repo.upsert_asset_attestation(
+        asset="BTC",
+        sector="payments",
+        backing="none",
+        pays_yield=False,
+        source="whitepaper",
+        attested_by="operator",
+        attested_at=1_700_000_200,
+    )
+    conn.close()
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(VALID_CONFIG_YAML)
+
+    for server in _bind(str(db_path), str(config_path)):
+        _status, _headers, everything = _csv(server, EXPORT + "?scope=all")
+        status, _headers, body = _csv(server, EXPORT + "?scope=all&kind=keel")
+
+    def kinds(text: str) -> list[str]:
+        # Past any `# NOTE` line above the header (a log gap or a broken chain), then by name.
+        rows = [row for row in csv.reader(io.StringIO(text)) if not row[0].startswith("# NOTE")]
+        kind_at = rows[0].index("kind")
+        return [row[kind_at] for row in rows[1:]]
+
+    every_kind = kinds(everything)
+    keel_only = kinds(body)
+    assert status == 200
+    assert sorted(every_kind) == ["attestation", "flow", "trade"], "the fixture reached the file"
+    assert keel_only == ["attestation"]
