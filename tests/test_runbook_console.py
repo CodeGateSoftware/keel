@@ -128,3 +128,20 @@ def test_the_section_says_where_the_folded_views_went() -> None:
         assert command in section, command
     listed = section.split("**Rules.**")[0]
     assert "Insights" not in listed and "Research" not in listed, "a retired view is still listed"
+
+
+def test_the_section_describes_the_four_views_and_where_the_last_retired_ones_went() -> None:
+    """Console PR4 completed the four views. The intro names exactly those, each has a paragraph,
+    and the Audit & Setup one says what an operator of the retired Timeline, Setup, Venues,
+    Balances and Plans views finds now: the keel-only timeline default, the CSV, the checklist,
+    readiness, and the terminal command for the venue declarations."""
+    section = _section()
+    intro = section.split("**Pulse.**")[0]
+
+    for retired in ("Setup,", "Balances", "Timeline", "Venues", "Plans", "being slimmed"):
+        assert retired not in intro, retired
+    for view in ("**Pulse.**", "**Holdings.**", "**Rules.**", "**Audit & Setup.**"):
+        assert section.count(view) == 1, view
+    audit = section.split("**Audit & Setup.**")[1].split("**Halting from the browser.**")[0]
+    for needle in ("`kind=keel`", "CSV", "job panel", "readiness", "`keel brokers list`"):
+        assert needle in audit, needle

@@ -18,7 +18,7 @@ published. Every architectural decision below is tested against that constitutio
 It ships today in three shapes, all from one artifact set:
 
 - **CLI** — `keel` commands over a local database (the operator's terminal).
-- **Local web console** — `keel serve`, loopback-only, zero-dependency static UI.
+- **Local web console** — `keel serve`, loopback-only, zero-dependency static UI: four engine views (Pulse, Holdings, Rules, Audit & Setup).
 - **Desktop distribution** — unsigned installers plus the `keel update` self-updater.
 
 ## 2. Package and module architecture
