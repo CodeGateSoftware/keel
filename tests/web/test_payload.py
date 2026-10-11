@@ -2139,6 +2139,28 @@ def test_the_holdings_groups_and_each_rows_group_are_the_reports() -> None:
     assert [row["group"] for row in document["rows"]] == ["rule-6", "rule-8"]
 
 
+def test_each_group_crosses_with_its_own_stop_list_not_the_first_groups() -> None:
+    """#960 F2: the stop column is decided per table, so the wire carries one list per group. A
+    live DCA rule (sentinel 0, lists none) first and a PAXG-like unattributed turtle with a stop
+    second: handing every group the first group's list would drop the PAXG stop."""
+    report = _holdings_report(
+        tranche={"rule_name": "dca", "rule_id": 6, "initial_stop": Decimal("0")},
+        extra_tranche={
+            "rule_name": "turtle_breakout",
+            "product_id": "PAXG-USD",
+            "initial_stop": Decimal("4521.76"),
+            "opened_at": NOW_TS - 3600,
+        },
+        mode="confirm",
+    )
+    document = payload.holdings_payload(report)
+    paxg_id = next(r["id"] for r in document["rows"] if r["group"] == "unattributed-1")
+    assert [(g["key"], g["stop_rows_present"]) for g in document["groups"]] == [
+        ("rule-6", []),
+        ("unattributed-1", [paxg_id]),
+    ]
+
+
 def test_a_matched_tranche_carries_its_entry_orders_figures() -> None:
     (row,) = payload.holdings_payload(_holdings_report(order={}))["rows"]
     assert row["entry_order_id"] != ""

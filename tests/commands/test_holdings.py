@@ -329,6 +329,26 @@ def test_each_group_lists_its_own_stop_carrying_tranches(repo: Repository, confi
     assert dca not in by_key["rule-6"]
 
 
+def test_an_attributed_turtle_tranche_lists_its_stop_under_its_own_rule_group(
+    repo: Repository, config: Config
+) -> None:
+    """Since v21 every new tranche carries a rule id: a rule-attributed turtle with a real stop
+    must put its id in ITS group's list, or its table loses the stop column."""
+    dca = _tranche(
+        repo, rule_name="dca", rule_id=6, initial_stop=Decimal("0"), opened_at=NOW_TS - 2 * DAY
+    )
+    turtle = _tranche(
+        repo,
+        rule_name="turtle_breakout",
+        rule_id=21,
+        initial_stop=Decimal("102.8"),
+        opened_at=NOW_TS - DAY,
+    )
+    report = replace(gather_holdings(repo, config, now_ts=NOW_TS), mode="confirm")
+    assert {g.key: g.stop_row_ids for g in report.groups} == {"rule-6": (), "rule-21": (turtle,)}
+    assert dca not in report.groups[0].stop_row_ids
+
+
 def test_a_paper_tranches_zero_stop_is_listed_as_it_was_before_961(
     repo: Repository, config: Config
 ) -> None:
