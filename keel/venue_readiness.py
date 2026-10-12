@@ -65,7 +65,6 @@ real repo and config.
 
 from __future__ import annotations
 
-import sqlite3
 from collections.abc import Mapping
 from dataclasses import dataclass
 from enum import Enum
@@ -73,6 +72,8 @@ from pathlib import Path
 from typing import Any
 
 from keel_core.trade_scope import READ_ONLY, TradeScopeState, VenueTradeScope
+
+from keel.data.db import connect_read_only
 
 
 class VenueReadiness(str, Enum):
@@ -322,9 +323,11 @@ def _read_only_trade_scope(db_path: str | None, venue: str) -> tuple[VenueTradeS
     an empty database that later commands would then find and believe in. `keel brokers list` is
     a read-only informational command and must litter nothing.
 
-    So this uses the `mode=ro` URI shape #610 promoted to a seam for exactly this hazard
-    (`keel/commands/_common.py::_open_repo_ro`), with the same explicit existence check in front
-    of it, because `mode=ro`'s own refusal is an `OperationalError` and this path wants an
+    So this uses `keel.data.db.connect_read_only` (#976): `mode=rw`, which creates no database
+    file, plus `PRAGMA query_only = ON`, which refuses every write. It replaced the `mode=ro`
+    URI shape (#610's seam, `keel/commands/_common.py::_open_repo_ro`), which cannot open a WAL
+    database whose `-shm` sidecar is absent and so reported a healthy `/api/venues` database as
+    unreadable. The explicit existence check stays in front of it, because this path wants an
     ANSWER, not an exception.
 
     Where it deliberately differs from that seam: `_open_repo_ro` REFUSES a database stamped
@@ -343,15 +346,14 @@ def _read_only_trade_scope(db_path: str | None, venue: str) -> tuple[VenueTradeS
     try:
         from keel.data.repository import Repository
 
-        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
-        conn.row_factory = sqlite3.Row
+        conn = connect_read_only(db_path)
         return Repository(conn).get_venue_trade_scope(venue), False
     except Exception:
         # A file IS there and this process could not read it: a schema older than #233's
-        # migration, a permissions problem, or -- the case that motivated separating these two
-        # answers -- a WAL database whose `-shm` sidecar is absent, which `mode=ro` cannot open
-        # because SQLite would have to CREATE that file. Every copied or restored backup has
-        # that shape. Reported as unknown, never as "nothing is attested".
+        # migration, a permissions problem, a locked or damaged file. (A WAL database whose
+        # `-shm` sidecar is absent was the case that motivated separating these two answers;
+        # since #976 it is read, not reported.) Reported as unknown, never as "nothing is
+        # attested".
         return None, True
     finally:
         if conn is not None:

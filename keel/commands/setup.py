@@ -46,6 +46,7 @@ from typing import Any
 import click
 
 from keel.commands._common import default_config_path, default_db_path
+from keel.data.db import connect_read_only
 
 #: The exact schema names this module reads. Named constants rather than string literals for a
 #: reason that is not style: I wrote `"subscriptions"` and `"state"` here first, and both are
@@ -446,7 +447,10 @@ def inspect(config_path: str | Path, db_path: str | Path) -> DeploymentState:
     conn: sqlite3.Connection | None = None
     if db_file.exists():
         try:
-            conn = sqlite3.connect(f"file:{db_file}?mode=ro", uri=True)
+            # `connect_read_only`, not `mode=ro` (#976): a WAL file whose sidecars are gone
+            # cannot be opened `mode=ro`, and this probe then reported a running deployment as
+            # having no usable database -- the console's stopped view, which has no HALT.
+            conn = connect_read_only(db_file)
             # `Repository` reads rows by COLUMN NAME (`row["value"]`, `row["state"]`, ...), which
             # `_scope_observation`/`_venue_interest_observation` now call straight into for the
             # same reason `_withdrawals_observation` stayed on raw SQL: one place to decode a
@@ -1297,7 +1301,7 @@ def _sleeve_sell_kind(db_path: Path, rule_id: int) -> str | None:
     from keel.data.repository import Repository
 
     try:
-        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        conn = connect_read_only(db_path)  # not `mode=ro`: see `inspect` (#976)
     except sqlite3.Error as exc:
         raise _UnreadableRule from exc
     conn.row_factory = sqlite3.Row

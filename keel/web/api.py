@@ -65,14 +65,28 @@ DIRECTIONS: tuple[str, ...] = ("asc", "desc")
 
 
 def open_repo(db_path: str) -> Any:
-    """A plain connection -- deliberately WITHOUT `migrate`.
+    """A READ-ONLY connection (`db.connect_read_only`) -- deliberately WITHOUT `migrate`.
 
     Every CLI command migrates on the way in, which is right for a command: it runs once, and a
     schema behind the code is a thing to fix rather than to fail on. It is wrong here. These
     pages auto-reload every 15 seconds, so migrating per request would have a view that calls
     itself read-only take a write lock on the deployment database four times a minute -- against
     a database the agent may be mid-cycle on. `server.ensure_schema` does it ONCE, at bind time,
-    before anything is served."""
+    before anything is served.
+
+    `query_only` since #976: every reader in this package goes through here, so SQLite itself
+    refuses a write through any of them. The halt is the one write, and it opens its own
+    connection (`open_repo_to_write`)."""
+    from keel.data.db import connect_read_only
+    from keel.data.repository import Repository
+
+    return Repository(connect_read_only(db_path))
+
+
+def open_repo_to_write(db_path: str) -> Any:
+    """The read-write connection for `gates._perform` -- the halt and the gated releases -- and
+    nothing else. Not `query_only`, so not for a reader: a page that read through this could write
+    the trading database. Like `open_repo`, it does not migrate."""
     from keel.data.db import connect
     from keel.data.repository import Repository
 

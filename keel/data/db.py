@@ -1213,6 +1213,35 @@ def connect(path: str | Path = "keel.db") -> sqlite3.Connection:
     return conn
 
 
+def connect_read_only(path: str | Path) -> sqlite3.Connection:
+    """Open an EXISTING database to read it, never to write it (#976).
+
+    **Why not `mode=ro`.** A WAL database's `-wal`/`-shm` sidecars can be gone while the file is
+    perfectly healthy -- a checkpointing last close removes them, and every copied backup lacks
+    them. Opening such a file needs the `-shm` re-created, which `mode=ro` forbids, so the open
+    fails with "unable to open database file". The console read that as "keel isn't running
+    here" on a running deployment, and its stopped view has no HALT.
+
+    So the file is opened `mode=rw` -- which may create the sidecars, and which, unlike a plain
+    `sqlite3.connect`, refuses to CREATE a missing database -- and `PRAGMA query_only = ON` is
+    set before anything is read. That makes SQLite itself refuse every write on this connection:
+    rows, schema, and header pragmas alike. Read-only holds at the engine, not by call discipline.
+
+    Unlike `connect`, this sets no `journal_mode`: changing the file's journal is a write, and a
+    reader has no business deciding it.
+    """
+    uri = Path(path).absolute().as_uri() + "?mode=rw"
+    conn = sqlite3.connect(uri, uri=True)
+    try:
+        conn.execute("PRAGMA query_only = ON")
+        conn.execute(f"PRAGMA busy_timeout = {BUSY_TIMEOUT_MS}")
+    except BaseException:
+        conn.close()
+        raise
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
 def table_present(conn: sqlite3.Connection, name: str) -> bool:
     """Does `name` exist on this database?
 
