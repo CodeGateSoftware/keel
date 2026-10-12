@@ -20,6 +20,7 @@ import ast
 import hashlib
 import http.client
 import json
+import re
 import sqlite3
 from collections.abc import Iterator
 from pathlib import Path, PurePosixPath, PureWindowsPath
@@ -353,10 +354,9 @@ def test_a_database_under_a_directory_with_awkward_characters_opens(tmp_path: Pa
 
 
 _REPO = Path(__file__).resolve().parents[2]
-#: What the console's read path must never send to SQLite: each of these either undoes
+#: What the console's read path must never send to SQLite (`_FORBIDDEN_SQL_RE`): each undoes
 #: `query_only` (it is per-connection and reversible by the connection itself), reaches another
 #: file, or writes the database file outside an ordinary statement.
-_FORBIDDEN_SQL = ("query_only", "attach", "wal_checkpoint", "vacuum")
 
 
 def _console_read_path_files() -> list[Path]:
@@ -392,73 +392,112 @@ def _is_write_only(file_name: str, function: str | None) -> bool:
     )
 
 
-def _execute_string_constants(tree: ast.AST) -> list[tuple[str | None, str]]:
-    """Every `.execute`/`.executemany`/`.executescript` call, as (enclosing function, SQL
-    string) -- one row per string constant inside its args, and one `(function, "")` row for a
-    call with none (so the call count is `len(result)` at least)."""
-    rows: list[tuple[str | None, str]] = []
+#: Case-insensitive; `attach` on a word boundary so `attachment; filename=` (a header) is not SQL.
+_FORBIDDEN_SQL_RE = re.compile(r"query_only|wal_checkpoint|vacuum|\battach\b", re.IGNORECASE)
+
+
+def _docstring_nodes(tree: ast.AST) -> set[int]:
+    """ids of the first-statement docstring constants of modules, classes and functions."""
+    ids: set[int] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Module | ast.ClassDef | ast.FunctionDef | ast.AsyncFunctionDef):
+            first = node.body[0] if node.body else None
+            if (
+                isinstance(first, ast.Expr)
+                and isinstance(first.value, ast.Constant)
+                and isinstance(first.value.value, str)
+            ):
+                ids.add(id(first.value))
+    return ids
+
+
+def _forbidden_sql(
+    source: str, path_label: str
+) -> tuple[list[tuple[str, str | None, str]], int, int]:
+    """The ONE filter the pin and its self-test share. Scans EVERY non-docstring string constant
+    (parts of f-strings included) -- not just literals written inside an `execute` call, since
+    SQL held in a variable or a module constant reaches `execute` all the same -- and returns
+    (offenders as (file, enclosing function, text), strings scanned, execute calls seen)."""
+    file_name = Path(path_label).name
+    tree = ast.parse(source)
+    docstrings = _docstring_nodes(tree)
+    offenders: list[tuple[str, str | None, str]] = []
+    counts = {"strings": 0, "calls": 0}
 
     def visit(node: ast.AST, function: str | None) -> None:
         if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef):
             function = node.name
+        if _is_write_only(file_name, function):
+            return
         if (
             isinstance(node, ast.Call)
             and isinstance(node.func, ast.Attribute)
             and node.func.attr in {"execute", "executemany", "executescript"}
         ):
-            strings = [
-                n.value
-                for arg in node.args
-                for n in ast.walk(arg)
-                if isinstance(n, ast.Constant) and isinstance(n.value, str)
-            ]
-            rows.extend([(function, text) for text in strings] or [(function, "")])
+            counts["calls"] += 1
+        if (
+            isinstance(node, ast.Constant)
+            and isinstance(node.value, str)
+            and id(node) not in docstrings
+        ):
+            counts["strings"] += 1
+            text = node.value
+            if text not in _ALLOWED_SQL.get((file_name, function), set()) and (
+                _FORBIDDEN_SQL_RE.search(text)
+            ):
+                offenders.append((file_name, function, text))
         for child in ast.iter_child_nodes(node):
             visit(child, function)
 
     visit(tree, None)
-    return rows
+    return offenders, counts["strings"], counts["calls"]
 
 
 def test_the_console_read_path_never_asks_sqlite_to_lift_read_only() -> None:
     """**`query_only` is per-connection and the connection can switch it off; ATTACH and the
     checkpoint pragmas are not blocked by it.** Read-only therefore rests on SQLite refusing
     ordinary writes PLUS no console reader issuing those statements. This is the second half,
-    pinned structurally over the AST of every module on the console's read path."""
+    pinned structurally over the AST of every module on the console's read path -- over every
+    string constant, so SQL held in a variable or constant is covered too (#977 round 3)."""
     files = _console_read_path_files()
     assert all(f.exists() for f in files), [str(f) for f in files if not f.exists()]
-    total = 0
+    strings = calls = 0
     offenders: list[tuple[str, str | None, str]] = []
     for file in files:
-        for function, text in _execute_string_constants(ast.parse(file.read_text())):
-            if _is_write_only(file.name, function):
-                continue
-            total += 1
-            if text in _ALLOWED_SQL.get((file.name, function), set()):
-                continue
-            if any(word in text.lower() for word in _FORBIDDEN_SQL):
-                offenders.append((file.name, function, text))
+        found, n_strings, n_calls = _forbidden_sql(file.read_text(), str(file))
+        offenders += found
+        strings += n_strings
+        calls += n_calls
 
-    assert total >= 50, f"the walker found only {total} SQL calls: it would pass by vacuum"
+    assert calls >= 50, f"the walker found only {calls} SQL calls: it would pass by vacuum"
+    assert strings >= 1500, f"only {strings} strings scanned: it would pass by vacuum"
     assert offenders == []
 
 
-def test_the_forbidden_sql_pin_sees_a_banned_statement_in_a_repository_method() -> None:
-    """The walker itself, on a planted source: an `OFF` pragma beside the one allowed `ON`, and
-    one in a Repository-shaped method, are both reported."""
-    src = (
-        "def connect_read_only(c):\n"
-        "    c.execute('PRAGMA query_only = ON')\n"
-        "    c.execute('PRAGMA query_only = OFF')\n"
-        "class R:\n"
-        "    def read(self):\n"
-        "        self.c.executemany('VACUUM', [])\n"
-    )
-    rows = _execute_string_constants(ast.parse(src))
-    flagged = [
-        (f, t)
-        for f, t in rows
-        if t not in _ALLOWED_SQL.get(("db.py", f), set())
-        and any(w in t.lower() for w in _FORBIDDEN_SQL)
+def test_the_forbidden_sql_pin_flags_what_it_must_and_spares_what_it_must() -> None:
+    """The REAL filter on planted sources. Variable-held and constant-held SQL must be caught
+    (the call-literal-only walker this replaced missed both)."""
+
+    def flagged(src: str, label: str = "repository.py") -> list[tuple[str | None, str]]:
+        return [(f, t) for _, f, t in _forbidden_sql(src, label)[0]]
+
+    assert flagged(
+        "class R:\n    def m(self):\n        self.c.execute('PRAGMA query_only = OFF')\n"
+    ) == [("m", "PRAGMA query_only = OFF")]
+    assert flagged(
+        "def m(self):\n    q = 'PRAGMA wal_checkpoint(TRUNCATE)'\n    self.c.execute(q)\n"
+    ) == [("m", "PRAGMA wal_checkpoint(TRUNCATE)")]
+    assert flagged("_SQL = \"ATTACH DATABASE 'x' AS y\"\n") == [(None, "ATTACH DATABASE 'x' AS y")]
+    assert [t for _, t in flagged("def m(self, t):\n    self.c.execute(f'VACUUM {t}')\n")] == [
+        "VACUUM "
     ]
-    assert flagged == [("connect_read_only", "PRAGMA query_only = OFF"), ("read", "VACUUM")]
+    # Negatives.
+    on = "PRAGMA query_only = ON"
+    assert flagged(f"def connect_read_only(c):\n    c.execute('{on}')\n", "db.py") == []
+    assert flagged(f"def other(c):\n    c.execute('{on}')\n", "db.py") == [("other", on)]
+    assert flagged("H = 'attachment; filename=x'\n", "server.py") == []
+    assert flagged(
+        "def connect_read_only(c):\n    c.execute('PRAGMA query_only = OFF')\n", "db.py"
+    ) == [("connect_read_only", "PRAGMA query_only = OFF")]
+    # Docstrings are prose, not SQL; the same words in a real string are not exempt.
+    assert flagged('def m():\n    """Never VACUUM here."""\n') == []

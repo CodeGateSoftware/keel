@@ -2364,6 +2364,81 @@ def test_a_halt_with_trustworthy_framing_keeps_the_connection_open(
     assert _statuses(received) == [b"200", b"200"], received[:300]
 
 
+def _browser_headers(cfg, extra: list[tuple[str, str]]) -> list[tuple[str, str]]:
+    """What Chrome sends for the console's `fetch` (api.js `post`): its own headers
+    (`X-Keel-Client`, `Accept`, the token header, `Content-Type` only with a body) plus the ones
+    the browser adds."""
+    return [
+        ("Host", f"{cfg.host}:{cfg.port}"),
+        ("Connection", "keep-alive"),
+        (
+            "User-Agent",
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/130",
+        ),
+        ("Accept", "application/json"),
+        ("Accept-Language", "en-US,en;q=0.9,fr;q=0.8"),
+        ("Origin", f"http://{cfg.host}:{cfg.port}"),
+        ("Sec-Fetch-Site", "same-origin"),
+        ("Sec-Fetch-Mode", "cors"),
+        ("Sec-Fetch-Dest", "empty"),
+        ("Cookie", f"theme=dark; {_session(cfg)}; other=1"),
+        ("X-Keel-Client", "1"),
+        *extra,
+    ]
+
+
+def _post_then_keepalive_get(cfg, path: str, headers: list[tuple[str, str]], body: bytes) -> bytes:
+    lines = [f"POST {path} HTTP/1.1", *[f"{n}: {v}" for n, v in headers]]
+    request = ("\r\n".join(lines) + "\r\n\r\n").encode() + body
+    request += (
+        f"GET /api/config HTTP/1.1\r\nHost: {cfg.host}:{cfg.port}\r\n"
+        f"Cookie: {_session(cfg)}\r\nX-Keel-Client: 1\r\nConnection: close\r\n\r\n"
+    ).encode()
+    received = b""
+    with socket.create_connection((cfg.host, cfg.port), timeout=3) as sock:
+        sock.sendall(request)
+        while chunk := sock.recv(65536):
+            received += chunk
+    return received
+
+
+def test_a_real_browser_halt_post_keeps_the_connection_open(deployment) -> None:
+    """#977 round 3: the exact header set api.js sends for the halt (no body, so the browser adds
+    `Content-Length: 0` and no `Content-Type`) with the headers Chrome adds on top and a
+    multi-pair Cookie. Pins existing behaviour: answered, and the follow-up GET on the SAME
+    socket is answered too."""
+    with _serving(deployment) as cfg:
+        headers = _browser_headers(
+            cfg, [(security.HALT_HEADER, security.halt_token(cfg.token)), ("Content-Length", "0")]
+        )
+        received = _post_then_keepalive_get(cfg, "/api/gates/halt", headers, b"")
+
+    assert _kill_switch(deployment[0]) is True
+    assert _statuses(received) == [b"200", b"200"], received[:300]
+
+
+def test_a_real_browser_setup_post_keeps_the_connection_open(empty_machine) -> None:
+    """The same for a JSON setup write: `Content-Type: application/json`, a small body with its
+    true Content-Length and the real CSRF header. The write itself may be refused on its merits
+    (the body is not a valid config); what is pinned is that it is ANSWERED and the connection
+    stays usable."""
+    cfg = empty_machine
+    body = json.dumps({"padding": "x"}).encode()
+    headers = _browser_headers(
+        cfg,
+        [
+            ("X-Keel-CSRF", _csrf(cfg)),
+            ("Content-Type", "application/json"),
+            ("Content-Length", str(len(body))),
+        ],
+    )
+    received = _post_then_keepalive_get(cfg, "/api/setup/config", headers, body)
+
+    statuses = _statuses(received)
+    assert len(statuses) == 2 and statuses[1] == b"200", received[:300]
+    assert statuses[0] != b"ERR" and statuses[0] != b"501", received[:300]
+
+
 def test_a_halt_with_an_oversized_body_still_engages_and_closes(deployment) -> None:
     """A body past `_MAX_BODY_BYTES` is not drained (that is the memory-exhaustion primitive the
     cap denies) -- the connection is closed instead. The halt itself must still happen: refusing
