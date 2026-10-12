@@ -22,9 +22,11 @@ unrealized P&L, stop distance) is derived from THAT number or from nothing at al
 WHAT IS ABSENT STAYS ABSENT. A product with no cached candle has no mark, and a row with no mark
 reports `None` for every figure that depends on one -- never zero. Zero market value renders a
 held position as a total loss, which is the most alarming thing this page could say, and it
-would be saying it about missing data. `initial_stop` is `None` for a DCA leg or a pre-v12
-tranche, so its distance is `None` too: a distance measured against a substituted zero would
-read as a position comfortably clear of a stop it does not have.
+would be saying it about missing data. A tranche with no stop has no stop distance either: a
+distance measured against a substituted zero would read as a position comfortably clear of a stop
+it does not have. "No stop" is `status.recorded_stop`'s reading, not `initial_stop is None`: the
+column is NULL on a pre-v12 tranche or an unattributed DCA leg, but `agent._open_tranche` copies
+`Dca.detect`'s `stop=0` sentinel onto every attributed DCA tranche, which stores "0" (#973).
 
 NO CLOSE ACTION, EVER (#701's own refusal). This module places nothing and cancels nothing.
 Exits degrade to the typed-phrase friction path; a panic tap on a table row must never be the
@@ -41,6 +43,7 @@ from keel_core.types import Granularity
 
 from keel import agent as agent_mod
 from keel.commands.doctor import ATTEST_WINDOW_APPROACHING_SEC as _DOCTOR_APPROACHING_SEC
+from keel.commands.status import recorded_stop
 from keel.config import Config
 from keel.data import freshness as freshness_mod
 from keel.data.repository import Repository
@@ -117,14 +120,18 @@ class PositionRow:
     market_value: Decimal | None
     unrealized_pnl: Decimal | None
 
-    #: The stop this tranche was SIZED against (`positions.initial_stop`). `None` means "not on
-    #: this row" -- a DCA leg, or a tranche predating v12 -- and NOT "no stop".
+    #: `positions.initial_stop` AS STORED: the stop this tranche was sized against, `None` on a
+    #: tranche predating v12 or an unattributed DCA leg, and `0` on an attributed DCA tranche (the
+    #: `Dca.detect` sentinel, which is no stop). Carried verbatim because Holdings' paper reading
+    #: names that 0 (`status.shown_stop`); anything that MEASURES against the stop reads it
+    #: through `status.recorded_stop`, as `stop_distance` does.
     initial_stop: Decimal | None
 
     #: `mark - initial_stop`, SIGNED: a tranche trading THROUGH its stop is the state an operator
     #: most needs to see, and an absolute distance would render it identically to one safely
     #: above. `stop_distance_pct` is that distance as a fraction OF THE MARK. Both `None` when
-    #: either the stop or the mark is missing.
+    #: the mark is missing or the tranche has no stop (`status.recorded_stop` is `None`: NULL,
+    #: or the zero a DCA tranche stores).
     stop_distance: Decimal | None
     stop_distance_pct: Decimal | None
 
@@ -391,15 +398,16 @@ def _row_from_dict(
     qty = raw["qty"]
     entry_fill = raw["entry_fill"]
     initial_stop = raw.get("initial_stop")
+    stop = recorded_stop(initial_stop)
 
     market_value = None if mark is None else qty * mark
     unrealized = None if mark is None else qty * (mark - entry_fill)
 
-    if mark is None or initial_stop is None:
+    if mark is None or stop is None:
         stop_distance: Decimal | None = None
         stop_distance_pct: Decimal | None = None
     else:
-        stop_distance = mark - initial_stop
+        stop_distance = mark - stop
         stop_distance_pct = _safe_ratio(stop_distance, mark)
 
     return PositionRow(
