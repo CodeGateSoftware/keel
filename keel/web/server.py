@@ -550,6 +550,9 @@ class KeelHandler(BaseHTTPRequestHandler):
         # A header line the stdlib parser could not read (`Content-Length : 2`, a space before the
         # colon) ends the header parse early: the length never reaches `self.headers`, and what is
         # left sits in the payload. Absence of a length is then NOT "a body of zero".
+        # By design this also closes (after answering) a `multipart/*` or `message/*` POST, whose
+        # header block the stdlib parses as a MIME container. The console sends only JSON or no
+        # body (`static/js/api.js`), and no route here takes a multipart upload.
         if self.headers.defects or self.headers.get_payload():
             self.close_connection = True
             return None
