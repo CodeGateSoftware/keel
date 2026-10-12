@@ -420,7 +420,9 @@ def test_every_reading_the_client_mints_carries_the_whole_envelope() -> None:
     # A literal reading `attestations: null` on the SUCCESS path carries the key and still
     # discards every alert the server sent -- the original defect exactly, one line further on.
     # Whatever the success literal does for `data` and `sort`, it must do for this.
-    (success,) = [literal for literal in literals if "document_." in literal]
+    # Picked by `document_.data`: since #958 the FAILURE literal forwards one key off its
+    # document too (`halt`), so "reads `document_` at all" no longer singles out the success.
+    (success,) = [literal for literal in literals if "document_.data" in literal]
     forwarded = set(re.findall(r"([a-z_]+): document_\.", success))
     assert envelope_keys - {"engine"} <= forwarded | {"as_of"}, (
         f"the success reading invents rather than forwards: {sorted(envelope_keys - forwarded)}"

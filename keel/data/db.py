@@ -16,8 +16,9 @@ from __future__ import annotations
 import json
 import sqlite3
 import time
+import urllib.parse
 from collections.abc import Callable
-from pathlib import Path
+from pathlib import Path, PurePath
 from typing import Any
 
 SCHEMA_VERSION = 22
@@ -1210,6 +1211,61 @@ def connect(path: str | Path = "keel.db") -> sqlite3.Connection:
     # database is also single-connection by nature, so there is nothing to protect.
     if str(path) != ":memory:":
         conn.execute("PRAGMA journal_mode = WAL")
+    return conn
+
+
+def _read_only_uri(path: PurePath) -> str:
+    """The `file:` URI `connect_read_only` opens, built from an ABSOLUTE path.
+
+    **Not `Path.as_uri()`.** On Windows it yields `file:///C:/...` for a drive path but, for a UNC
+    path (`\\\\server\\share`), a form SQLite does not read as the same file; and anything built
+    by hand must percent-encode, because in a URI `#`, `?` and `%` stop being path characters. So:
+    `as_posix()`, a `file://` prefix when the path already starts with `/` (POSIX, and UNC after
+    `as_posix` -- which gives `//server/share`, hence the four slashes) and `file:///` when it
+    starts with a drive letter, and `quote` keeping only `/` and `:`.
+    """
+    posix = path.as_posix()
+    prefix = "file://" if posix.startswith("/") else "file:///"
+    return prefix + urllib.parse.quote(posix, safe="/:") + "?mode=rw"
+
+
+def connect_read_only(path: str | Path) -> sqlite3.Connection:
+    """Open an EXISTING database to read it, never to write it (#976).
+
+    **Why not `mode=ro`.** A WAL database's `-wal`/`-shm` sidecars can be gone while the file is
+    perfectly healthy -- a checkpointing last close removes them, and every copied backup lacks
+    them. Opening such a file needs the `-shm` re-created, which `mode=ro` forbids, so the open
+    fails with "unable to open database file". The console read that as "keel isn't running
+    here" on a running deployment, and its stopped view has no HALT.
+
+    So the file is opened `mode=rw` -- which may create the sidecars, and which, unlike a plain
+    `sqlite3.connect`, refuses to CREATE a missing database -- and `PRAGMA query_only = ON` is
+    set before anything is read, so SQLite refuses every ordinary write on this connection: rows,
+    schema, and header pragmas alike.
+
+    **What that does and does not rest on.** `query_only` is per-connection and the connection can
+    switch it back off, and neither it nor `mode=rw` blocks `ATTACH` or the checkpoint pragmas.
+    Read-only here is SQLite refusing ordinary writes PLUS no console reader issuing
+    `PRAGMA query_only`, `ATTACH`, a checkpoint or `VACUUM`; a structural test walks the console's
+    read path for exactly those (`test_the_console_read_path_never_asks_sqlite_to_lift_read_only`).
+
+    **Checkpoint-on-close is disabled** (`SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE`). The last connection
+    to close a WAL database otherwise checkpoints it into the main file, and a console that closes
+    after the agent has gone would be writing the trading database. The `-wal` is left for the
+    writer, which checkpoints on its own schedule.
+
+    Unlike `connect`, this sets no `journal_mode`: changing the file's journal is a write, and a
+    reader has no business deciding it.
+    """
+    conn = sqlite3.connect(_read_only_uri(Path(path).absolute()), uri=True)
+    try:
+        conn.setconfig(sqlite3.SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE, True)
+        conn.execute("PRAGMA query_only = ON")
+        conn.execute(f"PRAGMA busy_timeout = {BUSY_TIMEOUT_MS}")
+    except BaseException:
+        conn.close()
+        raise
+    conn.row_factory = sqlite3.Row
     return conn
 
 

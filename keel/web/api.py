@@ -65,14 +65,28 @@ DIRECTIONS: tuple[str, ...] = ("asc", "desc")
 
 
 def open_repo(db_path: str) -> Any:
-    """A plain connection -- deliberately WITHOUT `migrate`.
+    """A READ-ONLY connection (`db.connect_read_only`) -- deliberately WITHOUT `migrate`.
 
     Every CLI command migrates on the way in, which is right for a command: it runs once, and a
     schema behind the code is a thing to fix rather than to fail on. It is wrong here. These
     pages auto-reload every 15 seconds, so migrating per request would have a view that calls
     itself read-only take a write lock on the deployment database four times a minute -- against
     a database the agent may be mid-cycle on. `server.ensure_schema` does it ONCE, at bind time,
-    before anything is served."""
+    before anything is served.
+
+    `query_only` since #976: every reader in this package goes through here, so SQLite itself
+    refuses a write through any of them. The halt is the one write, and it opens its own
+    connection (`open_repo_to_write`)."""
+    from keel.data.db import connect_read_only
+    from keel.data.repository import Repository
+
+    return Repository(connect_read_only(db_path))
+
+
+def open_repo_to_write(db_path: str) -> Any:
+    """The read-write connection for `gates._perform` -- the halt and the gated releases -- and
+    nothing else. Not `query_only`, so not for a reader: a page that read through this could write
+    the trading database. Like `open_repo`, it does not migrate."""
     from keel.data.db import connect
     from keel.data.repository import Repository
 
@@ -328,6 +342,30 @@ def read_pulse(cfg: ServeConfig, _query: Query, _state: Any, now_ts: int) -> dic
     finally:
         close_repo(repo)
     return payload.pulse_payload(report, halt_token=halt_token(cfg.token))
+
+
+def pulse_halt(cfg: ServeConfig) -> dict[str, str]:
+    """The HALT control's inputs when the Pulse report could not be built (#958).
+
+    `halt_token` is minted from the session, so it cannot fail. The kill-switch reading is the one
+    ledger read here, through its own repo open and `pulse.halt_resume_command` -- never through
+    `gather_pulse`, whose failure is why this exists. **A switch that cannot be read reads as not
+    halted**, which shows the button: halting a halted engine is harmless and idempotent, while a
+    HALTED line over a running engine would hide the only stop the page has. Never `gates_token`
+    (#968), on this path as on the success one."""
+    from keel.commands.pulse import halt_resume_command
+
+    resume = ""
+    repo = None
+    try:
+        repo = open_repo(cfg.db_path)
+        resume = halt_resume_command(repo)
+    except Exception:  # noqa: BLE001 - an unreadable switch must still answer with the button
+        resume = ""
+    finally:
+        if repo is not None:
+            close_repo(repo)
+    return payload.halt_fallback(halt_token=halt_token(cfg.token), resume_command=resume)
 
 
 def read_orders(cfg: ServeConfig, query: Query, _state: Any, now_ts: int) -> dict[str, Any]:
@@ -882,6 +920,10 @@ class ApiRoute:
     needs_database: bool = True
     collection: str = ""
     sortable: tuple[str, ...] = field(default=())
+    #: Whether a failed read still answers with the HALT control's inputs (#958). `/api/pulse`
+    #: only: it is the view that halts, and `pulse_halt` reads what the button needs apart from
+    #: the report, so a report that raises does not take the stop with it.
+    halt_on_failure: bool = False
 
 
 #: THE READ SURFACE, in full. Every one of the rendered routes in `server.ROUTES` appears here as
@@ -895,6 +937,7 @@ API_ROUTES: dict[str, ApiRoute] = {
     "/api/pulse": ApiRoute(
         html_route="/pulse",
         read=read_pulse,
+        halt_on_failure=True,
         # No sortable collection: every table on the glance page is an intrinsic order --
         # `rule_counts` by status, `data_freshness` in the config's product order, `live_rules`
         # in the ledger's, cycles newest first -- and a display sort would destroy each rather
@@ -1197,18 +1240,27 @@ def respond(cfg: ServeConfig, path: str, query: Query) -> tuple[int, dict[str, A
         data = route.read(cfg, query, state, now_ts)
     except ApiRefusal as refusal:
         return refusal.status, payload.error_envelope(
-            now_ts, status=refusal.status, title=refusal.title, detail=refusal.detail
+            now_ts,
+            status=refusal.status,
+            title=refusal.title,
+            detail=refusal.detail,
+            halt=pulse_halt(cfg) if route.halt_on_failure else None,
         )
     except Exception as exc:
         # A broken report is a stated failure, never a 200 with an empty payload -- that shape is
         # precisely the "blank view, or worse, stale figures" this envelope exists to prevent. The
         # detail carries the exception's TYPE and message and no traceback: a traceback in a
         # browser is a stack of file paths from someone else's machine.
+        #
+        # Pulse's failure still carries the HALT control's inputs (#958): the report failing is
+        # not a reason for the stop to disappear. Reached only after `_admitted`, like the
+        # success document that carries the same token.
         return 500, payload.error_envelope(
             now_ts,
             status=500,
             title="That report could not be built",
             detail=f"{type(exc).__name__}: {exc}",
+            halt=pulse_halt(cfg) if route.halt_on_failure else None,
         )
 
     if column:

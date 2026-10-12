@@ -263,6 +263,19 @@ def build_pulse(
     )
 
 
+def halt_resume_command(repo: Repository) -> str:
+    """`RESUME_COMMAND` when the kill switch reads engaged, else `""` -- the halt control's one
+    input besides its token, read ALONE (#958).
+
+    The Pulse report reads the same fact through `gather_status`, and when any part of that
+    report fails the whole report fails with it. The HALT button must not: stopping is never
+    slower than starting (`keel/web/gates.py`). So the web layer reads this on the failure path,
+    where nothing else on the ledger is trusted to answer. The same reading as
+    `gather_status`'s, `default=True` included -- an unset switch is ENGAGED, as the guards treat
+    it."""
+    return RESUME_COMMAND if bool(repo.get_state("kill_switch", default=True)) else ""
+
+
 def gather_pulse(
     repo: Repository, config: Config, feed: ActivityFeed, *, now_ts: int
 ) -> PulseReport:

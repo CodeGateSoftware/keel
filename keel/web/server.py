@@ -46,12 +46,13 @@ than a long-lived reader that could sit inside someone else's transaction.
 from __future__ import annotations
 
 import json
+import re
 import signal
 import socket
 import sys
 import time
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
@@ -83,6 +84,9 @@ _REFRESH_SEC = 15
 #: primitive and there is no proxy in front of this server to impose a limit. A setup form carries
 #: an action key and a token.
 _MAX_BODY_BYTES = 8 * 1024
+# More digits than any honest `Content-Length` has; a longer one is closed on, never `int()`-ed
+# (CPython raises ValueError past 4300 digits).
+_MAX_CONTENT_LENGTH_DIGITS = 18
 
 
 @dataclass(frozen=True)
@@ -395,7 +399,7 @@ class KeelHandler(BaseHTTPRequestHandler):
     #: Per REQUEST, not per connection, and reset at the top of each verb: a handler instance
     #: serves every request on a keep-alive connection, so a flag left set by one write would make
     #: the next refusal skip its drain and re-create the desynchronisation this exists to prevent.
-    #: `_drain_request_body` reads it; `_read_json_object` sets it.
+    #: `_drain_request_body` reads and sets it; `_read_json_object` sets it.
     body_consumed: bool = False
 
     # -- logging --
@@ -527,6 +531,48 @@ class KeelHandler(BaseHTTPRequestHandler):
             return
         self._send(code, f"{heading}\n\n{detail}\n")
 
+    def _declared_body_length(self) -> int | None:
+        """The request body's length, or `None` when the framing cannot be trusted -- and then the
+        connection is already marked to close.
+
+        **One parser, so the drain and the reader cannot disagree** about where a body ends (#955
+        review). Only ONE shape is trusted: no `Transfer-Encoding`, and either no `Content-Length`
+        (a body of zero) or exactly one, made only of ASCII digits. Everything else is a request
+        this server cannot size, and the safe answer is to stop using the connection rather than
+        guess: `int()` happily reads `"+2"`, `"-2"` and `"1_0"` (as 10); a negative length reads
+        as "no body"; a chunked body has no length at all; and two `Content-Length` headers (or one
+        beside a `Transfer-Encoding`) are the request-smuggling shape, where this server and
+        whatever sits in front of it measure the body differently. Draining by a wrong measure
+        leaves body bytes to be parsed as the next request line.
+
+        The halt never calls this to decide anything -- it reads no body and engages first.
+        """
+        # A header line the stdlib parser could not read (`Content-Length : 2`, a space before the
+        # colon) ends the header parse early: the length never reaches `self.headers`, and what is
+        # left sits in the payload. Absence of a length is then NOT "a body of zero".
+        # By design this also closes (after answering) a `multipart/*` or `message/*` POST, whose
+        # header block the stdlib parses as a MIME container. The console sends only JSON or no
+        # body (`static/js/api.js`), and no route here takes a multipart upload.
+        if self.headers.defects or self.headers.get_payload():
+            self.close_connection = True
+            return None
+        if self.headers.get("Transfer-Encoding") is not None:
+            self.close_connection = True
+            return None
+        values = self.headers.get_all("Content-Length") or []
+        if not values:
+            return 0
+        # Bounded BEFORE `int()`, which raises ValueError past 4300 digits. A few leading zeros
+        # ("01") still work; an absurdly padded or huge value closes like any unsizeable length.
+        if (
+            len(values) > 1
+            or len(values[0]) > _MAX_CONTENT_LENGTH_DIGITS
+            or re.fullmatch(r"[0-9]+", values[0]) is None
+        ):
+            self.close_connection = True
+            return None
+        return int(values[0])
+
     def _drain_request_body(self) -> None:
         """Consume an unread request body, or close the connection rather than consume it.
 
@@ -553,16 +599,17 @@ class KeelHandler(BaseHTTPRequestHandler):
             # Reading it a second time blocks until the client's timeout, which is a hang rather
             # than an error and was exactly what the first version of this did.
             return
-        try:
-            length = int(self.headers.get("Content-Length") or 0)
-        except ValueError:
-            self.close_connection = True
+        length = self._declared_body_length()
+        if length is None:
             return
-        if length <= 0:
+        if length == 0:
             return
         if length > _MAX_BODY_BYTES:
             self.close_connection = True
             return
+        # Before the read: whatever the read does, this request's body is no longer ours to read,
+        # and `do_POST`'s closing drain must not wait on it a second time.
+        self.body_consumed = True
         try:
             self.rfile.read(length)
         except OSError:  # pragma: no cover - a client that vanished mid-body
@@ -778,8 +825,28 @@ class KeelHandler(BaseHTTPRequestHandler):
         There is no dynamic dispatch here and no getattr on a user-supplied name. A write reaches
         keel through exactly two tables: `keel.commands.setup.ACTIONS` -- which contains only
         idempotent, non-destructive, `MECHANICAL` steps and cannot contain anything else without
-        failing a test -- or `gates.TIER1_ACTIONS` plus the halt, behind `_gated_action`."""
+        failing a test -- or `gates.TIER1_ACTIONS` plus the halt, behind `_gated_action`.
+
+        **Every POST ends at a request boundary (#955).** A branch that answers without reading
+        the body -- the halt, which takes no phrase and no values -- used to leave whatever a
+        client sent anyway in the socket, and on a kept-alive connection the stdlib parsed it as
+        the next request line (`{}GET /api/pulse`, answered 501). The drain is in a `finally`
+        here rather than in each branch, so a branch added later cannot forget it; it is bounded
+        and closes instead of reading an oversized or unreadable length (`_drain_request_body`).
+        Drain rather than always close: the console's next read rides the same connection, and
+        closing on every halt would cost each one a reconnect for a body nobody needs.
+
+        AFTER the answer, on purpose: the halt has already engaged and been reported by then, so a
+        client that declares a body it never sends stalls only its own connection, never the stop
+        -- stopping is never slower than starting (`keel/web/gates.py`)."""
         self.body_consumed = False
+        try:
+            self._post()
+        finally:
+            self._drain_request_body()
+
+    def _post(self) -> None:
+        """`do_POST`'s routing, minus the drain that every branch shares. Read `do_POST`."""
         parsed = urlsplit(self.path)
         if not self._admitted():
             return
@@ -927,11 +994,10 @@ class KeelHandler(BaseHTTPRequestHandler):
         bodies at #540 along with the form that sent them; this is the one place that difference
         can be exploited, so it is the one place it is refused.
         """
-        try:
-            length = int(self.headers.get("Content-Length") or 0)
-        except ValueError:
-            return None
-        if length < 0 or length > _MAX_BODY_BYTES:
+        length = self._declared_body_length()
+        if length is None or length > _MAX_BODY_BYTES:
+            # Untrusted framing has already closed the connection; an oversized length is closed
+            # by the drain that every refusal runs.
             return None
         if length == 0:
             # An action with no declared inputs is submitted with an empty body, and that is a
@@ -1177,15 +1243,13 @@ def serve(cfg: ServeConfig, *, echo: Callable[[str], None] = print) -> int:
         return 1
 
     bound_port = server.server_address[1]
-    running = ServeConfig(
-        host=cfg.host,
-        port=int(bound_port),
-        token=cfg.token,
-        db_path=cfg.db_path,
-        config_path=cfg.config_path,
-        build=cfg.build,
-        build_info=cfg.build_info,
-    )
+    # `replace`, never a hand-listed constructor: the port is the ONE thing binding learns, and
+    # every other field must reach the handler as `serve_cmd` resolved it. The constructor this
+    # replaced copied seven fields by name and dropped `external_hosts` and `started_at` (#971),
+    # so every `--external-host` run refused its own declared Host, never expired a remote
+    # session, and read "no declared remote origin" in the release locality check. A field added
+    # to `ServeConfig` later is carried here without anyone having to remember this line.
+    running = replace(cfg, port=int(bound_port))
     server.RequestHandlerClass.cfg = running  # type: ignore[attr-defined]
 
     if not running.host_policy.is_loopback:

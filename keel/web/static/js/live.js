@@ -143,6 +143,7 @@ export function subscribe(onReading) {
         error: null,
         sort: null,
         attestations: null,
+        halt: null,
       },
       "",
     );

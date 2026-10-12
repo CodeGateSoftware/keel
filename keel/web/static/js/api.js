@@ -84,6 +84,11 @@
  *                                        `undefined`, which every consumer treats as
  *                                        "nothing to show" rather than as a mistake. That
  *                                        is exactly how the banner shipped dead.
+ * @property {any}          halt    `{halt_token, resume_command}` on a failed `/api/pulse`, else
+ *                                  `null` (#958): the HALT control's inputs, delivered apart from
+ *                                  the report so a report that failed to build keeps the stop.
+ *                                  Read off a FAILURE document only -- a built Pulse carries the
+ *                                  same values in its `data`.
  */
 
 /**
@@ -160,7 +165,17 @@ export function readingFrom(document_, ok, status) {
     const error = /** @type {ApiError} */ (
       document_.error || { status: status, title: "Refused", detail: "" }
     );
-    return { as_of: as_of, engine: stopped(error.title), data: null, error: error, sort: null, attestations: null };
+    return {
+      as_of: as_of,
+      engine: stopped(error.title),
+      data: null,
+      error: error,
+      sort: null,
+      attestations: null,
+      // `?? null` like `data` below: a refusal or an older server sends no usable `halt`, and
+      // `undefined` here would be a key the page cannot tell from "nothing to offer".
+      halt: document_.halt ?? null,
+    };
   }
 
   // Cases 1 and 2. `engine` is validated rather than trusted: this page is served from the same
@@ -180,6 +195,7 @@ export function readingFrom(document_, ok, status) {
     error: null,
     sort: document_.sort ?? null,
     attestations: document_.attestations ?? null,
+    halt: null,
   };
 }
 
@@ -229,6 +245,7 @@ export async function read(endpoint, params) {
       },
       sort: null,
       attestations: null,
+      halt: null,
     };
   }
 
@@ -247,6 +264,7 @@ export async function read(endpoint, params) {
       error: { status: String(response.status), title: "Unreadable answer", detail: String(cause) },
       sort: null,
       attestations: null,
+      halt: null,
     };
   }
 
@@ -333,8 +351,10 @@ export async function runHalt(haltToken) {
  *
  * **A write whose route reads no body sends none.** The halt route never reads one, and on a
  * kept-alive connection bytes a handler leaves unread are parsed as the start of the NEXT request:
- * the PR1 browser check saw the repaint's `GET /api/pulse` arrive as `{}GET` and refused 501. So
- * `body` is optional, and the JSON content type travels only with a body.
+ * the PR1 browser check saw the repaint's `GET /api/pulse` arrive as `{}GET` and refused 501. The
+ * server now drains such bytes itself (#955, `server.do_POST`), and this still sends none: a body
+ * nobody reads is bytes on the wire for nothing. So `body` is optional, and the JSON content type
+ * travels only with a body.
  *
  * @param {URL} url
  * @param {Record<string, string>} extraHeaders  the token header for this write.
@@ -364,6 +384,7 @@ async function post(url, extraHeaders, body) {
       error: { status: "0", title: "No answer", detail: String(cause) },
       sort: null,
       attestations: null,
+      halt: null,
     };
   }
 
@@ -378,6 +399,7 @@ async function post(url, extraHeaders, body) {
       error: { status: String(response.status), title: "Unreadable answer", detail: String(cause) },
       sort: null,
       attestations: null,
+      halt: null,
     };
   }
 

@@ -252,3 +252,77 @@ def test_the_manifest_starts_at_pulse() -> None:
 
     assert manifest["start_url"] == "/pulse"
     assert manifest["id"] == "/"
+
+
+# -- HALT survives a Pulse that cannot be built (#958) ---------------------------------------------
+
+
+def test_every_reading_carries_the_halt_key_and_only_a_failure_reads_it() -> None:
+    """A `Reading` is the client's whole picture of one answer, so the failure document's `halt`
+    must survive `readingFrom` -- a key dropped there is `undefined`, which the page treats as
+    "no halt to offer", and a broken Pulse would hide the stop again. Every Reading literal in
+    every module carries the key (paired with `attestations`, which every literal has), and the
+    only one that READS it off a document is `readingFrom`'s failure arm."""
+
+    def keys(name: str, key: str) -> int:
+        # A Reading key sits on a line of its own; `{ halt: reading.halt }` inline is an argument.
+        return len(re.findall(rf"^\s+{key}: ", _comments_stripped(_source(name)), re.M))
+
+    literals = {name: keys(name, "attestations") for name in _MODULES}
+    halts = {name: keys(name, "halt") for name in _MODULES}
+    assert sum(literals.values()) >= 7, "the scan found no Reading literals; it has stopped working"
+    assert halts == literals
+
+    api = _comments_stripped(_source("api.js"))
+    reading_from = _function_body(_source("api.js"), "readingFrom")
+    failure_arm = reading_from[reading_from.index("if (!ok) {") : reading_from.index("\n  }\n")]
+    assert api.count("document_.halt") == 1
+    assert failure_arm.count("halt: document_.halt ?? null") == 1
+
+
+def _paint() -> str:
+    code = _comments_stripped(_source("main.js"))
+    start = code.index("async function paint(")
+    return code[start : code.index("\n}\n", start)]
+
+
+def test_a_failed_pulse_paints_the_halt_before_the_stopped_view() -> None:
+    """In `paint`'s `data: null` branch, a Pulse failure that carries `halt` gets its own view --
+    after the 403 branch (a refusal carries `halt: null` and needs the reconnect field), before
+    the stopped view (which offers no stop). The halt token is taken off that failure exactly as
+    `mount` takes it off a built report: through `rememberHaltToken`, the one holder."""
+    paint = _paint()
+    start = paint.index("if (primary.data === null) {")
+    null_branch = paint[start : paint.index("} else {\n      rebuildInto(mount(", start)]
+
+    refused = null_branch.index("primary.error.status === REFUSED_STATUS")
+    failed = null_branch.index('} else if (route.name === "pulse" && primary.halt) {')
+    stopped = null_branch.index("stoppedView(primary")
+    assert refused < failed < stopped
+    arm = null_branch[failed:stopped]
+    assert arm.count("rememberHaltToken(primary.halt);") == 1
+    assert arm.count("rebuildInto(pulseFailedView(primary), Boolean(force));") == 1
+    assert arm.index("rememberHaltToken(") < arm.index("pulseFailedView(")
+
+    main = _code_only(_source("main.js"))
+    assert len(re.findall(r"\brememberHaltToken\(", main)) == 2, "mount + the failure arm, no third"
+
+
+def test_the_failed_pulse_view_is_the_halt_control_and_the_error_only() -> None:
+    """`pulseFailedView` reuses `haltControl` -- the SAME form, button and HALTED line, so the
+    stop on a broken page is the stop on a working one -- with the failure's own `halt` in the
+    shape `haltControl` reads. HALT first, then why the rest is missing; none of the report's
+    sections, which have nothing to render. No extra confirm and no phrase: stopping is never
+    slower than starting, and the one confirm lives in `main.js`."""
+    body = _function_body(_source("render.js"), "pulseFailedView")
+
+    assert body.count("haltControl(") == 1
+    assert re.findall(r"haltControl\(([^)]*)\)", body) == ["{ halt: reading.halt }"]
+    assert body.count('el("h1"') == 1
+    assert body.index("haltControl(") < body.index("reading.error")
+    inside = body[body.index("{") :]
+    assert not re.search(r"\bpulse[A-Z]\w*\(", inside), "no report section on a failed report"
+    assert "confirm" not in body
+    render = _code_only(_source("render.js"))
+    assert len(re.findall(r"\bhaltControl\(", render)) == 3, "declaration + pulseView + failed"
+    assert "export function pulseFailedView(" in _comments_stripped(_source("render.js"))

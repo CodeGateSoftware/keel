@@ -235,9 +235,9 @@ def _perform(cfg: Any, operation: Callable[[Repository], None], done: str) -> st
     A `finally`, because every reader in `keel/web/` closes in one and a writer that leaked a
     connection would hold a write lock on the deployment database until refcounting noticed.
     """
-    from keel.web.api import close_repo, open_repo
+    from keel.web.api import close_repo, open_repo_to_write
 
-    repo = open_repo(cfg.db_path)
+    repo = open_repo_to_write(cfg.db_path)
     try:
         operation(repo)
     finally:
