@@ -2308,7 +2308,7 @@ def test_a_json_post_with_untrustworthy_framing_is_refused_and_closes(
     empty_machine, framing, body
 ) -> None:
     """The same framing on a setup action is refused (400, the shape a bad length gets today) and
-    the connection closes: the body is not read, not guessed at, and not left for the next request."""
+    the connection closes: the body is not read, not guessed at, and not left behind."""
     cfg = empty_machine
     headers = [
         ("Host", f"{cfg.host}:{cfg.port}"),
