@@ -15,7 +15,7 @@ evidence for the same fact -- a human, present, who typed something a script wou
 eight are refused here as firmly as they are refused to cron.
 
 **Not the whole gate either.** The typed phrase proves intent, not locality, and on its own it is
-the weakest of the three checks a request must pass. `security.gated_action_permitted` decides
+the weakest of the seven checks a release must pass. `security.gated_action_permitted` decides
 whether a request may attempt an action at all -- loopback peer, loopback bind, no declared
 remote origin -- and `security.gates_token` proves the caller holds this session's secret. No
 endpoint serves that token (#968): the console's HALT button holds `security.halt_token`, which

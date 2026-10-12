@@ -643,16 +643,28 @@ def test_rules_list_shows_rule_needs_no_passphrase(tmp_path):
     assert "candidate" in result.output
 
 
-def test_rules_backtest_with_no_candles_reports_zero_trades(tmp_path):
+def test_rules_backtest_with_no_candles_reports_zero_trades(tmp_path, valid_config_path):
     db_path = tmp_path / "test.db"
     repo = _repo_at(db_path)
     rule_id = repo.insert_rule("pullback_continuation", {"product_id": "BTC-USD"})
     runner = CliRunner()
 
-    result = runner.invoke(cli, ["--db", str(db_path), "rules", "backtest", str(rule_id)])
+    result = runner.invoke(
+        cli,
+        [
+            "--db",
+            str(db_path),
+            "--config",
+            str(valid_config_path),
+            "rules",
+            "backtest",
+            str(rule_id),
+        ],
+    )
 
     assert result.exit_code == 0, result.output
     assert "n_trades=0" in result.output
+    assert "fee_pct=1.2000%" in result.output
 
 
 def test_rules_backtest_states_the_fee_rate_it_priced_fills_at(tmp_path, valid_config_path):
@@ -710,14 +722,18 @@ def test_rules_backtest_prices_fills_at_the_configs_taker_rate(tmp_path, write_c
     assert "fee_pct=3.0000%" in result.output
 
 
-def test_rules_backtest_unknown_rule_id_errors(tmp_path):
+def test_rules_backtest_unknown_rule_id_errors(tmp_path, valid_config_path):
     db_path = tmp_path / "test.db"
     _repo_at(db_path)
     runner = CliRunner()
 
-    result = runner.invoke(cli, ["--db", str(db_path), "rules", "backtest", "999"])
+    result = runner.invoke(
+        cli,
+        ["--db", str(db_path), "--config", str(valid_config_path), "rules", "backtest", "999"],
+    )
 
     assert result.exit_code != 0
+    assert "no rule with id 999" in result.output
 
 
 def test_rules_promote_stays_when_floor_not_cleared(tmp_path, valid_config_path):
@@ -1361,7 +1377,9 @@ def test_rules_seed_respects_products_and_kinds_options(tmp_path, valid_config_p
     assert rows[0]["params"]["product_id"] == "BTC-USD"
 
 
-def test_rules_seed_unknown_kind_errors(tmp_path):
+def test_rules_seed_unknown_kind_errors(tmp_path, valid_config_path):
+    """Needs a real `--config`: `rules seed` loads config first, so without one the command
+    exits nonzero on 'file not found' and this passes whatever seed does with a bad kind."""
     db_path = tmp_path / "test.db"
     runner = CliRunner()
 
@@ -1370,6 +1388,8 @@ def test_rules_seed_unknown_kind_errors(tmp_path):
         [
             "--db",
             str(db_path),
+            "--config",
+            str(valid_config_path),
             "rules",
             "seed",
             "--products",
@@ -1380,6 +1400,7 @@ def test_rules_seed_unknown_kind_errors(tmp_path):
     )
 
     assert result.exit_code != 0
+    assert "unknown rule kind" in result.output
 
 
 def test_rules_seed_rows_round_trip_through_build_rule(tmp_path, valid_config_path):

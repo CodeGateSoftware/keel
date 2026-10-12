@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from decimal import Decimal
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -346,3 +347,10 @@ def _run_in_tmp_path(tmp_path, monkeypatch):
     A test that reads a repository file opens it from `__file__`, never from the cwd."""
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("KEEL_HOME", str(tmp_path))
+    # `python -c` children used to import keel from the cwd (the repo root); from `tmp_path` they
+    # would import whatever the venv's editable install points at -- the MAIN checkout, in a
+    # worktree that borrows its venv. Pin the tree under test, keeping any PYTHONPATH already set.
+    monkeypatch.setenv(
+        "PYTHONPATH",
+        os.pathsep.join(filter(None, [str(_REPO_ROOT), os.environ.get("PYTHONPATH")])),
+    )

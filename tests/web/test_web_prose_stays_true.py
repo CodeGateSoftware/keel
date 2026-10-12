@@ -195,6 +195,9 @@ def test_the_phrase_check_names_its_place_among_every_check_before_it() -> None:
 
     doc = inspect.getdoc(gates.run_gated_action) or ""
     assert _stated_count(doc, r"LAST of (\w+) checks") == checks
+    # the module docstring counts the same checks: it once said "three" three paragraphs above
+    # the "seven" here, so a reader got two numbers for one gate
+    assert _stated_count(gates.__doc__ or "", r"weakest of the (\w+) checks") == checks
 
     called = {
         node.func.attr if isinstance(node.func, ast.Attribute) else node.func.id
