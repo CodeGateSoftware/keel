@@ -883,8 +883,9 @@ does every figure of a rule with no closed trade. A realized rr or profit factor
 prints the CLI's own words on the record row and the gate card: `n/a (no losses yet)` for all wins
 (the profit factor's Infinity, a neutral state), `n/a (no wins yet)`, or `n/a (no wins or losses
 yet)` for all scratches (the profit factor is never 0.00 there). An all-losses profit factor of
-0.00 is a real measurement and stays a number. Then the DCA plan proposal (`/rules?budget=500&buffer=0.1` fills it; it is applied by the `keel dca plan`
-command it shows, at a terminal), then the research record: every trial, the evidence matrix, the
+0.00 is a real measurement and stays a number. Then the DCA plan proposal
+(`/rules?budget=500&buffer=0.1` fills it; it is applied by the `keel dca plan` command it shows, at
+a terminal), then the research record: every trial, the evidence matrix, the
 gauntlet and the slippage assumptions. Track records, promotion-gate distances and the research
 record used to be the Insights and Research views. The equity charts and the closed-trade table
 left the console: the closed-trade journal is `keel insights journal`, your own journal is `keel
