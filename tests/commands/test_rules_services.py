@@ -241,6 +241,28 @@ def test_add_rule_row_writes_the_candidate_and_returns_the_cli_lines(repo: Repos
     assert err == []
 
 
+@pytest.mark.parametrize("kind", ["turtle_breakout", "dca", "rsi_meanrev"])
+def test_add_rule_row_refuses_a_name_param_and_writes_no_row(repo: Repository, kind: str) -> None:
+    """A `name` in `--params` is refused (the dropped-param refusal, or the constructor's own
+    TypeError for a kind that takes no `name`), so no stored row can rename its rule: a turtle
+    named "dca" would have its missing bracket read as "no stop by design" (#961)."""
+    out, err = _collect()
+    before = len(repo.get_rules())
+    with pytest.raises(RulesRefused):
+        add_rule_row(
+            repo,
+            _config(),
+            kind=kind,
+            product="BTC-USD",
+            params_json='{"name": "dca"}',
+            now_ts=NOW_TS,
+            echo=out.append,
+            echo_err=err.append,
+        )
+    assert len(repo.get_rules()) == before == 0
+    assert err  # the refusal said why
+
+
 def test_add_rule_row_surfaces_the_services_own_validation_messages(repo: Repository) -> None:
     """A quoted number for a non-Decimal param is refused with the SAME message the CLI
     prints -- the console renders the service's own words, never a TUI-authored variant."""

@@ -10,8 +10,8 @@ the shape of the client, over its SOURCE TEXT (there is no JavaScript runtime in
 * it offers NO close, cancel or any other control of its own -- the only buttons on the page are
   the sort headers and the scope/status bars, which are built by `table()`/`scopeSwitch`/
   `statusSwitch` outside the region these pins scan;
-* the stop column is drawn on the PRESENCE of a list (`stop_rows_present`), never by reading a
-  `Field`'s `display` or `value`;
+* each table's stop column is drawn on the PRESENCE of its group's list (`stop_rows_present`),
+  never by reading a `Field`'s `display` or `value`;
 * a recent-orders read that failed is said so, and never rendered as an empty table.
 
 Every client pin asserts a count or a pairing over a PARSED function body, never a bare substring a
@@ -117,14 +117,14 @@ def test_a_tranche_with_no_recorded_stop_says_so_and_is_not_listed_as_stopped(
     document = web_payload.holdings_payload(gather_holdings(repo, config, now_ts=NOW_TS))
 
     assert document["rows"][0]["stop"]["state"] == "unknown"
-    assert document["stop_rows_present"] == []
+    assert [g["stop_rows_present"] for g in document["groups"]] == [[]]
 
 
 def test_a_tranche_with_a_stop_is_listed_so_the_view_can_draw_the_column(tmp_path: Path) -> None:
     repo, config = _ledger(tmp_path)
     document = web_payload.holdings_payload(gather_holdings(repo, config, now_ts=NOW_TS))
 
-    assert document["stop_rows_present"] == [document["rows"][0]["id"]]
+    assert [g["stop_rows_present"] for g in document["groups"]] == [[document["rows"][0]["id"]]]
 
 
 # -- the attestation chip on the wire (#701) -----------------------------------------------------
@@ -324,31 +324,40 @@ def test_the_holdings_view_has_no_close_or_cancel_action_anywhere() -> None:
     assert "showmodal" not in whole
 
 
-def test_the_holdings_view_groups_by_the_reports_own_rule_list() -> None:
-    """`data.rules`, not a set the client assembles from the rows: two answers to "which rules
-    hold tranches" is one too many, and the report already carries the ordered one."""
+def test_the_holdings_view_groups_by_the_reports_own_group_list() -> None:
+    """`data.groups`, not a set the client assembles from the rows: two answers to "which rules
+    hold tranches" is one too many, and the report already carries the ordered one -- one group
+    per rule ROW since #960."""
     region = _region()
     section = _builder("holdingsSection")
 
-    assert section.count("data.rules") == 1
-    assert re.search(r"for \(const \w+ of data\.rules[^)]*\)", section)
+    assert section.count("data.groups") == 1
+    assert re.findall(r"for \(const (\w+) of data\.groups[^)]*\)", section) == ["group"]
+    assert "data.rules" not in region
     assert "new Set(" not in region
     assert "Object.keys(" not in region
 
 
-def test_each_rule_gets_one_heading_and_one_table_for_its_own_rows() -> None:
+def test_each_group_gets_one_heading_and_one_table_for_its_own_rows() -> None:
     section = _builder("holdingsSection")
 
     assert section.count("heading(") == 1
-    assert re.findall(r'const id = \[("h-hold"), \w+\]\.join\("-"\);', section) == ['"h-hold"']
     assert section.count("table(") == 1
-    # The rows are filtered by the grouping key's equality with a bare string, as positionsView
-    # did with the product: a key comparison, not a judgement of any value.
-    assert re.findall(r"rows\.filter\(.*?\(row\) => (row\.rule_name === \w+)\)", section) == [
-        "row.rule_name === rule"
+    # The id is made from the group's KEY -- an integer or an ordinal the service built (#960;
+    # a raw rule name split `aria-labelledby`) -- and the heading AND the table share it.
+    assert re.findall(r'const id = \[("h-hold"), (group\.\w+)\]\.join\("-"\);', section) == [
+        ('"h-hold"', "group.key")
     ]
-    # And the heading names the rule, or says it is unattributed -- never a blank heading.
-    assert 'plain(rule) || "unattributed"' in section
+    assert re.findall(r"heading\((\w+), ", section) == ["id"]
+    assert re.findall(r"table\(\s*(\w+),", section) == ["id"]
+    # The rows are filtered by key equality with the group's key: a key comparison, not a
+    # judgement of any value, and never by the rule NAME (every DCA rule is named `dca`).
+    assert re.findall(r"rows\.filter\(.*?\(row\) => (row\.\w+ === \w+\.\w+)\)", section) == [
+        "row.group === group.key"
+    ]
+    assert "row.rule_name" not in section
+    # And the heading prints the service's words for the group -- never composed here.
+    assert re.findall(r"heading\(id, ([^;]*)\);", section) == ["plain(group.heading))"]
 
 
 def test_an_empty_book_says_so_in_a_sentence_before_any_table() -> None:
@@ -535,21 +544,29 @@ def test_the_tranche_sort_keys_are_ones_the_endpoint_declares() -> None:
     assert keys.count("cost") == 1 and keys.count("fill_divergence") == 1
 
 
-def test_the_stop_column_is_drawn_only_when_the_report_lists_a_stop() -> None:
-    """The branch is the EMPTINESS of a list the payload sends, exactly how `why_not` is branched
-    on. The client never reads a `Field`'s `display` or `value` to decide it.
+def test_the_stop_column_is_drawn_per_table_when_that_group_lists_a_stop() -> None:
+    """The branch is the EMPTINESS of the list the payload sends on EACH GROUP, exactly how
+    `why_not` is branched on: a DCA table whose tranches carry no stop draws no column of dashes
+    beside a PAXG table that does. The client never reads a `Field`'s `display` or `value`.
 
-    Kills: splicing the column unconditionally (the guard is read once and gates BOTH the header
-    and the cell), and deciding it from a row's `stop`."""
+    Kills: reading the page-wide `data.stop_rows_present` (which no longer exists on the wire),
+    hoisting the guard out of the group loop, splicing the column unconditionally (the guard is
+    read once per table and gates BOTH the header and the cell), and deciding it from a row's
+    `stop`."""
     region = _region()
     section = _builder("holdingsSection")
 
     assert region.count("stop_rows_present") == 1
+    assert "data.stop_rows_present" not in region
     guards = re.findall(
-        r"const (\w+) = \(data\.stop_rows_present \|\| \[\]\)\.length !== 0;", section
+        r"const (\w+) = \(group\.stop_rows_present \|\| \[\]\)\.length !== 0;", section
     )
     assert len(guards) == 1, guards
     guard = guards[0]
+    # The guard sits INSIDE the group loop, ahead of the table it serves.
+    loop = section.index("for (const group of")
+    assert section.index(f"const {guard} =") > loop
+    assert section.index(f"const {guard} =") < section.index("table(")
     # Two splices, one in the headers and one in the cells, and nothing else uses the guard.
     spliced = re.findall(rf"\.\.\.\({guard} \? \[(.*?)\] : \[\]\)", section, re.S)
     assert len(spliced) == 2, spliced

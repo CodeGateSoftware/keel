@@ -386,6 +386,15 @@ class Rule(ABC):
     #: or, with a daily timeframe declared, a fee-only round trip per buy closed on its fill bar
     #: by its `target=entry` sentinel -- neither of which belongs in the pooled G2 sample.
     accumulates: ClassVar[bool] = False
+    #: Whether a LIVE entry by this rule rests a protective bracket at the venue (#961). True by
+    #: default, and that default is the safe one: `keel.commands.status.bracket_verdict` reads it
+    #: off the class through `agent.RULE_REGISTRY`, and a live tranche of a kind that expects a
+    #: bracket and has none is the #519/#502 gap -- WARN on `keel status`, Pulse and Holdings. A
+    #: kind that never brackets BY DESIGN (`Dca`: no stop, `executor._is_dca_setup` skips the
+    #: bracket) declares False here, once, so its stop-less tranches read "no stop by design"
+    #: instead of a standing warning that teaches the reader to skip the real one. Not
+    #: `accumulates`: the sleeve-sell kinds accumulate too, and they open no tranche at all.
+    places_bracket: ClassVar[bool] = True
     #: Why the last `detect()` call declined, or `None` if it fired (or never recorded one).
     #: `strategy.engine.evaluate` merges it into the `engine.no_signal` event it already emits,
     #: so a cycle reporting `signals=0` can say whether price was 1% or 40% off the trigger.

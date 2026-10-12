@@ -468,26 +468,115 @@ def _session_line(s: MarketSessionStatus) -> str | None:
     return None
 
 
-def _bracket_display(pos: OpenPositionStatus, mode: str) -> str:
-    """The bracket column's text for one open position (#641).
+#: The five readings of an open tranche's bracket (#641, #961). `bracket_verdict` returns one;
+#: `_bracket_display` (here), `payload._bracket_field` (Pulse's roll-call and Holdings) and
+#: `pulse.build_pulse` (the missing-bracket count) each READ it and none judges on its own, so
+#: the terminal, the glance page and the tranche table cannot disagree about the same tranche.
+BRACKETED = "bracketed"
+#: The hazard: a non-paper tranche that should have a resting bracket and has none.
+BRACKET_MISSING = "missing"
+#: A non-paper tranche of a kind that never brackets (`Rule.places_bracket` False) and that
+#: recorded no stop: nothing is missing, by design.
+NO_STOP_BY_DESIGN = "no stop by design"
+#: Paper, with the stop `PaperTrader.on_candle` enforces on the row.
+PAPER_STOP = "paper stop"
+#: Paper, with no stop on the row.
+PAPER_NO_STOP = "paper no stop"
 
-    Live's meaning is untouched and load-bearing: `NO bracket` there names a real venue-order
-    gap -- exactly the state `reconcile_unbracketed_positions` and the `unbracketed:` crash
-    ledger (#519, #502) exist to heal. Paper never places a venue order, so `has_bracket` is
-    False on every paper position by construction; rendering that as the SAME WARN reports the
-    mode, not a hazard, and trains the reader to ignore the live case that matters.
 
-    Paper is not unprotected, though: `PaperTrader.on_candle` resolves the setup's stop/target
-    against each candle's range, so a paper row without a bracket names the protection that
-    mechanism actually enforces -- the stop the tranche was sized against, when the row recorded
-    one (`initial_stop`, since 0.12.2 / #520). A tranche that predates that migration, or a DCA
-    leg that never got one, has no number to show and says so instead of inventing one.
+def _kind_never_brackets(rule_kind: str) -> bool:
+    """Whether `rule_kind`'s rule class declares that its entries rest no bracket. A kind the
+    registry does not know (an empty `rule_name`, a retired kind) is NOT excused: its missing
+    bracket stays a warning, the reading that cannot hide a real gap.
+
+    `rule_kind` is `positions.rule_name`, which is `rule.name`. No shipped path stores a name:
+    seed stores `describe()["params"]`, which carries no `name` for any kind, and `keel rules
+    add` refuses a `name` in `--params` (its dropped-param refusal, or `rsi_meanrev`'s
+    constructor, which takes no `name`), so a rule rebuilt from a row is named its kind -- pinned
+    by `test_every_kind_is_named_its_kind_and_stores_no_name_param` and
+    `test_add_rule_row_refuses_a_name_param_and_writes_no_row`. A hand-written row naming
+    another kind would be judged as that kind; a name the registry does not know WARNs."""
+    rule_cls = agent.RULE_REGISTRY.get(rule_kind)
+    return rule_cls is not None and not rule_cls.places_bracket
+
+
+def recorded_stop(initial_stop: Decimal | None) -> Decimal | None:
+    """The tranche's REAL recorded stop, or `None`. `None` is no stop on the row; zero (or below)
+    is the `Setup` sentinel `Dca.detect` emits ("stop=0 ... there is no stop-loss"), which
+    `agent._open_tranche` copies onto every attributed DCA tranche -- a stop at zero protects
+    nothing on a long, so it is not one. Read by `bracket_verdict` for the non-paper kinds that
+    never bracket, and (through `shown_stop`) by Holdings' stop cell and column, so on a live
+    book the cell that says "no stop by design" never sits beside a "$0.00" stop. Paper does not
+    read it: see `shown_stop`."""
+    return initial_stop if initial_stop is not None and initial_stop > 0 else None
+
+
+def shown_stop(initial_stop: Decimal | None, mode: str) -> Decimal | None:
+    """The stop Holdings shows for a tranche: the one its bracket verdict names.
+
+    `bracket_verdict` reads the raw `initial_stop` in paper (`PAPER_STOP` "paper stop $0.00" for a
+    recorded 0 -- the stop `PaperTrader.on_candle` resolves against, unchanged by #961) and
+    `recorded_stop` everywhere else. The stop cell and the stop-column list take the same reading,
+    decided here once, so a paper tranche never prints "—" beside "paper stop $0.00" and a live
+    DCA tranche never prints "$0.00" beside "no stop by design". Neither the payload nor the view
+    compares the mode."""
+    return initial_stop if mode == "paper" else recorded_stop(initial_stop)
+
+
+def bracket_verdict(
+    *, has_bracket: bool, initial_stop: Decimal | None, rule_kind: str, mode: str
+) -> str:
+    """THE bracket judgement for one open tranche (#641, #961). Returns one of `BRACKETED`,
+    `BRACKET_MISSING`, `NO_STOP_BY_DESIGN`, `PAPER_STOP`, `PAPER_NO_STOP`.
+
+    Live's meaning is load-bearing: a missing bracket names a real venue-order gap -- exactly the
+    state `reconcile_unbracketed_positions` and the `unbracketed:` crash ledger (#519, #502)
+    exist to heal -- so it is `BRACKET_MISSING` for every non-paper tranche, with ONE exception.
+
+    The exception (#961) is keyed off the rule KIND, not off the missing stop: a tranche whose
+    kind declares it never brackets (`Rule.places_bracket` False -- `Dca`) AND that recorded no
+    real stop is `NO_STOP_BY_DESIGN`. A standing warning on every DCA leg was a permanent alarm
+    on the deliberate case, which trains the reader to skip the one that matters. A tranche that
+    DID record a stop and rests no bracket still warns whatever its kind, and so does every
+    non-DCA tranche without one -- the deliberate PAXG tranche included (#811 tracks that gap,
+    and it must keep showing).
+
+    Paper never places a venue order, so `has_bracket` is False on every paper position by
+    construction; that reports the MODE, not a hazard. Paper is not unprotected, though --
+    `PaperTrader.on_candle` resolves the setup's stop/target against each candle's range -- so a
+    paper tranche names the stop it was sized against when the row recorded one (`initial_stop`,
+    since 0.12.2 / #520) and otherwise says it has none. Unchanged by #961.
     """
-    if pos.has_bracket or mode != "paper":
-        return "bracketed" if pos.has_bracket else "NO bracket"
-    if pos.initial_stop is not None:
+    if has_bracket:
+        return BRACKETED
+    if mode == "paper":
+        return PAPER_STOP if initial_stop is not None else PAPER_NO_STOP
+    if _kind_never_brackets(rule_kind) and recorded_stop(initial_stop) is None:
+        return NO_STOP_BY_DESIGN
+    return BRACKET_MISSING
+
+
+def _bracket_display(pos: OpenPositionStatus, mode: str) -> str:
+    """The bracket column's text for one open position: `bracket_verdict`'s reading, in the
+    CLI's words. Nothing is judged here."""
+    verdict = bracket_verdict(
+        has_bracket=pos.has_bracket,
+        initial_stop=pos.initial_stop,
+        rule_kind=pos.rule_name,
+        mode=mode,
+    )
+    if verdict == PAPER_STOP:
         return f"paper stop {pos.initial_stop}"
-    return "n/a -- paper resolves stop/target on candle touch"
+    return _BRACKET_WORDS[verdict]
+
+
+#: The CLI's words for each verdict but `PAPER_STOP`, which names its stop.
+_BRACKET_WORDS = {
+    BRACKETED: "bracketed",
+    BRACKET_MISSING: "NO bracket",
+    NO_STOP_BY_DESIGN: "no stop by design",
+    PAPER_NO_STOP: "n/a -- paper resolves stop/target on candle touch",
+}
 
 
 def render_human(report: StatusReport) -> list[str]:

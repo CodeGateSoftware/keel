@@ -339,3 +339,49 @@ def test_required_params_names_exactly_each_kinds_required_constructor_params(ki
     }
     assert required == set(REQUIRED_PARAMS.get(kind, {})), kind
     assert build_rule_from_params(kind, minimal_params(kind)).product_id == "BTC-USD"
+
+
+# -- `places_bracket`: which kinds' entries rest a protective bracket (#961) -------------------
+
+
+def test_the_base_class_expects_a_bracket_so_a_stopless_kind_must_say_so() -> None:
+    """The default is True: a kind that forgot to declare would have its missing bracket WARN
+    (`status.bracket_verdict`) -- the loud failure, never a silenced one."""
+    assert Rule.places_bracket is True
+
+
+def test_dca_is_the_one_kind_that_never_brackets() -> None:
+    """`Dca` is accumulation with no stop (its module docstring); every other registered kind
+    either rests a bracket on its entries or opens none. A second stop-less kind is a deliberate
+    change to this list, not a silent one."""
+    stopless = sorted(kind for kind, cls in RULE_REGISTRY.items() if not cls.places_bracket)
+    assert stopless == ["dca"]
+
+
+@pytest.mark.parametrize("kind", sorted(RULE_REGISTRY))
+def test_every_kind_is_named_its_kind_and_stores_no_name_param(kind: str) -> None:
+    """#961's safety argument: a tranche's `rule_name` is `rule.name`, and
+    `status.bracket_verdict` excuses a missing bracket by that name. So a rule rebuilt from a
+    stored row must be named its kind, and `describe()["params"]` (what seed and `keel rules
+    add` store) must never carry a `name` that could rename it: a turtle named "dca" would read
+    "no stop by design"."""
+    rule = build_rule_from_params(kind, minimal_params(kind))
+    assert rule.name == kind
+    assert "name" not in rule.describe()["params"]
+
+
+def test_the_declaration_agrees_with_how_the_executor_routes_a_dca_entry() -> None:
+    """The flag is only true if the executor really skips the bracket: `Dca.detect` must emit a
+    setup the executor routes as the no-stop DCA order class (`_is_dca_setup`)."""
+    from keel.execution.executor import _is_dca_setup
+    from keel.strategy.rules.dca import Dca
+
+    day = 105  # a cadence-7 day
+    price = Decimal("100")
+    candles = [
+        Candle(ts=d * 86_400, open=price, high=price, low=price, close=price, volume=Decimal("1"))
+        for d in range(day - 3, day + 1)
+    ]
+    setup = Dca("BTC-USD", cadence_days=7).detect({Granularity.ONE_DAY: candles})
+    assert setup is not None  # the fixture reached a cadence day
+    assert _is_dca_setup(setup.context) is True

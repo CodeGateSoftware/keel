@@ -2065,6 +2065,7 @@ _HOLDING_ROW_KEYS = [
     "id",
     "product_id",
     "rule_name",
+    "group",
     "opened_at",
     "qty",
     "entry_fill",
@@ -2090,8 +2091,7 @@ _HOLDINGS_TOP_KEYS = [
     "generated_at",
     "mode",
     "open_count",
-    "rules",
-    "stop_rows_present",
+    "groups",
     "rows",
 ]
 
@@ -2115,8 +2115,50 @@ def test_the_holdings_top_level_reads_the_report() -> None:
     document = payload.holdings_payload(_holdings_report(order={}, mode="confirm"))
     assert document["mode"] == "confirm"
     assert document["open_count"]["value"] == "1"
-    assert document["rules"] == ["turtle_breakout"]
-    assert document["stop_rows_present"] == [document["rows"][0]["id"]]
+    assert document["groups"] == [
+        {
+            "key": "unattributed-1",
+            "heading": "turtle_breakout · unattributed",
+            "stop_rows_present": [document["rows"][0]["id"]],
+        }
+    ]
+
+
+def test_the_holdings_groups_and_each_rows_group_are_the_reports() -> None:
+    """#960: one group per rule row. The wire carries the report's groups in its order, and each
+    row names the group it is drawn under -- the client filters on that key and builds nothing."""
+    report = _holdings_report(
+        tranche={"rule_name": "dca", "rule_id": 6},
+        extra_tranche={"rule_name": "dca", "rule_id": 8, "product_id": "ETH-USD"},
+    )
+    document = payload.holdings_payload(report)
+    assert [(g["key"], g["heading"]) for g in document["groups"]] == [
+        (g.key, g.heading) for g in report.groups
+    ]
+    assert [g["key"] for g in document["groups"]] == ["rule-6", "rule-8"]
+    assert [row["group"] for row in document["rows"]] == ["rule-6", "rule-8"]
+
+
+def test_each_group_crosses_with_its_own_stop_list_not_the_first_groups() -> None:
+    """#960 F2: the stop column is decided per table, so the wire carries one list per group. A
+    live DCA rule (sentinel 0, lists none) first and a PAXG-like unattributed turtle with a stop
+    second: handing every group the first group's list would drop the PAXG stop."""
+    report = _holdings_report(
+        tranche={"rule_name": "dca", "rule_id": 6, "initial_stop": Decimal("0")},
+        extra_tranche={
+            "rule_name": "turtle_breakout",
+            "product_id": "PAXG-USD",
+            "initial_stop": Decimal("4521.76"),
+            "opened_at": NOW_TS - 3600,
+        },
+        mode="confirm",
+    )
+    document = payload.holdings_payload(report)
+    paxg_id = next(r["id"] for r in document["rows"] if r["group"] == "unattributed-1")
+    assert [(g["key"], g["stop_rows_present"]) for g in document["groups"]] == [
+        ("rule-6", []),
+        ("unattributed-1", [paxg_id]),
+    ]
 
 
 def test_a_matched_tranche_carries_its_entry_orders_figures() -> None:
@@ -2161,7 +2203,32 @@ def test_a_stop_is_absent_not_zero_when_none_was_recorded() -> None:
     (row,) = document["rows"]
     assert row["stop"]["state"] == "unknown" and row["stop"]["value"] == ""
     assert row["stop"]["display"] != "$0.00"
-    assert document["stop_rows_present"] == []
+    assert [g["stop_rows_present"] for g in document["groups"]] == [[]]
+
+
+def test_the_dca_stop_sentinel_crosses_as_absent_not_zero() -> None:
+    """#961: a DCA tranche's recorded `0` is `Dca.detect`'s sentinel, not a stop. Beside the
+    "no stop by design" bracket cell, "$0.00" would be a figure nobody set."""
+    document = payload.holdings_payload(
+        _holdings_report(tranche={"rule_name": "dca", "initial_stop": Decimal("0")}, mode="confirm")
+    )
+    (row,) = document["rows"]
+    assert row["stop"]["state"] == "unknown" and row["stop"]["value"] == ""
+    assert row["bracket"]["display"] == "no stop by design"
+    assert [g["stop_rows_present"] for g in document["groups"]] == [[]]
+
+
+def test_a_paper_dca_tranches_zero_stop_is_shown_as_origin_main_showed_it() -> None:
+    """#961 must not change paper: the bracket cell of a paper tranche names the stop it was sized
+    against ("paper stop $0.00" for a recorded 0), so the stop cell and the stop list say the same
+    thing rather than "—" beside it. Live reads the same 0 as the sentinel (the test above)."""
+    document = payload.holdings_payload(
+        _holdings_report(tranche={"rule_name": "dca", "initial_stop": Decimal("0")}, mode="paper")
+    )
+    (row,) = document["rows"]
+    assert row["bracket"]["display"] == "paper stop $0.00"
+    assert row["stop"]["display"] == "$0.00" and row["stop"]["value"] == "0"
+    assert [g["stop_rows_present"] for g in document["groups"]] == [[row["id"]]]
 
 
 def test_cost_crosses_as_the_services_figure() -> None:
