@@ -1148,10 +1148,20 @@ def _track_record_payload(record: RuleTrackRecord) -> dict[str, Any]:
     """One rule's track record. At zero closed trades every statistic is UNKNOWN, not zero: the
     sample is empty, so there is no win rate to be 0% and no average to be $0.00 (the report holds
     0 because `BacktestResult` does; serialising that as data would assert a measurement). The
-    trade count stays a real number. Win rate is in percent units (see `_gate_payload`)."""
+    trade count stays a real number. Win rate is in percent units (see `_gate_payload`).
+
+    One side of a TRADED sample can be empty too -- all wins, so no average loss (#965). The
+    report says so itself (`avg_win`/`avg_loss` are `None`), and `money(None)` is `absent()`:
+    nothing here works the empty side out from the win rate and the count.
+
+    `rule_name` is the rule's KIND; `rule_id` and `product_id` are what tell two rules of one kind
+    apart (#962). Identifiers, so bare strings like `_rule_row_payload`'s `id`; `None` on the
+    record of trades journalled with no rule id, which has neither."""
     traded = record.n_trades != 0
     return {
         "rule_name": record.rule_name,
+        "rule_id": str(record.rule_id) if record.rule_id is not None else None,
+        "product_id": record.product_id,
         "status": label(record.status),
         "promotion_class": record.promotion_class,
         "n_trades": count(record.n_trades),

@@ -2460,6 +2460,8 @@ function recordsSection(data) {
       "h-records",
       [
         { label: "rule", numeric: false },
+        { label: "id", numeric: false },
+        { label: "product", numeric: false },
         { label: "status", numeric: false },
         { label: "class", numeric: false },
         { label: "trades", numeric: true },
@@ -2475,6 +2477,8 @@ function recordsSection(data) {
       records.map(
         /** @param {any} row */ (row) => [
           plain(row.rule_name),
+          plain(row.rule_id) || "—",
+          plain(row.product_id) || "—",
           row.status,
           plain(row.promotion_class),
           row.n_trades,
@@ -2493,7 +2497,7 @@ function recordsSection(data) {
   );
   fragment.append(
     note(
-      "Rules in the promotion pipeline (candidate and paper). Below 30 closed trades a win rate is not yet distinguishable from random entry, which is why the sample column says so rather than leaving the number to speak for itself. A live rule's record is `keel insights summary --mode live` at a terminal.",
+      "Rules in the promotion pipeline (candidate and paper), one record per rule: each holds the paper trades that rule journalled. A record with no id holds the trades of that kind journalled with no rule id, which belong to no one rule. Below 30 closed trades a win rate is not yet distinguishable from random entry, which is why the sample column says so rather than leaving the number to speak for itself. A live rule's record is `keel insights summary --mode live` at a terminal.",
     ),
   );
 
@@ -2503,7 +2507,7 @@ function recordsSection(data) {
     fragment.append(
       note("Only rules in paper have one: a candidate has not backtested yet, and a live rule has already cleared it."),
     );
-    for (const [index, row] of gated.entries()) fragment.append(gateCard(row, index));
+    for (const row of gated) fragment.append(gateCard(row));
   }
   return fragment;
 }
@@ -2530,25 +2534,31 @@ function samplePill(significant) {
  * both and computes neither: "`passing` is the engine's verdict, copied; the floors are the
  * config's own values, copied. Nothing here re-runs `check_floors`."
  *
- * The summary's id carries the card's POSITION as well as the rule's name. A record is named by
- * its rule KIND, and a ledger can hold several paper rules of one kind, so a name-only id repeats
- * -- and `rebuildInto` reopens disclosures by `summary[id]`, so opening one such card reopened
- * every card of that kind on the next poll.
+ * The card is one RULE's (#962): `rule_name` is the rule's kind, and a ledger can hold several
+ * paper rules of one kind, so the summary names the kind, the product and the ledger id -- the
+ * Holdings heading's order -- and the id is built from the ledger id. A gate is only built for a
+ * ledger row, so every gated record carries one.
  *
- * @param {any} rule
- * @param {number} position  the card's place among the gated records, for its id.
+ * @param {any} rule  one record of `/api/rules`'s `records`, with a `gate`.
  * @returns {HTMLElement}
  */
-function gateCard(rule, position) {
+function gateCard(rule) {
   const gate = rule.gate;
   const node = el("details", "gate");
   const summary = el("summary");
   // An id on every summary, and it is not decoration: `main.js` restores which disclosures were
   // open across a rebuild by matching these, so a reader who expanded one does not watch it shut
-  // the moment the engine writes a row. Derived from the row it describes and its place in the
-  // service's order, so it is stable across a re-read that did not change the ledger.
-  summary.id = ["h-gatedist", plain(gate.rule_name), String(position)].join("-");
-  summary.append(plain(gate.rule_name), " · ");
+  // the moment the engine writes a row. The rule's ledger id: its own, and stable across a
+  // re-read and a reorder alike. (A kind-only id reopened every card of that kind, #953.)
+  summary.id = ["h-gatedist", plain(rule.rule_id)].join("-");
+  summary.append(
+    [
+      plain(rule.rule_name),
+      plain(rule.product_id) || "—",
+      "rule ".concat(plain(rule.rule_id)),
+    ].join(" · "),
+    " · ",
+  );
   summary.append(field(gate.passing));
   node.append(summary);
 
