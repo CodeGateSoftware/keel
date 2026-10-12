@@ -20,11 +20,41 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
+import pytest
+
 from keel.data.db import connect, migrate
 from keel.data.repository import Repository
-from tests.web.test_api import _get, _session, deployment, running  # noqa: F401
+from tests.conftest import VALID_CONFIG_YAML
+from tests.web.test_api import _get, _session, running  # noqa: F401
 
 EXPORT = "/api/timeline/export.csv"
+
+
+def _config_with_a_pinned_log(tmp_path: Path) -> Path:
+    """A config whose `logging.file` is ABSOLUTE, inside this test's own directory (#964).
+
+    Left at the default, `logs/keel.log` resolves against whatever the state root is, so these
+    tests read whichever engine log happened to sit there -- and an empty one, left by an earlier
+    run, turned the first line of every export into `# NOTE: the engine log could not be read
+    (empty)`. Pinned to a file nothing writes, the log is `missing`: the export's settled no-log
+    answer, which puts no note above the header."""
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        VALID_CONFIG_YAML + f"\nlogging:\n  file: {tmp_path / 'pinned-engine.log'}\n"
+    )
+    return config_path
+
+
+@pytest.fixture
+def deployment(tmp_path: Path) -> tuple[str, str]:
+    """`test_api.deployment`, with the engine log pinned (see `_config_with_a_pinned_log`).
+    `running` there asks for `deployment` by name, so this module's own fixture is the one it
+    binds."""
+    db_path = tmp_path / "keel.db"
+    conn = connect(str(db_path))
+    migrate(conn)
+    conn.close()
+    return str(db_path), str(_config_with_a_pinned_log(tmp_path))
 
 
 def _csv(server: Any, path: str = EXPORT) -> tuple[int, dict[str, str], str]:
@@ -261,7 +291,7 @@ def test_the_export_names_the_chain_status_beside_the_hash(running: Any) -> None
 def test_the_export_filters_by_the_composite_kind(tmp_path: Path) -> None:
     """Console PR4: the Audit page opens on `kind=keel`, and its CSV link carries that kind -- so
     the file has to hold exactly what the screen does: no `trade` and no `flow` rows."""
-    from tests.web.test_api import VALID_CONFIG_YAML, _bind
+    from tests.web.test_api import _bind
 
     db_path = tmp_path / "keel.db"
     conn = connect(str(db_path))
@@ -301,24 +331,21 @@ def test_the_export_filters_by_the_composite_kind(tmp_path: Path) -> None:
         attested_at=1_700_000_200,
     )
     conn.close()
-    config_path = tmp_path / "config.yaml"
-    config_path.write_text(VALID_CONFIG_YAML)
+    config_path = _config_with_a_pinned_log(tmp_path)
 
     for server in _bind(str(db_path), str(config_path)):
         _status, _headers, everything = _csv(server, EXPORT + "?scope=all")
         status, _headers, body = _csv(server, EXPORT + "?scope=all&kind=keel")
 
     def kinds(text: str) -> list[str]:
-        # Past any `# NOTE` line above the header (a log gap or a broken chain), then by name.
-        rows = [row for row in csv.reader(io.StringIO(text)) if not row[0].startswith("# NOTE")]
-        kind_at = rows[0].index("kind")
+        rows = list(csv.reader(io.StringIO(text)))
+        kind_at = rows[0].index("kind")  # the pinned log is missing: no `# NOTE` above it
         return [row[kind_at] for row in rows[1:]]
 
     every_kind = kinds(everything)
     keel_only = kinds(body)
     assert status == 200
-    # Cycle (`system`) rows come from whatever engine log the config resolves relative to the
-    # working directory (#964), so they may or may not appear; the seeded stores always do.
-    assert {"attestation", "flow", "trade"} <= set(every_kind), "the fixture reached the file"
-    assert "attestation" in keel_only
-    assert set(keel_only) <= {"system", "attestation"}, keel_only
+    # The engine log is pinned to a file nothing writes (#964), so there are no cycle (`system`)
+    # rows to filter, and each seeded store reaches the file exactly once.
+    assert sorted(every_kind) == ["attestation", "flow", "trade"], "the fixture reached the file"
+    assert keel_only == ["attestation"], keel_only

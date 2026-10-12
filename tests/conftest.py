@@ -277,3 +277,72 @@ def _restore_keel_logger():
         logger.setLevel(level)
         logger.propagate = propagate
         logger.handlers[:] = handlers
+
+
+#: The checkout a run must leave as it found it (#964), resolved once at import -- before any
+#: fixture has moved the working directory -- so the guard below watches the repository and the
+#: directory pytest was started in, not wherever a test happens to be standing.
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+_INVOCATION_CWD = Path.cwd().resolve()
+
+
+def _logs_snapshot(root: Path) -> dict[str, tuple[int, int]] | None:
+    """Every file under `root/logs` with its size and mtime, or `None` when there is no `logs/`.
+
+    Size AND mtime: a leak into an existing file (the operator ran `keel` in this checkout once)
+    grows it or touches it, and a leak that creates an EMPTY file -- the shape #964 reported --
+    still changes the answer from `None` to a dict."""
+    logs = root / "logs"
+    if not logs.is_dir():
+        return None
+    return {
+        str(path.relative_to(logs)): (path.stat().st_size, path.stat().st_mtime_ns)
+        for path in sorted(logs.rglob("*"))
+        if path.is_file()
+    }
+
+
+@pytest.fixture(autouse=True)
+def _the_checkouts_logs_are_untouched():
+    """Fail the test that wrote into the checkout's `logs/`, by name, the moment it does (#964).
+
+    `logging.file` defaults to the RELATIVE `logs/keel.log`, and `configure_logging` opens it
+    against the working directory. Every CLI test that loads a config without a `logging:`
+    section used to open it in the checkout, leaving a file that the NEXT run's timeline export
+    read back as "the engine log could not be read (empty)" -- red on the second run, green
+    after a manual `rm -rf logs`, and false kills in every mutation run in between.
+
+    Per test rather than once per session: a session check would say only that SOMETHING
+    leaked, and the leak is found by bisecting 8,000 tests. A `stat` per test is free.
+    `_run_in_tmp_path` below is what keeps it quiet; this is what notices when it stops."""
+    roots = sorted({_REPO_ROOT, _INVOCATION_CWD})
+    before = {root: _logs_snapshot(root) for root in roots}
+    yield
+    touched = [str(root / "logs") for root in roots if _logs_snapshot(root) != before[root]]
+    if touched:
+        pytest.fail(
+            f"this test wrote into {touched}: a test must log under its own tmp_path, never the "
+            "checkout (#964) -- the next run reads that file back as this deployment's engine log",
+            pytrace=False,
+        )
+
+
+@pytest.fixture(autouse=True)
+def _run_in_tmp_path(tmp_path, monkeypatch):
+    """Every test stands in its own `tmp_path`, with `KEEL_HOME` pinned to it (#964).
+
+    The working directory is where every relative path in a loaded config lands --
+    `logging.file`'s `logs/keel.log` first among them, which `configure_logging` opens as given.
+    Fixing that one test at a time is a game of whack-a-mole: dozens of CLI tests load a config
+    with no `logging:` section, and the next one written will too.
+
+    `KEEL_HOME` goes with it because leaving the checkout changes what `paths.state_root` picks.
+    The checkout holds a `config.yaml`, so it counted as a deployment root; a bare `tmp_path`
+    does not, and an unpinned lookup would fall through to the operator's REAL app-data
+    directory. Pinned, the writer (`configure_logging`, relative to the cwd) and the readers
+    (`resolve_under_state_root`) agree on one file inside the test's own directory. A test about
+    `state_root` itself unsets it or re-points it, as `tests/core/test_paths.py` already does.
+
+    A test that reads a repository file opens it from `__file__`, never from the cwd."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("KEEL_HOME", str(tmp_path))

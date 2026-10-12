@@ -1009,6 +1009,9 @@ def test_load_alpaca_secrets_reads_environment_then_env_file(tmp_path, monkeypat
     (tmp_path / ".env").write_text(
         "ALPACA_API_KEY_ID=file-key-id\nALPACA_API_SECRET_KEY=file-secret\n"
     )
+    # The `.env` is found by standing in the folder, not through `KEEL_HOME` (which the suite
+    # pins to `tmp_path`, #964, and would keep finding this file after the move below).
+    monkeypatch.delenv("KEEL_HOME", raising=False)
     monkeypatch.chdir(tmp_path)
     monkeypatch.delenv("ALPACA_API_KEY_ID", raising=False)
     monkeypatch.delenv("ALPACA_API_SECRET_KEY", raising=False)

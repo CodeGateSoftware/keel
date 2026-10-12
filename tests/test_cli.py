@@ -40,6 +40,11 @@ from tests.conftest import VALID_CONFIG_YAML
 
 FIXTURES_DIR = Path(__file__).parent / "fixtures" / "transactions_dir"
 
+#: The checkout's own `config.yaml`, which the simulate tests seed candles for and the telemetry
+#: test loads. Named explicitly: every test now runs in its own `tmp_path` (#964), so a bare
+#: invocation no longer falls through to the checkout's config.
+REPO_CONFIG = Path(__file__).resolve().parent.parent / "config.yaml"
+
 
 def _repo_at(db_path: Path) -> Repository:
     conn = connect(str(db_path))
@@ -1542,6 +1547,8 @@ def test_simulate_no_fetch_produces_report_and_never_touches_network(tmp_path, m
         [
             "--db",
             str(db_path),
+            "--config",
+            str(REPO_CONFIG),
             "simulate",
             "--no-fetch",
             "--years",
@@ -1660,6 +1667,8 @@ def test_simulate_reports_per_product_slippage_beside_the_results(tmp_path, monk
         [
             "--db",
             str(db_path),
+            "--config",
+            str(REPO_CONFIG),
             "simulate",
             "--no-fetch",
             "--years",
@@ -1712,7 +1721,18 @@ def test_simulate_prints_floor_cap_and_anchor_beside_every_result(tmp_path, monk
 
     result = CliRunner().invoke(
         cli,
-        ["--db", str(db_path), "simulate", "--no-fetch", "--years", "1", "--out", str(out_path)],
+        [
+            "--db",
+            str(db_path),
+            "--config",
+            str(REPO_CONFIG),
+            "simulate",
+            "--no-fetch",
+            "--years",
+            "1",
+            "--out",
+            str(out_path),
+        ],
     )
 
     assert result.exit_code == 0, result.output
@@ -1752,6 +1772,8 @@ def test_simulate_no_fetch_does_not_refetch_and_reuses_cached_db(tmp_path, monke
             [
                 "--db",
                 str(db_path),
+                "--config",
+                str(REPO_CONFIG),
                 "simulate",
                 "--no-fetch",
                 "--years",
@@ -1776,6 +1798,8 @@ def test_simulate_artifact_flag_writes_html_next_to_markdown(tmp_path, monkeypat
         [
             "--db",
             str(db_path),
+            "--config",
+            str(REPO_CONFIG),
             "simulate",
             "--no-fetch",
             "--years",
@@ -1818,6 +1842,8 @@ def test_simulate_no_fetch_skip_within_cap_still_produces_over_cap_tier_table(
         [
             "--db",
             str(db_path),
+            "--config",
+            str(REPO_CONFIG),
             "simulate",
             "--no-fetch",
             "--skip-within-cap",
@@ -1856,6 +1882,8 @@ def test_simulate_no_fetch_default_runs_full_tier_matrix(tmp_path, monkeypatch):
         [
             "--db",
             str(db_path),
+            "--config",
+            str(REPO_CONFIG),
             "simulate",
             "--no-fetch",
             "--years",
@@ -1901,7 +1929,10 @@ def test_loading_config_binds_the_venue_for_telemetry(tmp_path: Path) -> None:
 
     assert telemetry.current_venue() is None
 
-    result = CliRunner().invoke(cli, ["--db", str(tmp_path / "keel.db"), "subscription", "show"])
+    result = CliRunner().invoke(
+        cli,
+        ["--db", str(tmp_path / "keel.db"), "--config", str(REPO_CONFIG), "subscription", "show"],
+    )
 
     assert result.exit_code == 0, result.output
     assert telemetry.current_venue() == DEFAULT_VENUE
