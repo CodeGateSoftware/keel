@@ -1268,3 +1268,100 @@ def test_a_status_with_no_next_step_is_refused(status: str) -> None:
         status=status, promoted_at=0, reviewed_proposals=1, now_ts=100 * DAY, **_GATE
     )
     assert not ok and len(why) == 1 and status in why[0]
+
+
+# -- #980: an empty side is worded as empty, never as a measured zero -------------------------
+#
+# `check_floors` is the promotion gate, so the rewording is pinned BEFORE it is made: for each
+# sample shape the reasons describe, the verdict and the NUMBER of reasons are frozen here, read
+# off the code as it stood before #980. Only the words may change.
+
+
+def _no_trades() -> BacktestResult:
+    return summarize([])
+
+
+def _all_losses() -> BacktestResult:
+    return summarize([_trade_r("-1", "1") for _ in range(3)])
+
+
+def _all_wins() -> BacktestResult:
+    return summarize([_trade_r("2", "1") for _ in range(3)])
+
+
+def _losses_pool() -> list[ProductSample]:
+    return [ProductSample(f"P{i}-USD", _all_losses()) for i in range(MIN_POOLED_PRODUCTS)]
+
+
+def test_rewording_the_empty_sample_reasons_changes_no_verdict_and_no_reason_count() -> None:
+    from keel.strategy.promotion import _pooled_floors
+
+    cfg = PromotionConfig()
+    per_rule = {
+        "no trades": check_floors(_no_trades(), cfg),
+        "all losses": check_floors(_all_losses(), cfg),
+        "all wins": check_floors(_all_wins(), cfg),
+    }
+    pooled = {
+        "no trades": _pooled_floors(*pool_stats([]), cfg),
+        "all losses": _pooled_floors(*pool_stats(_losses_pool()), cfg),
+    }
+
+    assert {k: (ok, len(r)) for k, (ok, r) in per_rule.items()} == {
+        "no trades": (False, 3),
+        "all losses": (False, 4),
+        "all wins": (False, 1),
+    }
+    assert {k: (ok, len(r)) for k, (ok, r) in pooled.items()} == {
+        "no trades": (False, 4),
+        "all losses": (False, 5),
+    }
+
+
+def test_a_sample_with_no_trades_has_its_win_rate_reported_unknown_not_zero() -> None:
+    """At n=0 there is no win rate to be 0.0, and the record beside these reasons says "n/a".
+    The no-R refusal says there are no trades, not "none of the 0 closed trades"."""
+    ok, reasons = check_floors(_no_trades(), PromotionConfig())
+
+    assert ok is False
+    assert reasons == [
+        "n_trades 0 < min_trades 100",
+        "no R: no closed trades, so expectancy and R:R cannot be judged in R -- refusing "
+        "rather than passing",
+        "win_rate unknown: no closed trades, so min_win_rate 0.55 is not met",
+    ]
+
+
+def test_a_sample_with_no_winning_trade_has_its_rr_reported_as_no_wins_not_zero() -> None:
+    """All losses: the R:R has no average win to divide, so it is not a measured 0. The win
+    rate of 0.0 over three trades IS a measurement and keeps its number."""
+    ok, reasons = check_floors(_all_losses(), PromotionConfig())
+
+    assert ok is False
+    assert reasons == [
+        "n_trades 3 < min_trades 100",
+        "expectancy_r -1 <= min_expectancy 0 (in R)",
+        "rr_r unknown: no winning trade among the 3 trades with R, so min_rr 1.5 is not met (in R)",
+        "win_rate 0.0 < min_win_rate 0.55",
+    ]
+
+
+def test_the_pooled_reasons_word_an_empty_pool_and_a_winless_pool_the_same_way() -> None:
+    """`_pooled_floors` copies `check_floors`' axes, so it copies their wording too."""
+    from keel.strategy.promotion import _pooled_floors
+
+    cfg = PromotionConfig()
+    _ok, empty = _pooled_floors(*pool_stats([]), cfg)
+    _ok, winless = _pooled_floors(*pool_stats(_losses_pool()), cfg)
+
+    assert empty[2:] == [
+        "pooled no R: no pooled trades, so expectancy and R:R cannot be judged in R -- "
+        "refusing rather than passing",
+        "pooled win_rate unknown: no pooled trades, so min_win_rate 0.55 is not met",
+    ]
+    assert winless[2:] == [
+        "pooled expectancy_r -1 <= min_expectancy 0 (in R)",
+        "pooled rr_r unknown: no winning trade among the 15 pooled trades with R, so "
+        "min_rr 1.5 is not met (in R)",
+        "pooled win_rate 0.0 < min_win_rate 0.55",
+    ]

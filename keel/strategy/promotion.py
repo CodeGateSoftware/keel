@@ -183,7 +183,15 @@ def _realized_rr(stats: BacktestResult) -> Decimal | None:
 
 
 def _no_r_reason(n_trades: int, *, pooled: bool = False) -> str:
-    """The refusal a sample with no R gets on the expectancy and R:R axes (#820)."""
+    """The refusal a sample with no R gets on the expectancy and R:R axes (#820).
+
+    An EMPTY sample has no R because it has no trades, and says so (#980): "none of the 0
+    closed trades carries an initial risk" blames a risk field no trade exists to carry."""
+    if n_trades == 0:
+        return (
+            f"{'pooled ' if pooled else ''}no R: no {'pooled' if pooled else 'closed'} trades, "
+            "so expectancy and R:R cannot be judged in R -- refusing rather than passing"
+        )
     if pooled:
         return (
             f"pooled no R: none of the {n_trades} pooled trades carries an initial risk, so "
@@ -193,6 +201,37 @@ def _no_r_reason(n_trades: int, *, pooled: bool = False) -> str:
         f"no R: none of the {n_trades} closed trades carries an initial risk, so expectancy "
         "and R:R cannot be judged in R -- refusing rather than passing"
     )
+
+
+def _rr_reason(stats: BacktestResult, rr: Decimal, cfg: PromotionConfig, prefix: str = "") -> str:
+    """The R:R axis' blocking reason, worded for what the sample holds (#980).
+
+    A sample whose R side counts no winning trade has no average win to divide: `_realized_rr`
+    reads its `avg_win_r` of 0 as a ratio of 0, which fails the floor -- the VERDICT is
+    unchanged -- but "rr_r 0" beside a record that reads "no wins yet" states a measurement
+    nobody made. Decided by COUNTING the R sample's wins (`n_wins_r`), like
+    `insights._side_average`, and only when the ratio really is that 0: a hand-built result
+    whose counts were left at their defaults keeps the number it carries."""
+    if stats.n_wins_r == 0 and rr == 0:
+        with_r = stats.n_trades - stats.n_excluded_no_risk
+        trades = f"{with_r} pooled trades" if prefix else f"{with_r} trades"
+        return (
+            f"{prefix}rr_r unknown: no winning trade among the {trades} with R, so min_rr "
+            f"{cfg.min_rr} is not met (in R)"
+        )
+    return f"{prefix}rr_r {rr} < min_rr {cfg.min_rr} (in R)"
+
+
+def _win_rate_reason(stats: BacktestResult, cfg: PromotionConfig, prefix: str = "") -> str:
+    """The win-rate axis' blocking reason (#980). At zero trades there is no win rate to be
+    0.0 -- `summarize` writes 0.0 for an empty sample -- so the reason says it is unknown. A
+    win rate of 0.0 over a traded sample IS a measurement and keeps its number."""
+    if stats.n_trades == 0:
+        trades = "pooled trades" if prefix else "closed trades"
+        return (
+            f"{prefix}win_rate unknown: no {trades}, so min_win_rate {cfg.min_win_rate} is not met"
+        )
+    return f"{prefix}win_rate {stats.win_rate} < min_win_rate {cfg.min_win_rate}"
 
 
 def check_floors(stats: BacktestResult, cfg: PromotionConfig) -> tuple[bool, list[str]]:
@@ -225,10 +264,10 @@ def check_floors(stats: BacktestResult, cfg: PromotionConfig) -> tuple[bool, lis
                 f"expectancy_r {stats.expectancy_r} <= min_expectancy {cfg.min_expectancy} (in R)"
             )
         if rr < cfg.min_rr:
-            reasons.append(f"rr_r {rr} < min_rr {cfg.min_rr} (in R)")
+            reasons.append(_rr_reason(stats, rr, cfg))
 
     if stats.win_rate < cfg.min_win_rate:
-        reasons.append(f"win_rate {stats.win_rate} < min_win_rate {cfg.min_win_rate}")
+        reasons.append(_win_rate_reason(stats, cfg))
 
     return (len(reasons) == 0, reasons)
 
@@ -472,10 +511,10 @@ def _pooled_floors(
                 f"{cfg.min_expectancy} (in R)"
             )
         if rr < cfg.min_rr:
-            reasons.append(f"pooled rr_r {rr} < min_rr {cfg.min_rr} (in R)")
+            reasons.append(_rr_reason(pooled, rr, cfg, prefix="pooled "))
 
     if pooled.win_rate < cfg.min_win_rate:
-        reasons.append(f"pooled win_rate {pooled.win_rate} < min_win_rate {cfg.min_win_rate}")
+        reasons.append(_win_rate_reason(pooled, cfg, prefix="pooled "))
 
     return (len(reasons) == 0, reasons)
 
