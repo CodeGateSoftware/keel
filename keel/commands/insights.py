@@ -696,11 +696,11 @@ def _realized_rr_for_display(stats: Any) -> Decimal | None:
     display value, not a gate decision -- `check_floors` still decides the verdict. Each side is
     decided by COUNTING that side's trades, like `_side_average`.
     """
-    if stats.avg_loss == 0:
+    avg_win = _side_average(stats, "win", stats.avg_win)
+    avg_loss = _side_average(stats, "loss", stats.avg_loss)
+    if avg_win is None or avg_loss is None:
         return None
-    if not any(trade.outcome == "win" for trade in stats.trades):
-        return None
-    return stats.avg_win / abs(stats.avg_loss)
+    return avg_win / abs(avg_loss)
 
 
 def build_gate_distance(rule: Rule, stats: Any, default_floor: PromotionConfig) -> GateDistance:
@@ -1052,8 +1052,9 @@ def _quantized(x: Any) -> Any:
 
     Passes through anything that isn't a finite `Decimal` unchanged: a sentinel string
     ("n/a (no losses yet)", "n/a", "dca"), `None`, or a non-finite `Decimal` (`Infinity`,
-    which `BacktestResult.profit_factor`/a zero-loss realized-rr can legitimately be, and
-    which `.quantize()` itself refuses to round) all render exactly as before.
+    which `BacktestResult.profit_factor` can legitimately be, and which `.quantize()` itself
+    refuses to round) all render exactly as before. The display realized rr is never
+    `Infinity`: with no losing (or no winning) trades it is `None`.
     """
     if isinstance(x, Decimal) and x.is_finite():
         return x.quantize(_TWO_DP)

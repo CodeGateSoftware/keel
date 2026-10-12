@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 from decimal import Decimal
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -23,6 +24,7 @@ from keel.commands.insights import (
     InsightsReport,
     JournalEntry,
     RuleTrackRecord,
+    _realized_rr_for_display,
     build_account_summary,
     build_equity_curve,
     build_gate_distance,
@@ -304,6 +306,18 @@ def test_rule_track_record_realized_rr_none_when_no_losses(repo: Repository) -> 
     record = build_rule_track_record(row, stats, default_floor)
 
     assert record.realized_rr is None
+
+
+def test_realized_rr_for_display_counts_losing_trades_not_the_average() -> None:
+    """Both empty sides are decided by COUNTING trades (like `_side_average`): a sample with a
+    win and a non-zero `avg_loss` but no trade whose outcome is "loss" has no loss side."""
+    stats = SimpleNamespace(
+        trades=[SimpleNamespace(outcome="win")],
+        avg_win=Decimal("10"),
+        avg_loss=Decimal("-5"),
+    )
+
+    assert _realized_rr_for_display(stats) is None
 
 
 def test_rule_track_record_degrades_gracefully_for_unrecognized_kind(repo: Repository) -> None:
