@@ -10,6 +10,7 @@ edit that changes the code fails here until the prose is changed with it.
 from __future__ import annotations
 
 import ast
+import importlib
 import inspect
 import re
 import textwrap
@@ -78,6 +79,66 @@ def test_a_cited_private_server_constant_exists() -> None:
         for match in re.finditer(r"`server\.(_[A-Z][A-Z0-9_]*)`", path.read_text())
     }
     missing = sorted((where, name) for where, name in cited if not hasattr(server, name))
+
+    assert missing == []
+
+
+_FILE_SUFFIXES = {"py", "js", "css", "html", "json", "yaml", "md"}
+
+
+def _cited_web_references() -> list[tuple[str, int, str, str]]:
+    """Every backticked `module.name` in `keel/**/*.py` whose module is a `keel.web` module.
+
+    A bare stem is read as the SIBLING first (a `server.X` in `keel/web/` is `keel.web.server`);
+    outside `keel/web/` it is read only where no other keel module shares the stem (`server` is
+    also `keel.mcp.server`, so a citation there is not this test's to judge). `api.js` and
+    `payload.py` name files, not attributes, and are skipped by their suffix."""
+    web_stems = {path.stem for path in WEB.glob("*.py") if path.stem != "__init__"}
+    others: dict[str, int] = {}
+    for path in KEEL.rglob("*.py"):
+        if path.parent != WEB:
+            others[path.stem] = others.get(path.stem, 0) + 1
+    found: list[tuple[str, int, str, str]] = []
+    for path in sorted(KEEL.rglob("*.py")):
+        sibling = path.parent == WEB
+        for number, line in enumerate(path.read_text().splitlines(), 1):
+            for match in re.finditer(r"`(\w+)\.(\w+)(?:\(\))?`", line):
+                module, name = match.groups()
+                if module not in web_stems or name in _FILE_SUFFIXES:
+                    continue
+                if not sibling and others.get(module):
+                    continue
+                found.append((path.relative_to(KEEL.parent).as_posix(), number, module, name))
+    return found
+
+
+def _resolves(module: object, name: str) -> bool:
+    """A module-level name, or a method of a class the module defines: the prose says
+    `server._gated_action` for `KeelHandler._gated_action` and `server.shutdown()` for the
+    `shutdown` that `KeelServer` inherits, and both are findable from there."""
+    if hasattr(module, name):
+        return True
+    classes = [
+        value
+        for value in vars(module).values()
+        if inspect.isclass(value) and value.__module__ == getattr(module, "__name__", "")
+    ]
+    return any(hasattr(cls, name) for cls in classes)
+
+
+def test_a_cited_web_module_attribute_exists() -> None:
+    """Prose that says `server.needs_database` or `server.ROUTES` sends a reader to a name to
+    look up. Both were deleted with the renderer (#540) and were still cited, as was
+    `payload._order_payload` (now `_order_row_payload`). Only the `keel.web` modules are
+    resolved: elsewhere `config.quote_currency`, `orders.rule_id` and `agent.enter_evaluated`
+    name columns, settings and event kinds, which no import can check."""
+    cited = _cited_web_references()
+    assert cited, "the scan found no citations at all; the pattern has stopped matching"
+    missing = [
+        f"{where}:{number} `{module}.{name}`"
+        for where, number, module, name in cited
+        if not _resolves(importlib.import_module(f"keel.web.{module}"), name)
+    ]
 
     assert missing == []
 

@@ -37,8 +37,9 @@ STATIC_ROOT = Path(__file__).resolve().parent / "static"
 
 #: The URL prefix static requests are served under, and the prefix the client mounts at.
 #:
-#: **`/` since #540.** It was `/static/` from #535 to #539 only because `server.ROUTES` still owned
-#: the root paths; deleting the rendered pages freed them, and the client is the application now
+#: **`/` since #540.** It was `/static/` from #535 to #539 only because the rendered-page table
+#: (`ROUTES` in `server`, deleted at #540) still owned the root paths; deleting the rendered pages
+#: freed them, and the client is the application now
 #: rather than a second one parked beside it. The move was one edit per file rather than a hunt
 #: because `tests/web/test_client_assets.py::test_the_mount_prefix_is_spelled_the_same_everywhere`
 #: has pinned the three places that spell it -- here, `index.html`'s hrefs and `main.js`'s `BASE` --

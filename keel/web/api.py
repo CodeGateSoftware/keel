@@ -866,9 +866,11 @@ class ApiRoute:
     by a client that cannot render it. `""` means there is no rendered counterpart at all, which
     today is only `/api/config`.
 
-    `needs_database` is the JSON counterpart of `server.needs_database`: rather than serving the
-    setup checklist in place of a broken page, it answers `data: null` with `engine: "stopped"`,
-    which is the same statement in the shape a client can act on.
+    `needs_database` guards the whole route set rather than one page (it descends from the
+    `needs_database` wrapper in `server` that #540 deleted along with the rendered pages):
+    rather than reading tables that are not there, it answers `data: null` with
+    `engine: "stopped"`, which is the statement the setup checklist used to make, in the shape a
+    client can act on.
 
     `collection` and `sortable` are the sort surface. `collection` is the key of the one list in
     `data` that `?sort=` orders; `sortable` is the closed set of columns it may be ordered by, and
@@ -884,10 +886,11 @@ class ApiRoute:
     sortable: tuple[str, ...] = field(default=())
 
 
-#: THE READ SURFACE, in full. Every one of the rendered routes in `server.ROUTES` appears here as
-#: its `html_route` except `/glossary`, which gets no counterpart: it becomes an outbound
-#: keeltrading.com link in #539 and `render_glossary` is deleted in #540, so an `/api/glossary`
-#: would be a surface built in order to be removed -- and any client written against it would break
+#: THE READ SURFACE, in full. Every one of the rendered routes that `server`'s `ROUTES` held
+#: (the table #540 deleted) appears here as its `html_route` except `/glossary`, which gets no
+#: counterpart: it becomes an outbound keeltrading.com link in #539 and `render_glossary` is
+#: deleted in #540, so an `/api/glossary` would be a surface built in order to be removed -- and
+#: any client written against it would break
 #: on the release that removes it. `/api/pulse` carries the landing route (`/pulse`, the client's
 #: default): the glance page, and the one whose body holds the halt token (never the gate token).
 API_ROUTES: dict[str, ApiRoute] = {
