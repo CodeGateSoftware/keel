@@ -879,8 +879,11 @@ distance to the promotion gate -- unsorted, because a sorted record is a leaderb
 record per rule, named by kind, product and ledger id, holding the paper trades that rule journalled;
 paper trades journalled with no rule id get one record per kind with no id and no gate. An average
 win or loss with no trade on its side reads "—" (`n/a` in `keel insights summary`), not $0.00, and so
-does the realized rr with no win or no loss yet, and every figure of a rule with no closed trade. Then the
-DCA plan proposal (`/rules?budget=500&buffer=0.1` fills it; it is applied by the `keel dca plan`
+does every figure of a rule with no closed trade. A realized rr or profit factor with an empty side
+prints the CLI's own words on the record row and the gate card: `n/a (no losses yet)` for all wins
+(the profit factor's Infinity, a neutral state), `n/a (no wins yet)`, or `n/a (no wins or losses
+yet)` for all scratches (the profit factor is never 0.00 there). An all-losses profit factor of
+0.00 is a real measurement and stays a number. Then the DCA plan proposal (`/rules?budget=500&buffer=0.1` fills it; it is applied by the `keel dca plan`
 command it shows, at a terminal), then the research record: every trial, the evidence matrix, the
 gauntlet and the slippage assumptions. Track records, promotion-gate distances and the research
 record used to be the Insights and Research views. The equity charts and the closed-trade table
