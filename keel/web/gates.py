@@ -12,10 +12,10 @@ wrong.
 **Not a bypass, and not a seam in the TTY gate.** `_is_interactive` is untouched, has no env-var
 or flag override, and the CLI path still requires a real terminal. This is a SECOND kind of
 evidence for the same fact -- a human, present, who typed something a script would not. The other
-seven are refused here as firmly as they are refused to cron.
+eight are refused here as firmly as they are refused to cron.
 
 **Not the whole gate either.** The typed phrase proves intent, not locality, and on its own it is
-the weakest of the three checks a request must pass. `security.gated_action_permitted` decides
+the weakest of the seven checks a release must pass. `security.gated_action_permitted` decides
 whether a request may attempt an action at all -- loopback peer, loopback bind, no declared
 remote origin -- and `security.gates_token` proves the caller holds this session's secret. No
 endpoint serves that token (#968): the console's HALT button holds `security.halt_token`, which
@@ -213,10 +213,12 @@ def run_gated_action(cfg: Any, action_key: str, presented: object) -> str | None
     exist and asserts the refusal still returns rather than raising, which is what pins the
     ordering rather than merely describing it.
 
-    This is the LAST of four checks, not the only one. `server.do_POST` runs the admission gate,
-    the client-header gate, `security.gated_action_permitted` (loopback peer, loopback bind, no
-    declared remote origin) and `security.gates_token` -- never the halt token -- before anything
-    reaches here. The phrase proves intent; those prove locality and provenance.
+    This is the LAST of seven checks, not the only one. `server.do_POST` runs four on every write
+    -- admission (`_admitted`), `Sec-Fetch-Site` (`_sec_fetch_site_ok`), the `/api/` prefix and
+    the client header (`_api_client_header_ok`) -- and `server._gated_action` two more for a
+    release: `security.gated_action_permitted` (loopback peer, loopback bind, no declared remote
+    origin) and `security.gates_token` -- never the halt token. The phrase proves intent; those
+    prove locality and provenance.
     """
     action = TIER1_ACTIONS.get(action_key) if isinstance(action_key, str) else None
     if action is None or not phrase_matches(action_key, presented):

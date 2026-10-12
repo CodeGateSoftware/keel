@@ -256,10 +256,11 @@ def record_cash_posture_refutation(
     and not proof of a cash posture -- promoting a record on the strength of it would manufacture
     exactly the affirmation #666 established cannot be had.
 
-    `repo=None` is the read-only call sites (`keel balances`, `keel brokers list`), which have no
-    repository in hand and will not go on to trade. The CHECK still runs and still refuses for
-    them; only the recording is skipped, so threading a repo through every inspection command to
-    record a fact none of them acts on is churn nobody needs.
+    `repo=None` is every `_build_broker` caller with no repository in hand, none of which opens a
+    position: the inspections (`keel assets holdings`, `keel assets discover`), the candle fetch
+    behind `keel fetch`, `keel simulate` and the setup steps, and `keel orders cancel`. The CHECK
+    still runs and still refuses for them; only the recording is skipped, so threading a repo
+    through every one of them to record a fact none of them acts on is churn nobody needs.
     """
     try:
         broker.verify_cash_account()

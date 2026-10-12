@@ -40,6 +40,11 @@ from tests.conftest import VALID_CONFIG_YAML
 
 FIXTURES_DIR = Path(__file__).parent / "fixtures" / "transactions_dir"
 
+#: The checkout's own `config.yaml`, which the simulate tests seed candles for and the telemetry
+#: test loads. Named explicitly: every test now runs in its own `tmp_path` (#964), so a bare
+#: invocation no longer falls through to the checkout's config.
+REPO_CONFIG = Path(__file__).resolve().parent.parent / "config.yaml"
+
 
 def _repo_at(db_path: Path) -> Repository:
     conn = connect(str(db_path))
@@ -638,16 +643,28 @@ def test_rules_list_shows_rule_needs_no_passphrase(tmp_path):
     assert "candidate" in result.output
 
 
-def test_rules_backtest_with_no_candles_reports_zero_trades(tmp_path):
+def test_rules_backtest_with_no_candles_reports_zero_trades(tmp_path, valid_config_path):
     db_path = tmp_path / "test.db"
     repo = _repo_at(db_path)
     rule_id = repo.insert_rule("pullback_continuation", {"product_id": "BTC-USD"})
     runner = CliRunner()
 
-    result = runner.invoke(cli, ["--db", str(db_path), "rules", "backtest", str(rule_id)])
+    result = runner.invoke(
+        cli,
+        [
+            "--db",
+            str(db_path),
+            "--config",
+            str(valid_config_path),
+            "rules",
+            "backtest",
+            str(rule_id),
+        ],
+    )
 
     assert result.exit_code == 0, result.output
     assert "n_trades=0" in result.output
+    assert "fee_pct=1.2000%" in result.output
 
 
 def test_rules_backtest_states_the_fee_rate_it_priced_fills_at(tmp_path, valid_config_path):
@@ -705,14 +722,18 @@ def test_rules_backtest_prices_fills_at_the_configs_taker_rate(tmp_path, write_c
     assert "fee_pct=3.0000%" in result.output
 
 
-def test_rules_backtest_unknown_rule_id_errors(tmp_path):
+def test_rules_backtest_unknown_rule_id_errors(tmp_path, valid_config_path):
     db_path = tmp_path / "test.db"
     _repo_at(db_path)
     runner = CliRunner()
 
-    result = runner.invoke(cli, ["--db", str(db_path), "rules", "backtest", "999"])
+    result = runner.invoke(
+        cli,
+        ["--db", str(db_path), "--config", str(valid_config_path), "rules", "backtest", "999"],
+    )
 
     assert result.exit_code != 0
+    assert "no rule with id 999" in result.output
 
 
 def test_rules_promote_stays_when_floor_not_cleared(tmp_path, valid_config_path):
@@ -1356,7 +1377,9 @@ def test_rules_seed_respects_products_and_kinds_options(tmp_path, valid_config_p
     assert rows[0]["params"]["product_id"] == "BTC-USD"
 
 
-def test_rules_seed_unknown_kind_errors(tmp_path):
+def test_rules_seed_unknown_kind_errors(tmp_path, valid_config_path):
+    """Needs a real `--config`: `rules seed` loads config first, so without one the command
+    exits nonzero on 'file not found' and this passes whatever seed does with a bad kind."""
     db_path = tmp_path / "test.db"
     runner = CliRunner()
 
@@ -1365,6 +1388,8 @@ def test_rules_seed_unknown_kind_errors(tmp_path):
         [
             "--db",
             str(db_path),
+            "--config",
+            str(valid_config_path),
             "rules",
             "seed",
             "--products",
@@ -1375,6 +1400,7 @@ def test_rules_seed_unknown_kind_errors(tmp_path):
     )
 
     assert result.exit_code != 0
+    assert "unknown rule kind" in result.output
 
 
 def test_rules_seed_rows_round_trip_through_build_rule(tmp_path, valid_config_path):
@@ -1542,6 +1568,8 @@ def test_simulate_no_fetch_produces_report_and_never_touches_network(tmp_path, m
         [
             "--db",
             str(db_path),
+            "--config",
+            str(REPO_CONFIG),
             "simulate",
             "--no-fetch",
             "--years",
@@ -1660,6 +1688,8 @@ def test_simulate_reports_per_product_slippage_beside_the_results(tmp_path, monk
         [
             "--db",
             str(db_path),
+            "--config",
+            str(REPO_CONFIG),
             "simulate",
             "--no-fetch",
             "--years",
@@ -1712,7 +1742,18 @@ def test_simulate_prints_floor_cap_and_anchor_beside_every_result(tmp_path, monk
 
     result = CliRunner().invoke(
         cli,
-        ["--db", str(db_path), "simulate", "--no-fetch", "--years", "1", "--out", str(out_path)],
+        [
+            "--db",
+            str(db_path),
+            "--config",
+            str(REPO_CONFIG),
+            "simulate",
+            "--no-fetch",
+            "--years",
+            "1",
+            "--out",
+            str(out_path),
+        ],
     )
 
     assert result.exit_code == 0, result.output
@@ -1752,6 +1793,8 @@ def test_simulate_no_fetch_does_not_refetch_and_reuses_cached_db(tmp_path, monke
             [
                 "--db",
                 str(db_path),
+                "--config",
+                str(REPO_CONFIG),
                 "simulate",
                 "--no-fetch",
                 "--years",
@@ -1776,6 +1819,8 @@ def test_simulate_artifact_flag_writes_html_next_to_markdown(tmp_path, monkeypat
         [
             "--db",
             str(db_path),
+            "--config",
+            str(REPO_CONFIG),
             "simulate",
             "--no-fetch",
             "--years",
@@ -1818,6 +1863,8 @@ def test_simulate_no_fetch_skip_within_cap_still_produces_over_cap_tier_table(
         [
             "--db",
             str(db_path),
+            "--config",
+            str(REPO_CONFIG),
             "simulate",
             "--no-fetch",
             "--skip-within-cap",
@@ -1856,6 +1903,8 @@ def test_simulate_no_fetch_default_runs_full_tier_matrix(tmp_path, monkeypatch):
         [
             "--db",
             str(db_path),
+            "--config",
+            str(REPO_CONFIG),
             "simulate",
             "--no-fetch",
             "--years",
@@ -1901,7 +1950,10 @@ def test_loading_config_binds_the_venue_for_telemetry(tmp_path: Path) -> None:
 
     assert telemetry.current_venue() is None
 
-    result = CliRunner().invoke(cli, ["--db", str(tmp_path / "keel.db"), "subscription", "show"])
+    result = CliRunner().invoke(
+        cli,
+        ["--db", str(tmp_path / "keel.db"), "--config", str(REPO_CONFIG), "subscription", "show"],
+    )
 
     assert result.exit_code == 0, result.output
     assert telemetry.current_venue() == DEFAULT_VENUE

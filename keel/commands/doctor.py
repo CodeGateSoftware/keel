@@ -1809,8 +1809,10 @@ def position_watch_findings(
       there -- the only real way out on paper is re-promoting the rule.
     * `position.unprotected` -- an open tranche with a recorded `initial_stop > 0`, no resting
       bracket (`reconcile._has_resting_bracket`, passed in as `resting`), and no retry record.
-      The third clause makes it the complement of the reconcile sweep, not a duplicate. DCA
-      (`initial_stop` absent) is excluded for the reason the sweep skips it silently. SKIPPED
+      The third clause makes it the complement of the reconcile sweep, not a duplicate. DCA is
+      excluded for the reason the sweep skips it silently: an unattributed leg stores no
+      `initial_stop`, and an attributed one stores `Dca.detect`'s `0` sentinel (#973), which the
+      `> 0` clause reads as no stop, as `status.recorded_stop` does. SKIPPED
       ENTIRELY (reported `OK`) when `managed_status == "paper"` (#881): a paper fill never gets
       a bracket (`_paper_enter` places none), so `resting` is always False, and paper never
       writes an `unbracketed:` retry record either (`reconcile_unbracketed_positions` only runs

@@ -981,8 +981,9 @@ footer {
 
 /* Honour a reader who has asked the operating system for less motion. Written before there was
  * any animation to honour, so that the first one added inherited the courtesy rather than
- * depending on its author remembering -- the same reasoning `server.needs_database` gives for
- * guarding a whole route set instead of one page. #754's `keel-busy` is that first animation,
+ * depending on its author remembering -- the same reasoning the deleted `needs_database`
+ * wrapper in `server` gave for guarding a whole route set instead of one page. #754's
+ * `keel-busy` is that first animation,
  * and it arrived already covered, which is what the rule was for.
  *
  * Note what this does to it: `animation-duration: 0.01ms` plus `iteration-count: 1` leaves the

@@ -1097,7 +1097,7 @@ def _migrate_v21_positions_rule_id(conn: sqlite3.Connection) -> None:
     needed attributing: `executor.place_bracket` and the scale-out path build their
     `OrderIntent` from a POSITION rather than from a signal, so they had no `rules.id` to put on
     `orders.rule_id`. Every protective SELL was written unattributed, and
-    `payload._order_payload` rendered it as such.
+    `payload._order_row_payload` rendered it as such.
 
     That is not a cosmetic gap. Per-rule accounting reading `orders.rule_id` saw entries
     attributed and exits anonymous, which for a trend rule drops exactly the leg the outcome

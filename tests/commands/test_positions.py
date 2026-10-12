@@ -181,6 +181,25 @@ def test_a_tranche_with_no_recorded_stop_reports_no_distance(
     assert row.stop_distance_pct is None
 
 
+@pytest.mark.parametrize("sentinel", ["0", "-1"])
+def test_a_dca_tranches_zero_stop_is_no_stop_and_has_no_distance(
+    repo: Repository, tmp_path: Path, sentinel: str
+) -> None:
+    """#973. `agent._open_tranche` copies `Dca.detect`'s `stop=0` sentinel onto every attributed
+    DCA tranche, so the live ledger stores `initial_stop` "0", not NULL. Measured against it, the
+    distance is the whole mark -- "100% clear of its stop" about a tranche that has none, the
+    reading the module docstring refuses. `status.recorded_stop` (zero or below is no stop) is
+    the one reading of that column; the row still carries the column as stored."""
+    _open_tranche(repo, rule_name="dca", initial_stop=Decimal(sentinel))
+    _mark(repo, "150")
+
+    row = gather_positions(repo, _config(tmp_path), now_ts=NOW_TS).rows[0]
+
+    assert row.initial_stop == Decimal(sentinel)
+    assert row.stop_distance is None
+    assert row.stop_distance_pct is None
+
+
 def test_no_mark_means_no_stop_distance_either(repo: Repository, tmp_path: Path) -> None:
     """The distance is measured from the CURRENT price. With no mark there is nothing to measure
     from, and measuring from the entry instead would quietly answer a different question."""

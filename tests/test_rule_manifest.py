@@ -18,10 +18,14 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+import pytest  # noqa: E402
+
+from keel.commands.rules import RulesRefused, add_rule_row  # noqa: E402
 from keel.data.db import connect, migrate  # noqa: E402
 from keel.data.repository import Repository  # noqa: E402
 from keel.strategy.rules.dca import Dca  # noqa: E402
 from scripts.rule_manifest import apply, export  # noqa: E402
+from tests.commands.test_rules_services import _config  # noqa: E402
 
 DCA = {
     "kind": "dca",
@@ -129,6 +133,66 @@ def test_rules_match_on_kind_and_product(tmp_path: Path) -> None:
 
     assert apply(db, manifest, write=True) == 0
     assert {r["params"]["product_id"] for r in _rules(db)} == {"BTC-USD", "ETH-USD"}
+
+
+TURTLE_NAMED_DCA = {
+    "kind": "turtle_breakout",
+    "status": "candidate",
+    "params": {"product_id": "BTC-USD", "name": "dca"},
+}
+
+
+@pytest.mark.parametrize(
+    "entry",
+    [
+        TURTLE_NAMED_DCA,
+        {**DCA, "params": {**DCA["params"], "name": "dca"}},
+        {
+            "kind": "rsi_meanrev",
+            "status": "candidate",
+            "params": {"product_id": "BTC-USD", "name": "dca"},
+        },
+    ],
+    ids=lambda entry: entry["kind"],
+)
+def test_apply_refuses_a_name_param_and_writes_nothing(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], entry: dict
+) -> None:
+    """#974. `rule.name` is what `positions.rule_name` records, and #961 reads a stop-less kind's
+    name as "no stop by design". A manifest that stored `"name": "dca"` on a turtle would make that
+    turtle's missing bracket read as deliberate -- the one direction that hides a gap. `keel rules
+    add` refuses a `name` param; `apply` is the other writer of `rules`, so it refuses the same
+    way, with the same words, and inserts nothing for that entry."""
+    db = _db(tmp_path)
+    manifest = _manifest(tmp_path, [entry])
+
+    assert apply(db, manifest, write=True) == 1
+    assert _rules(db) == []
+
+    err: list[str] = []
+    with pytest.raises(RulesRefused):
+        add_rule_row(
+            Repository(connect(":memory:")),
+            _config(),
+            kind=entry["kind"],
+            product=entry["params"]["product_id"],
+            params_json=json.dumps({k: v for k, v in entry["params"].items() if k != "product_id"}),
+            now_ts=0,
+            echo_err=err.append,
+        )
+    stderr = capsys.readouterr().err
+    assert "REFUSED" in stderr
+    assert err and all(line.removeprefix("Error: ") in stderr for line in err), (err, stderr)
+
+
+def test_a_refused_entry_does_not_stop_the_valid_ones(tmp_path: Path) -> None:
+    """The refusal is per entry, as `--allow-live`'s is: the rest of the manifest still applies,
+    and the exit code says the database does not match the file."""
+    db = _db(tmp_path)
+    manifest = _manifest(tmp_path, [TURTLE_NAMED_DCA, DCA])
+
+    assert apply(db, manifest, write=True) == 1
+    assert [(r["kind"], r["params"]) for r in _rules(db)] == [("dca", DCA["params"])]
 
 
 def test_committed_manifest_is_valid(tmp_path: Path) -> None:

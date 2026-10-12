@@ -489,13 +489,17 @@ def _kind_never_brackets(rule_kind: str) -> bool:
     registry does not know (an empty `rule_name`, a retired kind) is NOT excused: its missing
     bracket stays a warning, the reading that cannot hide a real gap.
 
-    `rule_kind` is `positions.rule_name`, which is `rule.name`. No shipped path stores a name:
-    seed stores `describe()["params"]`, which carries no `name` for any kind, and `keel rules
-    add` refuses a `name` in `--params` (its dropped-param refusal, or `rsi_meanrev`'s
-    constructor, which takes no `name`), so a rule rebuilt from a row is named its kind -- pinned
-    by `test_every_kind_is_named_its_kind_and_stores_no_name_param` and
-    `test_add_rule_row_refuses_a_name_param_and_writes_no_row`. A hand-written row naming
-    another kind would be judged as that kind; a name the registry does not know WARNs."""
+    `rule_kind` is `positions.rule_name`, which is `rule.name`. No path that writes `rules`
+    stores a name: seed stores `describe()["params"]`, which carries no `name` for any kind, and
+    `keel rules add` and `scripts/rule_manifest.py apply` both refuse a `name` param through
+    `rules.validated_row_params` (its dropped-param refusal, or `rsi_meanrev`'s constructor,
+    which takes no `name`; #974), so a rule rebuilt from a row is named its kind -- pinned by
+    `test_every_kind_is_named_its_kind_and_stores_no_name_param`,
+    `test_add_rule_row_refuses_a_name_param_and_writes_no_row` and
+    `test_apply_refuses_a_name_param_and_writes_nothing`. Keyed off the name rather than
+    `rules.kind` through `positions.rule_id` because unattributed tranches have no `rule_id`, and
+    every caller would need a rule-id-to-kind read for the attributed rest. A hand-written SQL row
+    naming another kind would be judged as that kind; a name the registry does not know WARNs."""
     rule_cls = agent.RULE_REGISTRY.get(rule_kind)
     return rule_cls is not None and not rule_cls.places_bracket
 

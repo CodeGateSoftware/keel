@@ -254,7 +254,9 @@ def test_the_ledger_is_read_once_and_the_verdict_covers_those_rows(
 # -- the rail, scanned mechanically ---------------------------------------------------------------
 
 
-RECORD_MODULE_PATH = Path("keel/commands/research_record.py")
+RECORD_MODULE_PATH = (
+    Path(__file__).resolve().parents[2] / "keel" / "commands" / "research_record.py"
+)
 
 
 def test_the_record_module_never_sorts_ranks_or_maxes() -> None:

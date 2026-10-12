@@ -2305,85 +2305,35 @@ def rules_add(ctx: click.Context, kind: str, product: str, params_json: str | No
         ctx.exit(1)
 
 
-def add_rule_row(
-    repo: Repository,
-    config: Any,
-    *,
-    kind: str,
-    product: str,
-    params_json: str | None,
-    now_ts: int,
-    echo: Callable[[str], None] = _noop,
-    echo_err: Callable[[str], None] = _noop,
-) -> RulesOutcome:
-    """THE `rules add` service: every validation the CLI command performs, the single
-    `insert_rule`, and the confirmation lines -- the exact body the command ran, echoed
-    through the injected sinks in the exact order it printed them, so the CLI is
-    byte-compatible and the strategy console's add form renders the SAME messages.
-
-    The usage-error shapes raise `RulesUsageError` (message + param_hint: the CLI renders
-    `click.BadParameter`, the form renders `Error: ...`); the refusal shapes echo their
-    `Error: ...` lines to `echo_err` and raise `RulesRefused`. Nothing is ever written
-    before every check has passed."""
-    # Everything below this line VALIDATES; the single `insert_rule` is the last statement that
-    # can run. A refusal after a partial write would leave a row the operator was told did not
-    # exist -- and rows are what the agent polls.
-    try:
-        # `settlement_is_fatal` stays at the default, as in `rules seed` and for the same
-        # reason: this command WRITES a row the agent then polls every cycle, so a product the
-        # rails veto forever is not a lesser problem than a typo, only a quieter one.
-        product_list, _ = parse_products_option(product, config)
-    except ValueError as exc:
-        raise RulesUsageError(str(exc), param_hint="--product") from exc
-    if len(product_list) != 1:
-        raise RulesUsageError(
-            f"expects exactly ONE product id, got {len(product_list)} ({product!r}) -- one "
-            f"invocation inserts one rule, and the `rules backtest <id>` it prints names one id",
-            param_hint="--product",
-        )
-    product_id = product_list[0]
-
+def _require_rule_class(kind: str, echo_err: Callable[[str], None]) -> type:
+    """`kind`'s rule class, or the `unknown rule kind` refusal (echoed, then `RulesRefused`)."""
     rule_cls = agent.RULE_REGISTRY.get(kind)
     if rule_cls is None:
         echo_err(f"Error: unknown rule kind {kind!r}; known kinds: {sorted(agent.RULE_REGISTRY)!r}")
         raise RulesRefused(f"unknown rule kind {kind!r}")
+    return rule_cls
 
-    # "flag absent" and "flag given but empty" are different intentions, and only `is None`
-    # tells them apart. An empty string is what a shell hands over when the proposal plumbing
-    # misfires -- `--params "$(jq -c .params proposal.json)"` yields `""` when the key is
-    # missing or jq errors -- and reading that as "the kind's own defaults" is the worst
-    # available outcome: an id is printed, the operator backtests it, and the numbers they read
-    # belong to the stock rule rather than to the proposal they believe they measured.
-    if params_json is not None and not params_json.strip():
-        raise RulesUsageError(
-            "was given as an EMPTY string, which is not the same as omitting the flag. This is "
-            'almost always a shell accident (`--params "$(jq -c .params proposal.json)"` '
-            "yields an empty string when the key is missing or jq fails), and taking it as "
-            '"use the defaults" would print a rule id for a row that is NOT the parameter set '
-            "you meant to measure. Pass '{}' to ask for the kind's defaults deliberately, or "
-            "omit --params entirely.",
-            param_hint="--params",
-        )
 
-    try:
-        supplied: Any = json.loads(params_json) if params_json is not None else {}
-    except json.JSONDecodeError as exc:
-        raise RulesUsageError(f"not valid JSON ({exc})", param_hint="--params") from exc
-    if not isinstance(supplied, dict):
-        raise RulesUsageError(
-            f"must be a JSON object of constructor kwargs, got {type(supplied).__name__}",
-            param_hint="--params",
-        )
+def validated_row_params(
+    kind: str,
+    supplied: dict[str, Any],
+    product_id: str,
+    *,
+    echo_err: Callable[[str], None] = _noop,
+) -> dict[str, Any]:
+    """The params a `rules` row stores for `supplied`, or a refusal -- `add_rule_row`'s checks on
+    the params themselves, as one function so every writer of `rules` refuses the same rows.
 
-    # One source of truth for the product. Silently letting `--params` win would print one id
-    # and store another, and the stored one is the one that trades.
-    if "product_id" in supplied and supplied["product_id"] != product_id:
-        raise RulesUsageError(
-            f"names product_id {supplied['product_id']!r}, which disagrees with --product "
-            f"{product_id!r}; pass the product once, via --product",
-            param_hint="--params",
-        )
+    Builds the rule, then returns its `describe()` params (JSON-plain, `product_id` re-applied):
+    exactly what `agent._build_rule` reconstructs. Refuses -- `Error: ...` lines to `echo_err`,
+    then `RulesRefused`, nothing written -- an unknown kind, a mistyped or unknown param, one the
+    rule's own validation rejects, a non-finite number, and a param the row would not persist.
 
+    That last one is the `name` refusal #961 depends on (#974): `describe()` carries no `name`
+    for any kind, so a `"name": "dca"` on a turtle is a dropped param and never reaches the row
+    whose rebuilt `rule.name` becomes `positions.rule_name`. Read by `add_rule_row` and by
+    `scripts/rule_manifest.py apply`, the two writers that take params from outside."""
+    rule_cls = _require_rule_class(kind, echo_err)
     mismatches = _param_type_mismatches(kind, rule_cls, supplied)
     if mismatches:
         quotable = sorted(agent.coerced_param_keys(kind))
@@ -2422,7 +2372,7 @@ def add_rule_row(
     # `.describe()`'s params, JSON-plain -- the same thing `rules seed` stores, so the row is
     # exactly what `agent._build_rule` reconstructs. `product_id` is re-applied because not
     # every kind carries it in `describe()` (e.g. `TurtleBreakout` does not).
-    params = _json_plain(rule.describe()["params"])
+    params: dict[str, Any] = _json_plain(rule.describe()["params"])
     params["product_id"] = product_id
 
     # A constructor kwarg that `describe()` does not carry would be accepted, then LOST: the row
@@ -2441,6 +2391,86 @@ def add_rule_row(
             f"than storing a rule that is not the one you asked for."
         )
         raise RulesRefused(f"{kind} does not persist {dropped!r}")
+    return params
+
+
+def add_rule_row(
+    repo: Repository,
+    config: Any,
+    *,
+    kind: str,
+    product: str,
+    params_json: str | None,
+    now_ts: int,
+    echo: Callable[[str], None] = _noop,
+    echo_err: Callable[[str], None] = _noop,
+) -> RulesOutcome:
+    """THE `rules add` service: every validation the CLI command performs, the single
+    `insert_rule`, and the confirmation lines -- the exact body the command ran, echoed
+    through the injected sinks in the exact order it printed them, so the CLI is
+    byte-compatible and the strategy console's add form renders the SAME messages.
+
+    The usage-error shapes raise `RulesUsageError` (message + param_hint: the CLI renders
+    `click.BadParameter`, the form renders `Error: ...`); the refusal shapes echo their
+    `Error: ...` lines to `echo_err` and raise `RulesRefused`. Nothing is ever written
+    before every check has passed."""
+    # Everything below this line VALIDATES; the single `insert_rule` is the last statement that
+    # can run. A refusal after a partial write would leave a row the operator was told did not
+    # exist -- and rows are what the agent polls.
+    try:
+        # `settlement_is_fatal` stays at the default, as in `rules seed` and for the same
+        # reason: this command WRITES a row the agent then polls every cycle, so a product the
+        # rails veto forever is not a lesser problem than a typo, only a quieter one.
+        product_list, _ = parse_products_option(product, config)
+    except ValueError as exc:
+        raise RulesUsageError(str(exc), param_hint="--product") from exc
+    if len(product_list) != 1:
+        raise RulesUsageError(
+            f"expects exactly ONE product id, got {len(product_list)} ({product!r}) -- one "
+            f"invocation inserts one rule, and the `rules backtest <id>` it prints names one id",
+            param_hint="--product",
+        )
+    product_id = product_list[0]
+
+    _require_rule_class(kind, echo_err)
+
+    # "flag absent" and "flag given but empty" are different intentions, and only `is None`
+    # tells them apart. An empty string is what a shell hands over when the proposal plumbing
+    # misfires -- `--params "$(jq -c .params proposal.json)"` yields `""` when the key is
+    # missing or jq errors -- and reading that as "the kind's own defaults" is the worst
+    # available outcome: an id is printed, the operator backtests it, and the numbers they read
+    # belong to the stock rule rather than to the proposal they believe they measured.
+    if params_json is not None and not params_json.strip():
+        raise RulesUsageError(
+            "was given as an EMPTY string, which is not the same as omitting the flag. This is "
+            'almost always a shell accident (`--params "$(jq -c .params proposal.json)"` '
+            "yields an empty string when the key is missing or jq fails), and taking it as "
+            '"use the defaults" would print a rule id for a row that is NOT the parameter set '
+            "you meant to measure. Pass '{}' to ask for the kind's defaults deliberately, or "
+            "omit --params entirely.",
+            param_hint="--params",
+        )
+
+    try:
+        supplied: Any = json.loads(params_json) if params_json is not None else {}
+    except json.JSONDecodeError as exc:
+        raise RulesUsageError(f"not valid JSON ({exc})", param_hint="--params") from exc
+    if not isinstance(supplied, dict):
+        raise RulesUsageError(
+            f"must be a JSON object of constructor kwargs, got {type(supplied).__name__}",
+            param_hint="--params",
+        )
+
+    # One source of truth for the product. Silently letting `--params` win would print one id
+    # and store another, and the stored one is the one that trades.
+    if "product_id" in supplied and supplied["product_id"] != product_id:
+        raise RulesUsageError(
+            f"names product_id {supplied['product_id']!r}, which disagrees with --product "
+            f"{product_id!r}; pass the product once, via --product",
+            param_hint="--params",
+        )
+
+    params = validated_row_params(kind, supplied, product_id, echo_err=echo_err)
 
     existing = [
         row
