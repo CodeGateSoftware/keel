@@ -187,9 +187,10 @@ def _refusing_guards(method: object, *, stop_at: str | None = None) -> list[ast.
 def test_the_phrase_check_names_its_place_among_every_check_before_it() -> None:
     """`run_gated_action` is the LAST check a release passes. Its docstring says how many come
     first and which; both are read here from the two handler methods that run them, so a check
-    added to `do_POST` (as `Sec-Fetch-Site` was) fails this until the docstring counts it."""
+    added to `do_POST` (as `Sec-Fetch-Site` was) fails this until the docstring counts it.
+    `do_POST` itself only wraps `_post` in the body drain (#955), so the guards are read there."""
     handler = server.KeelHandler
-    before_dispatch = _refusing_guards(handler.do_POST, stop_at="_gated_action")
+    before_dispatch = _refusing_guards(handler._post, stop_at="_gated_action")
     in_gated_action = _refusing_guards(handler._gated_action)
     checks = len(before_dispatch) + len(in_gated_action) + 1  # + the phrase itself
 
