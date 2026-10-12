@@ -742,6 +742,42 @@ def test_an_empty_side_leaves_the_gate_verdict_exactly_as_check_floors_gives_it(
         )
 
 
+def test_an_all_losses_record_has_no_realized_rr_and_says_why(repo: Repository) -> None:
+    """No winning trade means no average win to divide: `realized_rr` is unknown (None), not the
+    0.00 that `0 / |avg_loss|` gives. The reason is told apart from "no losses yet" by which side
+    of the record is empty. The page's gate card and record row both read "—" (`ratio(None)`)."""
+    _btc, eth = _seed_two_turtles(repo)
+
+    record = next(r for r in _report(repo).rules if r.rule_id == eth)
+    line = next(ln for ln in render_summary(_report(repo)) if f"rule={eth} " in ln)
+    shown = _rules_records(repo)[1]
+
+    assert record.realized_rr is None
+    assert record.gate is not None and record.gate.realized_rr is None
+    assert "avg_win=n/a avg_loss=-10.00 rr=n/a (no wins yet) " in line
+    assert "(no losses yet)" not in line
+    assert shown["realized_rr"]["display"] == "—"
+    assert shown["gate"]["realized_rr"]["display"] == "—"
+
+
+def test_a_zero_trade_record_prints_every_figure_as_n_a_at_the_terminal(repo: Repository) -> None:
+    """Unknown shown as zero, in the terminal: with no trades there is no win rate, expectancy,
+    profit factor or drawdown to print. The page already says "—"; `--json` keeps its numbers
+    (n_trades=0 tells a reader they are placeholders)."""
+    rule_id = repo.insert_rule("turtle_breakout", {"product_id": "BTC-USD"}, status="paper")
+    report = _report(repo)
+
+    lines = render_summary(report)
+    record = [line for line in lines if line.startswith("  [turtle_breakout]")]
+
+    assert record == [
+        f"  [turtle_breakout] rule={rule_id} product=BTC-USD status=paper class=trend_follow "
+        "n=0 win_rate=n/a avg_win=n/a avg_loss=n/a rr=n/a (no trades yet) "
+        "expectancy=n/a profit_factor=n/a max_dd=n/a"
+    ]
+    assert report.rules[0].win_rate == 0 and report.rules[0].expectancy == 0
+
+
 # -- build_journal_report -----------------------------------------------------------------------
 
 

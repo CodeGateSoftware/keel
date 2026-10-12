@@ -687,14 +687,18 @@ def build_account_summary(report: StatusReport) -> AccountSummary:
 
 
 def _realized_rr_for_display(stats: Any) -> Decimal | None:
-    """`avg_win / |avg_loss|`, or `None` when there are no losing trades yet.
+    """`avg_win / |avg_loss|`, or `None` when either side is empty: no losing trades yet (nothing
+    to measure against) or no winning trades yet (#965: `avg_win` is then the 0 `BacktestResult`
+    writes for an empty side, and `0 / |avg_loss|` would read as a measured 0.00).
 
-    Deliberately diverges from `strategy.promotion._realized_rr` (which returns `Infinity` in
-    that case, because a promotion-gate check needs a comparable scalar). This is a display
-    value, not a gate decision -- `None` ("no losses yet, nothing to measure against") is the
-    honest reading, not a real-looking `Infinity`.
+    Deliberately diverges from `strategy.promotion._realized_rr` (which returns `Infinity` for no
+    losses, because a promotion-gate check needs a comparable scalar, and works in R). This is a
+    display value, not a gate decision -- `check_floors` still decides the verdict. Each side is
+    decided by COUNTING that side's trades, like `_side_average`.
     """
     if stats.avg_loss == 0:
+        return None
+    if not any(trade.outcome == "win" for trade in stats.trades):
         return None
     return stats.avg_win / abs(stats.avg_loss)
 
@@ -1093,16 +1097,30 @@ def render_summary(report: InsightsReport) -> list[str]:
 
     lines.append(f"rule track record ({len(report.rules)}):")
     for r in report.rules:
-        rr = r.realized_rr if r.realized_rr is not None else "n/a (no losses yet)"
+        if r.n_trades == 0:
+            # Nothing was measured: every figure is unknown, not the zero the engine holds.
+            win_rate = expectancy = profit_factor = max_dd = "n/a"
+            rr: Any = "n/a (no trades yet)"
+        else:
+            win_rate = f"{r.win_rate:.1%}"
+            expectancy = _money(r.expectancy)
+            profit_factor = _ratio(r.profit_factor)
+            max_dd = _money(r.max_drawdown)
+            if r.realized_rr is not None:
+                rr = r.realized_rr
+            elif r.avg_win is None:
+                rr = "n/a (no wins yet)"
+            else:
+                rr = "n/a (no losses yet)"
         rule_id = r.rule_id if r.rule_id is not None else "n/a"
         avg_win = _money(r.avg_win) if r.avg_win is not None else "n/a"
         avg_loss = _money(r.avg_loss) if r.avg_loss is not None else "n/a"
         lines.append(
             f"  [{r.rule_name}] rule={rule_id} product={r.product_id or 'n/a'} "
             f"status={r.status} class={r.promotion_class} n={r.n_trades} "
-            f"win_rate={r.win_rate:.1%} avg_win={avg_win} avg_loss={avg_loss} "
-            f"rr={_ratio(rr)} expectancy={_money(r.expectancy)} "
-            f"profit_factor={_ratio(r.profit_factor)} max_dd={_money(r.max_drawdown)}"
+            f"win_rate={win_rate} avg_win={avg_win} avg_loss={avg_loss} "
+            f"rr={_ratio(rr)} expectancy={expectancy} "
+            f"profit_factor={profit_factor} max_dd={max_dd}"
         )
         if r.status == UNATTRIBUTED:
             lines.append(f"    {_UNATTRIBUTED_NOTE}")

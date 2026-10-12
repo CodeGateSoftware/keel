@@ -183,6 +183,27 @@ def test_the_track_records_offer_no_sort_control() -> None:
     assert re.findall(r"\brecordsSection\(([^)]*)\)", _builder("rulesView")) == ["data"]
 
 
+def test_the_track_records_are_drawn_in_the_order_they_arrive() -> None:
+    """The server puts the ledger's rules first and the unattributed record last, and promises it.
+    The client must not undo that: the rows argument of `table("h-records", ...)` is `records.map(`
+    itself, and no use of `records` in the section reorders, copies or slices it."""
+    body = _builder("recordsSection")
+    found = re.search(r'table\(\s*"h-records"', body)
+    assert found is not None
+    columns, after = _balanced_block(body, body.index("[", found.start()))
+    rows_argument = body[after:].lstrip(" \n,")
+
+    assert rows_argument.startswith("records.map(")
+    # Every method called on the `records` binding (not `data.records`) is `.map(` -- the table
+    # rows -- or `.filter(` -- the gated subset, which keeps order. None hands it to a function.
+    methods = re.findall(r"(?<![\w.])records\s*\.\s*(\w+)\s*\(", body)
+    assert sorted(methods) == ["filter", "map"]
+    assert not re.search(r"[(,]\s*records\s*[,)]", body)
+    for reorder in ("sort", "reverse", "slice", "toSorted", "toReversed", "splice"):
+        assert not re.search(rf"\.\s*{reorder}\b", body), reorder
+    assert "..." not in body
+
+
 def test_the_gate_cards_are_drawn_on_the_presence_of_a_gate() -> None:
     """`GateDistance` is `None` for every status but `paper`, so the branch is the presence of the
     payload's object -- never a figure read and compared here."""
