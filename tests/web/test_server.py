@@ -2147,3 +2147,230 @@ def test_the_missing_gate_token_refusal_names_that_routes_own_cli_command(
 
     assert status == 403, body
     assert re.findall(r"`(keel [a-z-]+)`", body) == [command], body
+
+
+# -- a halt with a body (#955) ---------------------------------------------------------------------
+
+
+def _keepalive_halt_then_get(cfg, body: bytes) -> tuple[int, str, int, str]:
+    """POST the halt with `body` and a `Content-Length`, then GET down the SAME socket.
+
+    One connection for both, because that is the only way the desynchronisation is visible: a
+    body left unread is parsed by the stdlib as the start of the next request line."""
+    conn = http.client.HTTPConnection(cfg.host, cfg.port, timeout=10)
+    host = f"{cfg.host}:{cfg.port}"
+    try:
+        conn.request(
+            "POST",
+            "/api/gates/halt",
+            body=body,
+            headers={
+                "Host": host,
+                "Cookie": _session(cfg),
+                "X-Keel-Client": "1",
+                security.HALT_HEADER: security.halt_token(cfg.token),
+                "Content-Type": "application/json",
+                "Content-Length": str(len(body)),
+            },
+        )
+        first = conn.getresponse()
+        first_body = first.read().decode("utf-8", "replace")
+        conn.request("GET", "/api/config", headers={"Host": host, "Cookie": _session(cfg)})
+        second = conn.getresponse()
+        second_body = second.read().decode("utf-8", "replace")
+        return first.status, first_body, second.status, second_body
+    finally:
+        conn.close()
+
+
+@pytest.mark.parametrize(
+    "body",
+    [b"{}", b"xy", b"this is not json at all", b'{"phrase": ["nested"]}'],
+    ids=["empty-object", "two-bytes", "not-json", "nested-json"],
+)
+def test_a_halt_with_a_body_engages_and_leaves_the_connection_clean(deployment, body) -> None:
+    """**#955: the halt reads no body, and a body sent anyway must not poison the connection.**
+
+    Two pins in one drive. The halt answers 200 and engages the switch whatever the body is --
+    including bodies `_read_json_object` would refuse (not JSON, a nested value), so a halt that
+    started parsing its body and answering 400 fails here rather than only in the client suite.
+    And the GET after it, on the same kept-alive socket, answers 200: before the fix the body's
+    bytes were read as the next request line (`{}GET /api/config`) and answered 501."""
+    with _serving(deployment) as cfg:
+        assert _kill_switch(deployment[0]) in (None, False)
+        halt_status, halt_body, get_status, get_body = _keepalive_halt_then_get(cfg, body)
+
+    assert halt_status == 200, halt_body
+    assert _kill_switch(deployment[0]) is True
+    assert get_status == 200, get_body[:200]
+    assert json.loads(get_body)["data"] is not None
+
+
+def test_a_halt_with_an_oversized_body_still_engages(deployment) -> None:
+    """A body past `_MAX_BODY_BYTES` is not drained (that is the memory-exhaustion primitive the
+    cap denies) -- the connection is closed instead. The halt itself must still happen: refusing
+    a stop over its envelope is the one failure this route must not have."""
+    oversized = b"x" * (web_server._MAX_BODY_BYTES + 1)
+    with _serving(deployment) as cfg:
+        conn = http.client.HTTPConnection(cfg.host, cfg.port, timeout=10)
+        try:
+            conn.request(
+                "POST",
+                "/api/gates/halt",
+                body=oversized,
+                headers={
+                    "Host": f"{cfg.host}:{cfg.port}",
+                    "Cookie": _session(cfg),
+                    "X-Keel-Client": "1",
+                    security.HALT_HEADER: security.halt_token(cfg.token),
+                    "Content-Length": str(len(oversized)),
+                },
+            )
+            response = conn.getresponse()
+            response.read()
+        finally:
+            conn.close()
+
+    assert response.status == 200
+    assert _kill_switch(deployment[0]) is True
+
+
+# -- `serve()` keeps every field it was given (#971) -----------------------------------------------
+
+
+@contextmanager
+def _through_serve(deployment, monkeypatch, home: Path, **changes: object):
+    """Run the REAL `serve()` in a thread; yield the config it was given and the one its handler
+    answers with.
+
+    Not `_serving`, which builds the bound config itself: #971 was `serve()` rebuilding the
+    config after binding and dropping `external_hosts` and `started_at`, and every test that
+    built its own `ServeConfig` walked straight past it. The server object is captured by
+    wrapping `build_server` (still the real one), so the test can stop it and read the config
+    `serve()` installed on the handler -- the one every request is answered against."""
+    monkeypatch.setenv("KEEL_HOME", str(home))
+    from keel.web import runtime
+
+    # Interactive, so `record_serving` writes nothing (this test is not about the record).
+    monkeypatch.setattr(runtime, "stdout_is_interactive", lambda: True)
+    built: list[web_server.KeelServer] = []
+    real_build = web_server.build_server
+
+    def _capture(cfg: web_server.ServeConfig) -> web_server.KeelServer:
+        server = real_build(cfg)
+        built.append(server)
+        return server
+
+    monkeypatch.setattr(web_server, "build_server", _capture)
+    db_path, config_path = deployment
+    cfg = web_server.ServeConfig(
+        host="127.0.0.1",
+        port=0,
+        token=new_session_token(),
+        db_path=db_path,
+        config_path=config_path,
+        **changes,  # type: ignore[arg-type]
+    )
+    announced = threading.Event()
+    lines: list[str] = []
+
+    def _echo(line: str) -> None:
+        lines.append(line)
+        if "Press Ctrl-C" in line:
+            announced.set()
+
+    exit_codes: list[int] = []
+    thread = threading.Thread(
+        target=lambda: exit_codes.append(web_server.serve(cfg, echo=_echo)), daemon=True
+    )
+    thread.start()
+    try:
+        assert announced.wait(timeout=10), lines
+        server = built[0]
+        yield cfg, server.RequestHandlerClass.cfg  # type: ignore[attr-defined]
+    finally:
+        if built:
+            built[0].shutdown()
+        thread.join(timeout=10)
+    assert exit_codes == [0], lines
+
+
+def test_serve_keeps_every_field_it_was_given(deployment, monkeypatch, tmp_path) -> None:
+    """Every field but `port` survives the post-bind rebuild. Compared as WHOLE dataclasses, so a
+    field added to `ServeConfig` later cannot be dropped here without failing this test -- and
+    every optional field is given a non-default value, so a field that fell back to its default
+    cannot pass by coincidence."""
+    remote = frozenset({"keel.example.com"})
+    started = time.time() - 60
+    with _through_serve(
+        deployment,
+        monkeypatch,
+        tmp_path,
+        external_hosts=remote,
+        started_at=started,
+        build="keel test",
+        build_info=object(),
+    ) as (given, installed):
+        assert installed.port != 0, "the port is the one thing binding learns"
+        assert dataclasses.replace(installed, port=given.port) == given
+        assert installed.session_expired_at is not None
+        defaults = {
+            spec.name
+            for spec in dataclasses.fields(web_server.ServeConfig)
+            if spec.name not in {"port", "screen_cache"}
+            and spec.default is not dataclasses.MISSING
+            and getattr(given, spec.name) == spec.default
+        }
+        assert defaults == set(), "every optional field must be set off its default here"
+
+
+def test_serve_admits_a_declared_external_host(deployment, monkeypatch, tmp_path) -> None:
+    """#971 item 1: `keel serve --external-host keel.example.com` refused a request whose Host was
+    keel.example.com, because the declaration never reached the handler."""
+    with _through_serve(
+        deployment, monkeypatch, tmp_path, external_hosts=frozenset({"keel.example.com"})
+    ) as (_given, installed):
+        status, _headers, body = _request(
+            installed, "/api/config", cookie=_session(installed), host="keel.example.com"
+        )
+
+    assert status == 200, body
+
+
+def test_serve_enforces_the_remote_session_lifetime(deployment, monkeypatch, tmp_path) -> None:
+    """#971 item 2: `started_at` was dropped, so `session_expired_at` was always `None` and the
+    #648 lifetime never bit. A valid token on a run older than the lifetime must be refused."""
+    stale = time.time() - security.REMOTE_SESSION_MAX_AGE_SECONDS - 1
+    with _through_serve(
+        deployment,
+        monkeypatch,
+        tmp_path,
+        external_hosts=frozenset({"keel.example.com"}),
+        started_at=stale,
+    ) as (_given, installed):
+        status, _headers, body = _request(installed, "/api/config", cookie=_session(installed))
+
+    assert status == 403, body
+    assert "lifetime" in body
+
+
+def test_serve_refuses_a_release_on_a_declared_remote_deployment(
+    deployment, monkeypatch, tmp_path
+) -> None:
+    """#971 item 3: the release locality check read an empty declaration, so a tunnel that
+    rewrote Host to loopback passed it. With the declaration kept, a release from loopback --
+    which is what a tunnel looks like -- is refused before the gates token is even read."""
+    with _through_serve(
+        deployment, monkeypatch, tmp_path, external_hosts=frozenset({"keel.example.com"})
+    ) as (_given, installed):
+        status, _headers, body = _request(
+            installed,
+            "/api/gates/resume",
+            method="POST",
+            cookie=_session(installed),
+            gate=security.gates_token(installed.token),
+            raw_body=json.dumps({"phrase": "RESUME TRADING"}),
+        )
+
+    assert status == 403, body
+    assert "loopback session on a loopback bind" in body

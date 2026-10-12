@@ -51,7 +51,7 @@ import socket
 import sys
 import time
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
@@ -395,7 +395,7 @@ class KeelHandler(BaseHTTPRequestHandler):
     #: Per REQUEST, not per connection, and reset at the top of each verb: a handler instance
     #: serves every request on a keep-alive connection, so a flag left set by one write would make
     #: the next refusal skip its drain and re-create the desynchronisation this exists to prevent.
-    #: `_drain_request_body` reads it; `_read_json_object` sets it.
+    #: `_drain_request_body` reads and sets it; `_read_json_object` sets it.
     body_consumed: bool = False
 
     # -- logging --
@@ -563,6 +563,9 @@ class KeelHandler(BaseHTTPRequestHandler):
         if length > _MAX_BODY_BYTES:
             self.close_connection = True
             return
+        # Before the read: whatever the read does, this request's body is no longer ours to read,
+        # and `do_POST`'s closing drain must not wait on it a second time.
+        self.body_consumed = True
         try:
             self.rfile.read(length)
         except OSError:  # pragma: no cover - a client that vanished mid-body
@@ -778,8 +781,28 @@ class KeelHandler(BaseHTTPRequestHandler):
         There is no dynamic dispatch here and no getattr on a user-supplied name. A write reaches
         keel through exactly two tables: `keel.commands.setup.ACTIONS` -- which contains only
         idempotent, non-destructive, `MECHANICAL` steps and cannot contain anything else without
-        failing a test -- or `gates.TIER1_ACTIONS` plus the halt, behind `_gated_action`."""
+        failing a test -- or `gates.TIER1_ACTIONS` plus the halt, behind `_gated_action`.
+
+        **Every POST ends at a request boundary (#955).** A branch that answers without reading
+        the body -- the halt, which takes no phrase and no values -- used to leave whatever a
+        client sent anyway in the socket, and on a kept-alive connection the stdlib parsed it as
+        the next request line (`{}GET /api/pulse`, answered 501). The drain is in a `finally`
+        here rather than in each branch, so a branch added later cannot forget it; it is bounded
+        and closes instead of reading an oversized or unreadable length (`_drain_request_body`).
+        Drain rather than always close: the console's next read rides the same connection, and
+        closing on every halt would cost each one a reconnect for a body nobody needs.
+
+        AFTER the answer, on purpose: the halt has already engaged and been reported by then, so a
+        client that declares a body it never sends stalls only its own connection, never the stop
+        -- stopping is never slower than starting (`keel/web/gates.py`)."""
         self.body_consumed = False
+        try:
+            self._post()
+        finally:
+            self._drain_request_body()
+
+    def _post(self) -> None:
+        """`do_POST`'s routing, minus the drain that every branch shares. Read `do_POST`."""
         parsed = urlsplit(self.path)
         if not self._admitted():
             return
@@ -1177,15 +1200,13 @@ def serve(cfg: ServeConfig, *, echo: Callable[[str], None] = print) -> int:
         return 1
 
     bound_port = server.server_address[1]
-    running = ServeConfig(
-        host=cfg.host,
-        port=int(bound_port),
-        token=cfg.token,
-        db_path=cfg.db_path,
-        config_path=cfg.config_path,
-        build=cfg.build,
-        build_info=cfg.build_info,
-    )
+    # `replace`, never a hand-listed constructor: the port is the ONE thing binding learns, and
+    # every other field must reach the handler as `serve_cmd` resolved it. The constructor this
+    # replaced copied seven fields by name and dropped `external_hosts` and `started_at` (#971),
+    # so every `--external-host` run refused its own declared Host, never expired a remote
+    # session, and read "no declared remote origin" in the release locality check. A field added
+    # to `ServeConfig` later is carried here without anyone having to remember this line.
+    running = replace(cfg, port=int(bound_port))
     server.RequestHandlerClass.cfg = running  # type: ignore[attr-defined]
 
     if not running.host_policy.is_loopback:
