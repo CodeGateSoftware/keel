@@ -365,27 +365,59 @@ def _console_read_path_files() -> list[Path]:
         _REPO / "keel" / "commands" / "setup.py",
         _REPO / "keel" / "commands" / "pulse.py",
         _REPO / "keel" / "venue_readiness.py",
+        # #977 round 2: the readers' own SQL lives HERE, not in the modules above (the web
+        # modules hold five execute calls between them; `Repository` holds ~70). A banned
+        # statement added to a Repository read method reaches the read-only connection.
+        _REPO / "keel" / "data" / "repository.py",
+        _REPO / "keel" / "data" / "audit.py",
+        _REPO / "keel" / "data" / "db.py",
     ]
 
 
-def _execute_string_constants(tree: ast.AST) -> tuple[int, list[str]]:
-    """(number of `.execute`/`.executescript` calls, every string constant inside their args)."""
-    calls = 0
-    strings: list[str] = []
-    for node in ast.walk(tree):
+#: (file, enclosing function) -> the exact SQL strings allowed there. `connect_read_only` is the
+#: one place `query_only` is SET (to ON); allow-listed by function AND exact string, never by
+#: substring, so `PRAGMA query_only = OFF` in the same function still fails.
+_ALLOWED_SQL = {("db.py", "connect_read_only"): {"PRAGMA query_only = ON"}}
+
+#: db.py functions that are WRITE paths by construction and never run on a read-only connection:
+#: `connect` opens the read-write connection, `migrate` and the `_migrate_*` steps change schema.
+#: They are excluded by name (not by file), and none of them issues a banned statement today --
+#: the exclusion only keeps a future checkpoint-on-purpose there from tripping the reader ban.
+_WRITE_ONLY_FUNCTIONS = {("db.py", "connect"), ("db.py", "migrate")}
+
+
+def _is_write_only(file_name: str, function: str | None) -> bool:
+    return (file_name, function) in _WRITE_ONLY_FUNCTIONS or (
+        file_name == "db.py" and function is not None and function.startswith("_migrate")
+    )
+
+
+def _execute_string_constants(tree: ast.AST) -> list[tuple[str | None, str]]:
+    """Every `.execute`/`.executemany`/`.executescript` call, as (enclosing function, SQL
+    string) -- one row per string constant inside its args, and one `(function, "")` row for a
+    call with none (so the call count is `len(result)` at least)."""
+    rows: list[tuple[str | None, str]] = []
+
+    def visit(node: ast.AST, function: str | None) -> None:
+        if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef):
+            function = node.name
         if (
             isinstance(node, ast.Call)
             and isinstance(node.func, ast.Attribute)
-            and node.func.attr in {"execute", "executescript"}
+            and node.func.attr in {"execute", "executemany", "executescript"}
         ):
-            calls += 1
-            for arg in node.args:
-                strings += [
-                    n.value
-                    for n in ast.walk(arg)
-                    if isinstance(n, ast.Constant) and isinstance(n.value, str)
-                ]
-    return calls, strings
+            strings = [
+                n.value
+                for arg in node.args
+                for n in ast.walk(arg)
+                if isinstance(n, ast.Constant) and isinstance(n.value, str)
+            ]
+            rows.extend([(function, text) for text in strings] or [(function, "")])
+        for child in ast.iter_child_nodes(node):
+            visit(child, function)
+
+    visit(tree, None)
+    return rows
 
 
 def test_the_console_read_path_never_asks_sqlite_to_lift_read_only() -> None:
@@ -396,15 +428,37 @@ def test_the_console_read_path_never_asks_sqlite_to_lift_read_only() -> None:
     files = _console_read_path_files()
     assert all(f.exists() for f in files), [str(f) for f in files if not f.exists()]
     total = 0
-    offenders: list[tuple[str, str]] = []
+    offenders: list[tuple[str, str | None, str]] = []
     for file in files:
-        calls, strings = _execute_string_constants(ast.parse(file.read_text()))
-        total += calls
-        offenders += [
-            (file.name, text)
-            for text in strings
-            if any(word in text.lower() for word in _FORBIDDEN_SQL)
-        ]
+        for function, text in _execute_string_constants(ast.parse(file.read_text())):
+            if _is_write_only(file.name, function):
+                continue
+            total += 1
+            if text in _ALLOWED_SQL.get((file.name, function), set()):
+                continue
+            if any(word in text.lower() for word in _FORBIDDEN_SQL):
+                offenders.append((file.name, function, text))
 
-    assert total > 0, "the walker found no execute calls: it would pass by vacuum"
+    assert total >= 50, f"the walker found only {total} SQL calls: it would pass by vacuum"
     assert offenders == []
+
+
+def test_the_forbidden_sql_pin_sees_a_banned_statement_in_a_repository_method() -> None:
+    """The walker itself, on a planted source: an `OFF` pragma beside the one allowed `ON`, and
+    one in a Repository-shaped method, are both reported."""
+    src = (
+        "def connect_read_only(c):\n"
+        "    c.execute('PRAGMA query_only = ON')\n"
+        "    c.execute('PRAGMA query_only = OFF')\n"
+        "class R:\n"
+        "    def read(self):\n"
+        "        self.c.executemany('VACUUM', [])\n"
+    )
+    rows = _execute_string_constants(ast.parse(src))
+    flagged = [
+        (f, t)
+        for f, t in rows
+        if t not in _ALLOWED_SQL.get(("db.py", f), set())
+        and any(w in t.lower() for w in _FORBIDDEN_SQL)
+    ]
+    assert flagged == [("connect_read_only", "PRAGMA query_only = OFF"), ("read", "VACUUM")]

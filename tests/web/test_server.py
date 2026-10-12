@@ -2235,6 +2235,16 @@ _UNTRUSTWORTHY_FRAMING = [
         b"{}",
         id="length-and-transfer-encoding",
     ),
+    # #977 round 2: a digit string too long for `int()` (past the 4300-digit conversion limit) used
+    # to raise out of the handler; it must read as an unsizeable length and close.
+    pytest.param([("Content-Length", "0" * 5000 + "2")], b"{}", id="5000-digit-zero-padded-length"),
+    pytest.param([("Content-Length", "9" * 5000)], b"{}", id="5000-digit-huge-length"),
+    # A space before the colon stops the stdlib header parse: the length never reaches
+    # `self.headers`, so a drain that only looks there sees a body of zero bytes.
+    pytest.param([("Content-Length ", "2")], b"{}", id="space-before-colon-length"),
+    pytest.param(
+        [("Transfer-Encoding ", "chunked")], b"2\r\n{}\r\n0\r\n\r\n", id="space-before-colon-te"
+    ),
 ]
 
 
@@ -2321,6 +2331,37 @@ def test_a_json_post_with_untrustworthy_framing_is_refused_and_closes(
     assert _statuses(received) == [b"400"], received[:300]
     head, _, payload = received.partition(b"\r\n\r\n")
     assert json.loads(payload.decode())["error"]["status"] == "400"
+
+
+@pytest.mark.parametrize(
+    ("framing", "body"),
+    [
+        pytest.param([], b"", id="no-length"),
+        pytest.param([("Content-Length", "0")], b"", id="zero-length"),
+        pytest.param([("content-length", "2")], b"{}", id="lowercase-name"),
+        pytest.param([("Content-Length", "02")], b"{}", id="leading-zero"),
+    ],
+)
+def test_a_halt_with_trustworthy_framing_keeps_the_connection_open(
+    deployment, framing, body
+) -> None:
+    """#977 round 2: the new framing checks must not close an honest browser POST. The GET behind
+    the halt (its own `Connection: close` ends the read) is answered, so there are two 200s."""
+    with _serving(deployment) as cfg:
+        lines = ["POST /api/gates/halt HTTP/1.1"]
+        lines += [f"{n}: {v}" for n, v in [*_halt_headers(cfg), *framing]]
+        request = ("\r\n".join(lines) + "\r\n\r\n").encode() + body
+        request += (
+            f"GET /api/config HTTP/1.1\r\nHost: {cfg.host}:{cfg.port}\r\n"
+            f"Cookie: {_session(cfg)}\r\nX-Keel-Client: 1\r\nConnection: close\r\n\r\n"
+        ).encode()
+        received = b""
+        with socket.create_connection((cfg.host, cfg.port), timeout=3) as sock:
+            sock.sendall(request)
+            while chunk := sock.recv(65536):
+                received += chunk
+
+    assert _statuses(received) == [b"200", b"200"], received[:300]
 
 
 def test_a_halt_with_an_oversized_body_still_engages_and_closes(deployment) -> None:

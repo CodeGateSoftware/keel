@@ -84,6 +84,9 @@ _REFRESH_SEC = 15
 #: primitive and there is no proxy in front of this server to impose a limit. A setup form carries
 #: an action key and a token.
 _MAX_BODY_BYTES = 8 * 1024
+# More digits than any honest `Content-Length` has; a longer one is closed on, never `int()`-ed
+# (CPython raises ValueError past 4300 digits).
+_MAX_CONTENT_LENGTH_DIGITS = 18
 
 
 @dataclass(frozen=True)
@@ -544,13 +547,25 @@ class KeelHandler(BaseHTTPRequestHandler):
 
         The halt never calls this to decide anything -- it reads no body and engages first.
         """
+        # A header line the stdlib parser could not read (`Content-Length : 2`, a space before the
+        # colon) ends the header parse early: the length never reaches `self.headers`, and what is
+        # left sits in the payload. Absence of a length is then NOT "a body of zero".
+        if self.headers.defects or self.headers.get_payload():
+            self.close_connection = True
+            return None
         if self.headers.get("Transfer-Encoding") is not None:
             self.close_connection = True
             return None
         values = self.headers.get_all("Content-Length") or []
         if not values:
             return 0
-        if len(values) > 1 or re.fullmatch(r"[0-9]+", values[0]) is None:
+        # Bounded BEFORE `int()`, which raises ValueError past 4300 digits. A few leading zeros
+        # ("01") still work; an absurdly padded or huge value closes like any unsizeable length.
+        if (
+            len(values) > 1
+            or len(values[0]) > _MAX_CONTENT_LENGTH_DIGITS
+            or re.fullmatch(r"[0-9]+", values[0]) is None
+        ):
             self.close_connection = True
             return None
         return int(values[0])
