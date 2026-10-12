@@ -2490,7 +2490,12 @@ def envelope(
 
 
 def error_envelope(
-    now_ts: float | int | None, *, status: int, title: str, detail: str
+    now_ts: float | int | None,
+    *,
+    status: int,
+    title: str,
+    detail: str,
+    halt: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     """One `GET /api/*` refusal or failure.
 
@@ -2510,13 +2515,28 @@ def error_envelope(
     is always `null`: most refusals happen before the session cookie is checked, so filling it in
     would mean an unauthenticated request reading the deployment database -- the same argument
     that keeps `engine` out of this document.
+
+    `halt` (#958) is `null` on every failure but one: Pulse's own, after admission, where it is
+    `halt_fallback`'s `{halt_token, resume_command}`. The HALT button lives on Pulse, and a stop
+    that vanished whenever the report beside it failed to build would make stopping slower than
+    starting. Present and `null` everywhere else for `attestations`' reason -- a constant key set.
     """
     return {
         "as_of": iso(now_ts),
         "data": None,
         "attestations": None,
         "error": {"status": str(status), "title": title, "detail": detail},
+        "halt": halt,
     }
+
+
+def halt_fallback(*, halt_token: str, resume_command: str) -> dict[str, str]:
+    """What the HALT control needs when the Pulse report could not be built (#958): the halt
+    token and the resume command, the same two values `pulse_payload` carries as `halt_token`
+    and `halt.resume_command`, and nothing else. Bare strings, under the same names, so the
+    client hands them to the same two readers (`actions.rememberHaltToken`, `render.haltControl`)
+    rather than a second copy of either."""
+    return {"halt_token": str(halt_token), "resume_command": str(resume_command)}
 
 
 # -- ordering (#534) -----------------------------------------------------------------------------

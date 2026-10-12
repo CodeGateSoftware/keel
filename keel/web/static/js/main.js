@@ -47,6 +47,7 @@ import {
   paperBanner,
   consoleSwitcher,
   sessionChip,
+  pulseFailedView,
   pulseView,
   refusedView,
   rulesView,
@@ -640,6 +641,14 @@ async function paint(route, rebuild, force) {
     // keel printed is what admits this browser, and pasting it is the action either one needs.
       if (primary.error && primary.error.status === REFUSED_STATUS) {
         rebuildInto(refusedView(primary, reconnect), Boolean(force));
+      } else if (route.name === "pulse" && primary.halt) {
+        // #958: Pulse's report failed to build, and the failure still carries the HALT control's
+        // inputs. The stop is offered anyway -- stopping is never slower than starting
+        // (`keel/web/gates.py`) -- through the same token holder `mount` uses and the same
+        // control `pulseView` draws. Not the stopped view: keel is running, and that view
+        // offers no stop.
+        rememberHaltToken(primary.halt);
+        rebuildInto(pulseFailedView(primary), Boolean(force));
       } else {
         rebuildInto(stoppedView(primary, pathFor(SETUP_ROUTE)), Boolean(force));
       }

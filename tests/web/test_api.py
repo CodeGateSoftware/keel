@@ -47,6 +47,7 @@ from keel.web import api as web_api
 from keel.web import payload
 from keel.web import server as web_server
 from keel.web.security import (
+    HALT_HEADER,
     SESSION_COOKIE,
     csrf_token,
     gates_token,
@@ -1043,6 +1044,124 @@ def test_a_report_that_cannot_be_built_is_reported_not_swallowed(
 
 def _raise(*_args: Any, **_kwargs: Any) -> Any:
     raise RuntimeError("the ledger is on fire")
+
+
+# -- HALT survives a Pulse that cannot be built (#958) ---------------------------------------------
+
+
+def _set_kill_switch(db_path: str, engaged: bool) -> None:
+    from keel.data.repository import Repository
+
+    conn = connect(db_path)
+    try:
+        Repository(conn).set_state("kill_switch", engaged)
+    finally:
+        conn.close()
+
+
+def _post_halt(cfg: web_server.ServeConfig, token: str) -> int:
+    conn = http.client.HTTPConnection(cfg.host, cfg.port, timeout=10)
+    try:
+        conn.request(
+            "POST",
+            "/api/gates/halt",
+            headers={
+                "Host": f"{cfg.host}:{cfg.port}",
+                "Cookie": _session(cfg),
+                "X-Keel-Client": "1",
+                HALT_HEADER: token,
+            },
+        )
+        response = conn.getresponse()
+        response.read()
+        return response.status
+    finally:
+        conn.close()
+
+
+@pytest.mark.parametrize(
+    ("engaged", "resume"), [(False, ""), (True, "keel resume")], ids=["running", "halted"]
+)
+def test_a_pulse_that_cannot_be_built_still_carries_the_halt(
+    running: web_server.ServeConfig,
+    deployment: tuple[str, str],
+    monkeypatch: pytest.MonkeyPatch,
+    engaged: bool,
+    resume: str,
+) -> None:
+    """**#958: stopping must never be slower than starting, and that includes a broken report.**
+
+    Pulse is where the HALT button lives, and the button needs the halt token and whether the
+    kill switch is engaged. Neither may depend on the rest of the report: with `gather_pulse`
+    raising, the 500 still carries `halt` -- the token, and the resume command exactly when the
+    switch reads engaged (so the client shows the HALTED line instead of the button). The served
+    token then halts, which is the point of serving it."""
+    _set_kill_switch(deployment[0], engaged)
+    monkeypatch.setattr("keel.commands.pulse.gather_pulse", _raise, raising=True)
+
+    status, _headers, document = _json(running, "/api/pulse")
+
+    assert status == 500
+    assert document["data"] is None, "a failed report still renders no figures"
+    assert "RuntimeError" in document["error"]["detail"]
+    assert document["halt"] == {
+        "halt_token": halt_token(running.token),
+        "resume_command": resume,
+    }
+    served = json.dumps(document)
+    for other in (gates_token(running.token), csrf_token(running.token)):
+        assert other not in served
+    assert _post_halt(running, document["halt"]["halt_token"]) == 200
+
+
+def test_an_unreadable_kill_switch_offers_the_button(
+    running: web_server.ServeConfig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """When the report failed because the ledger itself is unreadable, the switch may be too.
+    Unknown reads as NOT halted -- the button, never the HALTED line: pressing HALT on a halted
+    engine is harmless, while a HALTED line over a running one would hide the only stop."""
+    from keel.commands import pulse as pulse_mod
+
+    monkeypatch.setattr(pulse_mod, "gather_pulse", _raise, raising=True)
+    monkeypatch.setattr(pulse_mod, "halt_resume_command", _raise, raising=True)
+
+    status, _headers, document = _json(running, "/api/pulse")
+
+    assert status == 500
+    assert document["halt"] == {"halt_token": halt_token(running.token), "resume_command": ""}
+
+
+def test_only_pulse_carries_the_halt_on_a_failure(
+    running: web_server.ServeConfig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Every route's read made to raise: Pulse's 500 carries `halt`, every other 500 carries it as
+    `null` -- the key set of a failure is constant, and the token rides the one view that halts,
+    on failure as on success (`test_pulse_carries_the_halt_token_and_only_pulse_does`)."""
+    import dataclasses
+
+    for path, route in list(web_api.API_ROUTES.items()):
+        monkeypatch.setitem(web_api.API_ROUTES, path, dataclasses.replace(route, read=_raise))
+
+    carriers = []
+    for path in web_api.API_ROUTES:
+        status, _headers, document = _json(running, path)
+        assert status == 500, path
+        assert "halt" in document, path
+        if document["halt"] is not None:
+            carriers.append(path)
+    assert carriers == ["/api/pulse"]
+    assert len(web_api.API_ROUTES) >= 10, "the sweep must cover the table, not an empty one"
+
+
+def test_a_refused_pulse_carries_no_halt(running: web_server.ServeConfig) -> None:
+    """Before admission there is no session, so there is nothing to hand a halt token to: the
+    pre-admission refusal carries `halt: null` like every other refusal."""
+    status, _headers, body = _get(running, "/api/pulse")
+
+    assert status == 403
+    document = json.loads(body)
+    assert document["halt"] is None
+    assert halt_token(running.token) not in body
 
 
 # -- headers and caching ---------------------------------------------------------------------------

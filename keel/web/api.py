@@ -330,6 +330,30 @@ def read_pulse(cfg: ServeConfig, _query: Query, _state: Any, now_ts: int) -> dic
     return payload.pulse_payload(report, halt_token=halt_token(cfg.token))
 
 
+def pulse_halt(cfg: ServeConfig) -> dict[str, str]:
+    """The HALT control's inputs when the Pulse report could not be built (#958).
+
+    `halt_token` is minted from the session, so it cannot fail. The kill-switch reading is the one
+    ledger read here, through its own repo open and `pulse.halt_resume_command` -- never through
+    `gather_pulse`, whose failure is why this exists. **A switch that cannot be read reads as not
+    halted**, which shows the button: halting a halted engine is harmless and idempotent, while a
+    HALTED line over a running engine would hide the only stop the page has. Never `gates_token`
+    (#968), on this path as on the success one."""
+    from keel.commands.pulse import halt_resume_command
+
+    resume = ""
+    repo = None
+    try:
+        repo = open_repo(cfg.db_path)
+        resume = halt_resume_command(repo)
+    except Exception:  # noqa: BLE001 - an unreadable switch must still answer with the button
+        resume = ""
+    finally:
+        if repo is not None:
+            close_repo(repo)
+    return payload.halt_fallback(halt_token=halt_token(cfg.token), resume_command=resume)
+
+
 def read_orders(cfg: ServeConfig, query: Query, _state: Any, now_ts: int) -> dict[str, Any]:
     """The audit trail: what keel actually bought and sold, and at what price (#659).
 
@@ -882,6 +906,10 @@ class ApiRoute:
     needs_database: bool = True
     collection: str = ""
     sortable: tuple[str, ...] = field(default=())
+    #: Whether a failed read still answers with the HALT control's inputs (#958). `/api/pulse`
+    #: only: it is the view that halts, and `pulse_halt` reads what the button needs apart from
+    #: the report, so a report that raises does not take the stop with it.
+    halt_on_failure: bool = False
 
 
 #: THE READ SURFACE, in full. Every one of the rendered routes in `server.ROUTES` appears here as
@@ -895,6 +923,7 @@ API_ROUTES: dict[str, ApiRoute] = {
     "/api/pulse": ApiRoute(
         html_route="/pulse",
         read=read_pulse,
+        halt_on_failure=True,
         # No sortable collection: every table on the glance page is an intrinsic order --
         # `rule_counts` by status, `data_freshness` in the config's product order, `live_rules`
         # in the ledger's, cycles newest first -- and a display sort would destroy each rather
@@ -1197,18 +1226,27 @@ def respond(cfg: ServeConfig, path: str, query: Query) -> tuple[int, dict[str, A
         data = route.read(cfg, query, state, now_ts)
     except ApiRefusal as refusal:
         return refusal.status, payload.error_envelope(
-            now_ts, status=refusal.status, title=refusal.title, detail=refusal.detail
+            now_ts,
+            status=refusal.status,
+            title=refusal.title,
+            detail=refusal.detail,
+            halt=pulse_halt(cfg) if route.halt_on_failure else None,
         )
     except Exception as exc:
         # A broken report is a stated failure, never a 200 with an empty payload -- that shape is
         # precisely the "blank view, or worse, stale figures" this envelope exists to prevent. The
         # detail carries the exception's TYPE and message and no traceback: a traceback in a
         # browser is a stack of file paths from someone else's machine.
+        #
+        # Pulse's failure still carries the HALT control's inputs (#958): the report failing is
+        # not a reason for the stop to disappear. Reached only after `_admitted`, like the
+        # success document that carries the same token.
         return 500, payload.error_envelope(
             now_ts,
             status=500,
             title="That report could not be built",
             detail=f"{type(exc).__name__}: {exc}",
+            halt=pulse_halt(cfg) if route.halt_on_failure else None,
         )
 
     if column:

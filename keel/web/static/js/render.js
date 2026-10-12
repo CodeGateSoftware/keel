@@ -626,6 +626,33 @@ export function refusedView(reading, onReconnect) {
 }
 
 /**
+ * Pulse when its report could not be built (#958): the halt control, then why nothing else is here.
+ *
+ * `reading.halt` is the failure document's `{halt_token, resume_command}`, read apart from the
+ * report on the server (`api.pulse_halt`), so a gather step that raised does not take the stop
+ * with it -- `keel/web/gates.py`'s rule that stopping must never be slower than starting. The
+ * control is `haltControl` itself, handed `reading.halt` in the shape it reads, so the button,
+ * the confirm `main.js` puts in front of it and the HALTED line are the working page's, unchanged.
+ * None of the report's sections are drawn: they have nothing to render, and a zero here would be
+ * a figure nobody read.
+ *
+ * @param {import("./api.js").Reading} reading  a failed `/api/pulse` that carried `halt`.
+ * @returns {DocumentFragment}
+ */
+export function pulseFailedView(reading) {
+  const fragment = document.createDocumentFragment();
+  fragment.append(el("h1", undefined, "Pulse"));
+  fragment.append(haltControl({ halt: reading.halt }));
+  const card = el("div", "card stopped");
+  card.append(el("p", undefined, reading.error ? reading.error.title : ""));
+  if (reading.error && reading.error.detail) {
+    card.append(el("p", "detail", reading.error.detail));
+  }
+  fragment.append(card);
+  return fragment;
+}
+
+/**
  * Pulse, the home view: `/api/pulse`'s payload -- what keel did today, what stopped it, what it
  * will do next, and the one control that can stop it (console PR1).
  *
