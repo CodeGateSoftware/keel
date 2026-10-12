@@ -1365,3 +1365,33 @@ def test_the_pooled_reasons_word_an_empty_pool_and_a_winless_pool_the_same_way()
         "min_rr 1.5 is not met (in R)",
         "pooled win_rate 0.0 < min_win_rate 0.55",
     ]
+
+
+def test_a_hand_built_result_with_a_real_rr_keeps_its_number_though_its_win_count_is_zero() -> None:
+    """`n_wins_r` left at its default 0 is not evidence of "no wins" when the ratio the result
+    carries is a real, non-zero one: the guard is `n_wins_r == 0 AND rr == 0`."""
+    stats = _stats(avg_win=Decimal("1"), avg_loss=Decimal("-1"))
+    stats.n_wins_r = 0
+
+    ok, reasons = check_floors(stats, PromotionConfig())
+
+    assert ok is False
+    assert reasons == ["rr_r 1 < min_rr 1.5 (in R)"]
+
+
+def test_the_no_win_rr_reason_counts_only_the_trades_that_carry_r() -> None:
+    """Closed trades with no initial risk are excluded from the R sample, so the "among the N
+    trades with R" count must not include them."""
+    no_risk = _trade_r("-1", "1")
+    no_risk.initial_risk = None
+    no_risk.r_multiple = None
+    stats = summarize([_trade_r("-1", "1") for _ in range(3)] + [no_risk, no_risk])
+
+    assert stats.n_excluded_no_risk > 0  # the fixture reaches the reader
+    assert stats.n_trades - stats.n_excluded_no_risk == 3
+
+    _ok, reasons = check_floors(stats, PromotionConfig())
+
+    assert (
+        "rr_r unknown: no winning trade among the 3 trades with R, so min_rr 1.5 is not met (in R)"
+    ) in reasons
