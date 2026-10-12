@@ -2633,3 +2633,237 @@ def test_serve_refuses_a_release_on_a_declared_remote_deployment(
     )
     # The refusal fired BEFORE the release could act: an engaged switch is still engaged.
     assert _kill_switch(deployment[0]) is True
+
+
+# -- a socket timeout on every connection (#981) ---------------------------------------------------
+
+
+def _read_until_closed(sock: socket.socket) -> tuple[bytes, float]:
+    """Everything the server sends until it closes, and how long that took.
+
+    Bounded by the socket's own timeout: a server that never closes raises `TimeoutError` here,
+    which is the failure these tests exist to report."""
+    started = time.monotonic()
+    received = b""
+    while True:
+        try:
+            chunk = sock.recv(65536)
+        except ConnectionResetError:
+            break
+        if not chunk:
+            break
+        received += chunk
+    return received, time.monotonic() - started
+
+
+@pytest.fixture
+def short_timeout(monkeypatch: pytest.MonkeyPatch) -> float:
+    """The handler's socket timeout, shortened so a test can watch it fire. Patched on the module
+    constant `build_server` reads, so a server built WITHOUT reading it keeps no timeout and the
+    tests below hang into their own client timeout instead of passing."""
+    monkeypatch.setattr(web_server, "REQUEST_TIMEOUT_SECONDS", 0.5)
+    return 0.5
+
+
+def test_a_refused_post_whose_body_never_arrives_is_answered_and_closed(
+    deployment, short_timeout
+) -> None:
+    """**#981.** `_refuse` drains a declared body BEFORE answering, so an unauthenticated client
+    that declares `Content-Length: 100` and sends nothing held its thread forever and was never
+    answered. With the timeout, the drain gives up, the refusal is sent, and the connection is
+    closed -- well inside the client's own 5 s bound."""
+    with _serving(deployment) as cfg:
+        lines = ["POST /api/gates/halt HTTP/1.1", f"Host: {cfg.host}:{cfg.port}"]
+        lines += ["X-Keel-Client: 1", "Content-Length: 100"]
+        with socket.create_connection((cfg.host, cfg.port), timeout=5) as sock:
+            sock.sendall(("\r\n".join(lines) + "\r\n\r\n").encode())
+            received, elapsed = _read_until_closed(sock)
+
+    assert _statuses(received) == [b"403"], received[:300]
+    assert elapsed < 4 * short_timeout, elapsed
+
+
+def test_an_idle_kept_alive_connection_is_closed(deployment, short_timeout) -> None:
+    """**#981.** A kept-alive connection that never sends its next request blocked its thread in
+    `readline` forever. It is closed now, once the timeout passes with nothing read."""
+    with _serving(deployment) as cfg:
+        with socket.create_connection((cfg.host, cfg.port), timeout=5) as sock:
+            request = f"GET /api/config HTTP/1.1\r\nHost: {cfg.host}:{cfg.port}\r\n"
+            request += f"Cookie: {_session(cfg)}\r\n\r\n"
+            sock.sendall(request.encode())
+            received, elapsed = _read_until_closed(sock)
+
+    assert _statuses(received) == [b"200"], received[:300]
+    assert elapsed < 4 * short_timeout, elapsed
+
+
+def test_a_halt_under_a_short_timeout_answers_first_and_then_closes(
+    deployment, short_timeout
+) -> None:
+    """**The timeout never makes the halt slower or refused.** The halt answers and engages
+    before it touches the socket again; only the drain that follows the answer waits on the
+    100 bytes this client declared and never sends, and it is that drain the timeout ends."""
+    with _serving(deployment) as cfg:
+        lines = ["POST /api/gates/halt HTTP/1.1"]
+        lines += [f"{name}: {value}" for name, value in _halt_headers(cfg)]
+        lines += ["Content-Length: 100"]
+        with socket.create_connection((cfg.host, cfg.port), timeout=5) as sock:
+            sock.sendall(("\r\n".join(lines) + "\r\n\r\n").encode())
+            received, elapsed = _read_until_closed(sock)
+
+    assert _statuses(received) == [b"200"], received[:300]
+    assert _kill_switch(deployment[0]) is True
+    assert elapsed < 4 * short_timeout, elapsed
+
+
+def test_the_served_timeout_is_the_module_constant(deployment) -> None:
+    """The production value, as the bound handler carries it: `StreamRequestHandler.setup` reads
+    `timeout` off the handler class, and `None` (the stdlib default) means no timeout at all."""
+    db_path, config_path = deployment
+    cfg = web_server.ServeConfig(
+        host="127.0.0.1",
+        port=0,
+        token=new_session_token(),
+        db_path=db_path,
+        config_path=config_path,
+    )
+    server = web_server.build_server(cfg)
+    try:
+        assert server.RequestHandlerClass.timeout == web_server.REQUEST_TIMEOUT_SECONDS
+        assert web_server.REQUEST_TIMEOUT_SECONDS > 0
+    finally:
+        server.server_close()
+
+
+# -- a GET's body is drained too (#981) ------------------------------------------------------------
+
+
+@pytest.mark.parametrize("path", ["/api/config", "/"])
+def test_a_get_with_a_body_leaves_the_connection_clean(deployment, path) -> None:
+    """**#955's shape on the read path.** A GET that carries a body (legal, if pointless) left it
+    in the socket on the success path, and the stdlib parsed it as the next request line on a
+    kept-alive connection. Both requests ride one socket; the second must be answered 200."""
+    with _serving(deployment) as cfg:
+        host = f"{cfg.host}:{cfg.port}"
+        conn = http.client.HTTPConnection(cfg.host, cfg.port, timeout=5)
+        try:
+            conn.request(
+                "GET",
+                path,
+                body=b"xy",
+                headers={"Host": host, "Cookie": _session(cfg), "Content-Length": "2"},
+            )
+            first = conn.getresponse()
+            first.read()
+            conn.request("GET", "/api/config", headers={"Host": host, "Cookie": _session(cfg)})
+            second = conn.getresponse()
+            second_body = second.read().decode("utf-8", "replace")
+        finally:
+            conn.close()
+
+    assert first.status == 200
+    assert second.status == 200, second_body[:200]
+    assert json.loads(second_body)["data"] is not None
+
+
+# -- the halt never creates a database (#981) ------------------------------------------------------
+
+
+def test_a_halt_against_a_missing_database_creates_none_and_says_so(deployment, tmp_path) -> None:
+    """**#981.** `gates._perform` opened with `connect`, which CREATES a missing file: a halt that
+    raced a deleted `keel.db` left an empty one behind, and then raised out of the handler with no
+    answer at all. It opens the existing file or nothing, and the failure is a stated 500."""
+    missing = tmp_path / "gone" / "keel.db"
+    missing.parent.mkdir()
+    with _serving((str(missing), deployment[1])) as cfg:
+        status, _headers, body = _halt(cfg, halt=security.halt_token(cfg.token))
+
+    assert sorted(missing.parent.iterdir()) == []
+    assert status == 500, body
+    error = json.loads(body)["error"]
+    assert (error["status"], error["title"]) == ("500", "The halt could not be recorded")
+
+
+# -- the halt outlives the remote session lifetime (#983) ------------------------------------------
+
+
+_REMOTE = frozenset({"keel.example.com"})
+
+
+def _expired() -> float:
+    return time.time() - security.REMOTE_SESSION_MAX_AGE_SECONDS - 1
+
+
+def test_an_expired_remote_session_can_still_halt_with_the_halt_token(deployment) -> None:
+    """**#983, owner decision (option 2).** Refusing a stop is the one failure mode this surface
+    must not have, and a console left running past the 12 h lifetime refused it. The halt is exempt
+    from the lifetime; it still needs the session cookie and the halt token."""
+    with _serving(deployment, external_hosts=_REMOTE, started_at=_expired()) as cfg:
+        status, _headers, body = _halt(cfg, halt=security.halt_token(cfg.token))
+
+    assert status == 200, body
+    assert _kill_switch(deployment[0]) is True
+
+
+@pytest.mark.parametrize(
+    "halt", [None, "not-the-halt-token"], ids=["no-halt-token", "wrong-halt-token"]
+)
+def test_an_expired_remote_session_without_the_halt_token_cannot_halt(deployment, halt) -> None:
+    with _serving(deployment, external_hosts=_REMOTE, started_at=_expired()) as cfg:
+        status, _headers, body = _halt(cfg, halt=halt)
+
+    assert status == 403, body
+    assert json.loads(body)["error"]["title"] == "Session expired"
+    assert _kill_switch(deployment[0]) in (None, False)
+
+
+def test_an_expired_remote_session_with_the_halt_token_but_no_session_cannot_halt(
+    deployment,
+) -> None:
+    """The exemption is from the LIFETIME, not from the session: a halt token without the cookie
+    is refused as it always was."""
+    with _serving(deployment, external_hosts=_REMOTE, started_at=_expired()) as cfg:
+        status, _headers, body = _request(
+            cfg, "/api/gates/halt", method="POST", halt=security.halt_token(cfg.token)
+        )
+
+    assert status == 403, body
+    assert _kill_switch(deployment[0]) in (None, False)
+
+
+@pytest.mark.parametrize(
+    ("method", "path", "extra"),
+    [
+        ("POST", "/api/gates/resume", {"raw_body": json.dumps({"phrase": "RESUME TRADING"})}),
+        (
+            "POST",
+            "/api/gates/resume-entries",
+            {"raw_body": json.dumps({"phrase": "CLEAR STREAK HALT"})},
+        ),
+        ("POST", "/api/setup/config", {"form": {}}),
+        ("GET", "/api/pulse", {}),
+        ("GET", "/api/config", {}),
+    ],
+    ids=["resume", "resume-entries", "setup-write", "read-pulse", "read-config"],
+)
+def test_an_expired_remote_session_is_refused_everything_but_the_halt(
+    deployment, method, path, extra
+) -> None:
+    """Every other route keeps the lifetime -- even carrying the halt token, which opens the halt
+    and nothing else (#968), and even with every other credential the route asks for."""
+    _engage_kill_switch(deployment[0])
+    with _serving(deployment, external_hosts=_REMOTE, started_at=_expired()) as cfg:
+        status, _headers, body = _request(
+            cfg,
+            path,
+            method=method,
+            cookie=_session(cfg),
+            halt=security.halt_token(cfg.token),
+            gate=security.gates_token(cfg.token),
+            csrf=_csrf(cfg),
+            **extra,
+        )
+
+    assert status == 403, body
+    assert json.loads(body)["error"]["title"] == "Session expired"
+    assert _kill_switch(deployment[0]) is True

@@ -86,11 +86,13 @@ def open_repo(db_path: str) -> Any:
 def open_repo_to_write(db_path: str) -> Any:
     """The read-write connection for `gates._perform` -- the halt and the gated releases -- and
     nothing else. Not `query_only`, so not for a reader: a page that read through this could write
-    the trading database. Like `open_repo`, it does not migrate."""
-    from keel.data.db import connect
+    the trading database. Like `open_repo`, it does not migrate, and like it, it opens only a
+    database that exists: `connect_existing` refuses a missing file rather than creating an empty
+    one for the halt to write a kill switch into (#981)."""
+    from keel.data.db import connect_existing
     from keel.data.repository import Repository
 
-    return Repository(connect(db_path))
+    return Repository(connect_existing(db_path))
 
 
 def load_config(config_path: str) -> Any:

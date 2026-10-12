@@ -28,7 +28,7 @@ from typing import Any
 
 import pytest
 
-from keel.data.db import _read_only_uri, connect, connect_read_only, migrate
+from keel.data.db import _read_only_uri, connect, connect_existing, connect_read_only, migrate
 from keel.data.repository import Repository
 from keel.web import api as web_api
 from keel.web import server as web_server
@@ -501,3 +501,32 @@ def test_the_forbidden_sql_pin_flags_what_it_must_and_spares_what_it_must() -> N
     ) == [("connect_read_only", "PRAGMA query_only = OFF")]
     # Docstrings are prose, not SQL; the same words in a real string are not exempt.
     assert flagged('def m():\n    """Never VACUUM here."""\n') == []
+
+
+def test_the_writer_opens_an_existing_database_and_never_creates_one(tmp_path: Path) -> None:
+    """`connect_existing` (#981): the halt's writer. A missing file is refused and NOT created --
+    no database, no sidecars -- while an existing one is written like any `connect` write."""
+    missing = tmp_path / "gone.db"
+    with pytest.raises(sqlite3.OperationalError):
+        connect_existing(missing)
+    assert sorted(tmp_path.iterdir()) == []
+
+    db = tmp_path / "keel.db"
+    conn = connect(db)
+    migrate(conn)
+    conn.close()
+    writer = connect_existing(db)
+    try:
+        assert writer.execute("PRAGMA foreign_keys").fetchone()[0] == 1
+        assert writer.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
+        writer.execute("INSERT INTO agent_state (key, value) VALUES ('probe', '1')")
+        writer.commit()
+    finally:
+        writer.close()
+    reader = connect(db)
+    try:
+        assert (
+            reader.execute("SELECT value FROM agent_state WHERE key = 'probe'").fetchone()[0] == "1"
+        )
+    finally:
+        reader.close()
