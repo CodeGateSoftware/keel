@@ -16,16 +16,18 @@ Every database in this module is a scratch copy under `tmp_path`.
 
 from __future__ import annotations
 
+import ast
+import hashlib
 import http.client
 import json
 import sqlite3
 from collections.abc import Iterator
-from pathlib import Path
+from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any
 
 import pytest
 
-from keel.data.db import connect
+from keel.data.db import _read_only_uri, connect, connect_read_only, migrate
 from keel.data.repository import Repository
 from keel.web import api as web_api
 from keel.web import server as web_server
@@ -273,3 +275,136 @@ def test_the_halt_still_writes_after_the_reads(
     assert halt_connections, "the spy must see the halt's open"
     assert all(_query_only(conn) == 0 for conn in halt_connections)
     assert _kill_switch(running.db_path) is True
+
+
+# -- a reader closing last must not checkpoint the trading database (#977 review) ---------------
+
+
+def _db_with_unckeckpointed_wal(path: Path) -> None:
+    """A database whose recent rows live ONLY in the `-wal`: the shape the agent leaves while it
+    runs. The writer turns auto-checkpoint and checkpoint-on-close off so the state is exact."""
+    conn = connect(str(path))
+    migrate(conn)
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    conn.close()
+    writer = sqlite3.connect(path)
+    writer.execute("PRAGMA wal_autocheckpoint = 0")
+    writer.setconfig(sqlite3.SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE, True)
+    Repository(writer).set_state("wal_only_row", {"n": 1})
+    writer.close()
+
+
+def _sha256(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def test_a_console_reader_closing_last_leaves_the_database_file_untouched(tmp_path: Path) -> None:
+    """**`query_only` does not stop the checkpoint a last close performs.** A console reader that
+    closes after the agent has gone would fold the WAL into `keel.db`; that is a write to the
+    trading database from a reader. `connect_read_only` disables checkpoint-on-close, so the main
+    file is byte-identical and the `-wal` is left for the writer."""
+    db = tmp_path / "keel.db"
+    _db_with_unckeckpointed_wal(db)
+    wal = Path(f"{db}-wal")
+    assert wal.exists() and wal.stat().st_size > 0, (
+        "the scratch state must hold an un-checkpointed WAL"
+    )
+    before = (_sha256(db), db.stat().st_size)
+
+    conn = connect_read_only(db)
+    try:
+        assert Repository(conn).get_state("wal_only_row", default=None) == {"n": 1}
+    finally:
+        conn.close()
+
+    assert (_sha256(db), db.stat().st_size) == before
+    assert wal.exists() and wal.stat().st_size > 0
+
+
+@pytest.mark.parametrize(
+    ("path", "uri"),
+    [
+        (PureWindowsPath(r"\\server\share\keel.db"), "file:////server/share/keel.db?mode=rw"),
+        (PureWindowsPath(r"C:\x y\keel.db"), "file:///C:/x%20y/keel.db?mode=rw"),
+        (PurePosixPath("/a b/#?%/keel.db"), "file:///a%20b/%23%3F%25/keel.db?mode=rw"),
+    ],
+    ids=["unc", "drive-with-space", "posix-reserved-characters"],
+)
+def test_the_read_only_uri_is_built_for_every_path_shape(path: PurePosixPath, uri: str) -> None:
+    """A URI is the one place a path's `#`, `?` and `%` change meaning, and a Windows path has no
+    leading slash for `file://` to attach to. Pure paths, so no Windows is needed to pin it."""
+    assert _read_only_uri(path) == uri
+
+
+def test_a_database_under_a_directory_with_awkward_characters_opens(tmp_path: Path) -> None:
+    awkward = tmp_path / "a b#?%\u00e9"
+    awkward.mkdir()
+    db = awkward / "keel.db"
+    conn = connect(str(db))
+    migrate(conn)
+    Repository(conn).set_state("k", {"v": 1})
+    conn.close()
+
+    reader = connect_read_only(db)
+    try:
+        assert Repository(reader).get_state("k", default=None) == {"v": 1}
+    finally:
+        reader.close()
+
+
+_REPO = Path(__file__).resolve().parents[2]
+#: What the console's read path must never send to SQLite: each of these either undoes
+#: `query_only` (it is per-connection and reversible by the connection itself), reaches another
+#: file, or writes the database file outside an ordinary statement.
+_FORBIDDEN_SQL = ("query_only", "attach", "wal_checkpoint", "vacuum")
+
+
+def _console_read_path_files() -> list[Path]:
+    return [
+        *sorted((_REPO / "keel" / "web").glob("*.py")),
+        _REPO / "keel" / "commands" / "setup.py",
+        _REPO / "keel" / "commands" / "pulse.py",
+        _REPO / "keel" / "venue_readiness.py",
+    ]
+
+
+def _execute_string_constants(tree: ast.AST) -> tuple[int, list[str]]:
+    """(number of `.execute`/`.executescript` calls, every string constant inside their args)."""
+    calls = 0
+    strings: list[str] = []
+    for node in ast.walk(tree):
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr in {"execute", "executescript"}
+        ):
+            calls += 1
+            for arg in node.args:
+                strings += [
+                    n.value
+                    for n in ast.walk(arg)
+                    if isinstance(n, ast.Constant) and isinstance(n.value, str)
+                ]
+    return calls, strings
+
+
+def test_the_console_read_path_never_asks_sqlite_to_lift_read_only() -> None:
+    """**`query_only` is per-connection and the connection can switch it off; ATTACH and the
+    checkpoint pragmas are not blocked by it.** Read-only therefore rests on SQLite refusing
+    ordinary writes PLUS no console reader issuing those statements. This is the second half,
+    pinned structurally over the AST of every module on the console's read path."""
+    files = _console_read_path_files()
+    assert all(f.exists() for f in files), [str(f) for f in files if not f.exists()]
+    total = 0
+    offenders: list[tuple[str, str]] = []
+    for file in files:
+        calls, strings = _execute_string_constants(ast.parse(file.read_text()))
+        total += calls
+        offenders += [
+            (file.name, text)
+            for text in strings
+            if any(word in text.lower() for word in _FORBIDDEN_SQL)
+        ]
+
+    assert total > 0, "the walker found no execute calls: it would pass by vacuum"
+    assert offenders == []

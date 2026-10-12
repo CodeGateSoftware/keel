@@ -2222,15 +2222,11 @@ def test_a_halt_with_a_body_engages_and_leaves_the_connection_clean(deployment, 
 # Framing a drain cannot trust: every case here declares a body the server cannot size by one plain
 # non-negative decimal `Content-Length`, so the only safe answer is to stop using the connection.
 _UNTRUSTWORTHY_FRAMING = [
-    pytest.param(
-        [("Transfer-Encoding", "chunked")], b"2\r\n{}\r\n0\r\n\r\n", id="chunked"
-    ),
+    pytest.param([("Transfer-Encoding", "chunked")], b"2\r\n{}\r\n0\r\n\r\n", id="chunked"),
     pytest.param([("Content-Length", "-2")], b"{}", id="negative-length"),
     pytest.param([("Content-Length", "+2")], b"{}", id="plus-signed-length"),
     pytest.param([("Content-Length", "1_0")], b"{}", id="underscore-length"),
-    pytest.param(
-        [("Content-Length", "2"), ("Content-Length", "2")], b"{}", id="duplicate-length"
-    ),
+    pytest.param([("Content-Length", "2"), ("Content-Length", "2")], b"{}", id="duplicate-length"),
     pytest.param(
         [("Content-Length", "2"), ("Content-Length", "40")], b"{}", id="conflicting-lengths"
     ),
