@@ -19,6 +19,8 @@ from __future__ import annotations
 import dataclasses
 import http.client
 import json
+import re
+import socket
 import threading
 import time
 from collections.abc import Iterator
@@ -1983,6 +1985,17 @@ def test_the_halt_still_needs_the_halt_token(deployment) -> None:
 # -- the halt token is not a release token (#968) --------------------------------------------------
 
 
+def _engage_kill_switch(db_path: str) -> None:
+    from keel.data.db import connect
+    from keel.data.repository import Repository
+
+    conn = connect(db_path)
+    try:
+        Repository(conn).set_state("kill_switch", True)
+    finally:
+        conn.close()
+
+
 def _kill_switch(db_path: str) -> object:
     from keel.data.db import connect
     from keel.data.repository import Repository
@@ -2206,32 +2219,134 @@ def test_a_halt_with_a_body_engages_and_leaves_the_connection_clean(deployment, 
     assert json.loads(get_body)["data"] is not None
 
 
-def test_a_halt_with_an_oversized_body_still_engages(deployment) -> None:
+# Framing a drain cannot trust: every case here declares a body the server cannot size by one plain
+# non-negative decimal `Content-Length`, so the only safe answer is to stop using the connection.
+_UNTRUSTWORTHY_FRAMING = [
+    pytest.param(
+        [("Transfer-Encoding", "chunked")], b"2\r\n{}\r\n0\r\n\r\n", id="chunked"
+    ),
+    pytest.param([("Content-Length", "-2")], b"{}", id="negative-length"),
+    pytest.param([("Content-Length", "+2")], b"{}", id="plus-signed-length"),
+    pytest.param([("Content-Length", "1_0")], b"{}", id="underscore-length"),
+    pytest.param(
+        [("Content-Length", "2"), ("Content-Length", "2")], b"{}", id="duplicate-length"
+    ),
+    pytest.param(
+        [("Content-Length", "2"), ("Content-Length", "40")], b"{}", id="conflicting-lengths"
+    ),
+    pytest.param(
+        [("Content-Length", "2"), ("Transfer-Encoding", "chunked")],
+        b"{}",
+        id="length-and-transfer-encoding",
+    ),
+]
+
+
+def _raw_post_then_get(
+    cfg, path: str, headers: list[tuple[str, str]], framing: list[tuple[str, str]], body: bytes
+) -> bytes:
+    """POST with hand-written framing, pipeline a GET behind it, and return everything the server
+    sends until it closes the socket.
+
+    `http.client` would normalise the framing, so this speaks bytes. The GET is written in the same
+    burst: a server that keeps the connection and mis-sizes the body answers it (or 501s on the
+    leftover bytes), so a second `HTTP/1.` status line in the result is the desynchronisation."""
+    lines = [f"POST {path} HTTP/1.1"]
+    lines += [f"{name}: {value}" for name, value in [*headers, *framing]]
+    request = ("\r\n".join(lines) + "\r\n\r\n").encode() + body
+    request += f"GET /api/config HTTP/1.1\r\nHost: {cfg.host}:{cfg.port}\r\n\r\n".encode()
+    received = b""
+    with socket.create_connection((cfg.host, cfg.port), timeout=3) as sock:
+        sock.sendall(request)
+        while True:
+            try:
+                chunk = sock.recv(65536)
+            except ConnectionResetError:
+                # A reset after the first response was read is the server closing with our bytes
+                # unread -- still a close. A reset before any response is not tolerated.
+                assert received, "connection reset before any response"
+                break
+            if not chunk:
+                break
+            received += chunk
+    return received
+
+
+def _statuses(received: bytes) -> list[bytes]:
+    """Every status code in a raw byte stream, found anywhere in it.
+
+    Not line-anchored: the stdlib writes its 501 straight after the previous body, and a request
+    line it cannot parse is answered with an HTML error page and no status line at all -- which
+    is also reported, as `b"ERR"`, because it is the same desynchronisation."""
+    found = re.findall(rb"HTTP/1\.[01] (\d{3})|(<h1>Error response</h1>)", received)
+    return [code or b"ERR" for code, _page in found]
+
+
+def _halt_headers(cfg) -> list[tuple[str, str]]:
+    return [
+        ("Host", f"{cfg.host}:{cfg.port}"),
+        ("Cookie", _session(cfg)),
+        ("X-Keel-Client", "1"),
+        (security.HALT_HEADER, security.halt_token(cfg.token)),
+    ]
+
+
+@pytest.mark.parametrize(("framing", "body"), _UNTRUSTWORTHY_FRAMING)
+def test_a_halt_with_untrustworthy_framing_engages_and_closes(deployment, framing, body) -> None:
+    """**#955 review: framing the server cannot size is not drained and not ignored -- it closes.**
+
+    `int("1_0")` is 10, `int("+2")` is 2, a negative length is "no body", and a chunked body has
+    no length at all. Each used to be drained wrongly or skipped, leaving the body to be parsed as
+    the next request. The halt still engages and answers 200 FIRST (it reads no body, and stopping
+    is never slower than starting); then the connection is closed, so the pipelined GET behind it
+    gets no answer at all -- never a 501."""
+    with _serving(deployment) as cfg:
+        received = _raw_post_then_get(cfg, "/api/gates/halt", _halt_headers(cfg), framing, body)
+
+    assert _kill_switch(deployment[0]) is True
+    assert _statuses(received) == [b"200"], received[:300]
+
+
+@pytest.mark.parametrize(("framing", "body"), _UNTRUSTWORTHY_FRAMING)
+def test_a_json_post_with_untrustworthy_framing_is_refused_and_closes(
+    empty_machine, framing, body
+) -> None:
+    """The same framing on a setup action is refused (400, the shape a bad length gets today) and
+    the connection closes: the body is not read, not guessed at, and not left for the next request."""
+    cfg = empty_machine
+    headers = [
+        ("Host", f"{cfg.host}:{cfg.port}"),
+        ("Cookie", _session(cfg)),
+        ("X-Keel-Client", "1"),
+        ("X-Keel-CSRF", _csrf(cfg)),
+    ]
+    received = _raw_post_then_get(cfg, "/api/setup/config", headers, framing, body)
+
+    assert _statuses(received) == [b"400"], received[:300]
+    head, _, payload = received.partition(b"\r\n\r\n")
+    assert json.loads(payload.decode())["error"]["status"] == "400"
+
+
+def test_a_halt_with_an_oversized_body_still_engages_and_closes(deployment) -> None:
     """A body past `_MAX_BODY_BYTES` is not drained (that is the memory-exhaustion primitive the
     cap denies) -- the connection is closed instead. The halt itself must still happen: refusing
-    a stop over its envelope is the one failure this route must not have."""
-    oversized = b"x" * (web_server._MAX_BODY_BYTES + 1)
-    with _serving(deployment) as cfg:
-        conn = http.client.HTTPConnection(cfg.host, cfg.port, timeout=10)
-        try:
-            conn.request(
-                "POST",
-                "/api/gates/halt",
-                body=oversized,
-                headers={
-                    "Host": f"{cfg.host}:{cfg.port}",
-                    "Cookie": _session(cfg),
-                    "X-Keel-Client": "1",
-                    security.HALT_HEADER: security.halt_token(cfg.token),
-                    "Content-Length": str(len(oversized)),
-                },
-            )
-            response = conn.getresponse()
-            response.read()
-        finally:
-            conn.close()
+    a stop over its envelope is the one failure this route must not have.
 
-    assert response.status == 200
+    Only the HEADERS declare the oversized length; the body is never sent. Sending it would let
+    the server's close reset the socket before the 200 is read, which says nothing about the
+    halt. Read to EOF: the 200, then the server hanging up, is the whole contract."""
+    declared = web_server._MAX_BODY_BYTES + 1
+    with _serving(deployment) as cfg:
+        lines = ["POST /api/gates/halt HTTP/1.1"]
+        lines += [f"{name}: {value}" for name, value in _halt_headers(cfg)]
+        lines += [f"Content-Length: {declared}"]
+        received = b""
+        with socket.create_connection((cfg.host, cfg.port), timeout=3) as sock:
+            sock.sendall(("\r\n".join(lines) + "\r\n\r\n").encode())
+            while chunk := sock.recv(65536):
+                received += chunk  # EOF (b"") ends the loop: the server closed
+
+    assert _statuses(received) == [b"200"], received[:300]
     assert _kill_switch(deployment[0]) is True
 
 
@@ -2351,7 +2466,9 @@ def test_serve_enforces_the_remote_session_lifetime(deployment, monkeypatch, tmp
         status, _headers, body = _request(installed, "/api/config", cookie=_session(installed))
 
     assert status == 403, body
-    assert "lifetime" in body
+    error = json.loads(body)["error"]
+    assert error["status"] == "403"
+    assert error["title"] == "Session expired"
 
 
 def test_serve_refuses_a_release_on_a_declared_remote_deployment(
@@ -2360,6 +2477,7 @@ def test_serve_refuses_a_release_on_a_declared_remote_deployment(
     """#971 item 3: the release locality check read an empty declaration, so a tunnel that
     rewrote Host to loopback passed it. With the declaration kept, a release from loopback --
     which is what a tunnel looks like -- is refused before the gates token is even read."""
+    _engage_kill_switch(deployment[0])
     with _through_serve(
         deployment, monkeypatch, tmp_path, external_hosts=frozenset({"keel.example.com"})
     ) as (_given, installed):
@@ -2373,4 +2491,11 @@ def test_serve_refuses_a_release_on_a_declared_remote_deployment(
         )
 
     assert status == 403, body
-    assert "loopback session on a loopback bind" in body
+    error = json.loads(body)["error"]
+    assert error["status"] == "403"
+    assert error["title"] == "Refused"
+    assert error["detail"].startswith(
+        "Gated actions are restricted to a loopback session on a loopback bind."
+    )
+    # The refusal fired BEFORE the release could act: an engaged switch is still engaged.
+    assert _kill_switch(deployment[0]) is True

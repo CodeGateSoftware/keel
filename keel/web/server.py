@@ -46,6 +46,7 @@ than a long-lived reader that could sit inside someone else's transaction.
 from __future__ import annotations
 
 import json
+import re
 import signal
 import socket
 import sys
@@ -527,6 +528,33 @@ class KeelHandler(BaseHTTPRequestHandler):
             return
         self._send(code, f"{heading}\n\n{detail}\n")
 
+    def _declared_body_length(self) -> int | None:
+        """The request body's length, or `None` when the framing cannot be trusted -- and then the
+        connection is already marked to close.
+
+        **One parser, so the drain and the reader cannot disagree** about where a body ends (#955
+        review). Only ONE shape is trusted: no `Transfer-Encoding`, and either no `Content-Length`
+        (a body of zero) or exactly one, made only of ASCII digits. Everything else is a request
+        this server cannot size, and the safe answer is to stop using the connection rather than
+        guess: `int()` happily reads `"+2"`, `"-2"` and `"1_0"` (as 10); a negative length reads
+        as "no body"; a chunked body has no length at all; and two `Content-Length` headers (or one
+        beside a `Transfer-Encoding`) are the request-smuggling shape, where this server and
+        whatever sits in front of it measure the body differently. Draining by a wrong measure
+        leaves body bytes to be parsed as the next request line.
+
+        The halt never calls this to decide anything -- it reads no body and engages first.
+        """
+        if self.headers.get("Transfer-Encoding") is not None:
+            self.close_connection = True
+            return None
+        values = self.headers.get_all("Content-Length") or []
+        if not values:
+            return 0
+        if len(values) > 1 or re.fullmatch(r"[0-9]+", values[0]) is None:
+            self.close_connection = True
+            return None
+        return int(values[0])
+
     def _drain_request_body(self) -> None:
         """Consume an unread request body, or close the connection rather than consume it.
 
@@ -553,12 +581,10 @@ class KeelHandler(BaseHTTPRequestHandler):
             # Reading it a second time blocks until the client's timeout, which is a hang rather
             # than an error and was exactly what the first version of this did.
             return
-        try:
-            length = int(self.headers.get("Content-Length") or 0)
-        except ValueError:
-            self.close_connection = True
+        length = self._declared_body_length()
+        if length is None:
             return
-        if length <= 0:
+        if length == 0:
             return
         if length > _MAX_BODY_BYTES:
             self.close_connection = True
@@ -950,11 +976,10 @@ class KeelHandler(BaseHTTPRequestHandler):
         bodies at #540 along with the form that sent them; this is the one place that difference
         can be exploited, so it is the one place it is refused.
         """
-        try:
-            length = int(self.headers.get("Content-Length") or 0)
-        except ValueError:
-            return None
-        if length < 0 or length > _MAX_BODY_BYTES:
+        length = self._declared_body_length()
+        if length is None or length > _MAX_BODY_BYTES:
+            # Untrusted framing has already closed the connection; an oversized length is closed
+            # by the drain that every refusal runs.
             return None
         if length == 0:
             # An action with no declared inputs is submitted with an empty body, and that is a
