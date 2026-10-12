@@ -287,8 +287,9 @@ def gate_named(name: str) -> Gate:
 
 
 def render_lines() -> list[str]:
-    """The inventory as text -- ONE renderer, so the CLI and the browser view cannot drift into
-    two accounts of the same safety model."""
+    """The inventory as text, read by `keel.commands.capabilities` (`keel capabilities`). ONE
+    renderer, so a second text surface reuses it rather than writing a second account of the same
+    safety model; the MCP tool serves `CAPABILITIES` itself, as data."""
     lines: list[str] = []
     for gate in GATES:
         covered = [cap for cap in CAPABILITIES if cap.gate == gate.name]

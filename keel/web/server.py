@@ -74,11 +74,6 @@ from keel.web.security import (
     tokens_match,
 )
 
-#: How often the live pages reload themselves. 15s matches the TUI's own poll: fast enough that
-#: "is it running" is answered without a keypress, slow enough that a page being read does not
-#: jump away every few seconds.
-_REFRESH_SEC = 15
-
 #: Cap on a form body. `rfile.read(n)` with an attacker-supplied `n` is a memory-exhaustion
 #: primitive and there is no proxy in front of this server to impose a limit. A setup form carries
 #: an action key and a token.

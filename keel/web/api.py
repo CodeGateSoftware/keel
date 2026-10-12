@@ -656,7 +656,7 @@ def read_rules(cfg: ServeConfig, _query: Query, _state: Any, now_ts: int) -> dic
 
 #: How long one deployment's admission screen stays cached (#856). 5 minutes: short enough that
 #: an operator who just fixed a candle gap or attested an asset sees it admitted within one
-#: coffee, long enough that `/rules?budget=`'s 15s poll (`server._REFRESH_SEC`) stops re-running
+#: coffee, long enough that `/rules?budget=`'s 15s poll (`main.js`'s `POLL_MS`) stops re-running
 #: the whole allowlist's `screen_product` against the database twenty times for every time an
 #: operator actually changes the budget or buffer in the address bar.
 _SCREEN_CACHE_TTL_SECONDS = 300

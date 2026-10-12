@@ -343,3 +343,26 @@ def test_no_row_or_gate_claims_a_browser_can_release_a_halt() -> None:
         assert cli in "\n".join(render_lines())
         assert "terminal" in cap.increases, cap.key
         assert "gates token" in cap.increases, cap.key
+
+
+def test_render_lines_names_the_surfaces_that_read_it() -> None:
+    """`render_lines` justified itself as the one renderer shared by "the CLI and the browser
+    view". The browser view went with the Gates page in #956, and the docstring went on naming
+    it (#967). It now names the modules that import it, and this keeps that list honest in both
+    directions: every importer named, and at least one."""
+    from pathlib import Path
+
+    keel_dir = Path(_ROOT) / "keel"
+    importers = set()
+    for path in sorted(keel_dir.rglob("*.py")):
+        for node in ast.walk(ast.parse(path.read_text())):
+            if (
+                isinstance(node, ast.ImportFrom)
+                and node.module == "keel.capabilities"
+                and any(alias.name == "render_lines" for alias in node.names)
+            ):
+                importers.add(".".join(path.relative_to(_ROOT).with_suffix("").parts))
+
+    assert importers, "render_lines has a reader; this test reads the import graph to find it"
+    doc = render_lines.__doc__ or ""
+    assert sorted(m for m in importers if f"`{m}`" not in doc) == []

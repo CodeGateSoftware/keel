@@ -5,10 +5,11 @@ honest-at-the-time claim outlives the fact that contradicted it, the record stil
 `doctor` still shows it green, and the only thing between that and a live entry is an exception
 nobody wrote down.
 
-`repo` is OPTIONAL on `_build_broker` on purpose. Most call sites are read-only inspection
-(`keel balances`, `keel brokers list`) with no repository in hand, and threading one through every
-one of them to record a fact none of them will act on would be churn. The paths that matter are
-the ones that go on to trade.
+`repo` is OPTIONAL on `_build_broker` on purpose. Most call sites have no repository in hand and
+open no position (inspection, the candle fetch, `keel orders cancel` -- the docstring of
+`record_cash_posture_refutation` names them), and threading one through every one of them to
+record a fact none of them will act on would be churn. The paths that matter are the ones that go
+on to trade.
 
 **The refusal still propagates.** Recording it is in addition to failing closed, never instead --
 `test_the_refusal_still_raises` pins that, because a refutation that swallowed the exception would
@@ -16,6 +17,8 @@ turn a hard stop into a database row.
 """
 
 from __future__ import annotations
+
+import re
 
 import pytest
 from keel_core.cash_posture import SPOT_CASH, CashPostureState, VenueCashPosture
@@ -99,3 +102,28 @@ def test_nothing_attested_records_nothing_and_still_raises(repo: Repository) -> 
     with pytest.raises(RuntimeError):
         record_cash_posture_refutation(_Refusing(), repo=repo, venue="coinbase", now_ts=NOW)
     assert repo.get_venue_cash_posture("coinbase") is None
+
+
+def test_every_command_the_docstring_names_as_a_repoless_caller_exists() -> None:
+    """The docstring is where a reader learns which commands skip the recording, so every command
+    it names must be one `keel` has. It named `keel balances` -- a command that never existed,
+    whose only web reader went in #966 (#967)."""
+    import click
+
+    from keel.cli import cli
+
+    doc = record_cash_posture_refutation.__doc__ or ""
+    cited = re.findall(r"`keel ([a-z][a-z-]*(?: [a-z][a-z-]*)*)`", doc)
+    assert cited, "the docstring names its repo-less callers; this test reads that list"
+
+    unknown = []
+    for invocation in cited:
+        command: click.Command | None = cli
+        for word in invocation.split():
+            if not isinstance(command, click.Group):
+                break
+            command = command.get_command(click.Context(command), word)
+            if command is None:
+                unknown.append(invocation)
+                break
+    assert unknown == []

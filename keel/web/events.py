@@ -91,7 +91,8 @@ CONTENT_TYPE = "text/event-stream; charset=utf-8"
 
 #: Seconds between ticks.
 #:
-#: Five, against `server._REFRESH_SEC`'s fifteen, and the two are answering different questions.
+#: Five, against the client's fifteen-second poll (`main.js`'s `POLL_MS`), and the two are
+#: answering different questions.
 #: Fifteen is how stale a FIGURE may get; five is how long a dead server may look alive, and that
 #: is the number an operator is standing in front of. It is also the heartbeat that keeps the
 #: connection from being reaped by anything in between -- there is nothing in between on loopback
