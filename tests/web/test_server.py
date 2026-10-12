@@ -2462,6 +2462,28 @@ def test_a_halt_with_an_oversized_body_still_engages_and_closes(deployment) -> N
     assert _kill_switch(deployment[0]) is True
 
 
+def test_a_halt_whose_body_never_arrives_answers_before_the_drain(deployment) -> None:
+    """**The drain runs AFTER the answer** -- stopping must never be slower than starting (#955).
+
+    The headers declare a 100-byte body that is never sent, and the socket stays open. The 200
+    and the engaged switch must both arrive while the server is still waiting for those bytes:
+    a halt that drained (or read) first would sit on the socket until the client gave up, with
+    the switch still off. The response is read up to its declared length, never to EOF -- the
+    server is still draining, so EOF only comes when this test hangs up."""
+    with _serving(deployment) as cfg:
+        lines = ["POST /api/gates/halt HTTP/1.1"]
+        lines += [f"{name}: {value}" for name, value in _halt_headers(cfg)]
+        lines += ["Content-Length: 100"]
+        with socket.create_connection((cfg.host, cfg.port), timeout=3) as sock:
+            sock.sendall(("\r\n".join(lines) + "\r\n\r\n").encode())
+            response = http.client.HTTPResponse(sock)
+            response.begin()
+            body = response.read()
+            assert response.status == 200, body[:300]
+            assert json.loads(body)["data"]["step_key"] == "halt"
+            assert _kill_switch(deployment[0]) is True, "engaged while the body is still owed"
+
+
 # -- `serve()` keeps every field it was given (#971) -----------------------------------------------
 
 
