@@ -24,6 +24,12 @@ re-run it and commit the diff whenever the live rule set changes deliberately.
   params from a JSON file would let an edited manifest change a LIVE rule's position size, which
   is exactly the kind of un-reviewed money change the promotion ladder exists to prevent.
   Reconcile drift deliberately, by hand.
+- It **refuses an entry `keel rules add` would refuse** -- an unknown kind, params the rule
+  rejects, or a param the row would not persist, `name` above all (#974): `rule.name` is what a
+  tranche records as `positions.rule_name`, and a turtle stored as `"name": "dca"` would have its
+  missing bracket read as "no stop by design" (#961). The check is
+  `keel.commands.rules.validated_row_params`, the one `add_rule_row` runs, so the two writers
+  refuse the same rows in the same words.
 - It **refuses to create `live` rules without `--allow-live`.** Seeding straight to `live` bypasses
   the promotion gate (same bypass as `keel rules seed --status live` and `rules promote --force`),
   so it takes an explicit flag and prints a loud warning, mirroring how those commands behave.
@@ -41,6 +47,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
+from keel.commands.rules import RulesRefused, validated_row_params
 from keel.data.db import connect
 from keel.data.repository import Repository
 
@@ -87,7 +94,8 @@ def apply(
     """Reconcile `db_path`'s rules against `manifest_path`.
 
     Returns a process exit code: 0 when the database matches (or was made to match) the manifest,
-    1 when drift or a refused `live` insert means it does not.
+    1 when drift, a refused `live` insert or an entry `validated_row_params` refuses means it does
+    not. A refused entry is skipped, never written; the rest of the manifest still applies.
     """
     manifest = json.loads(manifest_path.read_text())
     wanted = manifest["rules"] if isinstance(manifest, dict) else manifest
@@ -98,11 +106,19 @@ def apply(
     to_insert: list[dict[str, Any]] = []
     drift: list[str] = []
     refused: list[str] = []
+    invalid: list[str] = []
 
     for entry in wanted:
         kind, status, params = entry["kind"], entry["status"], entry["params"]
         key = _key(kind, params)
         current = existing.get(key)
+
+        problems: list[str] = []
+        try:
+            validated_row_params(kind, params, key[1], echo_err=problems.append)
+        except RulesRefused:
+            invalid.extend(f"{kind}:{key[1]}: {line.removeprefix('Error: ')}" for line in problems)
+            continue
 
         if current is None:
             if status in _ARMED_STATUSES and not allow_live:
@@ -143,15 +159,17 @@ def apply(
 
     for line in refused:
         print(f"REFUSED: {line} -- pass --allow-live to create armed rules", file=sys.stderr)
+    for line in invalid:
+        print(f"REFUSED: {line}", file=sys.stderr)
     for line in drift:
         print(f"DRIFT: {line}", file=sys.stderr)
 
-    if not to_insert and not drift and not refused:
+    if not to_insert and not drift and not refused and not invalid:
         print(f"in sync: {len(wanted)} rule(s) match {manifest_path}")
     elif not write and to_insert:
         print("\ndry run -- nothing written. Re-run with --apply to write.")
 
-    return 1 if (drift or refused) else 0
+    return 1 if (drift or refused or invalid) else 0
 
 
 def main(argv: list[str] | None = None) -> int:
