@@ -577,6 +577,36 @@ def _percent_units(fraction: float) -> Decimal:
     return (Decimal(repr(fraction)) * 100).normalize()
 
 
+#: Why a ratio on a rule's record has no value (#979). The words both the CLI and the page print,
+#: through `undefined_reading`, so the two cannot drift: `profit_factor` and `realized_rr` divide
+#: by a side of the sample, and a side with no trade has nothing to divide by.
+NO_TRADES_YET = "no trades yet"
+NO_WINS_YET = "no wins yet"
+NO_LOSSES_YET = "no losses yet"
+NO_WINS_OR_LOSSES_YET = "no wins or losses yet"
+
+
+def undefined_reading(reason: str) -> str:
+    """The one rendering of a ratio with no value -- `n/a (no losses yet)` -- for the terminal
+    line and the page cell alike."""
+    return f"n/a ({reason})"
+
+
+def _empty_side(n_trades: int, avg_win: Decimal | None, avg_loss: Decimal | None) -> str | None:
+    """Which side of the sample is empty, or `None` when both hold a trade. Read off the record's
+    `avg_win`/`avg_loss`, which are `None` exactly when `_side_average` COUNTED no trade on that
+    side -- never off a zero."""
+    if n_trades == 0:
+        return NO_TRADES_YET
+    if avg_win is None and avg_loss is None:
+        return NO_WINS_OR_LOSSES_YET
+    if avg_win is None:
+        return NO_WINS_YET
+    if avg_loss is None:
+        return NO_LOSSES_YET
+    return None
+
+
 @dataclass(frozen=True)
 class GateDistance:
     rule_name: str
@@ -644,6 +674,25 @@ class RuleTrackRecord:
     def win_rate_pct(self) -> Decimal:
         """`win_rate` in percent units, for the web page. The CLI keeps printing the fraction."""
         return _percent_units(self.win_rate)
+
+    @property
+    def realized_rr_reason(self) -> str | None:
+        """Why `realized_rr` is `None` -- the side of the sample with no trade -- or `None` when
+        it is a measurement (#979). The gate's `realized_rr` is judged on this same sample
+        (`build_rule_track_record`), so its card reads this reason too."""
+        return _empty_side(self.n_trades, self.avg_win, self.avg_loss)
+
+    @property
+    def profit_factor_reason(self) -> str | None:
+        """Why `profit_factor` is not a measurement, or `None` when it is (#979).
+
+        Gross profit over gross loss, so only an empty LOSS side leaves it undefined: all wins is
+        the `Infinity` `stats.summarize` writes ("no losses yet", a known fact, not a gap), and all
+        scratches is its 0 for 0/0 ("no wins or losses yet", unknown). All losses is a real 0 --
+        no gross profit over a real loss -- and keeps its number. The engine's own value is
+        untouched; the gate never reads it."""
+        reason = _empty_side(self.n_trades, self.avg_win, self.avg_loss)
+        return None if reason == NO_WINS_YET else reason
 
 
 @dataclass(frozen=True)
@@ -1051,10 +1100,10 @@ def _quantized(x: Any) -> Any:
     (`json.dumps(..., default=str)` never goes through this).
 
     Passes through anything that isn't a finite `Decimal` unchanged: a sentinel string
-    ("n/a (no losses yet)", "n/a", "dca"), `None`, or a non-finite `Decimal` (`Infinity`,
-    which `BacktestResult.profit_factor` can legitimately be, and which `.quantize()` itself
-    refuses to round) all render exactly as before. The display realized rr is never
-    `Infinity`: with no losing (or no winning) trades it is `None`.
+    ("n/a (no losses yet)", "n/a", "dca"), `None`, or a non-finite `Decimal` (which
+    `.quantize()` itself refuses to round) all render exactly as before. `render_summary`
+    never hands it the `Infinity` an all-wins `profit_factor` holds: that prints its
+    `profit_factor_reason` instead (#979), as the display realized rr, `None` there, does.
     """
     if isinstance(x, Decimal) and x.is_finite():
         return x.quantize(_TWO_DP)
@@ -1098,21 +1147,19 @@ def render_summary(report: InsightsReport) -> list[str]:
 
     lines.append(f"rule track record ({len(report.rules)}):")
     for r in report.rules:
+        rr_reason = r.realized_rr_reason
+        rr: Any = r.realized_rr if rr_reason is None else undefined_reading(rr_reason)
         if r.n_trades == 0:
             # Nothing was measured: every figure is unknown, not the zero the engine holds.
             win_rate = expectancy = profit_factor = max_dd = "n/a"
-            rr: Any = "n/a (no trades yet)"
         else:
             win_rate = f"{r.win_rate:.1%}"
             expectancy = _money(r.expectancy)
-            profit_factor = _ratio(r.profit_factor)
+            pf_reason = r.profit_factor_reason
+            profit_factor = (
+                _ratio(r.profit_factor) if pf_reason is None else undefined_reading(pf_reason)
+            )
             max_dd = _money(r.max_drawdown)
-            if r.realized_rr is not None:
-                rr = r.realized_rr
-            elif r.avg_win is None:
-                rr = "n/a (no wins yet)"
-            else:
-                rr = "n/a (no losses yet)"
         rule_id = r.rule_id if r.rule_id is not None else "n/a"
         avg_win = _money(r.avg_win) if r.avg_win is not None else "n/a"
         avg_loss = _money(r.avg_loss) if r.avg_loss is not None else "n/a"

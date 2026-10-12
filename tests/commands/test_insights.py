@@ -488,7 +488,7 @@ def test_the_cli_summary_still_prints_the_fraction_as_it_always_did(repo: Reposi
     assert record == [
         f"  [turtle_breakout] rule={rule_id} product=BTC-USD status=paper class=trend_follow "
         "n=2 win_rate=100.0% avg_win=10.00 avg_loss=n/a rr=n/a (no losses yet) "
-        "expectancy=10.00 profit_factor=Infinity max_dd=0.00"
+        "expectancy=10.00 profit_factor=n/a (no losses yet) max_dd=0.00"
     ]
     assert gate == [
         "    gate: blocked -- trades_remaining=98 (n>=100, win_rate>=0.3, rr>=1.5, expectancy>0)"
@@ -759,7 +759,8 @@ def test_an_empty_side_leaves_the_gate_verdict_exactly_as_check_floors_gives_it(
 def test_an_all_losses_record_has_no_realized_rr_and_says_why(repo: Repository) -> None:
     """No winning trade means no average win to divide: `realized_rr` is unknown (None), not the
     0.00 that `0 / |avg_loss|` gives. The reason is told apart from "no losses yet" by which side
-    of the record is empty. The page's gate card and record row both read "—" (`ratio(None)`)."""
+    of the record is empty. The page's gate card and record row print the CLI's own words (#979),
+    still as unknown: there is no average win to measure the ratio with."""
     _btc, eth = _seed_two_turtles(repo)
 
     record = next(r for r in _report(repo).rules if r.rule_id == eth)
@@ -770,8 +771,74 @@ def test_an_all_losses_record_has_no_realized_rr_and_says_why(repo: Repository) 
     assert record.gate is not None and record.gate.realized_rr is None
     assert "avg_win=n/a avg_loss=-10.00 rr=n/a (no wins yet) " in line
     assert "(no losses yet)" not in line
-    assert shown["realized_rr"]["display"] == "—"
-    assert shown["gate"]["realized_rr"]["display"] == "—"
+    no_wins = {"value": "", "display": "n/a (no wins yet)", "state": "unknown"}
+    assert shown["realized_rr"] == no_wins
+    assert shown["gate"]["realized_rr"] == no_wins
+    # All losses: a profit factor of 0 IS a measurement (no gross profit over a real loss).
+    assert "profit_factor=0.00 " in line
+    assert shown["profit_factor"] == {"value": "0", "display": "0.00", "state": "neutral"}
+
+
+def _cli_record_line(repo: Repository, rule_id: int) -> str:
+    return next(ln for ln in render_summary(_report(repo)) if f"rule={rule_id} " in ln)
+
+
+def test_an_all_wins_record_reads_no_losses_yet_on_the_page_and_at_the_terminal(
+    repo: Repository,
+) -> None:
+    """#979: with no losing trade the profit factor and the realized R:R have nothing to divide
+    by. That is a known fact about the sample, not a missing reading: the page says it in the
+    CLI's words with a neutral state, never "—"/unknown, and the CLI never prints "Infinity"."""
+    btc, _eth = _seed_two_turtles(repo)
+
+    record = next(r for r in _report(repo).rules if r.rule_id == btc)
+    shown = _rules_records(repo)[0]
+    line = _cli_record_line(repo, btc)
+
+    assert record.profit_factor == Decimal("Infinity")  # the engine's value is untouched
+    no_losses = {"value": "", "display": "n/a (no losses yet)", "state": "neutral"}
+    assert shown["profit_factor"] == no_losses
+    assert shown["realized_rr"] == no_losses
+    assert shown["gate"]["realized_rr"] == no_losses
+    assert line.endswith(
+        " rr=n/a (no losses yet) expectancy=10.00 profit_factor=n/a (no losses yet) max_dd=0.00"
+    )
+    assert "Infinity" not in line
+
+
+def test_an_all_scratch_record_has_no_profit_factor_rather_than_a_measured_zero(
+    repo: Repository,
+) -> None:
+    """#979 (comment): every closed trade a scratch is 0 gross profit over 0 gross loss -- 0/0,
+    which is unknown, where an all-losses 0.00 is a real measurement. The engine holds 0 and
+    the gate still reads it; the page and the CLI say there were no wins or losses."""
+    rule_id = repo.insert_rule("turtle_breakout", {"product_id": "BTC-USD"}, status="paper")
+    for i in range(2):
+        _seed_paper_trade(
+            repo,
+            "turtle_breakout",
+            rule_id=rule_id,
+            exit_price="100",
+            pnl="0",
+            r_multiple="0.0",
+            outcome="scratch",
+            entry_ts=1000 + i,
+            exit_ts=1100 + i,
+        )
+
+    record = _report(repo).rules[0]
+    shown = _rules_records(repo)[0]
+    line = _cli_record_line(repo, rule_id)
+
+    assert record.n_trades == 2 and record.profit_factor == 0
+    neither = {"value": "", "display": "n/a (no wins or losses yet)", "state": "unknown"}
+    assert shown["profit_factor"] == neither
+    assert shown["realized_rr"] == neither
+    assert shown["gate"]["realized_rr"] == neither
+    assert line.endswith(
+        " rr=n/a (no wins or losses yet) expectancy=0.00 profit_factor=n/a "
+        "(no wins or losses yet) max_dd=0.00"
+    )
 
 
 def test_a_zero_trade_record_prints_every_figure_as_n_a_at_the_terminal(repo: Repository) -> None:
