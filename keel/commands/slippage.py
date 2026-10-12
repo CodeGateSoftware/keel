@@ -166,7 +166,7 @@ class SlippageReport:
 def _row_for(repo: Repository, product_id: str, floor_pct: Decimal) -> SlippageRow:
     """One product, priced from its own cached daily bars.
 
-    ONE_DAY specifically, matching `simulate._slippage_for_products`: the statistic is a MEDIAN
+    ONE_DAY specifically, matching `simulate.slippage_assumptions`: the statistic is a MEDIAN
     DAILY quote volume, and computing it over hourly bars would answer a different question with
     the same name -- and answer it about a twenty-fourth of the volume.
     """

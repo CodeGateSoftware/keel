@@ -155,7 +155,7 @@ class Signal:
 
 
 #: How a trade ended. Named rather than spelled out at each use so the producer
-#: (`backtest._closed_trade`, which picks the branch) and the consumer (`Trade.outcome`) cannot
+#: (`backtest._close_trade`, which picks the branch) and the consumer (`Trade.outcome`) cannot
 #: drift: an inline `Literal[...]` repeated in both places lets one side gain a value the other
 #: silently rejects, and the mismatch only shows up as an `arg-type` error at the constructor.
 #

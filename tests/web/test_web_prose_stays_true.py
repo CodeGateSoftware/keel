@@ -143,6 +143,74 @@ def test_a_cited_web_module_attribute_exists() -> None:
     assert missing == []
 
 
+#: The modules outside `keel.web` whose backticked citations are resolved (#982), by the stem the
+#: prose uses. An ALLOWLIST, because a general resolver over every backticked `stem.name` reads
+#: `config.quote_currency`, `orders.rule_id` and `agent.enter_evaluated` -- a setting, a column
+#: and an event kind -- as attributes, and no import can check those. Each stem here names one
+#: module and nothing else in `keel/` (`test_the_allowlisted_stems_name_one_module_each`).
+_CITED_MODULES = {
+    "engine": "keel.strategy.engine",
+    "backtest": "keel.strategy.backtest",
+    "simulate": "keel.commands.simulate",
+}
+
+
+def test_the_allowlisted_stems_name_one_module_each() -> None:
+    """A second `engine.py` in `keel/` would make `engine.X` ambiguous, and the resolver below
+    would judge a citation of the other one against the wrong module."""
+    stems = {
+        stem: sorted(path.relative_to(KEEL.parent).as_posix() for path in KEEL.rglob(f"{stem}.py"))
+        for stem in _CITED_MODULES
+    }
+
+    assert stems == {
+        stem: [dotted.replace(".", "/") + ".py"] for stem, dotted in _CITED_MODULES.items()
+    }
+
+
+def _emitted_kinds(module: object) -> set[str]:
+    """Every string constant in `module`'s source. `engine.no_signal` and `engine.setup_detected`
+    are event KINDS the engine emits under exactly that spelling, not attributes -- read from the
+    source rather than listed, so a kind that is renamed stops being excused here."""
+    tree = ast.parse(inspect.getsource(module))  # type: ignore[arg-type]
+    return {
+        node.value
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Constant) and isinstance(node.value, str)
+    }
+
+
+def _cited_allowlisted_references() -> list[tuple[str, int, str, str]]:
+    found: list[tuple[str, int, str, str]] = []
+    for path in sorted(KEEL.rglob("*.py")):
+        for number, line in enumerate(path.read_text().splitlines(), 1):
+            for match in re.finditer(r"`(\w+)\.(\w+)(?:\(\))?`", line):
+                module, name = match.groups()
+                if module not in _CITED_MODULES or name in _FILE_SUFFIXES:
+                    continue
+                found.append((path.relative_to(KEEL.parent).as_posix(), number, module, name))
+    return found
+
+
+def test_a_cited_engine_backtest_or_simulate_attribute_exists() -> None:
+    """#967's class of bug outside `keel.web` (#982): `engine._assemble_cts_context` (public since,
+    as `assemble_cts_context`), `backtest._closed_trade` (the function is `_close_trade`) and
+    `simulate._slippage_for_products` (never there; `slippage_assumptions` is) all sent a reader
+    to a name that does not exist."""
+    cited = _cited_allowlisted_references()
+    assert {module for _where, _number, module, _name in cited} == set(_CITED_MODULES), (
+        "a stem in the allowlist is no longer cited, or the pattern has stopped matching"
+    )
+    missing = []
+    for where, number, module, name in cited:
+        resolved = importlib.import_module(_CITED_MODULES[module])
+        if _resolves(resolved, name) or f"{module}.{name}" in _emitted_kinds(resolved):
+            continue
+        missing.append(f"{where}:{number} `{module}.{name}`")
+
+    assert missing == []
+
+
 def _stated_count(text: str, pattern: str) -> int:
     match = re.search(pattern, " ".join(text.split()))
     assert match, f"the sentence matching {pattern!r} is gone; re-point this test at its successor"

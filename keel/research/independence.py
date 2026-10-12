@@ -56,8 +56,8 @@ def pearson(xs: Sequence[Decimal], ys: Sequence[Decimal]) -> Decimal:
     counts rather than a running covariance -- but phi and Pearson-on-{0,1} are the same
     number, so this function is that module's test ORACLE. An oracle imported through a
     private name is an oracle one refactor away from silently disappearing, and importing
-    `_pearson` across modules is exactly the wart `sim/portfolio_sim.py` already carries
-    against `engine._assemble_cts_context`. Promoted rather than duplicated.
+    `_pearson` across modules is exactly the wart `sim/portfolio_sim.py` carried against
+    `engine.assemble_cts_context` while that was private. Promoted rather than duplicated.
     """
     n = len(xs)
     if n < 2 or n != len(ys):
