@@ -2833,6 +2833,19 @@ def test_an_expired_remote_session_with_the_halt_token_but_no_session_cannot_hal
     assert _kill_switch(deployment[0]) in (None, False)
 
 
+def test_the_session_expired_refusal_names_the_terminal_commands_it_tells_the_operator_to_run(
+    deployment,
+) -> None:
+    """A reloaded console cannot fetch the halt token (`/api/pulse` keeps the lifetime), so the
+    refusal is the only place left that tells the operator how to stop trading now (#983, #985)."""
+    with _serving(deployment, external_hosts=_REMOTE, started_at=_expired()) as cfg:
+        status, _headers, body = _request(cfg, "/api/pulse", cookie=_session(cfg))
+
+    assert status == 403, body
+    detail = json.loads(body)["error"]["detail"]
+    assert re.findall(r"`(keel [a-z-]+)`", detail) == ["keel serve", "keel kill"], detail
+
+
 @pytest.mark.parametrize(
     ("method", "path", "extra"),
     [

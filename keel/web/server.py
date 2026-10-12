@@ -694,6 +694,11 @@ class KeelHandler(BaseHTTPRequestHandler):
         # have. What the exemption gives a leaked token is a halt -- which `keel resume` at a
         # terminal undoes -- and never a release: the halt token opens no other route (#968). The
         # cookie below is still checked, and so is the halt token, by `_gated_action`.
+        #
+        # It serves a console still showing a Pulse from before the lifetime ended (the token is
+        # in its memory), or any client that holds the token. A RELOADED console cannot get it:
+        # only `/api/pulse` serves the token and that keeps the lifetime. Its HALT is #985's to
+        # restore; until then the refusal below names `keel kill`.
         expires = self.cfg.session_expired_at
         if expires is not None and not outlives_the_lifetime and time.time() >= expires:
             self._refuse(
@@ -702,7 +707,8 @@ class KeelHandler(BaseHTTPRequestHandler):
                 "This session has reached its lifetime. keel enforces one when it is configured "
                 "to answer a remote hostname, because a token that leaked into a URL, a "
                 "screenshot or terminal scrollback should not still work tomorrow. Restart "
-                "`keel serve` and open the address it prints.",
+                "`keel serve` and open the address it prints. To stop trading now, run "
+                "`keel kill` at the terminal.",
             )
             return False
         cookies = parse_cookie_header(self.headers.get("Cookie"))

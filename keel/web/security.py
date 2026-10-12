@@ -125,6 +125,9 @@ SESSION_COOKIE_MAX_AGE_SECONDS = 30 * 24 * 60 * 60
 #: `halt_token` is admitted past the lifetime (`server.KeelHandler._is_a_tokened_halt`): refusing
 #: a stop is the one failure mode the console must not have, and what a leaked token gains from
 #: the exemption is the power to halt -- undone by `keel resume` at a terminal, never a release.
+#: It serves a console still showing a Pulse from before the lifetime ended, or any client holding
+#: the token; a reloaded console cannot get the token (`/api/pulse` keeps the lifetime), so its
+#: HALT waits on #985 and the refusal names `keel kill` meanwhile.
 REMOTE_SESSION_MAX_AGE_SECONDS = 12 * 60 * 60
 
 #: ⛔ THE BRUTE-FORCE ARITHMETIC, WRITTEN DOWN SO NOBODY ADDS A RATE LIMITER FOR THE WRONG
