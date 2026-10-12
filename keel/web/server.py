@@ -99,8 +99,11 @@ _MAX_CONTENT_LENGTH_DIGITS = 18
 #:
 #: **Why a minute.** It bounds a `sendall` too, as a total since Python 3.5, and the largest
 #: response here -- the whole audit trail as CSV -- has to reach a phone over a tunnel inside it.
-#: A shorter bound buys little: threads are not pooled, so this limits how long one connection is
-#: held, never how many an attacker opens. Read by `build_server`, so a test can shorten it.
+#: A shorter bound buys little: it limits how long a connection may sit SILENT, not how long
+#: it can be held. The timeout is per socket operation, so a client that trickles one byte inside
+#: every window never trips it (slowloris). That is accepted: threads are not pooled and an
+#: attacker can open more connections anyway, so no per-connection bound would cap the cost. Read
+#: by `build_server`, so a test can shorten it.
 REQUEST_TIMEOUT_SECONDS = 60.0
 
 
@@ -629,9 +632,36 @@ class KeelHandler(BaseHTTPRequestHandler):
         try:
             self.rfile.read(length)
         except OSError:
-            # A client that vanished mid-body, or one that declared a body and never sent it: the
-            # read gives up at `REQUEST_TIMEOUT_SECONDS` (#981), and a refusal still answers.
+            # A client that vanished mid-body, or one that declared a body and then went silent:
+            # the read gives up after `REQUEST_TIMEOUT_SECONDS` without a byte (#981), and a
+            # refusal still answers. A client that keeps trickling is not cut off here.
             self.close_connection = True
+
+    def handle_one_request(self) -> None:
+        """One request, and then a GET's or HEAD's body leaves the socket (#981).
+
+        **A GET ends at a request boundary too.** A GET may carry a body -- pointless, but legal
+        -- and the success path never read one, so on a kept-alive connection the stdlib parsed it
+        as the next request line: #955's shape on the read path, answered 501. `do_HEAD` delegates
+        to `do_GET`, so both are covered here.
+
+        **Why here, not in a `finally` like `do_POST`'s.** `do_GET` is left exactly as it was, so
+        the dataflow from `self.path` to what it reaches is unchanged; wrapping its body would
+        have put a new call on that path. The request boundary is the stdlib's own, and the drain
+        costs a no-op for the common case, a GET with no body.
+
+        **Skipped when `close_connection` is already set**: EOF, a timed-out `readline`, an SSE
+        stream, or framing already distrusted. There is no next request to protect, and reading
+        on would only wait. That is also the only time `self.command` is stale (the previous
+        request's, or unset), so it is read only after that check.
+
+        `do_GET` resets `body_consumed` at its top, so the drain starts clean; a refusal already
+        drained its own body, which makes this a no-op for it. An exception out of `do_GET` skips
+        the drain, which does not matter: the stdlib then drops the connection.
+        """
+        super().handle_one_request()
+        if not self.close_connection and self.command in ("GET", "HEAD"):
+            self._drain_request_body()
 
     # -- shared admission --
     def _admitted(self, *, outlives_the_lifetime: bool = False) -> bool:
@@ -1129,22 +1159,7 @@ class KeelHandler(BaseHTTPRequestHandler):
         self._send(303, "", extra=(("Location", runtime.url_for(record)),))
 
     def do_GET(self) -> None:  # noqa: N802 - stdlib's naming, not ours
-        """Every read, and every HEAD (`do_HEAD` delegates here). Routing is `_get`'s.
-
-        **A GET ends at a request boundary too (#981).** A GET may carry a body -- pointless, but
-        legal -- and the success path never read one, so on a kept-alive connection the stdlib
-        parsed it as the next request line: #955's shape on the read path, answered 501. The drain
-        is in a `finally` for `do_POST`'s reason: a branch added later cannot forget it. It is a
-        no-op for the common case, a GET with no body, and for a refusal, which drained already.
-        """
         self.body_consumed = False
-        try:
-            self._get()
-        finally:
-            self._drain_request_body()
-
-    def _get(self) -> None:
-        """`do_GET`'s routing, minus the drain that every branch shares. Read `do_GET`."""
         parsed = urlsplit(self.path)
         query = parse_qs(parsed.query, keep_blank_values=True)
 

@@ -2738,8 +2738,10 @@ def test_the_served_timeout_is_the_module_constant(deployment) -> None:
 # -- a GET's body is drained too (#981) ------------------------------------------------------------
 
 
-@pytest.mark.parametrize("path", ["/api/config", "/"])
-def test_a_get_with_a_body_leaves_the_connection_clean(deployment, path) -> None:
+@pytest.mark.parametrize(
+    ("method", "path"), [("GET", "/api/config"), ("GET", "/"), ("HEAD", "/api/config")]
+)
+def test_a_get_with_a_body_leaves_the_connection_clean(deployment, method, path) -> None:
     """**#955's shape on the read path.** A GET that carries a body (legal, if pointless) left it
     in the socket on the success path, and the stdlib parsed it as the next request line on a
     kept-alive connection. Both requests ride one socket; the second must be answered 200."""
@@ -2748,13 +2750,13 @@ def test_a_get_with_a_body_leaves_the_connection_clean(deployment, path) -> None
         conn = http.client.HTTPConnection(cfg.host, cfg.port, timeout=5)
         try:
             conn.request(
-                "GET",
+                method,
                 path,
                 body=b"xy",
                 headers={"Host": host, "Cookie": _session(cfg), "Content-Length": "2"},
             )
             first = conn.getresponse()
-            first.read()
+            first.read()  # b"" for a HEAD, but http.client wants it read before the next request
             conn.request("GET", "/api/config", headers={"Host": host, "Cookie": _session(cfg)})
             second = conn.getresponse()
             second_body = second.read().decode("utf-8", "replace")
