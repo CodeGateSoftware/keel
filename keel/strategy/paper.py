@@ -468,18 +468,56 @@ def track_record(repo: Repository, rule_name: str) -> BacktestResult:
     """Aggregate `rule_name`'s paper trades (from `orders(mode='paper')`) into a
     `BacktestResult`-shaped summary, directly comparable to `backtest.backtest()`'s
     historical output.
-    """
-    orders = repo.get_orders(mode="paper")
 
-    entries: dict[int, dict] = {}
-    exits: list[dict] = []
-    for order in orders:
+    `rule_name` is a rule KIND (`rules.kind`), so this pools every rule of that kind -- all
+    products, every lifecycle status. That pool is what `insights`' journal matches a closed
+    trade's R against (it has the kind, not the rule). A per-RULE record is
+    `track_records_by_rule`'s (#962).
+    """
+    return summarize(_journalled_trades(_paper_payloads(repo, rule_name)))
+
+
+def track_records_by_rule(repo: Repository, rule_name: str) -> dict[int | None, BacktestResult]:
+    """`track_record(repo, rule_name)` split by the rule that journalled each trade (#962).
+
+    Keyed by `orders.rule_id`: a real paper cycle writes it on the entry, and the exit copies
+    the entry's (see `_OpenPaperPosition.rule_id`), so a round trip never straddles two keys.
+    A fill written with NO `rule_id` (a hand-built signal, or a fill journalled before the
+    column was populated) is keyed `None` -- it belongs to no rule, and folding it into
+    whichever rule shares its kind would hand one rule another's trades. Only keys with at
+    least one journalled order appear; a rule that never traded has no entry here, and its
+    record is the empty sample, which the caller builds.
+
+    The partitions are disjoint and cover the kind: their `n_trades` sum to
+    `track_record(repo, rule_name).n_trades`. Path-dependent figures (drawdown, losing streak)
+    are each rule's own, over its own trades in journal order.
+    """
+    partitions: dict[int | None, list[tuple[dict, dict]]] = {}
+    for order, payload in _paper_payloads(repo, rule_name):
+        key = order.get("rule_id")
+        partitions.setdefault(int(key) if key is not None else None, []).append((order, payload))
+    return {key: summarize(_journalled_trades(rows)) for key, rows in partitions.items()}
+
+
+def _paper_payloads(repo: Repository, rule_name: str) -> list[tuple[dict, dict]]:
+    """Every journalled paper order of kind `rule_name`, with its decoded payload, oldest first."""
+    found: list[tuple[dict, dict]] = []
+    for order in repo.get_orders(mode="paper"):
         raw = order["raw_response"]
         if not raw:
             continue
         payload = json.loads(raw)
         if payload.get("rule_name") != rule_name:
             continue
+        found.append((order, payload))
+    return found
+
+
+def _journalled_trades(rows: list[tuple[dict, dict]]) -> list[Trade]:
+    """Pair entry and exit payloads into `Trade`s; an entry with no exit is an open trade."""
+    entries: dict[int, dict] = {}
+    exits: list[dict] = []
+    for order, payload in rows:
         if payload.get("role") == "entry":
             entries[order["id"]] = payload
         elif payload.get("role") == "exit":
@@ -533,4 +571,4 @@ def track_record(repo: Repository, rule_name: str) -> BacktestResult:
             )
         )
 
-    return summarize(trades)
+    return trades

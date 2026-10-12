@@ -875,7 +875,10 @@ cancel` and the exit path stay at the terminal.
 **Rules.** Everything keel knows about its rules, on one page, and nothing on it is a control:
 promotion happens in the CLI. The rule ledger and each rule's parameters come first, then the
 track records of the rules in the promotion pipeline (candidate and paper) with each paper rule's
-distance to the promotion gate -- unsorted, because a sorted record is a leaderboard -- then the
+distance to the promotion gate -- unsorted, because a sorted record is a leaderboard. There is one
+record per rule, named by kind, product and ledger id, holding the paper trades that rule journalled;
+paper trades journalled with no rule id get one record per kind with no id and no gate. An average
+win or loss with no trade on its side reads "—" (`n/a` in `keel insights summary`), not $0.00. Then the
 DCA plan proposal (`/rules?budget=500&buffer=0.1` fills it; it is applied by the `keel dca plan`
 command it shows, at a terminal), then the research record: every trial, the evidence matrix, the
 gauntlet and the slippage assumptions. Track records, promotion-gate distances and the research

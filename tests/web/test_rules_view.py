@@ -151,6 +151,8 @@ def _assert_pairs(body: str, table_id: str, expected: tuple[tuple[str, str], ...
 
 _RECORD_PAIRS = (
     ("rule", "rule_name"),
+    ("id", "rule_id"),
+    ("product", "product_id"),
     ("status", "status"),
     ("class", "promotion_class"),
     ("trades", "n_trades"),
@@ -192,22 +194,34 @@ def test_the_gate_cards_are_drawn_on_the_presence_of_a_gate() -> None:
 
 
 def test_every_gate_card_gets_an_id_of_its_own() -> None:
-    """A track record is named by its rule KIND, and a ledger can hold several paper rules of one
-    kind (the browser check found five `turtle_breakout` cards). An id built from the name alone
-    repeats, and `rebuildInto` restores open disclosures by `summary[id]` -- so opening one card
-    reopened all five on the next poll. The id carries the card's position as well."""
+    """Several paper rules share a kind (the browser check found five `turtle_breakout` cards), and
+    `rebuildInto` restores open disclosures by `summary[id]` -- so an id built from the kind
+    reopened every card of that kind on the next poll. #953 added the card's position; #962 gives
+    each record its ledger id, which is the rule's own and survives a reorder, so the id is that.
+    A gate is only ever built for a ledger row, so every gated record has one."""
     section = _builder("recordsSection")
     card = _builder("gateCard")
 
-    assert re.findall(r"function gateCard\((\w+), (\w+)\)", _code_only(_source("render.js"))) == [
-        ("rule", "position")
-    ]
-    assert re.findall(r"for \(const \[(\w+), (\w+)\] of gated\.entries\(\)\)", section) == [
-        ("index", "row")
-    ]
-    assert re.findall(r"gateCard\(([^)]*)\)", section) == ["row, index"]
+    assert re.findall(r"function gateCard\(([^)]*)\)", _code_only(_source("render.js"))) == ["rule"]
+    assert re.findall(r"gateCard\(([^)]*)\)", section) == ["row"]
     ids = re.findall(r"summary\.id = (.*);", card)
-    assert ids == ['["h-gatedist", plain(gate.rule_name), String(position)].join("-")'], ids
+    assert ids == ['["h-gatedist", plain(rule.rule_id)].join("-")'], ids
+
+
+def test_each_gate_card_names_its_rule_by_kind_product_and_id() -> None:
+    """#962: "turtle_breakout · blocked" five times named no rule. The summary reads the record's
+    kind, product and ledger id -- in that order, the Holdings heading's -- then the verdict."""
+    card = _builder("gateCard")
+    summary = card[card.index('el("summary")') : card.index("node.append(summary)")]
+
+    assert re.findall(r"\brule\.(\w+)", summary) == [
+        "rule_id",
+        "rule_name",
+        "product_id",
+        "rule_id",
+    ]
+    assert re.findall(r"\bgate\.(\w+)", summary) == ["passing"]
+    assert summary.index("rule.product_id") < summary.index("gate.passing")
 
 
 _GATE_PAIRS = (

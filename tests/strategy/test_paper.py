@@ -16,7 +16,12 @@ import pytest
 from keel.data.db import connect, migrate
 from keel.data.repository import Repository
 from keel.strategy.backtest import BacktestResult
-from keel.strategy.paper import _DEFAULT_FEE_PCT, PaperTrader, track_record
+from keel.strategy.paper import (
+    _DEFAULT_FEE_PCT,
+    PaperTrader,
+    track_record,
+    track_records_by_rule,
+)
 from keel.strategy.rules.base import Action, Setup, Signal
 from keel.types import Candle, Side
 
@@ -403,6 +408,54 @@ class TestTrackRecord:
         assert result.n_trades == 0
         assert len(result.trades) == 1
         assert result.trades[0].outcome == "open"
+
+    def _closed(
+        self, repo: Repository, rule_name: str, rule_id: int | None, ts: int, *, win: bool
+    ) -> None:
+        trader = PaperTrader(repo)
+        setup = _setup(entry="100", stop="90", target="120", ts=ts)
+        trader.on_signal(_enter_signal(rule_name=rule_name, setup=setup, rule_id=rule_id))
+        if win:
+            trader.on_candle("BTC-USD", _candle(ts + 60, "115", "121", "114", "120"))
+        else:
+            trader.on_candle("BTC-USD", _candle(ts + 60, "95", "96", "89", "90"))
+
+    def test_by_rule_splits_one_kind_into_each_rules_own_record(self, repo: Repository) -> None:
+        """#962: N rules of one kind are N records, each from the trades its own rule journalled
+        (`orders.rule_id`), not N copies of the kind's pooled record."""
+        first = repo.insert_rule("turtle_breakout", {"product_id": "BTC-USD"}, status="paper")
+        second = repo.insert_rule("turtle_breakout", {"product_id": "ETH-USD"}, status="paper")
+        self._closed(repo, "turtle_breakout", first, 1_000, win=True)
+        self._closed(repo, "turtle_breakout", first, 2_000, win=True)
+        self._closed(repo, "turtle_breakout", second, 3_000, win=False)
+        self._closed(repo, "other_kind", second, 4_000, win=True)
+
+        by_rule = track_records_by_rule(repo, "turtle_breakout")
+
+        assert sorted(by_rule, key=str) == [first, second]
+        assert (by_rule[first].n_trades, by_rule[first].win_rate) == (2, 1.0)
+        assert (by_rule[second].n_trades, by_rule[second].win_rate) == (1, 0.0)
+        # Every trade of the kind lands in exactly one partition: nothing lost, nothing doubled.
+        whole = track_record(repo, "turtle_breakout")
+        assert sum(r.n_trades for r in by_rule.values()) == whole.n_trades == 3
+
+    def test_by_rule_keeps_trades_journalled_without_a_rule_id_apart(
+        self, repo: Repository
+    ) -> None:
+        """A paper fill written with no `rule_id` (a hand-built signal, or a fill journalled before
+        `orders.rule_id` was populated) belongs to no rule. It is its own partition, keyed `None`,
+        never folded into a rule that happens to share the kind."""
+        rule = repo.insert_rule("turtle_breakout", {"product_id": "BTC-USD"}, status="paper")
+        self._closed(repo, "turtle_breakout", rule, 1_000, win=True)
+        self._closed(repo, "turtle_breakout", None, 2_000, win=False)
+
+        by_rule = track_records_by_rule(repo, "turtle_breakout")
+
+        assert (by_rule[rule].n_trades, by_rule[rule].win_rate) == (1, 1.0)
+        assert (by_rule[None].n_trades, by_rule[None].win_rate) == (1, 0.0)
+
+    def test_by_rule_has_no_partition_for_a_kind_with_no_trades(self, repo: Repository) -> None:
+        assert track_records_by_rule(repo, "turtle_breakout") == {}
 
     def test_no_paper_trades_yields_empty_result(self, repo: Repository) -> None:
         result = track_record(repo, "unknown_rule")

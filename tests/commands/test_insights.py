@@ -107,6 +107,7 @@ def _seed_paper_trade(
     pnl: str = "10",
     r_multiple: str | None = "1.0",
     outcome: str = "win",
+    rule_id: int | None = None,
 ) -> tuple[int, int]:
     """Write an entry+exit paper order pair directly (matching `paper.py`'s own payload
     shape) so tests can control exact win/loss/r_multiple stats without simulating candles."""
@@ -134,7 +135,7 @@ def _seed_paper_trade(
                 }
             ),
             confirmation="paper",
-            rule_id=None,
+            rule_id=rule_id,
             created_at=entry_ts,
             updated_at=entry_ts,
         )
@@ -169,7 +170,7 @@ def _seed_paper_trade(
                 }
             ),
             confirmation="paper",
-            rule_id=None,
+            rule_id=rule_id,
             created_at=exit_ts,
             updated_at=exit_ts,
         )
@@ -426,9 +427,11 @@ def test_a_real_records_win_rate_is_displayed_as_the_clis_percentage(repo: Repos
     """`win_rate` is a 0..1 fraction (`wins / n`); `percent()` takes percent units, so the page
     once showed 40% as "0.4%". Drive a REAL report through `rules_payload` and compare with the
     CLI's own `f"{win_rate:.1%}"` -- for the record, the gate's figure and the gate's floor."""
-    repo.insert_rule("turtle_breakout", {"product_id": "BTC-USD"}, status="paper")
+    rule_id = repo.insert_rule("turtle_breakout", {"product_id": "BTC-USD"}, status="paper")
     for i in range(2):
-        _seed_paper_trade(repo, "turtle_breakout", entry_ts=1000 + i, exit_ts=1100 + i)
+        _seed_paper_trade(
+            repo, "turtle_breakout", rule_id=rule_id, entry_ts=1000 + i, exit_ts=1100 + i
+        )
     for i in range(3):
         _seed_paper_trade(
             repo,
@@ -439,6 +442,7 @@ def test_a_real_records_win_rate_is_displayed_as_the_clis_percentage(repo: Repos
             outcome="loss",
             entry_ts=2000 + i,
             exit_ts=2100 + i,
+            rule_id=rule_id,
         )
     config = _config()
     report = build_insights_report(repo, config, gather_status(repo, config, now_ts=NOW_TS), NOW_TS)
@@ -455,9 +459,11 @@ def test_a_real_records_win_rate_is_displayed_as_the_clis_percentage(repo: Repos
 def test_the_cli_summary_still_prints_the_fraction_as_it_always_did(repo: Repository) -> None:
     """The percent-unit value is carried beside the fraction; the CLI line and the gate floor
     figures are untouched."""
-    repo.insert_rule("turtle_breakout", {"product_id": "BTC-USD"}, status="paper")
+    rule_id = repo.insert_rule("turtle_breakout", {"product_id": "BTC-USD"}, status="paper")
     for i in range(2):
-        _seed_paper_trade(repo, "turtle_breakout", entry_ts=1000 + i, exit_ts=1100 + i)
+        _seed_paper_trade(
+            repo, "turtle_breakout", rule_id=rule_id, entry_ts=1000 + i, exit_ts=1100 + i
+        )
     config = _config()
     report = build_insights_report(repo, config, gather_status(repo, config, now_ts=NOW_TS), NOW_TS)
 
@@ -466,8 +472,9 @@ def test_the_cli_summary_still_prints_the_fraction_as_it_always_did(repo: Reposi
     gate = [line for line in lines if line.startswith("    gate:")]
 
     assert record == [
-        "  [turtle_breakout] status=paper class=trend_follow n=2 win_rate=100.0% avg_win=10.00 "
-        "avg_loss=0.00 rr=n/a (no losses yet) expectancy=10.00 profit_factor=Infinity max_dd=0.00"
+        f"  [turtle_breakout] rule={rule_id} product=BTC-USD status=paper class=trend_follow "
+        "n=2 win_rate=100.0% avg_win=10.00 avg_loss=n/a rr=n/a (no losses yet) "
+        "expectancy=10.00 profit_factor=Infinity max_dd=0.00"
     ]
     assert gate == [
         "    gate: blocked -- trades_remaining=98 (n>=100, win_rate>=0.3, rr>=1.5, expectancy>0)"
@@ -496,8 +503,8 @@ def test_a_rule_with_no_closed_trades_shows_its_statistics_as_unknown_not_zero(
 
 
 def test_a_rule_with_one_closed_trade_still_shows_numbers(repo: Repository) -> None:
-    repo.insert_rule("turtle_breakout", {"product_id": "BTC-USD"}, status="paper")
-    _seed_paper_trade(repo, "turtle_breakout")
+    rule_id = repo.insert_rule("turtle_breakout", {"product_id": "BTC-USD"}, status="paper")
+    _seed_paper_trade(repo, "turtle_breakout", rule_id=rule_id)
 
     shown = _rules_records(repo)[0]
 
@@ -506,6 +513,233 @@ def test_a_rule_with_one_closed_trade_still_shows_numbers(repo: Repository) -> N
     for key in ("win_rate", "avg_win", "expectancy", "max_drawdown"):
         assert shown[key]["display"] != "—", key
     assert shown["gate"]["win_rate"]["display"] == "100.0%"
+
+
+# -- one record per rule, not per kind (#962) ----------------------------------------------------
+
+
+def _report(repo: Repository, **kwargs: Any) -> InsightsReport:
+    config = _config()
+    return build_insights_report(
+        repo, config, gather_status(repo, config, now_ts=NOW_TS), NOW_TS, **kwargs
+    )
+
+
+def _seed_two_turtles(repo: Repository) -> tuple[int, int]:
+    """Two paper rules of ONE kind: BTC with two wins, ETH with one loss."""
+    btc = repo.insert_rule("turtle_breakout", {"product_id": "BTC-USD"}, status="paper")
+    eth = repo.insert_rule("turtle_breakout", {"product_id": "ETH-USD"}, status="paper")
+    for i in range(2):
+        _seed_paper_trade(repo, "turtle_breakout", rule_id=btc, entry_ts=1000 + i, exit_ts=1100 + i)
+    _seed_paper_trade(
+        repo,
+        "turtle_breakout",
+        rule_id=eth,
+        product_id="ETH-USD",
+        exit_price="90",
+        pnl="-10",
+        r_multiple="-1.0",
+        outcome="loss",
+        entry_ts=3000,
+        exit_ts=3100,
+    )
+    return btc, eth
+
+
+def test_rules_of_one_kind_each_get_their_own_record(repo: Repository) -> None:
+    """#962: the records were keyed by KIND, so two turtle rules showed the kind's pooled figures
+    twice with nothing to tell them apart. Each record is now its own rule's trades, named by its
+    ledger id and product, and so is its gate."""
+    btc, eth = _seed_two_turtles(repo)
+
+    records = _report(repo).rules
+
+    assert [(r.rule_id, r.product_id, r.rule_name) for r in records] == [
+        (btc, "BTC-USD", "turtle_breakout"),
+        (eth, "ETH-USD", "turtle_breakout"),
+    ]
+    assert [(r.n_trades, r.win_rate) for r in records] == [(2, 1.0), (1, 0.0)]
+    gates = [r.gate for r in records]
+    assert all(g is not None for g in gates)
+    assert [(g.n_trades, g.win_rate) for g in gates if g is not None] == [(2, 1.0), (1, 0.0)]
+
+
+def test_a_rule_outside_the_scope_lends_its_trades_to_no_record(repo: Repository) -> None:
+    """A disabled rule's trades were pooled into the paper rule of the same kind. They are its
+    own, and it is not in the pipeline, so they appear nowhere in this report."""
+    retired = repo.insert_rule("turtle_breakout", {"product_id": "BTC-USD"}, status="disabled")
+    paper = repo.insert_rule("turtle_breakout", {"product_id": "ETH-USD"}, status="paper")
+    _seed_paper_trade(repo, "turtle_breakout", rule_id=retired)
+
+    records = _report(repo).rules
+
+    assert [(r.rule_id, r.n_trades) for r in records] == [(paper, 0)]
+
+
+def test_trades_with_no_rule_id_get_one_record_per_kind_after_the_rules(
+    repo: Repository,
+) -> None:
+    """A fill journalled with no `rule_id` belongs to no rule. It is shown -- dropping it would
+    hide a trade -- as ONE record for its kind, after the rules, with no id, no product and no
+    gate, never folded into a rule that shares the kind."""
+    btc, eth = _seed_two_turtles(repo)
+    _seed_paper_trade(repo, "turtle_breakout", entry_ts=5000, exit_ts=5100)
+    _seed_paper_trade(repo, "turtle_breakout", entry_ts=6000, exit_ts=6100)
+
+    records = _report(repo).rules
+
+    assert [(r.rule_id, r.status, r.n_trades) for r in records] == [
+        (btc, "paper", 2),
+        (eth, "paper", 1),
+        (None, "unattributed", 2),
+    ]
+    unattributed = records[-1]
+    assert unattributed.rule_name == "turtle_breakout"
+    assert unattributed.product_id is None
+    assert unattributed.gate is None
+    assert unattributed.promotion_class == records[0].promotion_class
+
+
+def test_a_rule_with_no_trades_of_its_own_is_not_lent_the_unattributed_ones(
+    repo: Repository,
+) -> None:
+    """The one rule of its kind, and no trade of its own: its record is the empty sample. The
+    unattributed trades are their own record, however natural it would be to hand them over."""
+    rule = repo.insert_rule("turtle_breakout", {"product_id": "BTC-USD"}, status="paper")
+    _seed_paper_trade(repo, "turtle_breakout")
+
+    records = _report(repo).rules
+
+    assert [(r.rule_id, r.n_trades) for r in records] == [(rule, 0), (None, 1)]
+    assert records[0].gate is not None and records[0].gate.n_trades == 0
+
+
+def test_unattributed_trades_of_a_kind_outside_the_scope_are_not_shown(repo: Repository) -> None:
+    """The unattributed record follows the kinds in scope: `--rule dca` shows no turtle row."""
+    repo.insert_rule("dca", {"product_id": "BTC-USD"}, status="paper")
+    _seed_paper_trade(repo, "turtle_breakout")
+
+    assert [r.rule_name for r in _report(repo).rules] == ["dca"]
+    assert _report(repo, rule_filter="turtle_breakout").rules == []
+
+
+def test_the_cli_names_each_records_rule_and_product(repo: Repository) -> None:
+    btc, eth = _seed_two_turtles(repo)
+    _seed_paper_trade(repo, "turtle_breakout", entry_ts=5000, exit_ts=5100)
+
+    lines = render_summary(_report(repo))
+    heads = [line.split(" status=")[0] for line in lines if line.startswith("  [")]
+
+    assert heads == [
+        f"  [turtle_breakout] rule={btc} product=BTC-USD",
+        f"  [turtle_breakout] rule={eth} product=ETH-USD",
+        "  [turtle_breakout] rule=n/a product=n/a",
+    ]
+    assert (
+        "    trades journalled with no rule id -- they belong to no one rule of this kind" in lines
+    )
+
+
+def test_the_json_summary_carries_each_records_rule_id(tmp_path, valid_config_path) -> None:
+    """`--json` is `asdict(report)`: the records gain `rule_id` and `product_id`, and keep every
+    key they had."""
+    db_path = tmp_path / "keel.db"
+    repo = _repo_at(db_path)
+    btc, eth = _seed_two_turtles(repo)
+    repo._conn.commit()
+
+    result = CliRunner().invoke(
+        cli,
+        ["--config", str(valid_config_path), "--db", str(db_path), "insights", "summary", "--json"],
+    )
+
+    assert result.exit_code == 0, result.output
+    rules = json.loads(result.output)["rules"]
+    assert [(r["rule_id"], r["product_id"], r["n_trades"]) for r in rules] == [
+        (btc, "BTC-USD", 2),
+        (eth, "ETH-USD", 1),
+    ]
+    assert set(rules[0]) == {
+        "rule_name",
+        "rule_id",
+        "product_id",
+        "status",
+        "promotion_class",
+        "n_trades",
+        "win_rate",
+        "avg_win",
+        "avg_loss",
+        "realized_rr",
+        "expectancy",
+        "profit_factor",
+        "max_drawdown",
+        "significant",
+        "gate",
+    }
+
+
+# -- an empty side is unknown, not $0.00 (#965) ---------------------------------------------------
+
+
+def test_an_all_wins_record_has_no_average_loss(repo: Repository) -> None:
+    btc, _eth = _seed_two_turtles(repo)
+
+    record = next(r for r in _report(repo).rules if r.rule_id == btc)
+
+    assert record.avg_win == Decimal("10")
+    assert record.avg_loss is None
+
+
+def test_an_all_losses_record_has_no_average_win(repo: Repository) -> None:
+    _btc, eth = _seed_two_turtles(repo)
+
+    record = next(r for r in _report(repo).rules if r.rule_id == eth)
+
+    assert record.avg_win is None
+    assert record.avg_loss == Decimal("-10")
+
+
+def test_an_empty_side_reads_unknown_on_the_rules_page(repo: Repository) -> None:
+    _seed_two_turtles(repo)
+
+    wins_only, losses_only = _rules_records(repo)
+
+    assert wins_only["avg_loss"]["display"] == "—"
+    assert wins_only["avg_loss"]["state"] == "unknown"
+    assert wins_only["avg_win"]["display"] != "—"
+    assert losses_only["avg_win"]["display"] == "—"
+    assert losses_only["avg_win"]["state"] == "unknown"
+    assert losses_only["avg_loss"]["display"] != "—"
+
+
+def test_an_empty_side_prints_n_a_at_the_terminal(repo: Repository) -> None:
+    btc, eth = _seed_two_turtles(repo)
+
+    lines = [line for line in render_summary(_report(repo)) if line.startswith("  [")]
+
+    assert "avg_win=10.00 avg_loss=n/a rr=" in lines[0]
+    assert "avg_win=n/a avg_loss=-10.00 rr=" in lines[1]
+
+
+def test_an_empty_side_leaves_the_gate_verdict_exactly_as_check_floors_gives_it(
+    repo: Repository,
+) -> None:
+    """#965 is display only. The engine's sample still holds 0 for the empty side -- `promotion`
+    reads it (`pool_stats` weights it by a zero count; `_realized_rr` turns a zero `avg_loss_r`
+    into Infinity) -- and the gate's verdict and reasons are `check_floors` on that sample."""
+    from keel.strategy.paper import track_records_by_rule
+    from keel.strategy.promotion import check_floors
+
+    btc, eth = _seed_two_turtles(repo)
+    by_rule = track_records_by_rule(repo, "turtle_breakout")
+    assert by_rule[btc].avg_loss == Decimal(0) and by_rule[eth].avg_win == Decimal(0)
+    floor = floor_for_class("trend_follow", default=_default_floor(_config()))
+
+    for record in _report(repo).rules:
+        assert record.rule_id is not None and record.gate is not None
+        assert (record.gate.passing, record.gate.blocking_reasons) == check_floors(
+            by_rule[record.rule_id], floor
+        )
 
 
 # -- build_journal_report -----------------------------------------------------------------------
@@ -759,6 +993,8 @@ def test_render_summary_quantizes_ratio_to_two_decimal_places() -> None:
     )
     rule = RuleTrackRecord(
         rule_name="dca",
+        rule_id=7,
+        product_id="BTC-USD",
         status="live",
         promotion_class="default",
         n_trades=40,

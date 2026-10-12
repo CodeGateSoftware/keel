@@ -156,6 +156,8 @@ def _insights_report(**overrides: Any) -> InsightsReport:
         rules=[
             RuleTrackRecord(
                 rule_name="turtle_breakout",
+                rule_id=10,
+                product_id="BTC-USD",
                 status="paper",
                 promotion_class="trend",
                 n_trades=12,
@@ -876,6 +878,34 @@ def test_the_closed_trade_count_is_read_from_the_report_not_measured_here() -> N
 
     assert built["closed_trade_count"]["value"] == "812"
     assert len(built["records"]) == 1
+
+
+def test_each_track_record_names_its_rule_by_ledger_id_and_product() -> None:
+    """#962: a record's `rule_name` is its KIND, so several rules of one kind read alike; the
+    ledger id and product tell them apart. Identifiers, so bare strings like `_rule_row_payload`'s
+    `id`. A record of trades journalled with no rule id has neither, and sends `None` -- never an
+    empty string the client would draw as a blank id."""
+    attributed = _insights_report().rules[0]
+    unattributed = replace(attributed, rule_id=None, product_id=None, status="unattributed")
+
+    built = payload.rules_payload([], records=_insights_report(rules=[attributed, unattributed]))
+
+    assert [(r["rule_name"], r["rule_id"], r["product_id"]) for r in built["records"]] == [
+        ("turtle_breakout", "10", "BTC-USD"),
+        ("turtle_breakout", None, None),
+    ]
+    assert built["records"][1]["status"]["display"] == "unattributed"
+
+
+def test_an_empty_side_of_the_sample_is_absent_not_zero() -> None:
+    """#965: the report holds `None` for an average with no trade on its side; the page draws the
+    absent mark, not $0.00, and the other side keeps its figure."""
+    record = replace(_insights_report().rules[0], avg_loss=None)
+
+    built = payload.rules_payload([], records=_insights_report(rules=[record]))["records"][0]
+
+    assert built["avg_loss"] == payload.absent()
+    assert built["avg_win"]["display"] == "$31.20"
 
 
 def test_every_field_carries_all_three_keys_always() -> None:

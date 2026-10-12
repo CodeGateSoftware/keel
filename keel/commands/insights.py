@@ -29,7 +29,8 @@ diary: emotion_score, rules_followed, etc.) with no accessor. `keel insights jou
 or writes it -- it is built entirely off `trade_outcomes` (see `Repository.get_trade_outcomes`).
 
 **On `--mode`:** `paper.track_record` is inherently paper-mode/R-aware regardless of a rule's
-current lifecycle `status` (it just replays `orders(mode='paper')` for a given rule name), so
+current lifecycle `status` (it just replays `orders(mode='paper')` -- per rule, by
+`orders.rule_id`, since #962 -- see `paper.track_records_by_rule`), so
 `--mode` does not change *how* stats are computed -- it selects *which* rules the report scopes
 to: `paper` (the default) shows rules still in the proving pipeline (`candidate`/`paper` status,
 i.e. "how close to promotion"); `live` shows rules already promoted and trading (`live` status,
@@ -54,7 +55,7 @@ from keel.commands._common import DISCLAIMER, _load_cfg, _open_repo
 from keel.commands.status import StatusReport, _human_age, gather_status
 from keel.config import Config
 from keel.data.repository import Repository
-from keel.strategy.paper import track_record
+from keel.strategy.paper import track_record, track_records_by_rule
 from keel.strategy.promotion import (
     PromotionConfig,
     check_floors,
@@ -62,6 +63,7 @@ from keel.strategy.promotion import (
     promotion_class_of,
 )
 from keel.strategy.rules.base import Rule
+from keel.strategy.stats import summarize
 
 # -- the pure report shapes -----------------------------------------------------------------
 
@@ -604,13 +606,28 @@ class GateDistance:
 
 @dataclass(frozen=True)
 class RuleTrackRecord:
+    """One rule's paper track record (#962: one per ledger ROW, not per kind).
+
+    `rule_name` is the rule's KIND (the `rules` table has no name column; `promotion` says why),
+    so it alone cannot tell two rules of one kind apart -- `rule_id` and `product_id` do. A record
+    with `rule_id=None` and `status="unattributed"` holds the kind's paper trades journalled with
+    no `orders.rule_id`: they belong to no one rule, and are shown rather than dropped or folded
+    into a rule that shares the kind (`build_insights_report`).
+    """
+
     rule_name: str
+    rule_id: int | None
+    product_id: str | None
     status: str
     promotion_class: str
     n_trades: int
     win_rate: float
-    avg_win: Decimal
-    avg_loss: Decimal
+    avg_win: Decimal | None
+    """`None` when the sample has no winning trade (#965). `BacktestResult` holds 0 there, a
+    figure `promotion.pool_stats` multiplies by a zero count; as a reading it is unknown, not
+    $0.00, so the report says so and the CLI prints "n/a"."""
+    avg_loss: Decimal | None
+    """`None` when the sample has no losing trade -- `avg_win`'s rule, on the loss side."""
     realized_rr: Decimal | None
     expectancy: Decimal
     profit_factor: Decimal
@@ -719,40 +736,93 @@ def _human_dt(ts: int) -> str:
     return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(ts))
 
 
+def _side_average(stats: Any, outcome: str, average: Decimal) -> Decimal | None:
+    """`average` (the sample's `avg_win` or `avg_loss`), or `None` when no closed trade in the
+    sample has `outcome` (#965). Decided by COUNTING that side's trades, not by reading the
+    average as zero: `BacktestResult` writes 0 for an empty side, and 0 is a value a reader
+    takes as measured."""
+    if not any(trade.outcome == outcome for trade in stats.trades):
+        return None
+    return average
+
+
+def _rule_and_class(row: dict[str, Any]) -> tuple[Rule | None, str]:
+    """`row`'s built rule and promotion class -- `(None, "default")` when its kind is no longer
+    in `RULE_REGISTRY` (`agent._build_rule` raises `ValueError` for that)."""
+    try:
+        rule = agent_mod._build_rule(row)
+    except ValueError:
+        return None, "default"
+    return rule, promotion_class_of(rule)
+
+
 def build_rule_track_record(
     row: dict[str, Any], stats: Any, default_floor: PromotionConfig
 ) -> RuleTrackRecord:
     """Aggregate `row` (a `repo.get_rules()` row) + its paper `stats` into a `RuleTrackRecord`.
 
+    `stats` is THIS rule's sample -- `track_records_by_rule(repo, kind)[row["id"]]` -- and the
+    gate is judged on it, so a gate card is one rule's distance, like its record (#962).
+
     Degrades gracefully -- promotion_class="default", gate=None -- when `row["kind"]` is no
-    longer in `RULE_REGISTRY` (`agent._build_rule` raises `ValueError` for that), rather than
-    crashing the whole report over one stale row.
+    longer in `RULE_REGISTRY`, rather than crashing the whole report over one stale row.
     """
-    try:
-        rule = agent_mod._build_rule(row)
-        promotion_class = promotion_class_of(rule)
-    except ValueError:
-        rule = None
-        promotion_class = "default"
+    rule, promotion_class = _rule_and_class(row)
 
     gate: GateDistance | None = None
     if row["status"] == "paper" and rule is not None:
         gate = build_gate_distance(rule, stats, default_floor)
 
+    product_id = (row.get("params") or {}).get("product_id")
     return RuleTrackRecord(
         rule_name=row["kind"],
+        rule_id=int(row["id"]),
+        product_id=str(product_id) if product_id is not None else None,
         status=row["status"],
         promotion_class=promotion_class,
         n_trades=stats.n_trades,
         win_rate=stats.win_rate,
-        avg_win=stats.avg_win,
-        avg_loss=stats.avg_loss,
+        avg_win=_side_average(stats, "win", stats.avg_win),
+        avg_loss=_side_average(stats, "loss", stats.avg_loss),
         realized_rr=_realized_rr_for_display(stats),
         expectancy=stats.expectancy,
         profit_factor=stats.profit_factor,
         max_drawdown=stats.max_drawdown,
         significant=stats.n_trades >= 30,
         gate=gate,
+    )
+
+
+#: The `status` of the record that holds a kind's trades journalled with no rule id.
+UNATTRIBUTED = "unattributed"
+
+
+def build_unattributed_track_record(kind_row: dict[str, Any], stats: Any) -> RuleTrackRecord:
+    """The record of `kind_row`'s KIND's paper trades journalled with no `orders.rule_id`.
+
+    They belong to no one rule: no id, no product, no gate (a gate is one rule's distance to
+    promotion, and these trades are no rule's evidence). The promotion class is a property of
+    the kind, so it is read off `kind_row`, a rule of that kind in scope. Shown rather than
+    dropped -- a hidden trade is a gap in the record nobody can see -- and never folded into a
+    rule that shares the kind, which would hand that rule another's trades (#962).
+    """
+    _rule, promotion_class = _rule_and_class(kind_row)
+    return RuleTrackRecord(
+        rule_name=kind_row["kind"],
+        rule_id=None,
+        product_id=None,
+        status=UNATTRIBUTED,
+        promotion_class=promotion_class,
+        n_trades=stats.n_trades,
+        win_rate=stats.win_rate,
+        avg_win=_side_average(stats, "win", stats.avg_win),
+        avg_loss=_side_average(stats, "loss", stats.avg_loss),
+        realized_rr=_realized_rr_for_display(stats),
+        expectancy=stats.expectancy,
+        profit_factor=stats.profit_factor,
+        max_drawdown=stats.max_drawdown,
+        significant=stats.n_trades >= 30,
+        gate=None,
     )
 
 
@@ -785,9 +855,20 @@ def build_insights_report(
     else:
         rows = [r for r in rows if r["status"] in _PAPER_PIPELINE_STATUSES]
 
+    # One read of the paper journal per KIND, split by the rule that journalled each trade (#962).
+    by_kind = {
+        kind: track_records_by_rule(repo, kind) for kind in dict.fromkeys(r["kind"] for r in rows)
+    }
+    no_trades = summarize([])
     rules = [
-        build_rule_track_record(row, track_record(repo, row["kind"]), default_floor) for row in rows
+        build_rule_track_record(row, by_kind[row["kind"]].get(row["id"], no_trades), default_floor)
+        for row in rows
     ]
+    # Trades journalled with no rule id, after the rules: one record per kind in scope.
+    for kind, partitions in by_kind.items():
+        if None in partitions:
+            first_row = next(r for r in rows if r["kind"] == kind)
+            rules.append(build_unattributed_track_record(first_row, partitions[None]))
 
     return InsightsReport(
         now_ts=now_ts,
@@ -956,6 +1037,8 @@ _SMALL_SAMPLE_NOTE = (
     "proven edge"
 )
 
+_UNATTRIBUTED_NOTE = "trades journalled with no rule id -- they belong to no one rule of this kind"
+
 _TWO_DP = Decimal("0.01")
 
 
@@ -1011,12 +1094,18 @@ def render_summary(report: InsightsReport) -> list[str]:
     lines.append(f"rule track record ({len(report.rules)}):")
     for r in report.rules:
         rr = r.realized_rr if r.realized_rr is not None else "n/a (no losses yet)"
+        rule_id = r.rule_id if r.rule_id is not None else "n/a"
+        avg_win = _money(r.avg_win) if r.avg_win is not None else "n/a"
+        avg_loss = _money(r.avg_loss) if r.avg_loss is not None else "n/a"
         lines.append(
-            f"  [{r.rule_name}] status={r.status} class={r.promotion_class} n={r.n_trades} "
-            f"win_rate={r.win_rate:.1%} avg_win={_money(r.avg_win)} avg_loss={_money(r.avg_loss)} "
+            f"  [{r.rule_name}] rule={rule_id} product={r.product_id or 'n/a'} "
+            f"status={r.status} class={r.promotion_class} n={r.n_trades} "
+            f"win_rate={r.win_rate:.1%} avg_win={avg_win} avg_loss={avg_loss} "
             f"rr={_ratio(rr)} expectancy={_money(r.expectancy)} "
             f"profit_factor={_ratio(r.profit_factor)} max_dd={_money(r.max_drawdown)}"
         )
+        if r.status == UNATTRIBUTED:
+            lines.append(f"    {_UNATTRIBUTED_NOTE}")
         if not r.significant:
             lines.append(f"    {_SMALL_SAMPLE_NOTE}")
         if r.gate is not None:
