@@ -36,10 +36,8 @@ def _strip_sidecars(db_path: str) -> None:
     """Leave the database the way a checkpointing last close leaves it: one file, no `-wal`, no
     `-shm`. Some SQLite builds keep the sidecars on close (persistent WAL), so the state is made
     explicitly rather than hoped for -- after a TRUNCATE checkpoint the WAL holds nothing, so
-    removing the files loses no committed row.
-
-    It then proves the state reaches the bug: a `mode=ro` open must fail here, or every test below
-    would pass by vacuum."""
+    removing the files loses no committed row. Whether `mode=ro` can open this state depends on
+    the SQLite build; `test_the_scratch_state_is_the_one_976_reported` says which one this is."""
     conn = sqlite3.connect(db_path)
     try:
         assert conn.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
@@ -49,12 +47,31 @@ def _strip_sidecars(db_path: str) -> None:
     for suffix in ("-wal", "-shm"):
         Path(db_path + suffix).unlink(missing_ok=True)
     assert sorted(p.name for p in Path(db_path).parent.glob("keel.db*")) == ["keel.db"]
+
+
+def _mode_ro_opens(db_path: str) -> bool:
     ro = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
     try:
-        with pytest.raises(sqlite3.OperationalError, match="unable to open"):
-            ro.execute("SELECT 1 FROM rules").fetchall()
+        ro.execute("SELECT 1 FROM rules").fetchall()
+    except sqlite3.OperationalError as exc:
+        assert "unable to open" in str(exc), exc
+        return False
     finally:
         ro.close()
+    return True
+
+
+def test_the_scratch_state_is_the_one_976_reported(deployment: tuple[str, str]) -> None:
+    """The fixture reaches the bug: on a SQLite build like the one #976 was found on (macOS,
+    3.51.0), `mode=ro` cannot open the sidecar-less file -- which is what every test below then
+    reads successfully. Some builds (Linux CI) create the `-shm` even under `mode=ro`; there the
+    old open worked too, the tests below still pin the read-only half, and this one says so
+    rather than passing by vacuum."""
+    db_path, _config_path = deployment
+    _strip_sidecars(db_path)
+    if _mode_ro_opens(db_path):
+        pytest.skip("this SQLite build opens a sidecar-less WAL database under mode=ro")
+    assert not Path(db_path + "-shm").exists()
 
 
 def _kill_switch(db_path: str) -> object:
