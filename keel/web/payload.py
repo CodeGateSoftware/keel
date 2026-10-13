@@ -105,6 +105,11 @@ from collections.abc import Mapping, Sequence
 from decimal import Decimal, InvalidOperation
 from typing import TYPE_CHECKING, Any, TypedDict
 
+# The words and the rendering of a track-record ratio with no value (#979), imported so the page
+# cell and `keel insights summary` print the same thing -- the reason `_human_age` is imported
+# below. Service layer, which this layer may read.
+from keel.commands.insights import NO_LOSSES_YET, undefined_reading
+
 # The CLI's own words for "how long ago" and "how much longer". Imported rather than
 # re-implemented so the browser and the terminal can never disagree about the age of the same
 # candle -- `keel/commands/insights.py` reaches into `status.py` for `_human_age` the same way,
@@ -1115,7 +1120,24 @@ def pulse_payload(report: PulseReport, *, halt_token: str = "") -> dict[str, Any
 # -- track records (on /api/rules since console PR3) ---------------------------------------------
 
 
-def _gate_payload(gate: GateDistance) -> dict[str, Any]:
+def _undefined_ratio(reason: str) -> Field:
+    """A ratio with nothing to divide by, in the CLI's words (#979): `n/a (no losses yet)`.
+
+    No `value`: there is no finite figure to re-parse, and `Infinity` on the wire would be the
+    serialiser inventing one. The STATE is the judgement: no losses yet is a known fact about the
+    sample -- the ratio is unbounded, and the gate treats it as clearing -- so it is `neutral`,
+    not the `unknown` that `absent()` would have said. Any other empty side (no wins, or neither)
+    leaves the ratio unmeasured, and that stays `unknown`."""
+    state = NEUTRAL if reason == NO_LOSSES_YET else UNKNOWN
+    return {"value": "", "display": undefined_reading(reason), "state": state}
+
+
+def _record_ratio(figure: Decimal | None, reason: str | None) -> Field:
+    """A traded record's ratio: the figure, or why there is none."""
+    return ratio(figure) if reason is None else _undefined_ratio(reason)
+
+
+def _gate_payload(gate: GateDistance, rr_reason: str | None) -> dict[str, Any]:
     """The promotion gate's distance. `passing` is the engine's verdict, copied; the floors are
     the config's own values, copied. Nothing here re-runs `check_floors`.
 
@@ -1123,7 +1145,11 @@ def _gate_payload(gate: GateDistance) -> dict[str, Any]:
     units (`win_rate_pct`) so `percent` only suffixes. The rule's OWN figures (win rate,
     expectancy) are unknown at zero trades -- `BacktestResult` returns 0 for an empty sample, and
     serialising that as data shows unknown as zero. The floors, the counts and the distance
-    remaining are known at zero trades and stay numbers."""
+    remaining are known at zero trades and stay numbers.
+
+    `rr_reason` is the record's `realized_rr_reason`: the gate is judged on the record's own
+    sample (`build_rule_track_record`), so its R:R is undefined for the same reason, worded the
+    same way (#979)."""
     traded = gate.n_trades != 0
     return {
         "rule_name": gate.rule_name,
@@ -1135,7 +1161,7 @@ def _gate_payload(gate: GateDistance) -> dict[str, Any]:
         ),
         "win_rate": percent(gate.win_rate_pct, places=1) if traded else absent(),
         "min_win_rate": percent(gate.min_win_rate_pct, places=1),
-        "realized_rr": ratio(gate.realized_rr),
+        "realized_rr": _record_ratio(gate.realized_rr, rr_reason) if traded else absent(),
         "min_rr": ratio(gate.min_rr),
         "expectancy": money(gate.expectancy, places=4, signed=True) if traded else absent(),
         "min_expectancy": money(gate.min_expectancy, places=4),
@@ -1152,7 +1178,11 @@ def _track_record_payload(record: RuleTrackRecord) -> dict[str, Any]:
 
     One side of a TRADED sample can be empty too -- all wins, so no average loss (#965). The
     report says so itself (`avg_win`/`avg_loss` are `None`), and `money(None)` is `absent()`:
-    nothing here works the empty side out from the win rate and the count.
+    nothing here works the empty side out from the win rate and the count. The two RATIOS that
+    divide by a side -- realized R:R and profit factor -- print the report's own reason for an
+    empty side instead (#979), so an all-wins profit factor reads "n/a (no losses yet)" here and
+    at the terminal, never "—" or "Infinity"; an all-losses profit factor of 0 is measured and
+    stays a number.
 
     `rule_name` is the rule's KIND; `rule_id` and `product_id` are what tell two rules of one kind
     apart (#962). Identifiers, so bare strings like `_rule_row_payload`'s `id`; `None` on the
@@ -1168,9 +1198,13 @@ def _track_record_payload(record: RuleTrackRecord) -> dict[str, Any]:
         "win_rate": percent(record.win_rate_pct, places=1) if traded else absent(),
         "avg_win": money(record.avg_win) if traded else absent(),
         "avg_loss": money(record.avg_loss) if traded else absent(),
-        "realized_rr": ratio(record.realized_rr),
+        "realized_rr": (
+            _record_ratio(record.realized_rr, record.realized_rr_reason) if traded else absent()
+        ),
         "expectancy": money(record.expectancy, places=4, signed=True) if traded else absent(),
-        "profit_factor": ratio(record.profit_factor) if traded else absent(),
+        "profit_factor": (
+            _record_ratio(record.profit_factor, record.profit_factor_reason) if traded else absent()
+        ),
         "max_drawdown": money(record.max_drawdown) if traded else absent(),
         # `significant` is `n_trades >= 30`, computed by the report. Below that floor a win rate
         # is not distinguishable from random entry, so the payload SAYS so rather than leaving the
@@ -1182,7 +1216,11 @@ def _track_record_payload(record: RuleTrackRecord) -> dict[str, Any]:
             on_state=NEUTRAL,
             off_state=WARN,
         ),
-        "gate": _gate_payload(record.gate) if record.gate is not None else None,
+        "gate": (
+            _gate_payload(record.gate, record.realized_rr_reason)
+            if record.gate is not None
+            else None
+        ),
     }
 
 
