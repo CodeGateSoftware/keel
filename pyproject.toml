@@ -38,7 +38,7 @@ dependencies = [
 keel = "keel.cli:main"
 
 [build-system]
-requires = ["uv_build>=0.10.4,<0.13.0"]
+requires = ["uv_build>=0.10.4,<0.14.0"]
 build-backend = "uv_build"
 
 [tool.uv.build-backend]
@@ -51,7 +51,7 @@ module-name = "keel"
 # fresh install, and (#535) the web UI's static assets so `keel serve` has something to serve
 # from an installed wheel rather than a checkout.
 #
-# ⚠️ Measured against the pinned uv_build (`uv_build>=0.10.4,<0.13.0`, resolving to 0.11.31 as
+# ⚠️ Measured against the pinned uv_build (`uv_build>=0.10.4,<0.14.0`, resolving to 0.11.31 as
 # of #535): this key has NO observable effect. `artifacts` does not appear in uv_build's
 # documented `[tool.uv.build-backend]` schema (`module-root`, `module-name`, `namespace`, `data`,
 # `source-include`, `source-exclude`, `wheel-exclude`, `default-excludes`), and removing this
