@@ -42,6 +42,7 @@ from keel import agent
 from keel.analysis import indicators
 from keel.commands._common import _load_cfg, _open_repo, with_disclaimer
 from keel.commands._products import parse_products_option
+from keel.commands.insights import profit_factor_reason_of, undefined_reading
 from keel.compliance import screen as screen_mod
 from keel.data.history import GRANULARITY_SECONDS
 from keel.data.repository import Repository
@@ -624,6 +625,16 @@ def _r_text(value: Decimal | None) -> str:
     return "n/a" if value is None else str(value)
 
 
+def _profit_factor_text(stats: backtest_mod.BacktestResult) -> str:
+    """The profit factor for the `rules backtest` line: the engine's value when it is a
+    measurement, else `keel insights summary`'s reading of the empty side (#988) -- `n/a (no
+    losses yet)` for the all-wins `Infinity`, `n/a (no wins or losses yet)` for an all-scratch
+    0/0, `n/a (no trades yet)` for no closed trade. An all-losses 0 is measured and stays 0.
+    Display only: the returned `BacktestResult` keeps the engine's value."""
+    reason = profit_factor_reason_of(stats)
+    return str(stats.profit_factor) if reason is None else undefined_reading(reason)
+
+
 def run_rule_backtest(
     repo: Repository,
     config: Any | None,
@@ -652,7 +663,7 @@ def run_rule_backtest(
         f"rule {rule_id} ({resolved.row['kind']}): n_trades={stats.n_trades} "
         f"win_rate={stats.win_rate:.2%} expectancy_r={_r_text(stats.expectancy_r)} "
         f"max_drawdown_r={_r_text(stats.max_drawdown_r)} "
-        f"profit_factor={stats.profit_factor} expectancy_px={stats.expectancy} "
+        f"profit_factor={_profit_factor_text(stats)} expectancy_px={stats.expectancy} "
         f"max_drawdown_px={stats.max_drawdown} (px = price units, 1-coin notional) "
         f"{_describe_fee(resolved.fee_pct, resolved.fee_source)}"
     )
