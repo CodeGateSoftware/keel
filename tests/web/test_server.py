@@ -2953,9 +2953,11 @@ def test_a_post_to_pulse_after_the_lifetime_is_served_no_halt(deployment) -> Non
 
 
 def test_the_halt_an_expired_pulse_serves_opens_no_release(deployment) -> None:
-    """The token the expired refusal serves is the halt token (#968): it releases nothing, in
-    either header, with the real phrase. The kill switch is engaged first, so a release that got
-    through would show."""
+    """The token the expired refusal serves is the halt token, not the gates token (#968), and
+    with it the expired session still releases nothing. The first is asserted on the token
+    itself; the second on each release being refused by the expiry gate ("Session expired"), so
+    the refusal is that gate's and not an incidental one. The kill switch is engaged first, so a
+    release that got through would show."""
     _set_kill_switch(deployment[0], True)
     with _serving(deployment, external_hosts=_REMOTE, started_at=_expired()) as cfg:
         _status, _headers, body = _request(cfg, "/api/pulse", cookie=_session(cfg))
@@ -2968,15 +2970,20 @@ def test_the_halt_an_expired_pulse_serves_opens_no_release(deployment) -> None:
                 cookie=_session(cfg),
                 **{header: served},
                 raw_body=json.dumps({"phrase": phrase}),
-            )[0]
+            )
             for route, phrase in (
                 ("/api/gates/resume", "RESUME TRADING"),
                 ("/api/gates/resume-entries", "CLEAR STREAK HALT"),
             )
             for header in ("halt", "gate")
         ]
+        halt = security.halt_token(cfg.token)
+        gates = security.gates_token(cfg.token)
 
-    assert refusals == [403, 403, 403, 403]
+    assert served == halt
+    assert served != gates
+    assert [status for status, _h, _b in refusals] == [403, 403, 403, 403]
+    assert [json.loads(b)["error"]["title"] for _s, _h, b in refusals] == ["Session expired"] * 4
     assert _kill_switch(deployment[0]) is True
 
 

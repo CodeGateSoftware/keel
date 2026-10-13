@@ -348,7 +348,14 @@ def read_pulse(cfg: ServeConfig, _query: Query, _state: Any, now_ts: int) -> dic
 
 
 def pulse_halt(cfg: ServeConfig) -> dict[str, str]:
-    """The HALT control's inputs when the Pulse report could not be built (#958).
+    """The HALT control's inputs when the Pulse report could not be built (#958), and for the
+    expired-session refusal of that read (#985).
+
+    Two callers, one shape. The Pulse route calls it when `gather_pulse` fails; and
+    `server.KeelHandler._expired_pulse_halt` calls it on the remote-lifetime refusal, for a request
+    carrying this session's cookie only, before admission completes. There the kill-switch reading
+    below is the only ledger read, read-only -- the same read as on #958's path -- so an expired
+    session reaches no report, no other table and no write.
 
     `halt_token` is minted from the session, so it cannot fail. The kill-switch reading is the one
     ledger read here, through its own repo open and `pulse.halt_resume_command` -- never through
