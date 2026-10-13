@@ -1154,8 +1154,10 @@ def test_only_pulse_carries_the_halt_on_a_failure(
 
 
 def test_a_refused_pulse_carries_no_halt(running: web_server.ServeConfig) -> None:
-    """Before admission there is no session, so there is nothing to hand a halt token to: the
-    pre-admission refusal carries `halt: null` like every other refusal."""
+    """A GET of `/api/pulse` with no session cookie is refused before admission, and there is no
+    session to hand a halt token to: that refusal carries `halt: null` like every other. Since
+    #985 the one exception is the expired-lifetime refusal to a request bearing this session's
+    cookie, which carries the halt; it is pinned in tests/web/test_server.py, not here."""
     status, _headers, body = _get(running, "/api/pulse")
 
     assert status == 403

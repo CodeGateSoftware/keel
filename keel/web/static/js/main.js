@@ -639,16 +639,22 @@ async function paint(route, rebuild, force) {
     // refused this browser. The two 403s (`_admitted`'s host check and its session check) share
     // this branch on purpose. They have the same remedy from the operator's side: the address
     // keel printed is what admits this browser, and pasting it is the action either one needs.
-      if (primary.error && primary.error.status === REFUSED_STATUS) {
-        rebuildInto(refusedView(primary, reconnect), Boolean(force));
-      } else if (route.name === "pulse" && primary.halt) {
-        // #958: Pulse's report failed to build, and the failure still carries the HALT control's
-        // inputs. The stop is offered anyway -- stopping is never slower than starting
+    //
+    // The HALT arm comes FIRST, ahead of the 403 (#985). Two Pulse answers carry `halt`: #958's
+    // failed report, and the expired remote session's 403, which the server sends with `halt`
+    // only to this session's cookie (`server._expired_pulse_halt`) -- since #983 it accepts the
+    // halt past the lifetime, and a reloaded console has no other way to get the token. Every
+    // other 403 carries `halt: null` and reaches the reconnect field as before. The branch is on
+    // the PRESENCE of `halt`, never on the refusal's title.
+      if (route.name === "pulse" && primary.halt) {
+        // The stop is offered anyway -- stopping is never slower than starting
         // (`keel/web/gates.py`) -- through the same token holder `mount` uses and the same
-        // control `pulseView` draws. Not the stopped view: keel is running, and that view
-        // offers no stop.
+        // control `pulseView` draws, with the failure's or the refusal's own words under it.
+        // Not the stopped view: keel is running, and that view offers no stop.
         rememberHaltToken(primary.halt);
         rebuildInto(pulseFailedView(primary), Boolean(force));
+      } else if (primary.error && primary.error.status === REFUSED_STATUS) {
+        rebuildInto(refusedView(primary, reconnect), Boolean(force));
       } else {
         rebuildInto(stoppedView(primary, pathFor(SETUP_ROUTE)), Boolean(force));
       }

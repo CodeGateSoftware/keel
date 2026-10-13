@@ -52,7 +52,8 @@ Five independent layers, none of which is sufficient alone:
    `HttpOnly` and must never be written into the page.
 
    One derivation per surface, never one shared: `csrf_token` for a setup step (served on
-   `/api/setup`), `halt_token` for the halt (served on `/api/pulse`), and `gates_token` for a
+   `/api/setup`), `halt_token` for the halt (served on `/api/pulse` -- in its document, or in its
+   expired-session refusal to the session's own cookie, #985), and `gates_token` for a
    Tier 1 release -- which is served by NO endpoint (#968), so a browser session can stop keel
    and cannot restart it. Each route checks its own token in its own header.
 
@@ -126,8 +127,11 @@ SESSION_COOKIE_MAX_AGE_SECONDS = 30 * 24 * 60 * 60
 #: a stop is the one failure mode the console must not have, and what a leaked token gains from
 #: the exemption is the power to halt -- undone by `keel resume` at a terminal, never a release.
 #: It serves a console still showing a Pulse from before the lifetime ended, or any client holding
-#: the token; a reloaded console cannot get the token (`/api/pulse` keeps the lifetime), so its
-#: HALT waits on #985 and the refusal names `keel kill` meanwhile.
+#: the token. A reloaded console gets the token from the expiry refusal itself: on `/api/pulse`,
+#: and for a request carrying this session's cookie only, that refusal carries the HALT control's
+#: `{halt_token, resume_command}` (`server.KeelHandler._expired_pulse_halt`, #985). It re-opens
+#: no read and no other endpoint serves the token. The refusal still names `keel kill`, for a
+#: browser with no cached shell, which is refused the page that would draw the button.
 REMOTE_SESSION_MAX_AGE_SECONDS = 12 * 60 * 60
 
 #: ⛔ THE BRUTE-FORCE ARITHMETIC, WRITTEN DOWN SO NOBODY ADDS A RATE LIMITER FOR THE WRONG

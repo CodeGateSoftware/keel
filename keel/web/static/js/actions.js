@@ -63,7 +63,8 @@ import { runAction, runHalt } from "./api.js";
 let token = "";
 
 /**
- * This session's halt token, from `/api/pulse`'s `data.halt_token`.
+ * This session's halt token, from `/api/pulse`'s `data.halt_token` -- or its failure's or
+ * expired-session refusal's `halt.halt_token` (#958, #985), handed in the same shape.
  *
  * `""` until a pulse document has been read, for `token`'s reason: the only thing that can halt
  * is a form this client drew from that document. An empty gate reaches the server and is refused

@@ -769,9 +769,12 @@ def test_a_refusal_is_not_painted_as_an_outage(running: server.ServeConfig) -> N
     # `refusedView` anywhere in the file passes against a guard that is inverted, one that is
     # dead (`false &&`), one that reads `primary.data` instead of `primary.error`, and one that
     # sits AFTER the `stoppedView` call and can therefore never run -- four edits that each
-    # restore the "keel isn't running" lie.
+    # restore the "keel isn't running" lie. Since #985 it is an `else if`, after the HALT arm a
+    # Pulse answer carrying `halt` takes (`test_pulse_view` pins that order); that prefix and no
+    # other is allowed.
     guard = re.search(
-        r"^\s*if \(primary\.error && primary\.error\.status === REFUSED_STATUS\) \{\s*$",
+        r"^\s*(?:\} else )?if \(primary\.error && primary\.error\.status === REFUSED_STATUS\) "
+        r"\{\s*$",
         main,
         re.MULTILINE,
     )

@@ -286,23 +286,30 @@ def _paint() -> str:
     return code[start : code.index("\n}\n", start)]
 
 
-def test_a_failed_pulse_paints_the_halt_before_the_stopped_view() -> None:
-    """In `paint`'s `data: null` branch, a Pulse failure that carries `halt` gets its own view --
-    after the 403 branch (a refusal carries `halt: null` and needs the reconnect field), before
-    the stopped view (which offers no stop). The halt token is taken off that failure exactly as
-    `mount` takes it off a built report: through `rememberHaltToken`, the one holder."""
+def test_a_failed_pulse_paints_the_halt_before_the_refused_and_stopped_views() -> None:
+    """In `paint`'s `data: null` branch, a Pulse answer that carries `halt` gets the halt view
+    FIRST -- before the 403 branch and before the stopped view (which offers no stop). Two answers
+    carry it: #958's failed report (a 500), and since #985 the expired remote session's 403, which
+    the server sends with `halt` only for this session's cookie. Every other 403 carries
+    `halt: null` and still reaches the reconnect field. The branch is on the PRESENCE of `halt`,
+    never on the refusal's title. The halt token is taken off that answer exactly as `mount` takes
+    it off a built report: through `rememberHaltToken`, the one holder."""
     paint = _paint()
     start = paint.index("if (primary.data === null) {")
     null_branch = paint[start : paint.index("} else {\n      rebuildInto(mount(", start)]
 
-    refused = null_branch.index("primary.error.status === REFUSED_STATUS")
-    failed = null_branch.index('} else if (route.name === "pulse" && primary.halt) {')
+    assert null_branch.count('route.name === "pulse" && primary.halt') == 1
+    assert null_branch.count("primary.error.status === REFUSED_STATUS") == 1
+    failed = null_branch.index('if (route.name === "pulse" && primary.halt) {')
+    refused = null_branch.index("} else if (primary.error && primary.error.status === REFUSED")
     stopped = null_branch.index("stoppedView(primary")
-    assert refused < failed < stopped
-    arm = null_branch[failed:stopped]
+    assert failed < refused < stopped
+    arm = null_branch[failed:refused]
     assert arm.count("rememberHaltToken(primary.halt);") == 1
     assert arm.count("rebuildInto(pulseFailedView(primary), Boolean(force));") == 1
     assert arm.index("rememberHaltToken(") < arm.index("pulseFailedView(")
+    assert "Session expired" not in _comments_stripped(_source("main.js"))
+    assert null_branch[refused:stopped].count("refusedView(primary, reconnect)") == 1
 
     main = _code_only(_source("main.js"))
     assert len(re.findall(r"\brememberHaltToken\(", main)) == 2, "mount + the failure arm, no third"

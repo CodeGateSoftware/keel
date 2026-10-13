@@ -523,7 +523,9 @@ class KeelHandler(BaseHTTPRequestHandler):
         if self.command != "HEAD":
             self.wfile.write(payload)
 
-    def _refuse(self, code: int, heading: str, detail: str) -> None:
+    def _refuse(
+        self, code: int, heading: str, detail: str, *, halt: dict[str, str] | None = None
+    ) -> None:
         """A refusal, in the media type the caller asked for by the path it used.
 
         **Path-scoped, not method-scoped, and not content-negotiated.** A refusal handed to a
@@ -542,12 +544,15 @@ class KeelHandler(BaseHTTPRequestHandler):
         `Accept`-based negotiation was the alternative and it is worse here: a client that forgets
         the header would get the wrong media type from a JSON endpoint, and the one thing this
         server can be certain about is which path was requested.
+
+        `halt` is `None` on every refusal but one: the expired session's on `/api/pulse`, for
+        this session's cookie (`_expired_pulse_halt`, #985). It rides the JSON document only.
         """
         # **Before anything is written.** See `_drain_request_body`: a refusal that leaves a
         # request body unread poisons the next request on the same connection.
         self._drain_request_body()
         if urlsplit(self.path).path.startswith(API_PREFIX):
-            self._send_json(code, api.refusal_document(code, heading, detail))
+            self._send_json(code, api.refusal_document(code, heading, detail, halt=halt))
             return
         self._send(code, f"{heading}\n\n{detail}\n")
 
@@ -716,8 +721,13 @@ class KeelHandler(BaseHTTPRequestHandler):
             )
             return False
         # #648: an ENFORCED lifetime, checked before the token so an expired session cannot be
-        # distinguished from a wrong one by which refusal comes back. Only a remote-configured
-        # server has one -- see `ServeConfig.session_expired_at`.
+        # distinguished from a wrong one by which refusal comes back -- with one exception since
+        # #985: on a GET or HEAD of `/api/pulse` a request bearing THIS session's cookie gets a
+        # refusal that carries `halt`, and a wrong or missing cookie gets `halt: null`. That is
+        # acceptable because only the holder of the real 256-bit session token can see the
+        # difference, and it tells them nothing they could not already use (`_is_a_tokened_halt`
+        # admits that halt anyway). Every other request still cannot tell the two apart. Only a
+        # remote-configured server has a lifetime -- see `ServeConfig.session_expired_at`.
         #
         # #983, the owner's decision: the halt is exempt. A console left running past the lifetime
         # refused its own stop, and refusing a stop is the one failure mode this surface must not
@@ -726,9 +736,10 @@ class KeelHandler(BaseHTTPRequestHandler):
         # cookie below is still checked, and so is the halt token, by `_gated_action`.
         #
         # It serves a console still showing a Pulse from before the lifetime ended (the token is
-        # in its memory), or any client that holds the token. A RELOADED console cannot get it:
-        # only `/api/pulse` serves the token and that keeps the lifetime. Its HALT is #985's to
-        # restore; until then the refusal below names `keel kill`.
+        # in its memory), or any client that holds the token. A RELOADED console gets the token
+        # back from this refusal itself, on `/api/pulse` and for this session's cookie only
+        # (#985, `_expired_pulse_halt`). The refusal still names `keel kill`: a browser with no
+        # cached shell is refused the page that would draw the button.
         expires = self.cfg.session_expired_at
         if expires is not None and not outlives_the_lifetime and time.time() >= expires:
             self._refuse(
@@ -739,6 +750,7 @@ class KeelHandler(BaseHTTPRequestHandler):
                 "screenshot or terminal scrollback should not still work tomorrow. Restart "
                 "`keel serve` and open the address it prints. To stop trading now, run "
                 "`keel kill` at the terminal.",
+                halt=self._expired_pulse_halt(),
             )
             return False
         cookies = parse_cookie_header(self.headers.get("Cookie"))
@@ -765,6 +777,39 @@ class KeelHandler(BaseHTTPRequestHandler):
             )
             return False
         return True
+
+    def _expired_pulse_halt(self) -> dict[str, str] | None:
+        """The HALT control's inputs for the expired-session refusal, or `None` (#985).
+
+        **Owner-approved design.** Since #983 a halt carrying the halt token outlives the remote
+        session lifetime, but the token reaches a browser only on `/api/pulse`, which keeps the
+        lifetime -- so a console reloaded after it had no button. The expiry refusal on that one
+        read now carries #958's `{halt_token, resume_command}` (`api.pulse_halt`), the same shape
+        a failed Pulse carries, so the client draws the same control.
+
+        Three conditions, all of them: a GET (or HEAD) -- the read, never a write to the same
+        path; a path whose route is the one that halts (`ApiRoute.halt_on_failure`, `/api/pulse`
+        alone); and THIS session's cookie. Without the cookie the refusal is the #648 one with
+        nothing extra: the halt token is derived from the session token, and a request that has
+        not shown the session is not handed a credential. With it, nothing is handed that the
+        cookie's holder could not already use -- `_is_a_tokened_halt` admits exactly that halt.
+        This is the one place an expired session's refusal differs from a wrong token's (see the
+        #648 note in `_admitted`); only the holder of the real session token can see it.
+
+        Nothing else about the expired session changes: the refusal is still a 403 with
+        `data: null`, no release and no setup write is admitted, no other read answers, and no
+        other endpoint serves the halt token. Never `gates_token` (#968), here as on every path.
+        The one ledger read is `pulse_halt`'s kill-switch reading, read-only, as on #958's path.
+        """
+        if self.command not in ("GET", "HEAD"):
+            return None
+        route = api.API_ROUTES.get(urlsplit(self.path).path)
+        if route is None or not route.halt_on_failure:
+            return None
+        cookies = parse_cookie_header(self.headers.get("Cookie"))
+        if not tokens_match(cookies.get(SESSION_COOKIE), self.cfg.token):
+            return None
+        return api.pulse_halt(self.cfg)
 
     def _sec_fetch_site_ok(self) -> bool:
         """Checked on EVERY `POST`, `/setup/*` included -- unlike `_api_client_header_ok` below,

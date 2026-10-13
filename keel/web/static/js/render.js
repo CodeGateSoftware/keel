@@ -626,7 +626,8 @@ export function refusedView(reading, onReconnect) {
 }
 
 /**
- * Pulse when its report could not be built (#958): the halt control, then why nothing else is here.
+ * Pulse when its report could not be built (#958), or when the remote session's lifetime refused
+ * it (#985): the halt control, then why nothing else is here.
  *
  * `reading.halt` is the failure document's `{halt_token, resume_command}`, read apart from the
  * report on the server (`api.pulse_halt`), so a gather step that raised does not take the stop
@@ -636,7 +637,11 @@ export function refusedView(reading, onReconnect) {
  * None of the report's sections are drawn: they have nothing to render, and a zero here would be
  * a figure nobody read.
  *
- * @param {import("./api.js").Reading} reading  a failed `/api/pulse` that carried `halt`.
+ * Since #985 the expired remote session's 403 reaches here too, carrying `halt` only for this
+ * session's cookie (`server._expired_pulse_halt`): the server takes that halt past the lifetime
+ * (#983), so the button is drawn over the refusal's own title and detail.
+ *
+ * @param {import("./api.js").Reading} reading  a failed or expired `/api/pulse` that carried `halt`.
  * @returns {DocumentFragment}
  */
 export function pulseFailedView(reading) {
