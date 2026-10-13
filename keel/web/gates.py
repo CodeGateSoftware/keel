@@ -196,6 +196,15 @@ class UngatedAction:
 #: have meant an operator could start trading from a phone and not stop from it, which is the
 #: inversion this tier is ordered to avoid (#790). The console's HALT reaches `run_halt` through
 #: `/api/gates/halt`, carrying `security.halt_token`.
+#:
+#: **It outlives the remote session lifetime (#983).** On `keel serve --external-host` every
+#: other request stops authenticating after `security.REMOTE_SESSION_MAX_AGE_SECONDS`; a halt
+#: carrying the session cookie and the halt token does not (`server._is_a_tokened_halt`). That
+#: serves a console still showing a Pulse from before the lifetime ended, whose memory holds the
+#: token, or any client that holds it. A RELOADED console cannot obtain the token: only
+#: `/api/pulse` serves it, and that keeps the lifetime. Its HALT is #985's to restore; meanwhile
+#: the refusal names `keel kill`. A leaked halt token can at worst halt, which `keel resume` at
+#: a terminal undoes, and it opens no release (#968).
 HALT = UngatedAction(operation=engage_kill_switch, done=KILL_ENGAGED_LINE)
 
 
@@ -214,8 +223,10 @@ def run_gated_action(cfg: Any, action_key: str, presented: object) -> str | None
     ordering rather than merely describing it.
 
     This is the LAST of seven checks, not the only one. `server.do_POST` runs four on every write
-    -- admission (`_admitted`), `Sec-Fetch-Site` (`_sec_fetch_site_ok`), the `/api/` prefix and
-    the client header (`_api_client_header_ok`) -- and `server._gated_action` two more for a
+    -- admission (`_admitted`, whose remote session lifetime binds a release always: only a halt
+    carrying its own token is exempt, `_is_a_tokened_halt`, #983), `Sec-Fetch-Site`
+    (`_sec_fetch_site_ok`), the `/api/` prefix and the client header (`_api_client_header_ok`) --
+    and `server._gated_action` two more for a
     release: `security.gated_action_permitted` (loopback peer, loopback bind, no declared remote
     origin) and `security.gates_token` -- never the halt token. The phrase proves intent; those
     prove locality and provenance.

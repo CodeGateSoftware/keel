@@ -1229,6 +1229,29 @@ def _read_only_uri(path: PurePath) -> str:
     return prefix + urllib.parse.quote(posix, safe="/:") + "?mode=rw"
 
 
+def connect_existing(path: str | Path) -> sqlite3.Connection:
+    """`connect`, to a database that already exists -- never one this call creates (#981).
+
+    For a WRITER that is acting on a deployment rather than making one: the console's halt and
+    its gated releases (`keel.web.gates._perform`). A plain `sqlite3.connect` creates a missing
+    file, so a halt that raced a deleted `keel.db` left an empty database behind -- a file the
+    next `keel serve` would read as a deployment with no history. Opened `mode=rw` through the
+    same URI `connect_read_only` builds, which refuses a missing file with "unable to open
+    database file" and creates nothing; everything after the open is `connect`'s, so a write here
+    behaves exactly like any other keel write (foreign keys, busy timeout, WAL).
+    """
+    conn = sqlite3.connect(_read_only_uri(Path(path).absolute()), uri=True)
+    try:
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA foreign_keys = ON")
+        conn.execute(f"PRAGMA busy_timeout = {BUSY_TIMEOUT_MS}")
+        conn.execute("PRAGMA journal_mode = WAL")
+    except BaseException:
+        conn.close()
+        raise
+    return conn
+
+
 def connect_read_only(path: str | Path) -> sqlite3.Connection:
     """Open an EXISTING database to read it, never to write it (#976).
 

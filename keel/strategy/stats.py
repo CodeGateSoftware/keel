@@ -85,7 +85,7 @@ def _closed_pnl(trade: Trade) -> Decimal:
     """`trade`'s realised P&L, with the closed-trade invariant stated instead of assumed.
 
     `Trade.pnl` is `Decimal | None` because an OPEN trade has no realised P&L yet. Every other
-    outcome is produced by a close path that sets it (`backtest._closed_trade`; `paper` does the
+    outcome is produced by a close path that sets it (`backtest._close_trade`; `paper` does the
     same), and `summarize` filters to `outcome != "open"` before computing any aggregate -- so
     within those aggregates `pnl` is never `None`. Nothing in the type system said so, which left
     every `sum()` below summing `Decimal | None`.

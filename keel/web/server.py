@@ -83,6 +83,29 @@ _MAX_BODY_BYTES = 8 * 1024
 # (CPython raises ValueError past 4300 digits).
 _MAX_CONTENT_LENGTH_DIGITS = 18
 
+#: Seconds any ONE socket read or write may block before the connection is dropped (#981).
+#:
+#: Without it, a client that declared `Content-Length: 100` and sent nothing held its thread
+#: forever: `_refuse` drains before it answers, so an unauthenticated request never got its
+#: refusal and never let go. An idle kept-alive connection did the same in the stdlib's
+#: `readline`. Enough of either starves the server of threads, and the halt with it.
+#:
+#: **What it cannot cost the halt.** The timeout is per operation, and an honest client's request
+#: line, headers and body arrive at once; the halt reads no body, answers before `do_POST`'s
+#: drain, and writes a response of a few hundred bytes. The one new failure is the universal
+#: keep-alive race -- this server closing an idle connection as the browser reuses it -- and
+#: browsers resend a request whose reused connection closed before any response byte, which is
+#: what makes every server's idle close (nginx's is 75 s, Apache's 5 s) safe to have.
+#:
+#: **Why a minute.** It bounds a `sendall` too, as a total since Python 3.5, and the largest
+#: response here -- the whole audit trail as CSV -- has to reach a phone over a tunnel inside it.
+#: A shorter bound buys little: it limits how long a connection may sit SILENT, not how long
+#: it can be held. The timeout is per socket operation, so a client that trickles one byte inside
+#: every window never trips it (slowloris). That is accepted: threads are not pooled and an
+#: attacker can open more connections anyway, so no per-connection bound would cap the cost. Read
+#: by `build_server`, so a test can shorten it.
+REQUEST_TIMEOUT_SECONDS = 60.0
+
 
 @dataclass(frozen=True)
 class ServeConfig:
@@ -127,7 +150,8 @@ class ServeConfig:
         """When this session stops authenticating, or `None` if it does not expire.
 
         `None` on a loopback-only server, and that is a decision rather than an omission --
-        `REMOTE_SESSION_MAX_AGE_SECONDS` carries the argument. The population who could use a
+        `REMOTE_SESSION_MAX_AGE_SECONDS` carries the argument, and the one request it does not
+        bind, a halt with its token (#983). The population who could use a
         leaked token on loopback is software already running as this operator, and no session
         lifetime helps against that; a remote origin changes the population to anyone who can
         reach the tunnel, and the 30-day cookie is a browser hint such an attacker ignores.
@@ -607,15 +631,50 @@ class KeelHandler(BaseHTTPRequestHandler):
         self.body_consumed = True
         try:
             self.rfile.read(length)
-        except OSError:  # pragma: no cover - a client that vanished mid-body
+        except OSError:
+            # A client that vanished mid-body, or one that declared a body and then went silent:
+            # the read gives up after `REQUEST_TIMEOUT_SECONDS` without a byte (#981), and a
+            # refusal still answers. A client that keeps trickling is not cut off here.
             self.close_connection = True
 
+    def handle_one_request(self) -> None:
+        """One request, and then a GET's or HEAD's body leaves the socket (#981).
+
+        **A GET ends at a request boundary too.** A GET may carry a body -- pointless, but legal
+        -- and the success path never read one, so on a kept-alive connection the stdlib parsed it
+        as the next request line: #955's shape on the read path, answered 501. `do_HEAD` delegates
+        to `do_GET`, so both are covered here.
+
+        **Why here, not in a `finally` like `do_POST`'s.** `do_GET` is left exactly as it was, so
+        the dataflow from `self.path` to what it reaches is unchanged; wrapping its body would
+        have put a new call on that path. The request boundary is the stdlib's own, and the drain
+        costs a no-op for the common case, a GET with no body.
+
+        **Skipped when `close_connection` is already set**: EOF, a timed-out `readline`, an SSE
+        stream, or framing already distrusted. There is no next request to protect, and reading
+        on would only wait. That is also the only time `self.command` is stale (the previous
+        request's, or unset), so it is read only after that check.
+
+        `do_GET` resets `body_consumed` at its top, so the drain starts clean; a refusal already
+        drained its own body, which makes this a no-op for it. An exception out of `do_GET` skips
+        the drain, which does not matter: the stdlib then drops the connection.
+        """
+        super().handle_one_request()
+        if not self.close_connection and self.command in ("GET", "HEAD"):
+            self._drain_request_body()
+
     # -- shared admission --
-    def _admitted(self) -> bool:
-        """Host header, then session cookie. `False` means a refusal has already been sent.
+    def _admitted(self, *, outlives_the_lifetime: bool = False) -> bool:
+        """Host header, then the remote session lifetime, then session cookie. `False` means a
+        refusal has already been sent.
 
         Factored out so GET and POST cannot drift into two admission policies -- a write path
-        with a laxer check than the read path is exactly the shape of a bug nobody notices."""
+        with a laxer check than the read path is exactly the shape of a bug nobody notices.
+
+        `outlives_the_lifetime` skips the LIFETIME and nothing else, and exactly one caller sets
+        it: `_post`, for a halt that carries this session's halt token (`_is_a_tokened_halt`,
+        #983). Every other request -- a release, a setup write, every read -- keeps it.
+        """
         if not self.cfg.host_policy.permits(self.headers.get("Host")):
             # DNS rebinding lands exactly here: the packet arrived on loopback, so the bind check
             # passed, and only the header tells the truth about who the browser thinks it is
@@ -629,15 +688,27 @@ class KeelHandler(BaseHTTPRequestHandler):
         # #648: an ENFORCED lifetime, checked before the token so an expired session cannot be
         # distinguished from a wrong one by which refusal comes back. Only a remote-configured
         # server has one -- see `ServeConfig.session_expired_at`.
+        #
+        # #983, the owner's decision: the halt is exempt. A console left running past the lifetime
+        # refused its own stop, and refusing a stop is the one failure mode this surface must not
+        # have. What the exemption gives a leaked token is a halt -- which `keel resume` at a
+        # terminal undoes -- and never a release: the halt token opens no other route (#968). The
+        # cookie below is still checked, and so is the halt token, by `_gated_action`.
+        #
+        # It serves a console still showing a Pulse from before the lifetime ended (the token is
+        # in its memory), or any client that holds the token. A RELOADED console cannot get it:
+        # only `/api/pulse` serves the token and that keeps the lifetime. Its HALT is #985's to
+        # restore; until then the refusal below names `keel kill`.
         expires = self.cfg.session_expired_at
-        if expires is not None and time.time() >= expires:
+        if expires is not None and not outlives_the_lifetime and time.time() >= expires:
             self._refuse(
                 403,
                 "Session expired",
                 "This session has reached its lifetime. keel enforces one when it is configured "
                 "to answer a remote hostname, because a token that leaked into a URL, a "
                 "screenshot or terminal scrollback should not still work tomorrow. Restart "
-                "`keel serve` and open the address it prints.",
+                "`keel serve` and open the address it prints. To stop trading now, run "
+                "`keel kill` at the terminal.",
             )
             return False
         cookies = parse_cookie_header(self.headers.get("Cookie"))
@@ -806,11 +877,14 @@ class KeelHandler(BaseHTTPRequestHandler):
 
         Four checks apply to every write, in this order -- admission (`_admitted`),
         `Sec-Fetch-Site`, the `/api/` prefix and the `X-Keel-Client` header -- and then the path
-        splits. A setup action must also carry the session's CSRF write token; a gated action is
-        `_gated_action`'s: the halt carries `halt_token` in `HALT_HEADER` and nothing more, and a
-        release carries `gates_token` in `GATES_HEADER` plus locality and the typed phrase --
-        three tokens, three headers, no route accepting another's (#968). Read its own docstring
-        for why. That every write now passes the `X-Keel-Client` gate is the change #540 brought.
+        splits. Admission is the same for every write but one: a halt carrying its halt token is
+        not bound by the remote session lifetime (#983, `_is_a_tokened_halt`); it still needs the
+        session cookie, and every other check. A setup action must also carry the session's CSRF
+        write token; a gated action is `_gated_action`'s: the halt carries `halt_token` in
+        `HALT_HEADER` and nothing more, and a release carries `gates_token` in `GATES_HEADER`
+        plus locality and the typed phrase -- three tokens, three headers, no route accepting
+        another's (#968). Read its own docstring for why. That every write now passes the
+        `X-Keel-Client` gate is the change #540 brought.
         While the write surface was an HTML form at `/setup/*`, the `X-Keel-Client` gate could
         not cover it (a form cannot set a header) and the two paths had to differ;
         `_api_client_header_ok`'s docstring called that "the fix for one" defect and said the
@@ -843,7 +917,7 @@ class KeelHandler(BaseHTTPRequestHandler):
     def _post(self) -> None:
         """`do_POST`'s routing, minus the drain that every branch shares. Read `do_POST`."""
         parsed = urlsplit(self.path)
-        if not self._admitted():
+        if not self._admitted(outlives_the_lifetime=self._is_a_tokened_halt(parsed.path)):
             return
 
         if not self._sec_fetch_site_ok():
@@ -901,6 +975,20 @@ class KeelHandler(BaseHTTPRequestHandler):
         # so a repeated submission is harmless by construction rather than by a redirect.
         self._send_json(200, api.action_document(result))
 
+    def _is_a_tokened_halt(self, path: str) -> bool:
+        """Whether this POST is the halt AND carries this session's halt token -- the one request
+        the remote session lifetime does not bind (#983, `_admitted`).
+
+        **The token is part of the test, not only checked later.** An expired session that sends
+        the halt WITHOUT it is refused as "Session expired", exactly as before, rather than
+        reaching the halt-token refusal; so the exemption tells a caller without the token nothing
+        it could not learn already. `_gated_action` still checks the token itself, so nothing
+        about the halt's own refusal rests on this.
+        """
+        return path == API_GATES_PREFIX + HALT_KEY and tokens_match(
+            self.headers.get(HALT_HEADER), halt_token(self.cfg.token)
+        )
+
     def _gated_action(self, key: str) -> None:
         """One Tier 1 release, or the halt (#781). Four checks, and the order is the contract.
 
@@ -914,7 +1002,9 @@ class KeelHandler(BaseHTTPRequestHandler):
            and `halt_token` in `HALT_HEADER`, because it is a write; it needs nothing else,
            because refusing a stop is the one failure mode this surface must not have. The halt
            token is the one `/api/pulse` serves, and it is checked HERE ONLY: it opens no release
-           (#968).
+           (#968). For the same reason a halt carrying it outlives the remote session lifetime,
+           which `_post` lifts for it alone (`_is_a_tokened_halt`, #983) -- the session cookie
+           itself is still required.
 
         2. **Locality, for a release.** `gated_action_permitted` wants a loopback peer, a
            loopback bind and no declared remote origin -- see its own docstring for why the peer
@@ -939,7 +1029,20 @@ class KeelHandler(BaseHTTPRequestHandler):
             if not tokens_match(self.headers.get(HALT_HEADER), halt_token(self.cfg.token)):
                 self._refuse(403, "Refused", _NO_HALT_TOKEN)
                 return
-            self._send_json(200, api.gate_document(HALT_KEY, gates.run_halt(self.cfg)))
+            try:
+                halted = gates.run_halt(self.cfg)
+            except Exception as exc:
+                # A halt that could not be written -- the database is gone (`connect_existing`
+                # creates none, #981), or locked past its busy timeout -- is a stated 500 the
+                # console shows beside the button, never a reset connection that reads as nothing
+                # having happened. `keel kill` at a terminal is the fallback it names.
+                self._refuse(
+                    500,
+                    "The halt could not be recorded",
+                    f"{type(exc).__name__}: {exc}. Run `keel kill` at the terminal.",
+                )
+                return
+            self._send_json(200, api.gate_document(HALT_KEY, halted))
             return
 
         if key not in gates.TIER1_ACTIONS:
@@ -1185,6 +1288,8 @@ def build_server(cfg: ServeConfig) -> KeelServer:
 
     class BoundKeelHandler(KeelHandler):
         cfg = bound_cfg
+        # `StreamRequestHandler.setup` hands this to `settimeout` on every accepted socket (#981).
+        timeout = REQUEST_TIMEOUT_SECONDS
 
     class BoundKeelServer(KeelServer):
         address_family = socket.AF_INET6 if ":" in cfg.host else socket.AF_INET
