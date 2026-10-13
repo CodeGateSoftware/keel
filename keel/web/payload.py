@@ -2583,7 +2583,9 @@ def error_envelope(
 
 
 def halt_fallback(*, halt_token: str, resume_command: str) -> dict[str, str]:
-    """What the HALT control needs when the Pulse report could not be built (#958): the halt
+    """What the HALT control needs when the Pulse report could not be built (#958), or when the
+    remote session's lifetime has expired and `/api/pulse` is refused for this session's cookie
+    (#985, `server.KeelHandler._expired_pulse_halt`): the halt
     token and the resume command, the same two values `pulse_payload` carries as `halt_token`
     and `halt.resume_command`, and nothing else. Bare strings, under the same names, so the
     client hands them to the same two readers (`actions.rememberHaltToken`, `render.haltControl`)

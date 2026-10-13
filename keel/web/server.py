@@ -691,8 +691,13 @@ class KeelHandler(BaseHTTPRequestHandler):
             )
             return False
         # #648: an ENFORCED lifetime, checked before the token so an expired session cannot be
-        # distinguished from a wrong one by which refusal comes back. Only a remote-configured
-        # server has one -- see `ServeConfig.session_expired_at`.
+        # distinguished from a wrong one by which refusal comes back -- with one exception since
+        # #985: on a GET or HEAD of `/api/pulse` a request bearing THIS session's cookie gets a
+        # refusal that carries `halt`, and a wrong or missing cookie gets `halt: null`. That is
+        # acceptable because only the holder of the real 256-bit session token can see the
+        # difference, and it tells them nothing they could not already use (`_is_a_tokened_halt`
+        # admits that halt anyway). Every other request still cannot tell the two apart. Only a
+        # remote-configured server has a lifetime -- see `ServeConfig.session_expired_at`.
         #
         # #983, the owner's decision: the halt is exempt. A console left running past the lifetime
         # refused its own stop, and refusing a stop is the one failure mode this surface must not
@@ -758,6 +763,8 @@ class KeelHandler(BaseHTTPRequestHandler):
         nothing extra: the halt token is derived from the session token, and a request that has
         not shown the session is not handed a credential. With it, nothing is handed that the
         cookie's holder could not already use -- `_is_a_tokened_halt` admits exactly that halt.
+        This is the one place an expired session's refusal differs from a wrong token's (see the
+        #648 note in `_admitted`); only the holder of the real session token can see it.
 
         Nothing else about the expired session changes: the refusal is still a 403 with
         `data: null`, no release and no setup write is admitted, no other read answers, and no
