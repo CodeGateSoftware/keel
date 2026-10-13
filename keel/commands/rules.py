@@ -629,8 +629,11 @@ def _profit_factor_text(stats: backtest_mod.BacktestResult) -> str:
     """The profit factor for the `rules backtest` line: the engine's value when it is a
     measurement, else `keel insights summary`'s reading of the empty side (#988) -- `n/a (no
     losses yet)` for the all-wins `Infinity`, `n/a (no wins or losses yet)` for an all-scratch
-    0/0, `n/a (no trades yet)` for no closed trade. An all-losses 0 is measured and stays 0.
-    Display only: the returned `BacktestResult` keeps the engine's value."""
+    0/0. An all-losses 0 is measured and stays 0. With no closed trade nothing was measured, so
+    the line prints bare `n/a` for it, as `render_summary` does at `n_trades == 0` (see
+    `run_rule_backtest`). Display only: the returned `BacktestResult` keeps the engine's value."""
+    if stats.n_trades == 0:
+        return "n/a"
     reason = profit_factor_reason_of(stats)
     return str(stats.profit_factor) if reason is None else undefined_reading(reason)
 
@@ -650,7 +653,12 @@ def run_rule_backtest(
     Returns the outcome (its single echoed line) beside the raw `BacktestResult` -- the
     strategy console's retry flow renders both, and a caller that only wants the CLI's
     line reads `outcome.lines`. Refusals (unknown id, no granularity) are the service's
-    `RulesRefused` shapes, already echoed to `echo_err`."""
+    `RulesRefused` shapes, already echoed to `echo_err`.
+
+    At `n_trades == 0` nothing was measured, so `win_rate`, `profit_factor`, `expectancy_px`
+    and `max_drawdown_px` print bare `n/a` (the R pair already does) -- what `keel insights
+    summary` prints for a rule with no trade (#988). Display only: the engine's zeros stay in
+    the returned `BacktestResult`."""
     resolved = resolve_rule_backtest(
         repo, config, rule_id, granularity_opt=granularity_opt, echo_err=echo_err
     )
@@ -659,12 +667,16 @@ def run_rule_backtest(
     # Every figure names its unit (#820): the R pair is what the promotion gate judges; the
     # `_px` pair is price units for a one-coin position, which is money, not R, and not
     # comparable across assets.
+    measured = stats.n_trades > 0
+    win_rate = f"{stats.win_rate:.2%}" if measured else "n/a"
+    expectancy_px = stats.expectancy if measured else "n/a"
+    max_drawdown_px = stats.max_drawdown if measured else "n/a"
     sink(
         f"rule {rule_id} ({resolved.row['kind']}): n_trades={stats.n_trades} "
-        f"win_rate={stats.win_rate:.2%} expectancy_r={_r_text(stats.expectancy_r)} "
+        f"win_rate={win_rate} expectancy_r={_r_text(stats.expectancy_r)} "
         f"max_drawdown_r={_r_text(stats.max_drawdown_r)} "
-        f"profit_factor={_profit_factor_text(stats)} expectancy_px={stats.expectancy} "
-        f"max_drawdown_px={stats.max_drawdown} (px = price units, 1-coin notional) "
+        f"profit_factor={_profit_factor_text(stats)} expectancy_px={expectancy_px} "
+        f"max_drawdown_px={max_drawdown_px} (px = price units, 1-coin notional) "
         f"{_describe_fee(resolved.fee_pct, resolved.fee_source)}"
     )
     return (
