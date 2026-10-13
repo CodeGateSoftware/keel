@@ -636,7 +636,8 @@ def profit_factor_r_reason_of(stats: Any) -> str | None:
     report's `Profit factor (R)` cell. Its sides are decided by COUNTING that sample's trades
     (`n_wins_r` / `n_losses_r`), never by reading `profit_factor_r`: the engine writes `Infinity`
     for no losing R, and `0` both for an all-losses sample (a measured 0) and for an all-scratch
-    sample (no reading); only the counts tell those two apart. So an R profit factor with an empty side is worded as the track record and
+    sample (no reading); only the counts tell those two apart.
+    So an R profit factor with an empty side is worded as the track record and
     `rules backtest` word a money one. An empty R sample returns `NO_TRADES_YET`; the edge table
     prints a bare `n/a` there instead, as it does for every R figure of a row with no R. The
     engine's value is untouched."""

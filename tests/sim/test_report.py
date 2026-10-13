@@ -1339,7 +1339,7 @@ def test_edge_section_words_an_empty_side_profit_factor_as_insights_does():
     not as the engine's `Infinity` / `0`. Sides are decided by COUNTING the R sample
     (`n_wins_r` / `n_losses_r`): an all-scratch sample and an all-losses sample both
     have an engine profit factor of 0, yet only the latter is a measurement. (The hand-built
-    `zero:D` row, a zero-R win, is not engine output; it guards counting over reading.) An all-losses 0 is a measurement and keeps its number;
+    `zero:D` row, a zero-R win, is not engine output; it guards counting over reading.) An all-losses 0 keeps its number;
     a row with no R at all stays a bare `n/a`."""
     all_wins = summarize([_r_trade_at(_HOUR, "20"), _r_trade_at(2 * _HOUR, "10")])
     all_scratch = summarize([_scratch_r_trade_at(_HOUR), _scratch_r_trade_at(2 * _HOUR)])
@@ -1390,7 +1390,5 @@ def test_importing_sim_report_does_not_load_click_or_the_commands_layer():
         "banned = ('click', 'keel.agent', 'keel.commands.insights'); "
         "print(sorted(m for m in banned if m in sys.modules))"
     )
-    done = subprocess.run(
-        [sys.executable, "-c", code], capture_output=True, text=True, check=True
-    )
+    done = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, check=True)
     assert done.stdout.strip() == "[]"
