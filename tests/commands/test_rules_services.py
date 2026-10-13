@@ -20,13 +20,16 @@ Two surfaces:
 
 from __future__ import annotations
 
+import re
 from decimal import Decimal
 from typing import Any
 
 import pytest
 
 from keel import agent
+from keel.commands import insights as insights_mod
 from keel.commands import rules as rules_mod
+from keel.commands.insights import build_rule_track_record
 from keel.commands.rules import (
     RulesRefused,
     RulesUsageError,
@@ -52,8 +55,10 @@ from keel.research import bias
 from keel.strategy import backtest as backtest_mod
 from keel.strategy import promotion as promotion_mod
 from keel.strategy.reduction import Reduction
+from keel.strategy.rules.base import Trade
 from keel.strategy.rules.reverse_dca import ReverseDca
-from keel.types import Candle, Granularity
+from keel.strategy.stats import summarize
+from keel.types import Candle, Granularity, Side
 from tests.data.test_sell_proposals import _row as _proposal_row
 from tests.strategy.rule_conformance import minimal_params
 
@@ -624,10 +629,153 @@ def test_run_rule_backtest_line_labels_the_units_of_every_figure(repo: Repositor
         "expectancy_px",
         "max_drawdown_px",
     ]
-    assert f"expectancy_px={stats.expectancy} " in out[0]
-    assert f"max_drawdown_px={stats.max_drawdown} (px = price units, 1-coin notional)" in out[0]
+    # This flat series closes no trade, so nothing was measured: the px figures read `n/a`, not
+    # the engine's 0 (#988). The legend stays either way.
+    assert stats.n_trades == 0
+    assert "expectancy_px=n/a " in out[0]
+    assert "max_drawdown_px=n/a (px = price units, 1-coin notional)" in out[0]
     assert stats.expectancy_r is None  # this flat series closes no trade that carries R
     assert "expectancy_r=n/a " in out[0]
+
+
+def _closed(outcome: str, pnl: str, i: int = 0) -> Trade:
+    return Trade(
+        entry_ts=1_700_000_000 + i,
+        exit_ts=1_700_000_100 + i,
+        entry=Decimal("100"),
+        exit=Decimal("100") + Decimal(pnl),
+        qty=Decimal("1"),
+        side=Side.BUY,
+        pnl=Decimal(pnl),
+        r_multiple=None,
+        mfe=Decimal(0),
+        mae=Decimal(0),
+        outcome=outcome,  # type: ignore[arg-type]
+    )
+
+
+def _backtest_line_over(
+    repo: Repository, monkeypatch: pytest.MonkeyPatch, trades: list[Trade]
+) -> tuple[str, backtest_mod.BacktestResult]:
+    """The `rules backtest` line for a backtest that closed exactly `trades`, through the real
+    `run_rule_backtest` (resolution, rendering) with only the engine run replaced."""
+    repo.insert_rule(
+        "dca", {"product_id": "BTC-USD", "cadence_days": 7}, status="candidate", now_ts=NOW_TS
+    )
+    repo.upsert_candles("BTC-USD", Granularity.ONE_DAY, _daily_candles(30))
+    calls: list[int] = []
+
+    def _stats(_resolved: Any) -> backtest_mod.BacktestResult:
+        calls.append(1)
+        return summarize(trades)
+
+    monkeypatch.setattr(rules_mod, "backtest_resolved", _stats)
+    out, err = _collect()
+    _outcome, stats = run_rule_backtest(
+        repo, _config(), 1, granularity_opt="ONE_DAY", echo=out.append, echo_err=err.append
+    )
+    assert calls == [1] and len(out) == 1  # the replaced engine run is the one rendered
+    return out[0], stats
+
+
+def _profit_factor_text(line: str) -> str:
+    match = re.search(r" profit_factor=(.*?) expectancy_px=", line)
+    assert match is not None, line
+    return match.group(1)
+
+
+@pytest.mark.parametrize(
+    ("trades", "engine_value", "shown"),
+    [
+        # All wins: gross profit over no loss -- the engine's Infinity, a known fact (#988).
+        ([("win", "10"), ("win", "5")], Decimal("Infinity"), "n/a (no losses yet)"),
+        # All scratches: 0/0 -- the engine's 0 is not a measurement.
+        ([("scratch", "0"), ("scratch", "0")], Decimal(0), "n/a (no wins or losses yet)"),
+        # No closed trade at all: nothing was measured.
+        ([], Decimal(0), "n/a"),
+        # A win that made nothing: counting says it has no losses, so "no losses yet" -- reading
+        # the zero average would say "no wins or losses". Gross 0 over gross 0 is the engine's 0.
+        ([("win", "0")], Decimal(0), "n/a (no losses yet)"),
+        # All losses: no gross profit over a real loss IS a measured 0, and keeps its number.
+        ([("loss", "-10"), ("loss", "-5")], Decimal(0), "0"),
+        # Both sides hold a trade: the ratio, as before.
+        ([("win", "30"), ("loss", "-10")], Decimal(3), "3"),
+    ],
+    ids=["all-wins", "all-scratch", "no-trades", "zero-pnl-win", "all-losses", "mixed"],
+)
+def test_run_rule_backtest_words_an_empty_side_profit_factor_like_insights(
+    repo: Repository,
+    monkeypatch: pytest.MonkeyPatch,
+    trades: list[tuple[str, str]],
+    engine_value: Decimal,
+    shown: str,
+) -> None:
+    """#988: the backtest line printed the engine's `profit_factor` raw -- `Infinity` for all
+    wins, a measured-looking `0` for all scratches or no trade. It now prints the reading
+    `keel insights summary` prints for the same sample (#986), while the returned
+    `BacktestResult` keeps the engine's own value."""
+    line, stats = _backtest_line_over(
+        repo, monkeypatch, [_closed(o, pnl, i) for i, (o, pnl) in enumerate(trades)]
+    )
+
+    assert stats.profit_factor == engine_value  # the engine's value is untouched
+    assert _profit_factor_text(line) == shown
+    assert "Infinity" not in line
+
+
+_N0_LINE = re.compile(
+    r"^rule 1 \(dca\): n_trades=(?P<n_trades>\S+) win_rate=(?P<win_rate>\S+) "
+    r"expectancy_r=(?P<expectancy_r>\S+) max_drawdown_r=(?P<max_drawdown_r>\S+) "
+    r"profit_factor=(?P<profit_factor>.+?) expectancy_px=(?P<expectancy_px>\S+) "
+    r"max_drawdown_px=(?P<max_drawdown_px>\S+) \(px = price units, 1-coin notional\) "
+)
+
+
+def test_run_rule_backtest_prints_n_a_for_every_figure_when_no_trade_closed(
+    repo: Repository, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#988: at n_trades == 0 `keel insights summary` prints bare `n/a` for every figure,
+    because nothing was measured -- the engine's 0.00% / 0 are not measurements. The backtest
+    line says the same, in the same key order, with the n and the legend untouched."""
+    line, stats = _backtest_line_over(repo, monkeypatch, [])
+
+    match = _N0_LINE.match(line)
+    assert match is not None, line
+    assert match.groupdict() == {
+        "n_trades": "0",
+        "win_rate": "n/a",
+        "expectancy_r": "n/a",
+        "max_drawdown_r": "n/a",
+        "profit_factor": "n/a",
+        "expectancy_px": "n/a",
+        "max_drawdown_px": "n/a",
+    }
+    assert stats.n_trades == 0 and stats.win_rate == 0  # display only: the engine value stays
+
+
+@pytest.mark.parametrize(
+    "trades",
+    [
+        [_closed("win", "10")],
+        [_closed("scratch", "0")],
+        [_closed("win", "0")],
+    ],
+    ids=["all-wins", "all-scratch", "zero-pnl-win"],
+)
+def test_run_rule_backtest_reads_the_same_reason_insights_records_for_the_sample(
+    repo: Repository, monkeypatch: pytest.MonkeyPatch, trades: list[Trade]
+) -> None:
+    """One rule, not two: for each empty-side shape the backtest LINE's profit factor IS
+    `undefined_reading` over the reason a `RuleTrackRecord` of the same stats carries."""
+    line, stats = _backtest_line_over(repo, monkeypatch, trades)
+    record = build_rule_track_record(
+        {"id": 1, "kind": "dca", "status": "candidate", "params": {"product_id": "BTC-USD"}},
+        stats,
+        promotion_mod.PromotionConfig(),
+    )
+
+    assert record.profit_factor_reason is not None
+    assert _profit_factor_text(line) == insights_mod.undefined_reading(record.profit_factor_reason)
 
 
 # -- the sleeve_sell route through attempt_promotion (P12 Task 12.2, spec §3.7, plan R21) ---------
