@@ -62,7 +62,6 @@ from dataclasses import dataclass, replace
 from decimal import Decimal
 from typing import TYPE_CHECKING
 
-from keel.commands.insights import profit_factor_r_reason_of, undefined_reading
 from keel.execution import sizing
 from keel.execution.guards import _asset
 from keel.sim.benchmark import BenchmarkResult
@@ -1093,6 +1092,9 @@ def _profit_factor_r_cell(result: BacktestResult) -> str:
     is unchanged), so the cell carries the reading rather than the sentinel."""
     if result.profit_factor_r is None:
         return _r_cell(None)
+    # Lazy: keeps click and the commands layer out of `import keel.sim.report`.
+    from keel.commands.insights import profit_factor_r_reason_of, undefined_reading
+
     reason = profit_factor_r_reason_of(result)
     if reason is not None:
         return undefined_reading(reason)
@@ -1101,9 +1103,9 @@ def _profit_factor_r_cell(result: BacktestResult) -> str:
 
 def _r_cell(value: Decimal | None) -> str:
     """An R aggregate for the edge table: `n/a` when the sample had no R (never a 0 that
-    reads as a measured flat edge). `inf` is left only for the degenerate profit factor whose
-    two sides both hold a trade but whose losing R sums to zero (a zero-R loss beside a win);
-    an EMPTY side never reaches here -- `_profit_factor_r_cell` words it (#1000)."""
+    reads as a measured flat edge). `inf` is unreachable from engine output: an EMPTY
+    side is worded by `_profit_factor_r_cell` (#1000), and a loss always has negative R (the
+    engine classifies by pnl sign). It is kept as a guard for a hand-built result."""
     if value is None:
         return "n/a"
     if value.is_infinite():

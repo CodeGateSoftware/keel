@@ -9,6 +9,8 @@ known exactly -- no network, no real market data, no wall-clock reads.
 from __future__ import annotations
 
 import dataclasses
+import subprocess
+import sys
 from decimal import Decimal
 
 from keel.config import TierConfig
@@ -1335,8 +1337,9 @@ _PF_R = 6  # the "Profit factor (R)" column
 def test_edge_section_words_an_empty_side_profit_factor_as_insights_does():
     """#1000: an empty side of the R sample reads as the track record words it (#986/#998),
     not as the engine's `Infinity` / `0`. Sides are decided by COUNTING the R sample
-    (`n_wins_r` / `n_losses_r`): a zero-R win with no loss has an engine profit factor of 0,
-    yet it is a sample with no losses. An all-losses 0 is a measurement and keeps its number;
+    (`n_wins_r` / `n_losses_r`): an all-scratch sample and an all-losses sample both
+    have an engine profit factor of 0, yet only the latter is a measurement. (The hand-built
+    `zero:D` row, a zero-R win, is not engine output; it guards counting over reading.) An all-losses 0 is a measurement and keeps its number;
     a row with no R at all stays a bare `n/a`."""
     all_wins = summarize([_r_trade_at(_HOUR, "20"), _r_trade_at(2 * _HOUR, "10")])
     all_scratch = summarize([_scratch_r_trade_at(_HOUR), _scratch_r_trade_at(2 * _HOUR)])
@@ -1375,3 +1378,19 @@ def test_edge_section_words_an_empty_side_profit_factor_as_insights_does():
     assert {len(row) for row in table} == {11}
     # The engine's value is untouched by the rendering.
     assert all_wins.profit_factor_r == Decimal("Infinity")
+
+
+def test_importing_sim_report_does_not_load_click_or_the_commands_layer():
+    """#1000: `keel.sim.report` words the profit-factor cell through `keel.commands.insights`,
+    but only lazily -- a bare `import keel.sim.report` must not drag click, `keel.agent` or the
+    commands package into the interpreter (origin/main loads none of them). A fresh interpreter,
+    since this process has long since imported them."""
+    code = (
+        "import sys; import keel.sim.report; "
+        "banned = ('click', 'keel.agent', 'keel.commands.insights'); "
+        "print(sorted(m for m in banned if m in sys.modules))"
+    )
+    done = subprocess.run(
+        [sys.executable, "-c", code], capture_output=True, text=True, check=True
+    )
+    assert done.stdout.strip() == "[]"
