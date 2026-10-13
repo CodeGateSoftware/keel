@@ -80,10 +80,17 @@ URL, in terminal scrollback, and in whatever got pasted while asking for help. T
 `Max-Age` is a *browser* hint that such an attacker ignores entirely.
 
 So a server configured with `--external-host` enforces a **12-hour session lifetime on its own
-side of the wire**, checked before the token so an expired session cannot be told apart from a
-wrong one by which refusal comes back. A loopback-only server has none, and that asymmetry is
-the argument rather than an exemption. Restarting `keel serve` remains the instant revocation
-gesture in both postures.
+side of the wire**. It is checked before the token, so an expired session and a wrong one get the
+same refusal. There are two exceptions, and both are for the stop. A halt that carries the
+session cookie and the halt token is accepted past the lifetime (#983): a console left running
+overnight must still be able to stop trading. And a read of Pulse (`/api/pulse`) that carries
+this session's cookie is refused as expired, but the refusal carries the HALT control's inputs,
+so a console reloaded after the lifetime still shows HALT (#985). Only the holder of the real
+session token sees the difference. Nothing else is reopened: no release, no setup write, no other
+read, and the release token is still served nowhere. A browser with no cached console is refused
+the page itself; it can stop trading with `keel kill` at the terminal. A loopback-only server has
+no lifetime, and that asymmetry is the argument rather than an exemption. Restarting `keel serve`
+remains the instant revocation gesture in both postures.
 
 ## Capability-increasing actions are refused unless the bind is loopback
 
