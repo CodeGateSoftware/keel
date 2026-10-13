@@ -62,6 +62,7 @@ from dataclasses import dataclass, replace
 from decimal import Decimal
 from typing import TYPE_CHECKING
 
+from keel.commands.insights import profit_factor_r_reason_of, undefined_reading
 from keel.execution import sizing
 from keel.execution.guards import _asset
 from keel.sim.benchmark import BenchmarkResult
@@ -1005,7 +1006,7 @@ def _render_edge_section(
         lines.append(
             f"| {label} | {result.n_trades} | {result.win_rate:.1%} | "
             f"{_r_cell(result.expectancy_r)} | {_r_cell(result.avg_win_r)} | "
-            f"{_r_cell(result.avg_loss_r)} | {_r_cell(result.profit_factor_r)} | "
+            f"{_r_cell(result.avg_loss_r)} | {_profit_factor_r_cell(result)} | "
             f"{_r_cell(result.max_drawdown_r)} | {result.max_losing_streak} | "
             f"{_r_cell(result.avg_mfe_r)} | {_r_cell(result.avg_mae_r)} |"
         )
@@ -1079,9 +1080,30 @@ def _render_accumulation_section(accumulation: dict[str, DcaSleeve]) -> list[str
     ]
 
 
+def _profit_factor_r_cell(result: BacktestResult) -> str:
+    """The edge table's `Profit factor (R)` cell (#1000): a bare `n/a` when the row has no R
+    (as `_r_cell` gives every R figure), `undefined_reading` of the reason when a side of the R
+    sample is empty -- `n/a (no losses yet)`, `n/a (no wins or losses yet)`, the words
+    `insights summary`, the Rules page and `rules backtest` print (#986/#998), through the one
+    shared `insights.profit_factor_r_reason_of` -- and the measured ratio otherwise. An
+    all-losses `0.000` is a measurement and keeps its number.
+
+    The engine's `inf` / `0` were printed raw here until #1000. Nothing parses this Markdown
+    table (it is read by a person, and the run's figures are kept on `BacktestResult`, which
+    is unchanged), so the cell carries the reading rather than the sentinel."""
+    if result.profit_factor_r is None:
+        return _r_cell(None)
+    reason = profit_factor_r_reason_of(result)
+    if reason is not None:
+        return undefined_reading(reason)
+    return _r_cell(result.profit_factor_r)
+
+
 def _r_cell(value: Decimal | None) -> str:
     """An R aggregate for the edge table: `n/a` when the sample had no R (never a 0 that
-    reads as a measured flat edge), `inf` for a profit factor with no losing R."""
+    reads as a measured flat edge). `inf` is left only for the degenerate profit factor whose
+    two sides both hold a trade but whose losing R sums to zero (a zero-R loss beside a win);
+    an EMPTY side never reaches here -- `_profit_factor_r_cell` words it (#1000)."""
     if value is None:
         return "n/a"
     if value.is_infinite():
