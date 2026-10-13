@@ -313,7 +313,8 @@ def read_pulse(cfg: ServeConfig, _query: Query, _state: Any, now_ts: int) -> dic
     this endpoint's to interpret. A read that failed and a window that held nothing are different
     facts, so a non-ok window keeps its own status and detail rather than flattening to "empty".
 
-    `halt_token` is `security.halt_token(cfg.token)`, on this endpoint only, for the HALT button:
+    `halt_token` is `security.halt_token(cfg.token)`, on this endpoint only, for the HALT button
+    (and in this endpoint's failure and expired-session refusal, `pulse_halt`, #958 #985):
     see `payload.setup_payload` for why a derived write token may ride a GET body, and
     `server._gated_action` for why the halt needs nothing else. Never `gates_token`, which no
     endpoint serves (#968): it releases a halt, and the page that stops keel must not hold the
@@ -926,7 +927,9 @@ class ApiRoute:
     sortable: tuple[str, ...] = field(default=())
     #: Whether a failed read still answers with the HALT control's inputs (#958). `/api/pulse`
     #: only: it is the view that halts, and `pulse_halt` reads what the button needs apart from
-    #: the report, so a report that raises does not take the stop with it.
+    #: the report, so a report that raises does not take the stop with it. The same flag picks
+    #: the one route whose remote-lifetime refusal carries them to the session's own cookie
+    #: (`server.KeelHandler._expired_pulse_halt`, #985).
     halt_on_failure: bool = False
 
 
@@ -1332,15 +1335,23 @@ def _bound_venue(cfg: ServeConfig) -> str:
         return guards.DEFAULT_VENUE
 
 
-def refusal_document(status: int, title: str, detail: str) -> dict[str, Any]:
+def refusal_document(
+    status: int, title: str, detail: str, *, halt: dict[str, str] | None = None
+) -> dict[str, Any]:
     """A refusal raised BEFORE routing -- a failed host check, a missing session cookie.
 
     Lives here rather than in the handler so that every `/api/*` body, admitted or not, is built by
     one function against one contract. It carries no `engine`, and that is the reason the success
     and failure documents are told apart by HTTP status rather than by a field: these refusals
     happen before admission, and filling in `engine` would mean an unauthenticated request reading
-    the deployment state off disk."""
-    return payload.error_envelope(int(time.time()), status=status, title=title, detail=detail)
+    the deployment state off disk.
+
+    `halt` is `None` but for one refusal: the expired remote session's, on `/api/pulse`, for a
+    request carrying this session's cookie (`server.KeelHandler._expired_pulse_halt`, #985) --
+    `pulse_halt`'s `{halt_token, resume_command}`, the shape #958's failed Pulse carries."""
+    return payload.error_envelope(
+        int(time.time()), status=status, title=title, detail=detail, halt=halt
+    )
 
 
 def action_document(result: Any) -> dict[str, Any]:

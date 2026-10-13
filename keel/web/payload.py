@@ -2564,10 +2564,14 @@ def error_envelope(
     would mean an unauthenticated request reading the deployment database -- the same argument
     that keeps `engine` out of this document.
 
-    `halt` (#958) is `null` on every failure but one: Pulse's own, after admission, where it is
-    `halt_fallback`'s `{halt_token, resume_command}`. The HALT button lives on Pulse, and a stop
-    that vanished whenever the report beside it failed to build would make stopping slower than
-    starting. Present and `null` everywhere else for `attestations`' reason -- a constant key set.
+    `halt` (#958) is `null` on every failure but two, both Pulse's, where it is `halt_fallback`'s
+    `{halt_token, resume_command}`: the report failing after admission (#958), and the remote
+    session's lifetime refusal to a request carrying this session's cookie (#985,
+    `server.KeelHandler._expired_pulse_halt`), which a halt carrying the token outlives (#983).
+    The HALT button lives on Pulse, and a stop that vanished whenever the report beside it failed
+    to build, or whenever the console was reloaded after the lifetime, would make stopping slower
+    than starting. Present and `null` everywhere else for `attestations`' reason -- a constant
+    key set.
     """
     return {
         "as_of": iso(now_ts),

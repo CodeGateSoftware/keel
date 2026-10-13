@@ -2836,14 +2836,163 @@ def test_an_expired_remote_session_with_the_halt_token_but_no_session_cannot_hal
 def test_the_session_expired_refusal_names_the_terminal_commands_it_tells_the_operator_to_run(
     deployment,
 ) -> None:
-    """A reloaded console cannot fetch the halt token (`/api/pulse` keeps the lifetime), so the
-    refusal is the only place left that tells the operator how to stop trading now (#983, #985)."""
+    """The refusal tells the operator how to get a working console back and how to stop trading
+    from a terminal (#983). Since #985 a reloaded console also gets its HALT button back from this
+    same refusal on `/api/pulse`, but a browser with no cached shell is refused the page itself,
+    so the sentence naming `keel kill` stays."""
     with _serving(deployment, external_hosts=_REMOTE, started_at=_expired()) as cfg:
         status, _headers, body = _request(cfg, "/api/pulse", cookie=_session(cfg))
 
     assert status == 403, body
     detail = json.loads(body)["error"]["detail"]
     assert re.findall(r"`(keel [a-z-]+)`", detail) == ["keel serve", "keel kill"], detail
+
+
+# -- a reloaded console keeps its HALT after the lifetime (#985) -----------------------------------
+
+
+def _set_kill_switch(db_path: str, engaged: bool) -> None:
+    from keel.data.db import connect
+    from keel.data.repository import Repository
+
+    conn = connect(db_path)
+    try:
+        Repository(conn).set_state("kill_switch", engaged)
+    finally:
+        conn.close()
+
+
+@pytest.mark.parametrize(
+    ("engaged", "resume"), [(False, ""), (True, "keel resume")], ids=["running", "halted"]
+)
+def test_an_expired_pulse_refusal_carries_the_halt_to_its_own_session(
+    deployment, engaged, resume
+) -> None:
+    """**#985, owner-approved design.** Since #983 the server takes a halt with the halt token past
+    the lifetime, but `/api/pulse` -- the only endpoint that serves the token -- keeps it, so a
+    reloaded console had no button. The expired refusal on `/api/pulse` now carries #958's
+    `{halt_token, resume_command}` when the session cookie matches, and nothing else changes: it
+    is still a 403 "Session expired" with `data: null`. The served token halts, and it is the halt
+    token and no other -- neither the gates token (#968) nor the setup write token is in the body.
+    """
+    _set_kill_switch(deployment[0], engaged)
+    with _serving(deployment, external_hosts=_REMOTE, started_at=_expired()) as cfg:
+        status, _headers, body = _request(cfg, "/api/pulse", cookie=_session(cfg))
+
+        assert status == 403, body
+        document = json.loads(body)
+        assert document["error"]["title"] == "Session expired"
+        assert document["data"] is None, "the refusal re-opens no read"
+        assert document["attestations"] is None
+        assert document["halt"] == {
+            "halt_token": security.halt_token(cfg.token),
+            "resume_command": resume,
+        }
+        for other in (security.gates_token(cfg.token), security.csrf_token(cfg.token), cfg.token):
+            assert other not in body
+
+        status, _headers, halted = _halt(cfg, halt=document["halt"]["halt_token"])
+        assert status == 200, halted
+        assert _kill_switch(deployment[0]) is True
+
+
+@pytest.mark.parametrize(
+    "cookie",
+    [None, f"{SESSION_COOKIE}=not-this-session"],
+    ids=["no-cookie", "wrong-cookie"],
+)
+def test_an_expired_pulse_refusal_without_the_session_carries_no_halt(deployment, cookie) -> None:
+    """Without this session's cookie the refusal is exactly the #648 one: no `halt`, and no token
+    anywhere in the body. The halt token is derived from the session token, and serving it to a
+    request that has not shown the session would hand out a credential to anyone who can reach
+    the tunnel."""
+    with _serving(deployment, external_hosts=_REMOTE, started_at=_expired()) as cfg:
+        status, _headers, body = _request(cfg, "/api/pulse", cookie=cookie)
+        halt = security.halt_token(cfg.token)
+
+    assert status == 403, body
+    document = json.loads(body)
+    assert document["error"]["title"] == "Session expired"
+    assert document["halt"] is None
+    assert halt not in body
+
+
+def test_an_expired_session_is_served_the_halt_on_pulse_alone(deployment) -> None:
+    """Every other GET under `/api/` -- every route in the table but Pulse, and the CSV export --
+    keeps the plain expiry refusal with `halt: null`, cookie and all. Pulse is the view that
+    halts; no other endpoint serves the halt token (#968), expired or not. The route count is
+    asserted so a table that shrank cannot pass this by vacuum."""
+    from keel.web import api
+
+    others = sorted((set(api.API_ROUTES) | {api.CSV_EXPORT_PATH}) - {"/api/pulse"})
+    assert len(others) >= 13
+    with _serving(deployment, external_hosts=_REMOTE, started_at=_expired()) as cfg:
+        halt = security.halt_token(cfg.token)
+        answers = {path: _request(cfg, path, cookie=_session(cfg)) for path in others}
+
+    for path, (status, _headers, body) in answers.items():
+        assert status == 403, (path, body)
+        document = json.loads(body)
+        assert document["error"]["title"] == "Session expired", path
+        assert document["halt"] is None, path
+        assert halt not in body, path
+
+
+def test_a_post_to_pulse_after_the_lifetime_is_served_no_halt(deployment) -> None:
+    """The halt rides the READ of Pulse. A POST to the same path is no read, and is refused like
+    any other expired write, with nothing extra."""
+    with _serving(deployment, external_hosts=_REMOTE, started_at=_expired()) as cfg:
+        status, _headers, body = _request(
+            cfg, "/api/pulse", method="POST", cookie=_session(cfg), form={}
+        )
+        halt = security.halt_token(cfg.token)
+
+    assert status == 403, body
+    assert json.loads(body)["halt"] is None
+    assert halt not in body
+
+
+def test_the_halt_an_expired_pulse_serves_opens_no_release(deployment) -> None:
+    """The token the expired refusal serves is the halt token (#968): it releases nothing, in
+    either header, with the real phrase. The kill switch is engaged first, so a release that got
+    through would show."""
+    _set_kill_switch(deployment[0], True)
+    with _serving(deployment, external_hosts=_REMOTE, started_at=_expired()) as cfg:
+        _status, _headers, body = _request(cfg, "/api/pulse", cookie=_session(cfg))
+        served = json.loads(body)["halt"]["halt_token"]
+        refusals = [
+            _request(
+                cfg,
+                route,
+                method="POST",
+                cookie=_session(cfg),
+                **{header: served},
+                raw_body=json.dumps({"phrase": phrase}),
+            )[0]
+            for route, phrase in (
+                ("/api/gates/resume", "RESUME TRADING"),
+                ("/api/gates/resume-entries", "CLEAR STREAK HALT"),
+            )
+            for header in ("halt", "gate")
+        ]
+
+    assert refusals == [403, 403, 403, 403]
+    assert _kill_switch(deployment[0]) is True
+
+
+def test_a_fresh_remote_pulse_is_unchanged_by_the_expiry_halt(deployment) -> None:
+    """Before the lifetime ends, Pulse answers as it always did: a 200 with the halt token in
+    `data` and `halt: null` on the envelope. The #985 path is the expiry's alone."""
+    with _serving(deployment, external_hosts=_REMOTE, started_at=time.time()) as cfg:
+        status, _headers, body = _request(
+            cfg, "/api/pulse", cookie=_session(cfg), host="keel.example.com"
+        )
+        halt = security.halt_token(cfg.token)
+
+    assert status == 200, body
+    document = json.loads(body)
+    assert document["data"]["halt_token"] == halt
+    assert document.get("halt") is None
 
 
 @pytest.mark.parametrize(

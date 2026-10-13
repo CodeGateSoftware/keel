@@ -84,9 +84,11 @@
  *                                        `undefined`, which every consumer treats as
  *                                        "nothing to show" rather than as a mistake. That
  *                                        is exactly how the banner shipped dead.
- * @property {any}          halt    `{halt_token, resume_command}` on a failed `/api/pulse`, else
- *                                  `null` (#958): the HALT control's inputs, delivered apart from
- *                                  the report so a report that failed to build keeps the stop.
+ * @property {any}          halt    `{halt_token, resume_command}` on a failed `/api/pulse`
+ *                                  (#958), or on its remote-lifetime 403 to this session's
+ *                                  cookie (#985), else `null`: the HALT control's inputs,
+ *                                  delivered apart from the report so a report that failed to
+ *                                  build, or a console reloaded after the lifetime, keeps the stop.
  *                                  Read off a FAILURE document only -- a built Pulse carries the
  *                                  same values in its `data`.
  */
