@@ -2882,3 +2882,100 @@ def test_an_expired_remote_session_is_refused_everything_but_the_halt(
     assert status == 403, body
     assert json.loads(body)["error"]["title"] == "Session expired"
     assert _kill_switch(deployment[0]) is True
+
+
+# -- an HTTP/0.9 request line is refused before dispatch (#989) ------------------------------------
+
+
+def _send_raw_and_read(cfg, request: bytes) -> bytes:
+    """Write `request` in one burst and return everything the server sends until it closes.
+
+    Every wait is bounded by the socket's 5 s timeout: a server that never closes raises
+    `TimeoutError` here, which is a failure, never a hang. A reset is tolerated only after bytes
+    arrived (the server closing with ours unread is still a close); a reset with NOTHING sent back
+    is the #989 symptom itself and is re-raised."""
+    received = b""
+    with socket.create_connection((cfg.host, cfg.port), timeout=5) as sock:
+        sock.sendall(request)
+        while True:
+            try:
+                chunk = sock.recv(65536)
+            except ConnectionResetError:
+                if not received:
+                    raise
+                break
+            if not chunk:
+                break
+            received += chunk
+    return received
+
+
+def _status_line(received: bytes) -> bytes:
+    return received.split(b"\r\n", 1)[0]
+
+
+def _status_lines(received: bytes) -> list[bytes]:
+    """Every HTTP/1.x status code in the stream. Not `_statuses`, which counts the stdlib's HTML
+    error page as a separate `ERR` -- and that page is the expected BODY of the 505 here."""
+    return re.findall(rb"HTTP/1\.[01] (\d{3}) ", received)
+
+
+@pytest.mark.parametrize(
+    "path", ["/api/config", "/", "/api/gates/halt"], ids=["api", "shell", "halt-path"]
+)
+def test_an_http09_request_line_is_answered_and_closed_with_nothing_on_stderr(
+    deployment, capfd, path
+) -> None:
+    """**#989.** A request line with no version (`GET /api/config`) is HTTP/0.9: the stdlib parses
+    no header block for it and leaves `self.headers` a plain `dict`. `_refuse` then drained through
+    `_declared_body_length`, which raised `AttributeError` on `.defects` -- the client got a reset
+    with no answer, and a traceback of absolute source paths reached the stderr `log_message`
+    exists to keep quiet. It is refused with a STATED status line now, then closed."""
+    with _serving(deployment) as cfg:
+        received = _send_raw_and_read(cfg, f"GET {path}\r\n".encode())
+
+    assert re.fullmatch(rb"HTTP/1\.[01] 505 .*", _status_line(received)), received[:300]
+    assert _status_lines(received) == [b"505"], received[:300]
+    assert capfd.readouterr().err == ""
+
+
+def test_an_explicit_http09_request_with_a_session_is_refused_not_served_unframed(
+    deployment, capfd
+) -> None:
+    """The three-word form, `GET /api/config HTTP/0.9`, DOES get its headers parsed -- so with a
+    valid Host and session it used to be admitted and answered with the stdlib's 0.9 framing: the
+    JSON body with no status line and no headers. Asked for keep-alive, the connection then stayed
+    open, so that unframed body sat in front of the next response on the same socket.
+
+    It is refused before dispatch like the two-word form, and the pipelined GET behind it is never
+    answered: one status line, then the close."""
+    with _serving(deployment) as cfg:
+        host = f"{cfg.host}:{cfg.port}"
+        request = (
+            f"GET /api/config HTTP/0.9\r\nHost: {host}\r\nCookie: {_session(cfg)}\r\n"
+            "Connection: keep-alive\r\n\r\n"
+            f"GET /api/config HTTP/1.1\r\nHost: {host}\r\nCookie: {_session(cfg)}\r\n"
+            "Connection: close\r\n\r\n"
+        ).encode()
+        received = _send_raw_and_read(cfg, request)
+
+    assert re.fullmatch(rb"HTTP/1\.[01] 505 .*", _status_line(received)), received[:300]
+    assert _status_lines(received) == [b"505"], received[:300]
+    assert b'"data"' not in received, received[:300]
+    assert capfd.readouterr().err == ""
+
+
+@pytest.mark.parametrize("version", ["HTTP/1.0", "HTTP/1.1"])
+def test_an_honest_versioned_get_is_still_served(deployment, version) -> None:
+    """The #989 refusal is for HTTP/0.9 only: a 1.0 or 1.1 request with a Host and a session is
+    answered 200 with the config document, exactly as before."""
+    with _serving(deployment) as cfg:
+        request = (
+            f"GET /api/config {version}\r\nHost: {cfg.host}:{cfg.port}\r\n"
+            f"Cookie: {_session(cfg)}\r\nConnection: close\r\n\r\n"
+        ).encode()
+        received = _send_raw_and_read(cfg, request)
+
+    assert _statuses(received) == [b"200"], received[:300]
+    _head, _, body = received.partition(b"\r\n\r\n")
+    assert json.loads(body)["data"] is not None
