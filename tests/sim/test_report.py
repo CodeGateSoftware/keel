@@ -8,6 +8,9 @@ known exactly -- no network, no real market data, no wall-clock reads.
 
 from __future__ import annotations
 
+import dataclasses
+import subprocess
+import sys
 from decimal import Decimal
 
 from keel.config import TierConfig
@@ -1321,3 +1324,72 @@ def test_edge_section_shows_r_as_na_and_counts_trades_excluded_for_no_risk():
     assert notes == [
         "Excluded from R (no initial risk recorded): a:A 1 of 2 trades, b:B 1 of 1 trades."
     ]
+
+
+def _scratch_r_trade_at(exit_ts: int) -> Trade:
+    """A closed trade WITH R that is neither a win nor a loss (the engine's `scratch`)."""
+    return dataclasses.replace(_r_trade_at(exit_ts, "0"), outcome="scratch")
+
+
+_PF_R = 6  # the "Profit factor (R)" column
+
+
+def test_edge_section_words_an_empty_side_profit_factor_as_insights_does():
+    """#1000: an empty side of the R sample reads as the track record words it (#986/#998),
+    not as the engine's `Infinity` / `0`. Sides are decided by COUNTING the R sample
+    (`n_wins_r` / `n_losses_r`): an all-scratch sample and an all-losses sample both
+    have an engine profit factor of 0, yet only the latter is a measurement. (The hand-built
+    `zero:D` row, a zero-R win, is not engine output; it guards counting over reading.)
+    An all-losses 0 keeps its number;
+    a row with no R at all stays a bare `n/a`."""
+    all_wins = summarize([_r_trade_at(_HOUR, "20"), _r_trade_at(2 * _HOUR, "10")])
+    all_scratch = summarize([_scratch_r_trade_at(_HOUR), _scratch_r_trade_at(2 * _HOUR)])
+    all_losses = summarize([_r_trade_at(_HOUR, "-10")])
+    zero_r_win = summarize([dataclasses.replace(_r_trade_at(_HOUR, "0"), outcome="win")])
+    both_sides = summarize([_r_trade_at(_HOUR, "20"), _r_trade_at(2 * _HOUR, "-10")])
+    no_trades = summarize([])
+    # The fixtures reach the cases they name: the engine's raw values.
+    assert all_wins.profit_factor_r == Decimal("Infinity")
+    assert all_scratch.profit_factor_r == 0 and all_scratch.n_wins_r == 0
+    assert all_losses.profit_factor_r == 0 and all_losses.n_losses_r == 1
+    assert zero_r_win.profit_factor_r == 0 and zero_r_win.n_wins_r == 1
+    assert no_trades.profit_factor_r is None
+
+    edge = {
+        "wins:A": all_wins,
+        "scratch:B": all_scratch,
+        "losses:C": all_losses,
+        "zero:D": zero_r_win,
+        "both:E": both_sides,
+        "none:F": no_trades,
+        POOLED_KEY: all_wins,
+    }
+    table = _table(_render_edge_section(edge, Decimal("0.012")))
+
+    assert [(row[0], row[_PF_R]) for row in table[1:]] == [
+        ("wins:A", "n/a (no losses yet)"),
+        ("scratch:B", "n/a (no wins or losses yet)"),
+        ("losses:C", "0.000"),
+        ("zero:D", "n/a (no losses yet)"),
+        ("both:E", "2.000"),
+        ("none:F", "n/a"),
+        (f"**{POOLED_KEY}**", "n/a (no losses yet)"),
+    ]
+    # Every row still has the header's eleven cells.
+    assert {len(row) for row in table} == {11}
+    # The engine's value is untouched by the rendering.
+    assert all_wins.profit_factor_r == Decimal("Infinity")
+
+
+def test_importing_sim_report_does_not_load_click_or_the_commands_layer():
+    """#1000: `keel.sim.report` words the profit-factor cell through `keel.commands.insights`,
+    but only lazily -- a bare `import keel.sim.report` must not drag click, `keel.agent` or the
+    commands package into the interpreter (origin/main loads none of them). A fresh interpreter,
+    since this process has long since imported them."""
+    code = (
+        "import sys; import keel.sim.report; "
+        "banned = ('click', 'keel.agent', 'keel.commands.insights'); "
+        "print(sorted(m for m in banned if m in sys.modules))"
+    )
+    done = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, check=True)
+    assert done.stdout.strip() == "[]"

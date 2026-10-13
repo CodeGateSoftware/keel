@@ -630,6 +630,24 @@ def profit_factor_reason_of(stats: Any) -> str | None:
     )
 
 
+def profit_factor_r_reason_of(stats: Any) -> str | None:
+    """`_profit_factor_reason` over a `BacktestResult`'s R SAMPLE (#1000) -- the closed trades
+    that carry an initial risk, `n_trades - n_excluded_no_risk` of them -- for the `keel sim`
+    report's `Profit factor (R)` cell. Its sides are decided by COUNTING that sample's trades
+    (`n_wins_r` / `n_losses_r`), never by reading `profit_factor_r`: the engine writes `Infinity`
+    for no losing R, and `0` both for an all-losses sample (a measured 0) and for an all-scratch
+    sample (no reading); only the counts tell those two apart.
+    So an R profit factor with an empty side is worded as the track record and
+    `rules backtest` word a money one. An empty R sample returns `NO_TRADES_YET`; the edge table
+    prints a bare `n/a` there instead, as it does for every R figure of a row with no R. The
+    engine's value is untouched."""
+    return _profit_factor_reason(
+        stats.n_trades - stats.n_excluded_no_risk,
+        stats.avg_win_r if stats.n_wins_r else None,
+        stats.avg_loss_r if stats.n_losses_r else None,
+    )
+
+
 @dataclass(frozen=True)
 class GateDistance:
     rule_name: str
