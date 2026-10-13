@@ -13,7 +13,7 @@ dependencies = ["keel-core==0.21.0", "keel-broker-api==0.21.0"]
 kraken = "keel_broker_kraken:KrakenAdapter"
 
 [build-system]
-requires = ["uv_build>=0.10.4,<0.13.0"]
+requires = ["uv_build>=0.10.4,<0.14.0"]
 build-backend = "uv_build"
 
 [tool.uv.build-backend]
