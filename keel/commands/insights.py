@@ -618,9 +618,11 @@ def _profit_factor_reason(
 
 def profit_factor_reason_of(stats: Any) -> str | None:
     """`_profit_factor_reason` over a `BacktestResult` itself, its sides decided by COUNTING
-    (`_side_average`) exactly as `build_rule_track_record` decides a record's (#988). The
-    `rules backtest` line prints `undefined_reading` of it, so a backtest and a track record of
-    the same sample word an empty side the same way; the engine's value is untouched."""
+    (`_side_average`) exactly as `build_rule_track_record` decides a record's (#988). When the
+    sample has trades the `rules backtest` line prints `undefined_reading` of it, so a backtest
+    and a track record of the same sample word an empty side the same way; at n_trades == 0 it
+    prints a bare `n/a`, as `render_summary` does for a rule with no trade. The engine's value
+    is untouched."""
     return _profit_factor_reason(
         stats.n_trades,
         _side_average(stats, "win", stats.avg_win),
