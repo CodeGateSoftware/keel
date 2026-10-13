@@ -53,6 +53,7 @@ import sys
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field, replace
+from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
@@ -662,6 +663,35 @@ class KeelHandler(BaseHTTPRequestHandler):
         super().handle_one_request()
         if not self.close_connection and self.command in ("GET", "HEAD"):
             self._drain_request_body()
+
+    def parse_request(self) -> bool:
+        """The stdlib's parse, and then an HTTP/0.9 request is refused before any verb sees it
+        (#989).
+
+        **No route here can answer 0.9 correctly.** A versionless request line (`GET /x`) gets no
+        header block parsed, so `self.headers` is a plain `dict` and `_declared_body_length` --
+        reached by every `_refuse` -- raised on it: a reset instead of an answer, and a traceback
+        on the stderr `log_message` keeps quiet. The explicit form (`GET /x HTTP/0.9`) does get
+        headers, so it could be admitted, and was then answered in 0.9 framing: a body with no
+        status line and no length, which on a kept-alive connection sat in front of the next
+        response. Both are the same check -- the stdlib's own test for "answer without a status
+        line" -- so after this every request a verb sees has a parsed header block.
+
+        **Answered, then closed.** A 505 with a status line, as the stdlib frames every other
+        request line it refuses, rather than a silent close: a client that sent a version this
+        server will not speak is told so. `request_version` is moved off 0.9 only so that the
+        refusal carries its status line; `send_error` marks the connection to close. No browser
+        sends 0.9, the console's `fetch` included, so the halt is never refused by this.
+        """
+        if not super().parse_request():
+            return False
+        if self.request_version != "HTTP/0.9":
+            return True
+        self.request_version = "HTTP/1.0"
+        self.send_error(
+            HTTPStatus.HTTP_VERSION_NOT_SUPPORTED, explain="keel speaks HTTP/1.0 and HTTP/1.1."
+        )
+        return False
 
     # -- shared admission --
     def _admitted(self, *, outlives_the_lifetime: bool = False) -> bool:
