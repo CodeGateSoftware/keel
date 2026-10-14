@@ -809,9 +809,10 @@ class KeelHandler(BaseHTTPRequestHandler):
         a file: a shipped asset or a name in `CLIENT_ROUTES` / `RETIRED_CLIENT_ROUTES`. The request
         path is only compared against that package-side list, never passed to a filesystem call,
         so this adds no second user-controlled path flow. The list is walked per call, which is
-        acceptable because this is reached only once the lifetime has expired. A spelling
-        `_serve_static` would still resolve (`/js/../js/main.js`) is not in the list, so it is
-        NOT exempted and is refused as expired: stricter, and fine. Everything under `API_PREFIX`
+        acceptable because this is reached only once the lifetime has expired. The list and
+        `_serve_static` agree by construction: `resolve_static_asset` answers from the same
+        `_servable_files` listing, so a non-canonical spelling (`/js/../js/main.js`) is neither
+        exempted here nor served there. Everything under `API_PREFIX`
         (`EVENTS_PATH` included) and `SWITCH_PREFIX` is excluded by name first, so no later file
         under the static root can shadow one; an unmapped path keeps the lifetime and is refused as
         expired, not 404ed.
@@ -1318,12 +1319,15 @@ class KeelHandler(BaseHTTPRequestHandler):
         presented = (query.get("token") or [""])[0]
         if tokens_match(presented, self.cfg.token):
             # Exchange the token for a cookie and get it out of the URL, so it stops appearing in
-            # history, in a bookmark, and in anything the user pastes when asking for help.
+            # history, in a bookmark, and in anything the user pastes when asking for help. The
+            # target is one of the console's own paths, never the request's spelling of one
+            # (`staticfiles.shell_redirect_target`, CodeQL alert #2).
+            location = staticfiles.shell_redirect_target(staticfiles.STATIC_ROOT, parsed.path)
             self._send(
                 303,
                 "",
                 extra=(
-                    ("Location", parsed.path or "/"),
+                    ("Location", location),
                     ("Set-Cookie", session_cookie(self.cfg.token)),
                 ),
             )

@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import json
 import re
+from html.parser import HTMLParser
 from pathlib import Path
 
 import pytest
@@ -174,6 +175,27 @@ def _markup_only(html: str) -> str:
     cannot check.
     """
     return re.sub(r"<!--.*?-->", " ", html, flags=re.DOTALL)
+
+
+class _StartTags(HTMLParser):
+    """Every start tag in document order, as `(name, {attribute: value})`."""
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.tags: list[tuple[str, dict[str, str]]] = []
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        self.tags.append((tag, {name: value or "" for name, value in attrs}))
+
+    def handle_startendtag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        self.handle_starttag(tag, attrs)
+
+
+def _start_tags(html: str) -> list[tuple[str, dict[str, str]]]:
+    parser = _StartTags()
+    parser.feed(html)
+    parser.close()
+    return parser.tags
 
 
 #: Every character that can only be arithmetic once comments and strings are gone. `/` is in the
@@ -938,18 +960,29 @@ def test_the_shell_ships_no_inline_script_or_style() -> None:
     html = _markup_only(_INDEX.read_text(encoding="utf-8")).lower()
     assert "<style" not in html
     assert "<base" not in html
+    # Tags come from `html.parser`, not a regex: a tag pattern is a hand-rolled HTML tokenizer
+    # (CodeQL alert #8), and the parser is the one that agrees with the browser about `<SCRIPT>`,
+    # attribute order and whitespace inside a tag.
+    tags = _start_tags(html)
+    assert not [tag for tag, _attrs in tags if tag in {"style", "base"}]
     # A `<script>` with a `src` is the only permitted form.
-    tags = re.findall(r"<script[^>]*>", html)
-    assert tags, "the shell loads no script at all"
-    for tag in tags:
-        assert "src=" in tag, f"inline script in index.html: {tag}"
+    scripts = [(index, attrs) for index, (tag, attrs) in enumerate(tags) if tag == "script"]
+    assert scripts, "the shell loads no script at all"
+    for _index, attrs in scripts:
+        assert attrs.get("src"), f"inline script in index.html: {attrs}"
     # Everything is an ES module except the one pre-paint classic script...
-    classic = [tag for tag in tags if 'type="module"' not in tag]
-    assert classic == ['<script src="/js/theme.js">'], (
+    classic = [(index, attrs) for index, attrs in scripts if attrs.get("type") != "module"]
+    assert [attrs for _index, attrs in classic] == [{"src": "/js/theme.js"}], (
         f"the one permitted non-module script is the theme restore: {classic}"
     )
     # ...and that one runs before the stylesheet is applied, which is the no-flash property.
-    assert html.index('<script src="/js/theme.js"') < html.index('<link rel="stylesheet"'), (
+    stylesheets = [
+        index
+        for index, (tag, attrs) in enumerate(tags)
+        if tag == "link" and attrs.get("rel") == "stylesheet"
+    ]
+    assert stylesheets, "the shell links no stylesheet at all"
+    assert classic[0][0] < stylesheets[0], (
         "the theme restore must load before the stylesheet, or the page paints before it runs"
     )
 

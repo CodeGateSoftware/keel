@@ -12,16 +12,26 @@ handler roots itself at the process's current working directory, which is wherev
 happened to be launched from -- not a fixed location inside the package. Wiring it up safely
 would mean overriding `translate_path` anyway, at which point there is nothing left to reuse.
 
-**The traversal defence is `resolve()` then `relative_to()`, not string matching.** A check for
-the literal substring `".."` is a losing game against encoding (`%2e%2e`), redundant separators,
-and symlinks, and it also has a sharper failure mode that is easy to miss entirely: `Path`'s `/`
-operator DISCARDS the left side when the right side is absolute --
+**The traversal defence is a lookup in a listing, not a join and not string matching.** A check
+for the literal substring `".."` is a losing game against encoding (`%2e%2e`), redundant
+separators, and symlinks, and it also has a sharper failure mode that is easy to miss entirely:
+`Path`'s `/` operator DISCARDS the left side when the right side is absolute --
 `Path("/srv/static") / "/etc/passwd"` is `Path("/etc/passwd")`, not an error and not a joined
 path. A resolver that only rejected strings containing `".."` would serve `/etc/passwd` to a
-request for `/static//etc/passwd` and never notice. Resolving the candidate against the
-filesystem and then asking whether it is still `relative_to` the static root catches both
-failure modes with one check, because it asks the only question that matters: where does this
-path ACTUALLY point, not what does its spelling suggest.
+request for `/static//etc/passwd` and never notice.
+
+So the request path is never joined onto the root at all. `_servable_files` walks the root -- the
+package's own directory, a fixed location -- and lists every regular file whose REAL location
+(`resolve()`, symlinks followed) is still under the root (it does not descend into symlinked
+directories at all); `resolve_static_asset` then answers by exact name from that listing. A
+request path is only ever COMPARED with names the package produced, never handed to a
+filesystem call, so there is no spelling of it -- `..`, an absolute
+path, `%2e%2e`, a null byte, a symlinked file planted inside the root that points out of it --
+that can name a file the listing does not already hold. Until the CodeQL alerts #3/#5/#7 this was
+`(root / rel).resolve()` then `relative_to(root)`, which enforced the same containment but walked
+a user-supplied path to get there; the listing is at least as strict (it also refuses
+non-canonical spellings such as `sub/../index.html`, which no browser sends) and puts no request
+byte near the filesystem. The walk is per call, over a directory of a few dozen files.
 """
 
 from __future__ import annotations
@@ -48,7 +58,7 @@ STATIC_ROOT = Path(__file__).resolve().parent / "static"
 #: **The consequence worth stating: this prefix no longer NARROWS anything.** While it was
 #: `/static/`, `url_path.startswith(STATIC_PREFIX)` was itself a filter, and `resolve_static_asset`
 #: could not be reached by a request for `/api/pulse`. At `/` every path passes that test, so the
-#: containment check in `resolve_static_asset` -- `resolve()` then `relative_to()` -- is the only
+#: containment in `resolve_static_asset` -- an exact-name lookup in `_servable_files` -- is the only
 #: thing keeping a request inside the static root, and `server.do_GET` orders `/api/` ahead of
 #: static resolution rather than relying on the prefix to separate them.
 STATIC_PREFIX = "/"
@@ -80,37 +90,40 @@ def content_type_for(path: Path) -> str | None:
     return _CONTENT_TYPES.get(path.suffix.lower())
 
 
+def _servable_files(root: Path) -> dict[str, Path]:
+    """Every regular file under `root`, by its request name (`relpath`, POSIX separators), mapped
+    to its real location. Symlinked DIRECTORIES are not descended into (`Path.rglob` does not
+    follow them by default), so nothing beneath one is listed, whether it points inside the root
+    or outside it. A symlinked FILE is listed only if its resolved target is under `root`; that is
+    what the `is_relative_to` filter is for. So the listing can never name a file the root does
+    not hold. Built from the filesystem alone; no request path reaches it (see the module
+    docstring)."""
+    root_resolved = root.resolve()
+    files: dict[str, Path] = {}
+    for path in root.rglob("*"):
+        real = path.resolve()  # non-strict: a symlink loop resolves to a non-file, not an error
+        if not real.is_relative_to(root_resolved) or not real.is_file():
+            continue
+        files[path.relative_to(root).as_posix()] = real
+    return files
+
+
 def resolve_static_asset(root: Path, url_path: str) -> Path | None:
     """A file inside `root` for a request path under `STATIC_PREFIX`, or `None`.
 
     `None` covers three cases the caller must treat identically -- as a 404, never as a 500 or
-    as "serve something close enough": the path does not start with the static prefix, the
-    computed target does not exist or is not a plain file, or the target would land outside
-    `root` once symlinks and `..` segments are resolved. Decoded ONCE (`unquote`), matching
-    `http.server`'s own behaviour and the browser's: a doubly-encoded `%252e%252e` decodes here
-    to the literal, inert string `%2e%2e`, not to `..`.
+    as "serve something close enough": the path does not start with the static prefix, no file
+    of that exact name is in `_servable_files`'s listing (missing, a directory, a non-canonical
+    spelling of a real file), or the only file of that name lives outside `root` once symlinks
+    are followed. Decoded ONCE (`unquote`), matching `http.server`'s own behaviour and the
+    browser's: a doubly-encoded `%252e%252e` decodes here to the literal, inert string `%2e%2e`,
+    not to `..` -- and then, like a null byte or `..` itself, simply names nothing in the listing.
+    The returned `Path` is the listing's own value, never one built from the request.
     """
     if not url_path.startswith(STATIC_PREFIX):
         return None
     rel = unquote(url_path[len(STATIC_PREFIX) :])
-    if not rel or "\x00" in rel:
-        # A null byte truncates a C string in some filesystem APIs beneath Python's own; refused
-        # here rather than let `resolve()` raise it as an uncaught `ValueError` a layer up.
-        return None
-
-    root_resolved = root.resolve()
-    try:
-        # See the module docstring: `root / rel` alone is not a safe join when `rel` can be
-        # absolute. `resolve()` then `relative_to()` is what actually enforces containment,
-        # regardless of how `rel` got here.
-        candidate = (root / rel).resolve()
-        candidate.relative_to(root_resolved)
-    except ValueError:
-        return None
-
-    if not candidate.is_file():
-        return None
-    return candidate
+    return _servable_files(root).get(rel)
 
 
 # -- the client's own routes (#536) ---------------------------------------------------------------
@@ -227,15 +240,37 @@ def shell_request_paths(root: Path) -> frozenset[str]:
     **Why enumerate rather than resolve.** `server.KeelHandler._is_a_sessioned_shell_read` asks
     "is this request path one the shell answers" and compares against this set, so the request
     path is only ever COMPARED, never handed to a filesystem call: what is built here comes from
-    the package's own directory listing. Resolving the path instead would be a second
-    user-controlled flow into `resolve_static_asset`. The walk is per call, which is cheap
-    enough because its one caller is reached only once the remote session lifetime has expired.
+    the package's own directory listing (`_servable_files`, the same one `resolve_static_asset`
+    answers from). Its callers are that session check, reached only once the remote session
+    lifetime has expired, and `shell_redirect_target`, reached only by a token exchange; the walk
+    is per call, as `resolve_static_asset`'s is.
     """
     names = {
-        STATIC_PREFIX + path.relative_to(root).as_posix()
-        for path in root.rglob("*")
-        if path.is_file() and content_type_for(path) is not None
+        STATIC_PREFIX + name
+        for name, path in _servable_files(root).items()
+        if content_type_for(path) is not None
     }
     names.add(STATIC_PREFIX)
     names.update(STATIC_PREFIX + name for name in (*CLIENT_ROUTES, *RETIRED_CLIENT_ROUTES))
     return frozenset(names)
+
+
+def shell_redirect_target(root: Path, url_path: str) -> str:
+    """The path the token exchange redirects to: the member of `shell_request_paths` that
+    `url_path` names once decoded, else `STATIC_PREFIX` (CodeQL alert #2).
+
+    **The answer is always one of the set's own strings, never the request's.** The redirect's
+    `Location` used to be the request path as sent, which put request bytes into a response
+    header; `http.server` splits the request line on whitespace, so a raw CR or LF never reached
+    it, but a backslash did (`/\\host` is the protocol-relative `//host` to a browser), and a
+    header built from what the client sent is one safe only for as long as every layer beneath
+    it stays that way. Comparing against the closed set and returning the matched member means no
+    byte of the request can be in the header at all. A `?token=` link to any path the console
+    does not answer -- an `/api/` route, a typo -- lands on the home view, which is where the
+    printed address sends everyone anyway.
+    """
+    wanted = unquote(url_path)
+    for known in shell_request_paths(root):
+        if known == wanted:
+            return known
+    return STATIC_PREFIX

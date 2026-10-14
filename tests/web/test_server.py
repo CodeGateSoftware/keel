@@ -955,6 +955,59 @@ def test_a_cookie_from_another_serve_run_is_refused(
     assert "Not authorised" in body
 
 
+@pytest.mark.parametrize(
+    ("asked", "location"),
+    [
+        ("/", "/"),
+        ("/rules", "/rules"),
+        ("/status", "/status"),
+        # CodeQL alert #2: the Location header was the request's own path, spelled as sent.
+        ("/%0d%0aSet-Cookie:%20injected=1", "/"),
+        ("/%0D%0ASet-Cookie:%20injected=1", "/"),
+        # A backslash is a slash to a browser: `/\\host` is the protocol-relative `//host`.
+        ("/%5Cevil.example", "/"),
+        ("/\\evil.example", "/"),
+        ("/api/pulse", "/"),
+        ("/no-such-view", "/"),
+    ],
+)
+def test_the_token_exchange_redirects_only_to_a_path_the_console_answers(
+    running: web_server.ServeConfig, asked: str, location: str
+) -> None:
+    """The redirect that takes the token out of the URL names one of the console's own paths --
+    the closed set `staticfiles.shell_request_paths` lists -- or `/`. The request's spelling is
+    compared against that set, never copied into the header, so no byte of it can end up in a
+    response header: not a CR/LF pair, not a protocol-relative host."""
+    status, headers, _body = _request(running, f"{asked}?token={running.token}")
+    assert status == 303
+    assert headers["Location"] == location
+    assert "injected" not in "".join(f"{k}: {v}\n" for k, v in headers.items())
+    assert headers["Set-Cookie"].startswith(f"{SESSION_COOKIE}={running.token}")
+
+
+def test_a_raw_carriage_return_in_the_request_line_injects_no_header(
+    running: web_server.ServeConfig,
+) -> None:
+    """Pins the PREMISE `staticfiles.shell_redirect_target`'s docstring relies on: `http.server`
+    refuses a raw CR in the request line (400, before `do_GET` runs), so only percent-encoded
+    spellings ever reach the handler, and those are what the parametrized test above covers.
+    This cannot fail against the fix itself; it fails if a stdlib change lets the line through.
+    """
+    request = (
+        f"GET /x\rSet-Cookie: injected=1?token={running.token} HTTP/1.1\r\n"
+        f"Host: {running.host}:{running.port}\r\nConnection: close\r\n\r\n"
+    ).encode("latin-1")
+    with socket.create_connection((running.host, running.port), timeout=3) as sock:
+        sock.sendall(request)
+        chunks = []
+        while chunk := sock.recv(65536):
+            chunks.append(chunk)
+    head = b"".join(chunks).split(b"\r\n\r\n", 1)[0].decode("latin-1")
+    lines = head.split("\r\n")
+    assert lines[0].startswith("HTTP/1.1 400 "), head
+    assert not any("injected" in line for line in lines[1:]), head
+
+
 def test_the_module_that_mints_the_session_token_cannot_write_it_anywhere() -> None:
     """`keel/web/security.py` has no way to reach the filesystem, and that is load-bearing.
 
