@@ -45,7 +45,7 @@ from collections.abc import Sequence
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from decimal import Decimal
-from typing import Any
+from typing import Any, Literal
 
 import click
 from keel_core.types import EquityReading
@@ -646,6 +646,23 @@ def profit_factor_r_reason_of(stats: Any) -> str | None:
         stats.avg_win_r if stats.n_wins_r else None,
         stats.avg_loss_r if stats.n_losses_r else None,
     )
+
+
+def avg_r_reason_of(stats: Any, outcome: Literal["win", "loss"]) -> str | None:
+    """Why a `BacktestResult`'s `avg_win_r` (`outcome="win"`) or `avg_loss_r` (`"loss"`) is not
+    a measurement, or `None` when it is (#1004) -- for the `keel sim` report's `Avg win (R)` /
+    `Avg loss (R)` cells. Decided by COUNTING the R sample's trades on that side (`n_wins_r` /
+    `n_losses_r`), never by reading the average: the engine writes 0 for an empty side (the
+    figure `promotion.pool_stats` multiplies by a zero count), and a side whose trades truly
+    average 0 R is a measured 0. So an empty side reads `no wins yet` / `no losses yet`, the
+    words `_empty_side` gives a track record's empty side. An empty R sample returns
+    `NO_TRADES_YET`, which the edge table prints as a bare `n/a` like every R figure of a row
+    with no R. The engine's value is untouched."""
+    if stats.n_trades - stats.n_excluded_no_risk == 0:
+        return NO_TRADES_YET
+    if outcome == "win":
+        return None if stats.n_wins_r else NO_WINS_YET
+    return None if stats.n_losses_r else NO_LOSSES_YET
 
 
 @dataclass(frozen=True)

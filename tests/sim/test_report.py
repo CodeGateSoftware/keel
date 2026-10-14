@@ -1393,3 +1393,74 @@ def test_importing_sim_report_does_not_load_click_or_the_commands_layer():
     )
     done = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, check=True)
     assert done.stdout.strip() == "[]"
+
+
+_AVG_WIN_R, _AVG_LOSS_R = 4, 5  # the "Avg win (R)" / "Avg loss (R)" columns
+
+
+def test_edge_section_words_an_empty_side_average_r_as_its_profit_factor_does():
+    """#1004: `Avg win (R)` / `Avg loss (R)` of a side the R sample has no trade on read
+    `n/a (no wins yet)` / `n/a (no losses yet)`, not the engine's `0` -- a 0 there reads as a
+    measured flat side. Sides are decided by COUNTING (`n_wins_r` / `n_losses_r`), so a side
+    that HAS trades and averages exactly 0 R (the hand-built zero-R win and zero-R loss, which
+    guard counting over reading) keeps `0.000`. A row with no R at all stays a bare `n/a`."""
+    all_wins = summarize([_r_trade_at(_HOUR, "20"), _r_trade_at(2 * _HOUR, "10")])
+    all_scratch = summarize([_scratch_r_trade_at(_HOUR), _scratch_r_trade_at(2 * _HOUR)])
+    all_losses = summarize([_r_trade_at(_HOUR, "-10")])
+    zero_r_sides = summarize(
+        [
+            dataclasses.replace(_r_trade_at(_HOUR, "0"), outcome="win"),
+            dataclasses.replace(_r_trade_at(2 * _HOUR, "0"), outcome="loss"),
+        ]
+    )
+    both_sides = summarize([_r_trade_at(_HOUR, "20"), _r_trade_at(2 * _HOUR, "-10")])
+    no_trades = summarize([])
+    # The fixtures reach the cases they name: the engine's raw values and counts.
+    assert (all_wins.avg_loss_r, all_wins.n_losses_r) == (0, 0)
+    assert (all_losses.avg_win_r, all_losses.n_wins_r) == (0, 0)
+    assert (all_scratch.avg_win_r, all_scratch.avg_loss_r) == (0, 0)
+    assert (all_scratch.n_wins_r, all_scratch.n_losses_r) == (0, 0)
+    assert (zero_r_sides.avg_win_r, zero_r_sides.avg_loss_r) == (0, 0)
+    assert (zero_r_sides.n_wins_r, zero_r_sides.n_losses_r) == (1, 1)
+    assert no_trades.avg_win_r is None and no_trades.avg_loss_r is None
+
+    edge = {
+        "wins:A": all_wins,
+        "scratch:B": all_scratch,
+        "losses:C": all_losses,
+        "zero:D": zero_r_sides,
+        "both:E": both_sides,
+        "none:F": no_trades,
+        POOLED_KEY: all_losses,
+    }
+    table = _table(_render_edge_section(edge, Decimal("0.012")))
+
+    assert [(row[0], row[_AVG_WIN_R], row[_AVG_LOSS_R]) for row in table[1:]] == [
+        ("wins:A", "1.500", "n/a (no losses yet)"),
+        ("scratch:B", "n/a (no wins yet)", "n/a (no losses yet)"),
+        ("losses:C", "n/a (no wins yet)", "-1.000"),
+        ("zero:D", "0.000", "0.000"),
+        ("both:E", "2.000", "-1.000"),
+        ("none:F", "n/a", "n/a"),
+        (f"**{POOLED_KEY}**", "n/a (no wins yet)", "-1.000"),
+    ]
+    assert table[0][_AVG_WIN_R] == "Avg win (R)" and table[0][_AVG_LOSS_R] == "Avg loss (R)"
+    # Every row still has the header's eleven cells.
+    assert {len(row) for row in table} == {11}
+    # The engine's values are untouched by the rendering.
+    assert (all_wins.avg_loss_r, all_losses.avg_win_r) == (0, 0)
+
+
+def test_avg_r_reason_of_an_empty_r_sample_is_no_trades_yet_on_either_side():
+    """#1004: with no R sample there is no side to be empty -- the reason is `no trades yet`
+    (the edge table prints a bare `n/a` there, before asking). Counts of zero on both sides
+    must not be read as `no wins yet` / `no losses yet`: an all-unrisked sample is not one."""
+    from keel.commands.insights import avg_r_reason_of
+
+    unrisked = summarize([dataclasses.replace(_r_trade_at(_HOUR, "20"), initial_risk=None)])
+    assert (unrisked.n_trades, unrisked.n_excluded_no_risk) == (1, 1)
+    for sample in (summarize([]), unrisked):
+        assert [avg_r_reason_of(sample, "win"), avg_r_reason_of(sample, "loss")] == [
+            "no trades yet",
+            "no trades yet",
+        ]
