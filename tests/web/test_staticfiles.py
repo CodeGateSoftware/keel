@@ -109,6 +109,53 @@ def test_a_doubly_encoded_traversal_is_inert_not_decoded_twice(root: Path) -> No
     assert staticfiles.resolve_static_asset(root, _P("%252e%252e/secret.txt")) is None
 
 
+def test_a_symlink_out_of_the_root_is_refused(root: Path) -> None:
+    """A file inside the root that POINTS outside it is not inside it. The listing the resolver
+    answers from keeps only entries whose real location is under the root."""
+    (root / "leak.txt").symlink_to(root.parent / "secret.txt")
+    assert staticfiles.resolve_static_asset(root, _P("leak.txt")) is None
+
+
+def test_a_symlinked_directory_out_of_the_root_is_refused(root: Path) -> None:
+    outside = root.parent / "outside-dir"
+    outside.mkdir()
+    (outside / "inner.txt").write_text("do not serve me either")
+    (root / "linked").symlink_to(outside, target_is_directory=True)
+    assert staticfiles.resolve_static_asset(root, _P("linked/inner.txt")) is None
+
+
+def test_a_symlink_that_stays_inside_the_root_resolves_to_its_target(root: Path) -> None:
+    (root / "alias.css").symlink_to(root / "style.css")
+    assert staticfiles.resolve_static_asset(root, _P("alias.css")) == (root / "style.css").resolve()
+
+
+def test_a_symlink_loop_in_the_root_names_nothing_and_breaks_nothing(root: Path) -> None:
+    (root / "loop-a").symlink_to(root / "loop-b")
+    (root / "loop-b").symlink_to(root / "loop-a")
+    assert staticfiles.resolve_static_asset(root, _P("loop-a")) is None
+    assert staticfiles.resolve_static_asset(root, _P("index.html")) == root / "index.html"
+
+
+@pytest.mark.parametrize(
+    "spelling",
+    [
+        _P("sub/../index.html"),
+        _P("./index.html"),
+        _P("sub//nested.html"),
+        _P("sub/./nested.html"),
+        _P("sub%2fnested.html/"),
+    ],
+)
+def test_a_non_canonical_spelling_of_a_real_file_is_refused_not_normalised(
+    root: Path, spelling: str
+) -> None:
+    """The request is looked up, by exact name, in the list of files the root holds -- it is never
+    joined onto the root and walked. A browser canonicalises `.` and `..` before it sends a
+    request, so the only client that sends these spellings is one probing the resolver, and it
+    gets the same 404 as any other name the listing does not hold."""
+    assert staticfiles.resolve_static_asset(root, spelling) is None
+
+
 # -- content types ------------------------------------------------------------------------------
 
 

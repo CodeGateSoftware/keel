@@ -1318,12 +1318,15 @@ class KeelHandler(BaseHTTPRequestHandler):
         presented = (query.get("token") or [""])[0]
         if tokens_match(presented, self.cfg.token):
             # Exchange the token for a cookie and get it out of the URL, so it stops appearing in
-            # history, in a bookmark, and in anything the user pastes when asking for help.
+            # history, in a bookmark, and in anything the user pastes when asking for help. The
+            # target is one of the console's own paths, never the request's spelling of one
+            # (`staticfiles.shell_redirect_target`, CodeQL alert #2).
+            location = staticfiles.shell_redirect_target(staticfiles.STATIC_ROOT, parsed.path)
             self._send(
                 303,
                 "",
                 extra=(
-                    ("Location", parsed.path or "/"),
+                    ("Location", location),
                     ("Set-Cookie", session_cookie(self.cfg.token)),
                 ),
             )

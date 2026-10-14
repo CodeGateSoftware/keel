@@ -497,7 +497,14 @@ def main(argv: list[str] | None = None) -> int:
     api_key = (values.get(args.api_key_var) or "").strip()
     private_key = (values.get(args.private_key_var) or "").strip()
     if not api_key or not private_key:
-        print(f"missing {args.api_key_var} or {args.private_key_var} in {args.env}")
+        # Named by FLAG, never by the value after it (CodeQL alert #1): that value is whatever the
+        # operator typed, and a key pasted where its variable name belongs would be echoed here.
+        missing = [
+            flag
+            for flag, value in (("--api-key-var", api_key), ("--private-key-var", private_key))
+            if not value
+        ]
+        print(f"no value in {args.env} for the variable named by {' or '.join(missing)}")
         return 2
 
     transport = RobinhoodTransport(api_key=api_key, private_key_b64=private_key)

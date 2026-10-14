@@ -373,3 +373,35 @@ def test_the_float_repr_trap_stays_closed() -> None:
     the original text is bypassed and `0.00000001` becomes `1e-08`. This is the regression test
     for that having actually happened here."""
     assert "e-" not in dumps_venue_json({"tiny": Decimal("0.00000001")})
+
+
+# --- the credential check -----------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("env_text", "missing_flag", "present_flag"),
+    [
+        ("ROBINHOOD_API_KEY=rh-api-key-value\n", "--private-key-var", "--api-key-var"),
+        ("ROBINHOOD_PRIVATE_KEY=cHJpdmF0ZS1rZXktdmFsdWU=\n", "--api-key-var", "--private-key-var"),
+    ],
+)
+def test_a_missing_credential_is_named_by_its_flag_and_echoes_no_value(
+    tmp_path: Any, capsys: Any, env_text: str, missing_flag: str, present_flag: str
+) -> None:
+    """CodeQL alert #1. The refusal used to print `args.api_key_var` and `args.private_key_var`
+    back -- variable NAMES by default, but whatever the operator typed after the flag, so a key
+    pasted where its variable name belongs was echoed straight to the terminal. The refusal now
+    names the FLAG that is missing and repeats nothing the operator or the `.env` supplied."""
+    env = tmp_path / "probe.env"
+    env.write_text(env_text)
+    pasted = "PASTED-INTO-THE-NAME-FLAG-not-a-variable-name"
+
+    code = probe.main(["--env", str(env), missing_flag, pasted])
+
+    out = capsys.readouterr().out
+    assert code == 2
+    assert pasted not in out
+    assert "rh-api-key-value" not in out
+    assert "cHJpdmF0ZS1rZXktdmFsdWU=" not in out
+    assert missing_flag in out
+    assert present_flag not in out
