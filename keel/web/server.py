@@ -57,7 +57,7 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
-from urllib.parse import parse_qs, urlsplit
+from urllib.parse import parse_qs, unquote, urlsplit
 
 from keel.web import api, events, runtime, staticfiles
 from keel.web.security import (
@@ -805,11 +805,16 @@ class KeelHandler(BaseHTTPRequestHandler):
         byte -- `_serve_static` reads and sends it unaltered, there is no template -- so it carries
         no reading of the ledger and no token; the halt token still comes only from the
         cookie-matched Pulse refusal (#985), and `gates_token` is served nowhere (#968). The test
-        is the same resolution `_serve_static` performs, so the exemption covers exactly the
-        paths that answer a file: a shipped asset or a name in `CLIENT_ROUTES` /
-        `RETIRED_CLIENT_ROUTES`. Everything under `API_PREFIX` (`EVENTS_PATH` included) and
-        `SWITCH_PREFIX` is excluded by name first, so no later file under the static root can
-        shadow one; an unmapped path keeps the lifetime and is refused as expired, not 404ed.
+        is membership in `staticfiles.shell_request_paths`, the paths `_serve_static` answers with
+        a file: a shipped asset or a name in `CLIENT_ROUTES` / `RETIRED_CLIENT_ROUTES`. The request
+        path is only compared against that package-side list, never passed to a filesystem call,
+        so this adds no second user-controlled path flow. The list is walked per call, which is
+        acceptable because this is reached only once the lifetime has expired. A spelling
+        `_serve_static` would still resolve (`/js/../js/main.js`) is not in the list, so it is
+        NOT exempted and is refused as expired: stricter, and fine. Everything under `API_PREFIX`
+        (`EVENTS_PATH` included) and `SWITCH_PREFIX` is excluded by name first, so no later file
+        under the static root can shadow one; an unmapped path keeps the lifetime and is refused as
+        expired, not 404ed.
 
         **Why this session's cookie, and not any browser (#1006's held question, ruled here).**
         Before the lifetime, a request without the cookie is refused the shell
@@ -827,10 +832,7 @@ class KeelHandler(BaseHTTPRequestHandler):
         path = urlsplit(self.path).path
         if path.startswith((API_PREFIX, SWITCH_PREFIX)):
             return False
-        resolved = staticfiles.resolve_static_asset(staticfiles.STATIC_ROOT, path)
-        if resolved is None:
-            resolved = staticfiles.resolve_client_route(staticfiles.STATIC_ROOT, path)
-        if resolved is None or staticfiles.content_type_for(resolved) is None:
+        if unquote(path) not in staticfiles.shell_request_paths(staticfiles.STATIC_ROOT):
             return False
         cookies = parse_cookie_header(self.headers.get("Cookie"))
         return tokens_match(cookies.get(SESSION_COOKIE), self.cfg.token)

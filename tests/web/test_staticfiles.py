@@ -144,3 +144,34 @@ def test_an_unknown_extension_does_not_resolve_even_though_the_file_exists(root:
     resolved = staticfiles.resolve_static_asset(root, _P("unknown.exe"))
     assert resolved == root / "unknown.exe"  # resolves fine -- the type check is a SEPARATE gate
     assert staticfiles.content_type_for(resolved) is None
+
+
+# -- every path the shell answers (#1006) ---------------------------------------------------------
+
+
+def test_shell_request_paths_name_every_servable_file_and_client_route(tmp_path: Path) -> None:
+    """The enumeration is built from the package side only, so a request path never reaches the
+    filesystem. Exact membership for the mount, a shipped file, and a live and a retired client
+    route; the count is files-with-a-known-type, plus the mount, plus every route name; a file
+    whose extension has no Content-Type is absent."""
+    paths = staticfiles.shell_request_paths(staticfiles.STATIC_ROOT)
+
+    for expected in ("/", "/index.html", "/js/main.js", "/pulse", "/status"):
+        assert expected in paths, expected
+    files = [
+        p
+        for p in staticfiles.STATIC_ROOT.rglob("*")
+        if p.is_file() and staticfiles.content_type_for(p) is not None
+    ]
+    routes = len(staticfiles.CLIENT_ROUTES) + len(staticfiles.RETIRED_CLIENT_ROUTES)
+    assert len(files) >= 10
+    assert len(paths) == len(files) + 1 + routes
+
+    (tmp_path / "index.html").write_text("x")
+    (tmp_path / "sub").mkdir()
+    (tmp_path / "sub" / "a.js").write_text("x")
+    (tmp_path / "keel.bin").write_text("x")
+    planted = staticfiles.shell_request_paths(tmp_path)
+    assert _P("keel.bin") not in planted
+    assert _P("sub/a.js") in planted
+    assert len(planted) == 2 + 1 + routes

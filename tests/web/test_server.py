@@ -3101,6 +3101,17 @@ def test_the_shell_is_served_to_its_own_session_past_the_lifetime(deployment) ->
     assert answers[_P("index.html")][2] == answers[_P("")][2] == answers[_P("pulse")][2]
 
 
+def test_a_head_of_the_shell_is_served_to_its_own_session_past_the_lifetime(deployment) -> None:
+    """The verb check admits HEAD as well as GET: a HEAD of a shell path with this session's
+    cookie answers 200 with no body, past the lifetime."""
+    with _serving(deployment, external_hosts=_REMOTE, started_at=_expired()) as cfg:
+        status, headers, body = _request(cfg, _P("index.html"), method="HEAD", cookie=_session(cfg))
+
+    assert status == 200
+    assert headers["Content-Type"].startswith("text/html")
+    assert body == ""
+
+
 @pytest.mark.parametrize(
     "cookie",
     [None, f"{SESSION_COOKIE}=not-this-session"],

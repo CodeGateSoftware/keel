@@ -196,8 +196,9 @@ def resolve_client_route(root: Path, url_path: str) -> Path | None:
     because `server.do_GET` checks both before any static path is looked at. The one difference
     from an `/api/` read is the remote session lifetime: a path this function or
     `resolve_static_asset` answers is served past it to this session's cookie (#1006,
-    `server.KeelHandler._is_a_sessioned_shell_read`, which asks these two functions), because the
-    shell is files and the expired Pulse refusal it reads is what carries the HALT (#985).
+    `server.KeelHandler._is_a_sessioned_shell_read`, which asks `shell_request_paths`, the list of
+    the paths these two functions answer), because the shell is files and the expired Pulse
+    refusal it reads is what carries the HALT (#985).
     """
     if not url_path.startswith(STATIC_PREFIX):
         return None
@@ -213,3 +214,28 @@ def resolve_client_route(root: Path, url_path: str) -> Path | None:
     if not shell.is_file():
         return None
     return shell
+
+
+def shell_request_paths(root: Path) -> frozenset[str]:
+    """Every request path the shell answers, spelled out (#1006).
+
+    `STATIC_PREFIX + relpath` for each file under `root` that `content_type_for` can label (the
+    files `resolve_static_asset` would serve), `STATIC_PREFIX` itself, and `STATIC_PREFIX` plus
+    each name in `CLIENT_ROUTES` and `RETIRED_CLIENT_ROUTES` (the paths `resolve_client_route`
+    answers with the shell).
+
+    **Why enumerate rather than resolve.** `server.KeelHandler._is_a_sessioned_shell_read` asks
+    "is this request path one the shell answers" and compares against this set, so the request
+    path is only ever COMPARED, never handed to a filesystem call: what is built here comes from
+    the package's own directory listing. Resolving the path instead would be a second
+    user-controlled flow into `resolve_static_asset`. The walk is per call, which is cheap
+    enough because its one caller is reached only once the remote session lifetime has expired.
+    """
+    names = {
+        STATIC_PREFIX + path.relative_to(root).as_posix()
+        for path in root.rglob("*")
+        if path.is_file() and content_type_for(path) is not None
+    }
+    names.add(STATIC_PREFIX)
+    names.update(STATIC_PREFIX + name for name in (*CLIENT_ROUTES, *RETIRED_CLIENT_ROUTES))
+    return frozenset(names)
