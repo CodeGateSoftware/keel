@@ -1398,7 +1398,7 @@ def test_importing_sim_report_does_not_load_click_or_the_commands_layer():
 _AVG_WIN_R, _AVG_LOSS_R = 4, 5  # the "Avg win (R)" / "Avg loss (R)" columns
 
 
-def test_edge_section_words_an_empty_side_average_r_as_its_profit_factor_does():
+def test_edge_section_words_an_empty_side_average_r_by_counting_the_r_sample():
     """#1004: `Avg win (R)` / `Avg loss (R)` of a side the R sample has no trade on read
     `n/a (no wins yet)` / `n/a (no losses yet)`, not the engine's `0` -- a 0 there reads as a
     measured flat side. Sides are decided by COUNTING (`n_wins_r` / `n_losses_r`), so a side

@@ -1105,8 +1105,11 @@ def _avg_r_cell(result: BacktestResult, outcome: Literal["win", "loss"]) -> str:
     """The edge table's `Avg win (R)` / `Avg loss (R)` cell (#1004): a bare `n/a` when the row
     has no R (as `_r_cell` gives every R figure), `undefined_reading` of the reason when the R
     sample has no trade on that side -- `n/a (no wins yet)` / `n/a (no losses yet)`, through the
-    one shared `insights.avg_r_reason_of`, the words the `Profit factor (R)` cell beside it uses
-    -- and the measured mean otherwise, `0.000` included when that side's trades average 0 R.
+    one shared `insights.avg_r_reason_of`, the empty-side words (`insights._empty_side`'s family)
+    a track record gives its empty side -- and the measured mean otherwise, `0.000` included when
+    that side's trades average 0 R. Unlike the `Profit factor (R)` cell beside it, an all-losses
+    row's Avg win reads `no wins yet`: an average of no trades is unmeasured, while a profit
+    factor of 0 over real losses is measured.
 
     The engine's empty-side `0` was printed here until #1004; it read as a measured flat side.
     `BacktestResult` is unchanged (`promotion.pool_stats` weights these means by their counts)."""
