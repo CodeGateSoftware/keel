@@ -117,11 +117,22 @@ def test_a_symlink_out_of_the_root_is_refused(root: Path) -> None:
 
 
 def test_a_symlinked_directory_out_of_the_root_is_refused(root: Path) -> None:
+    """Pins the outcome only; `test_a_symlink_out_of_the_root_is_refused` pins the filter."""
     outside = root.parent / "outside-dir"
     outside.mkdir()
     (outside / "inner.txt").write_text("do not serve me either")
     (root / "linked").symlink_to(outside, target_is_directory=True)
     assert staticfiles.resolve_static_asset(root, _P("linked/inner.txt")) is None
+
+
+def test_nothing_under_a_symlinked_directory_is_listed_even_inside_the_root(root: Path) -> None:
+    """The walk does not descend into symlinked directories, so even a link that stays inside
+    the root names nothing; the real directory still resolves."""
+    (root / "inlink").symlink_to(root / "sub", target_is_directory=True)
+    assert staticfiles.resolve_static_asset(root, _P("inlink/nested.html")) is None
+    assert staticfiles.resolve_static_asset(root, _P("sub/nested.html")) == (
+        root / "sub" / "nested.html"
+    )
 
 
 def test_a_symlink_that_stays_inside_the_root_resolves_to_its_target(root: Path) -> None:
