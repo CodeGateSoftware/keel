@@ -193,7 +193,11 @@ def resolve_client_route(root: Path, url_path: str) -> Path | None:
     **This is a read, and it widens nothing.** It maps the names in `CLIENT_ROUTES` and
     `RETIRED_CLIENT_ROUTES` onto one file that is already served at
     `STATIC_PREFIX + CLIENT_ENTRY`; the same session cookie and the same `Host` check gate it,
-    because `server.do_GET` checks both before any static path is looked at.
+    because `server.do_GET` checks both before any static path is looked at. The one difference
+    from an `/api/` read is the remote session lifetime: a path this function or
+    `resolve_static_asset` answers is served past it to this session's cookie (#1006,
+    `server.KeelHandler._is_a_sessioned_shell_read`, which asks these two functions), because the
+    shell is files and the expired Pulse refusal it reads is what carries the HALT (#985).
     """
     if not url_path.startswith(STATIC_PREFIX):
         return None

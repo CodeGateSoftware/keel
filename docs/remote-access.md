@@ -81,16 +81,20 @@ URL, in terminal scrollback, and in whatever got pasted while asking for help. T
 
 So a server configured with `--external-host` enforces a **12-hour session lifetime on its own
 side of the wire**. It is checked before the token, so an expired session and a wrong one get the
-same refusal. There are two exceptions, and both are for the stop. A halt that carries the
-session cookie and the halt token is accepted past the lifetime (#983): a console left running
-overnight must still be able to stop trading. And a read of Pulse (`/api/pulse`) that carries
-this session's cookie is refused as expired, but the refusal carries the HALT control's inputs,
-so a console reloaded after the lifetime still shows HALT (#985). Only the holder of the real
-session token sees the difference. Nothing else is reopened: no release, no setup write, no other
-read, and the release token is still served nowhere. A browser with no cached console is refused
-the page itself; it can stop trading with `keel kill` at the terminal. A loopback-only server has
-no lifetime, and that asymmetry is the argument rather than an exemption. Restarting `keel serve`
-remains the instant revocation gesture in both postures.
+same refusal. There are three exceptions, and all of them are for the stop. A halt that carries
+the session cookie and the halt token is accepted past the lifetime (#983): a console left running
+overnight must still be able to stop trading. A read of Pulse (`/api/pulse`) that carries this
+session's cookie is refused as expired, but the refusal carries the HALT control's inputs, so a
+console reloaded after the lifetime still shows HALT (#985). And the console's own files (the
+page, its scripts, stylesheet and icons) are served past the lifetime to a request carrying this
+session's cookie (#1006), so a browser with no cached console — or one that opens the address
+`keel serve` printed, which sets the cookie — loads the page and reaches that HALT. Those files
+are the package's own, unaltered: no data and no token. Only the holder of the real session token
+sees any of the difference. Nothing else is reopened: no release, no setup write, no other read,
+and the release token is still served nowhere. A browser without the cookie is refused the page
+exactly as before the lifetime ended; it can stop trading with `keel kill` at the terminal. A
+loopback-only server has no lifetime, and that asymmetry is the argument rather than an
+exemption. Restarting `keel serve` remains the instant revocation gesture in both postures.
 
 ## Capability-increasing actions are refused unless the bind is loopback
 
