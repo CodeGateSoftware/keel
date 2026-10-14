@@ -57,7 +57,7 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
-from urllib.parse import parse_qs, urlsplit
+from urllib.parse import parse_qs, unquote, urlsplit
 
 from keel.web import api, events, runtime, staticfiles
 from keel.web.security import (
@@ -708,7 +708,10 @@ class KeelHandler(BaseHTTPRequestHandler):
 
         `outlives_the_lifetime` skips the LIFETIME and nothing else, and exactly one caller sets
         it: `_post`, for a halt that carries this session's halt token (`_is_a_tokened_halt`,
-        #983). Every other request -- a release, a setup write, every read -- keeps it.
+        #983). The one other request that skips it is decided here rather than by `do_GET`, so
+        that handler is untouched: a read of the shell carrying this session's cookie
+        (`_is_a_sessioned_shell_read`, #1006). Every other request -- a release, a setup write,
+        every `/api/` read -- keeps it.
         """
         if not self.cfg.host_policy.permits(self.headers.get("Host")):
             # DNS rebinding lands exactly here: the packet arrived on loopback, so the bind check
@@ -721,13 +724,16 @@ class KeelHandler(BaseHTTPRequestHandler):
             )
             return False
         # #648: an ENFORCED lifetime, checked before the token so an expired session cannot be
-        # distinguished from a wrong one by which refusal comes back -- with one exception since
-        # #985: on a GET or HEAD of `/api/pulse` a request bearing THIS session's cookie gets a
-        # refusal that carries `halt`, and a wrong or missing cookie gets `halt: null`. That is
-        # acceptable because only the holder of the real 256-bit session token can see the
-        # difference, and it tells them nothing they could not already use (`_is_a_tokened_halt`
-        # admits that halt anyway). Every other request still cannot tell the two apart. Only a
-        # remote-configured server has a lifetime -- see `ServeConfig.session_expired_at`.
+        # distinguished from a wrong one by which refusal comes back -- with two exceptions. Since
+        # #985, on a GET or HEAD of `/api/pulse` a request bearing THIS session's cookie gets a
+        # refusal that carries `halt`, and a wrong or missing cookie gets `halt: null`. Since
+        # #1006, a GET or HEAD of the shell bearing THIS session's cookie is served it, and a
+        # wrong or missing cookie is refused as expired. Both are acceptable because only the
+        # holder of the real 256-bit session token can see the difference, and it tells them
+        # nothing they could not already use (`_is_a_tokened_halt` admits that halt anyway, and
+        # the shell is the package's files). Every other request still cannot tell the two
+        # apart. Only a remote-configured server has a lifetime -- see
+        # `ServeConfig.session_expired_at`.
         #
         # #983, the owner's decision: the halt is exempt. A console left running past the lifetime
         # refused its own stop, and refusing a stop is the one failure mode this surface must not
@@ -738,10 +744,17 @@ class KeelHandler(BaseHTTPRequestHandler):
         # It serves a console still showing a Pulse from before the lifetime ended (the token is
         # in its memory), or any client that holds the token. A RELOADED console gets the token
         # back from this refusal itself, on `/api/pulse` and for this session's cookie only
-        # (#985, `_expired_pulse_halt`). The refusal still names `keel kill`: a browser with no
-        # cached shell is refused the page that would draw the button.
+        # (#985, `_expired_pulse_halt`). A browser with no cached shell gets the page from this
+        # server past the lifetime too, for this session's cookie only (#1006,
+        # `_is_a_sessioned_shell_read`), so it reaches that refusal. The refusal still names
+        # `keel kill`, for a browser without the cookie, which is refused the page as before.
         expires = self.cfg.session_expired_at
-        if expires is not None and not outlives_the_lifetime and time.time() >= expires:
+        if (
+            expires is not None
+            and not outlives_the_lifetime
+            and time.time() >= expires
+            and not self._is_a_sessioned_shell_read()
+        ):
             self._refuse(
                 403,
                 "Session expired",
@@ -777,6 +790,52 @@ class KeelHandler(BaseHTTPRequestHandler):
             )
             return False
         return True
+
+    def _is_a_sessioned_shell_read(self) -> bool:
+        """Whether this request is a GET (or HEAD) of the client shell carrying this session's
+        cookie -- the read the remote session lifetime does not bind (#1006).
+
+        **Why.** Since #985 an expired `/api/pulse` refusal carries the HALT control to this
+        session's cookie, but only a console that is already loaded can read it. A browser with no
+        cached console -- a first visit after the lifetime, through the printed `?token=` address,
+        or a browser whose cached files were cleared -- was refused the page itself, so it never
+        drew the button and its only stop was `keel kill` at a terminal.
+
+        **What it re-opens: files, never data.** The shell is `staticfiles.STATIC_ROOT` byte for
+        byte -- `_serve_static` reads and sends it unaltered, there is no template -- so it carries
+        no reading of the ledger and no token; the halt token still comes only from the
+        cookie-matched Pulse refusal (#985), and `gates_token` is served nowhere (#968). The test
+        is membership in `staticfiles.shell_request_paths`, the paths `_serve_static` answers with
+        a file: a shipped asset or a name in `CLIENT_ROUTES` / `RETIRED_CLIENT_ROUTES`. The request
+        path is only compared against that package-side list, never passed to a filesystem call,
+        so this adds no second user-controlled path flow. The list is walked per call, which is
+        acceptable because this is reached only once the lifetime has expired. A spelling
+        `_serve_static` would still resolve (`/js/../js/main.js`) is not in the list, so it is
+        NOT exempted and is refused as expired: stricter, and fine. Everything under `API_PREFIX`
+        (`EVENTS_PATH` included) and `SWITCH_PREFIX` is excluded by name first, so no later file
+        under the static root can shadow one; an unmapped path keeps the lifetime and is refused as
+        expired, not 404ed.
+
+        **Why this session's cookie, and not any browser (#1006's held question, ruled here).**
+        Before the lifetime, a request without the cookie is refused the shell
+        (`test_static_assets_are_behind_the_same_admission_as_every_other_page`: "not exempted
+        ... just because it holds no secrets today"). Serving it to anyone after expiry would make
+        an EXPIRED session more open to a stranger than a live one, and a browser without the
+        cookie gains nothing from the page: the Pulse refusal draws HALT only for the cookie. A
+        browser that has only the printed address gets the cookie from the token exchange, which
+        `do_GET` performs before admission, so the first visit is covered. So, as for #985: only
+        the holder of the real session token can see the difference, and it tells them nothing
+        they could not already use.
+        """
+        if self.command not in ("GET", "HEAD"):
+            return False
+        path = urlsplit(self.path).path
+        if path.startswith((API_PREFIX, SWITCH_PREFIX)):
+            return False
+        if unquote(path) not in staticfiles.shell_request_paths(staticfiles.STATIC_ROOT):
+            return False
+        cookies = parse_cookie_header(self.headers.get("Cookie"))
+        return tokens_match(cookies.get(SESSION_COOKIE), self.cfg.token)
 
     def _expired_pulse_halt(self) -> dict[str, str] | None:
         """The HALT control's inputs for the expired-session refusal, or `None` (#985).

@@ -203,9 +203,11 @@ class UngatedAction:
 #: serves a console still showing a Pulse from before the lifetime ended, whose memory holds the
 #: token, or any client that holds it. A RELOADED console gets the token from `/api/pulse`'s
 #: expiry refusal, which carries `{halt_token, resume_command}` to a request bearing this
-#: session's cookie and to nothing else (`server._expired_pulse_halt`, #985); that refusal still
-#: names `keel kill`. A leaked halt token can at worst halt, which `keel resume` at
-#: a terminal undoes, and it opens no release (#968).
+#: session's cookie and to nothing else (`server._expired_pulse_halt`, #985); the shell that
+#: reads it is served past the lifetime to that cookie too, so a browser with no cached console
+#: reaches it (`server._is_a_sessioned_shell_read`, #1006). That refusal still names
+#: `keel kill`. A leaked halt token can at worst halt, which `keel resume` at a terminal
+#: undoes, and it opens no release (#968).
 HALT = UngatedAction(operation=engage_kill_switch, done=KILL_ENGAGED_LINE)
 
 

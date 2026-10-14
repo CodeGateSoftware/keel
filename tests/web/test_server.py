@@ -1499,18 +1499,27 @@ def test_an_expired_remote_session_is_refused_even_with_a_valid_token(deployment
     like, for as long as they like. So the bound has to be applied on this side of the wire --
     and it has to bite while the token itself is still perfectly valid, which is what makes
     this a lifetime rather than a second way of spelling "wrong token".
+
+    Asserted on a data read. The shell's own files are served past the lifetime to this
+    session's cookie since #1006 (they carry no data and no token), so `/` no longer shows the
+    bound; `test_past_the_lifetime_only_the_shell_is_reopened` covers what else keeps it.
     """
     remote = frozenset({"keel.example.com"})
     stale = time.time() - security.REMOTE_SESSION_MAX_AGE_SECONDS - 1
 
     with _serving(deployment, external_hosts=remote, started_at=time.time()) as fresh:
-        status, _headers, _body = _request(fresh, "/", cookie=f"{SESSION_COOKIE}={fresh.token}")
+        status, _headers, _body = _request(
+            fresh, "/api/config", cookie=f"{SESSION_COOKIE}={fresh.token}"
+        )
         assert status == 200, "a fresh remote session must answer"
 
     with _serving(deployment, external_hosts=remote, started_at=stale) as old:
-        status, _headers, body = _request(old, "/", cookie=f"{SESSION_COOKIE}={old.token}")
+        status, _headers, body = _request(
+            old, "/api/config", cookie=f"{SESSION_COOKIE}={old.token}"
+        )
         assert status == 403
-        assert "lifetime" in body
+        assert json.loads(body)["error"]["title"] == "Session expired"
+        assert "lifetime" in json.loads(body)["error"]["detail"]
 
 
 def test_a_loopback_session_of_the_same_age_still_answers(deployment) -> None:
@@ -2838,8 +2847,9 @@ def test_the_session_expired_refusal_names_the_terminal_commands_it_tells_the_op
 ) -> None:
     """The refusal tells the operator how to get a working console back and how to stop trading
     from a terminal (#983). Since #985 a reloaded console also gets its HALT button back from this
-    same refusal on `/api/pulse`, but a browser with no cached shell is refused the page itself,
-    so the sentence naming `keel kill` stays."""
+    same refusal on `/api/pulse`, and since #1006 a browser with no cached shell is served the
+    page for this session's cookie; a browser without the cookie is still refused the page, so the
+    sentence naming `keel kill` stays."""
     with _serving(deployment, external_hosts=_REMOTE, started_at=_expired()) as cfg:
         status, _headers, body = _request(cfg, "/api/pulse", cookie=_session(cfg))
 
@@ -3038,6 +3048,180 @@ def test_an_expired_remote_session_is_refused_everything_but_the_halt(
     assert status == 403, body
     assert json.loads(body)["error"]["title"] == "Session expired"
     assert _kill_switch(deployment[0]) is True
+
+
+# -- the shell outlives the remote session lifetime, for this session's cookie (#1006) -------------
+
+
+def _shell_paths() -> list[str]:
+    """Every path the client is served at: each shipped file under the static root, the mount
+    itself, and every client route (live and retired). Enumerated from the package rather than
+    listed, so a file added later is covered without editing this test."""
+    from keel.web import staticfiles
+
+    root = staticfiles.STATIC_ROOT
+    files = sorted(
+        _P(path.relative_to(root).as_posix())
+        for path in root.rglob("*")
+        if path.is_file() and staticfiles.content_type_for(path) is not None
+    )
+    routes = [
+        _P(name) for name in ("", *staticfiles.CLIENT_ROUTES, *staticfiles.RETIRED_CLIENT_ROUTES)
+    ]
+    return files + routes
+
+
+def _tokens(cfg) -> dict[str, str]:
+    return {
+        "session": cfg.token,
+        "halt": security.halt_token(cfg.token),
+        "gates": security.gates_token(cfg.token),
+        "csrf": _csrf(cfg),
+    }
+
+
+def test_the_shell_is_served_to_its_own_session_past_the_lifetime(deployment) -> None:
+    """**#1006.** A browser with no cached console was refused the page itself after the 12 h
+    lifetime, so it never reached the expired-Pulse HALT that #985 serves. Every shell path --
+    each shipped file, the mount, every client route -- answers 200 to THIS session's cookie past
+    the lifetime, with the content type it has before it, and no token of any kind is in any of
+    them: the shell is the package's files byte for byte, carrying no data and no credential."""
+    paths = _shell_paths()
+    assert len(paths) >= 20, paths
+    assert _P("index.html") in paths and _P("js/main.js") in paths and _P("sw.js") in paths
+    with _serving(deployment, external_hosts=_REMOTE, started_at=_expired()) as cfg:
+        answers = {path: _request(cfg, path, cookie=_session(cfg)) for path in paths}
+        tokens = _tokens(cfg)
+
+    for path, (status, headers, body) in answers.items():
+        assert status == 200, (path, body[:200])
+        assert headers["Content-Type"] != "application/json; charset=utf-8", path
+        for name, token in tokens.items():
+            assert token not in body, (path, name)
+    assert answers[_P("index.html")][2] == answers[_P("")][2] == answers[_P("pulse")][2]
+
+
+def test_a_head_of_the_shell_is_served_to_its_own_session_past_the_lifetime(deployment) -> None:
+    """The verb check admits HEAD as well as GET: a HEAD of a shell path with this session's
+    cookie answers 200 with no body, past the lifetime."""
+    with _serving(deployment, external_hosts=_REMOTE, started_at=_expired()) as cfg:
+        status, headers, body = _request(cfg, _P("index.html"), method="HEAD", cookie=_session(cfg))
+
+    assert status == 200
+    assert headers["Content-Type"].startswith("text/html")
+    assert body == ""
+
+
+@pytest.mark.parametrize(
+    "cookie",
+    [None, f"{SESSION_COOKIE}=not-this-session"],
+    ids=["no-cookie", "wrong-cookie"],
+)
+def test_the_shell_past_the_lifetime_is_refused_without_the_session(deployment, cookie) -> None:
+    """The exemption is for this session's cookie only, as #985's is: a stranger past the lifetime
+    is refused the shell exactly as before (and before the lifetime they are refused it too, by
+    `test_static_assets_are_behind_the_same_admission_as_every_other_page`). Same refusal text for
+    every path, so a stranger cannot tell a shell path from any other by the answer."""
+    paths = _shell_paths()
+    with _serving(deployment, external_hosts=_REMOTE, started_at=_expired()) as cfg:
+        answers = {path: _request(cfg, path, cookie=cookie) for path in paths}
+        tokens = _tokens(cfg)
+
+    assert {status for status, _h, _b in answers.values()} == {403}
+    assert {body.split("\n", 1)[0] for _s, _h, body in answers.values()} == {"Session expired"}
+    for path, (_status, _headers, body) in answers.items():
+        for name, token in tokens.items():
+            assert token not in body, (path, name)
+
+
+def test_a_token_link_past_the_lifetime_reaches_the_shell(deployment) -> None:
+    """The first visit in #1006's title: a browser that has never held the cookie opens the
+    address keel printed. The token exchange already happened before admission, so it gets the
+    cookie; the shell it is redirected to is now served rather than refused, and its Pulse read
+    then carries the HALT (#985)."""
+    with _serving(deployment, external_hosts=_REMOTE, started_at=_expired()) as cfg:
+        status, headers, _body = _request(cfg, f"/?token={cfg.token}")
+        assert status == 303
+        cookie = headers["Set-Cookie"].split(";", 1)[0]
+        assert cookie == _session(cfg)
+        shell_status, _h, shell = _request(cfg, headers["Location"], cookie=cookie)
+        pulse_status, _h, pulse = _request(cfg, "/api/pulse", cookie=cookie)
+
+    assert shell_status == 200, shell[:200]
+    assert '<script type="module"' in shell
+    assert pulse_status == 403
+    assert json.loads(pulse)["halt"]["halt_token"] == security.halt_token(cfg.token)
+
+
+@pytest.mark.parametrize(
+    "path",
+    ["/api/events", "/api/config", "/api/pulse/", "/switch/8766", "/does-not-exist.js", "/nope"],
+)
+def test_past_the_lifetime_only_the_shell_is_reopened(deployment, path) -> None:
+    """Everything that is not a shipped file or a client route keeps the lifetime for its own
+    session: the event stream, every API read (the route table is
+    `test_an_expired_session_is_served_the_halt_on_pulse_alone`'s), the profile switch, and an
+    unmapped path -- which is refused as expired, not answered with the 404 that would confirm
+    the name is not a file."""
+    with _serving(deployment, external_hosts=_REMOTE, started_at=_expired()) as cfg:
+        status, _headers, body = _request(cfg, path, cookie=_session(cfg))
+
+    assert status == 403, (path, body[:200])
+    title = json.loads(body)["error"]["title"] if path.startswith("/api/") else body.split("\n")[0]
+    assert title == "Session expired"
+
+
+@pytest.mark.parametrize(
+    "path", ["/api/pulse.json", "/api/events.js", "/switch/8766.html", "/keel.bin"], ids=lambda p: p
+)
+def test_a_file_planted_under_the_static_root_reopens_no_other_path(
+    deployment, tmp_path, monkeypatch, path
+) -> None:
+    """The exemption asks whether a path names a servable FILE, so it must not be widened by one
+    that happens to exist: a file under `api/` or `switch/` in the static root, with an extension
+    `_serve_static` would label (`do_GET` routes those paths to the API and the switch, never to
+    `_serve_static`), or one whose extension has no Content-Type (which `_serve_static` refuses).
+    Each is planted in a static root of this test's own, and each keeps the lifetime -- while that
+    root's `index.html` is served, so the plant is proved to be the root in use."""
+    from keel.web import staticfiles
+
+    (tmp_path / "api").mkdir()
+    (tmp_path / "switch").mkdir()
+    for name in ("index.html", "api/pulse.json", "api/events.js", "switch/8766.html", "keel.bin"):
+        (tmp_path / name).write_text("planted", encoding="utf-8")
+    monkeypatch.setattr(staticfiles, "STATIC_ROOT", tmp_path)
+    with _serving(deployment, external_hosts=_REMOTE, started_at=_expired()) as cfg:
+        shell = _request(cfg, _P("index.html"), cookie=_session(cfg))
+        status, _headers, body = _request(cfg, path, cookie=_session(cfg))
+
+    assert (shell[0], shell[2]) == (200, "planted")
+    assert status == 403, (path, body[:200])
+    title = json.loads(body)["error"]["title"] if path.startswith("/api/") else body.split("\n")[0]
+    assert title == "Session expired"
+
+
+def test_a_post_to_a_shell_path_past_the_lifetime_keeps_it(deployment) -> None:
+    """The exemption is for a READ of the shell. A POST to the same path is refused as any
+    expired write is, before any of `do_POST`'s own checks."""
+    with _serving(deployment, external_hosts=_REMOTE, started_at=_expired()) as cfg:
+        status, _headers, body = _request(
+            cfg, _P("index.html"), method="POST", cookie=_session(cfg), form={}
+        )
+
+    assert status == 403, body
+    assert body.split("\n", 1)[0] == "Session expired"
+
+
+def test_before_the_lifetime_the_shell_is_admitted_as_it_always_was(deployment) -> None:
+    """The exemption is the expiry's alone: a live remote session is served the shell with its
+    cookie and refused it without, exactly as a loopback one is."""
+    with _serving(deployment, external_hosts=_REMOTE, started_at=time.time()) as cfg:
+        admitted = _request(cfg, _P("index.html"), cookie=_session(cfg))
+        refused = _request(cfg, _P("index.html"))
+
+    assert admitted[0] == 200
+    assert refused[0] == 403
+    assert refused[2].split("\n", 1)[0] == "Not authorised"
 
 
 # -- an HTTP/0.9 request line is refused before dispatch (#989) ------------------------------------

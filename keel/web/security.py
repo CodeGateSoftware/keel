@@ -130,8 +130,10 @@ SESSION_COOKIE_MAX_AGE_SECONDS = 30 * 24 * 60 * 60
 #: the token. A reloaded console gets the token from the expiry refusal itself: on `/api/pulse`,
 #: and for a request carrying this session's cookie only, that refusal carries the HALT control's
 #: `{halt_token, resume_command}` (`server.KeelHandler._expired_pulse_halt`, #985). It re-opens
-#: no read and no other endpoint serves the token. The refusal still names `keel kill`, for a
-#: browser with no cached shell, which is refused the page that would draw the button.
+#: no read and no other endpoint serves the token. A browser with no cached shell is served the
+#: shell's static files past the lifetime, for this session's cookie only, so it reaches that
+#: refusal (`server.KeelHandler._is_a_sessioned_shell_read`, #1006); they carry no data and no
+#: token. The refusal still names `keel kill`, for a browser without the cookie.
 REMOTE_SESSION_MAX_AGE_SECONDS = 12 * 60 * 60
 
 #: ⛔ THE BRUTE-FORCE ARITHMETIC, WRITTEN DOWN SO NOBODY ADDS A RATE LIMITER FOR THE WRONG
