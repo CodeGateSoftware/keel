@@ -23,9 +23,9 @@ request for `/static//etc/passwd` and never notice.
 So the request path is never joined onto the root at all. `_servable_files` walks the root -- the
 package's own directory, a fixed location -- and lists every regular file whose REAL location
 (`resolve()`, symlinks followed) is still under the root (it does not descend into symlinked
-directories at all); `resolve_static_asset` then answers by
-exact name from that listing. A request path is only ever COMPARED with names the package
-produced, never handed to a filesystem call, so there is no spelling of it -- `..`, an absolute
+directories at all); `resolve_static_asset` then answers by exact name from that listing. A
+request path is only ever COMPARED with names the package produced, never handed to a
+filesystem call, so there is no spelling of it -- `..`, an absolute
 path, `%2e%2e`, a null byte, a symlinked file planted inside the root that points out of it --
 that can name a file the listing does not already hold. Until the CodeQL alerts #3/#5/#7 this was
 `(root / rel).resolve()` then `relative_to(root)`, which enforced the same containment but walked
@@ -96,8 +96,8 @@ def _servable_files(root: Path) -> dict[str, Path]:
     follow them by default), so nothing beneath one is listed, whether it points inside the root
     or outside it. A symlinked FILE is listed only if its resolved target is under `root`; that is
     what the `is_relative_to` filter is for. So the listing can never name a file the root does
-    not hold. Built from the filesystem alone; no request path reaches
-    it (see the module docstring)."""
+    not hold. Built from the filesystem alone; no request path reaches it (see the module
+    docstring)."""
     root_resolved = root.resolve()
     files: dict[str, Path] = {}
     for path in root.rglob("*"):
