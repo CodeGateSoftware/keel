@@ -60,7 +60,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import dataclass, replace
 from decimal import Decimal
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
 
 from keel.execution import sizing
 from keel.execution.guards import _asset
@@ -1004,8 +1004,8 @@ def _render_edge_section(
         label = f"**{key}**" if key == POOLED_KEY else key
         lines.append(
             f"| {label} | {result.n_trades} | {result.win_rate:.1%} | "
-            f"{_r_cell(result.expectancy_r)} | {_r_cell(result.avg_win_r)} | "
-            f"{_r_cell(result.avg_loss_r)} | {_profit_factor_r_cell(result)} | "
+            f"{_r_cell(result.expectancy_r)} | {_avg_r_cell(result, 'win')} | "
+            f"{_avg_r_cell(result, 'loss')} | {_profit_factor_r_cell(result)} | "
             f"{_r_cell(result.max_drawdown_r)} | {result.max_losing_streak} | "
             f"{_r_cell(result.avg_mfe_r)} | {_r_cell(result.avg_mae_r)} |"
         )
@@ -1099,6 +1099,30 @@ def _profit_factor_r_cell(result: BacktestResult) -> str:
     if reason is not None:
         return undefined_reading(reason)
     return _r_cell(result.profit_factor_r)
+
+
+def _avg_r_cell(result: BacktestResult, outcome: Literal["win", "loss"]) -> str:
+    """The edge table's `Avg win (R)` / `Avg loss (R)` cell (#1004): a bare `n/a` when the row
+    has no R (as `_r_cell` gives every R figure), `undefined_reading` of the reason when the R
+    sample has no trade on that side -- `n/a (no wins yet)` / `n/a (no losses yet)`, through the
+    one shared `insights.avg_r_reason_of`, the empty-side words (`insights._empty_side`'s family)
+    a track record gives its empty side -- and the measured mean otherwise, `0.000` included when
+    that side's trades average 0 R. Unlike the `Profit factor (R)` cell beside it, an all-losses
+    row's Avg win reads `no wins yet`: an average of no trades is unmeasured, while a profit
+    factor of 0 over real losses is measured.
+
+    The engine's empty-side `0` was printed here until #1004; it read as a measured flat side.
+    `BacktestResult` is unchanged (`promotion.pool_stats` weights these means by their counts)."""
+    value = result.avg_win_r if outcome == "win" else result.avg_loss_r
+    if value is None:
+        return _r_cell(None)
+    # Lazy: keeps click and the commands layer out of `import keel.sim.report`.
+    from keel.commands.insights import avg_r_reason_of, undefined_reading
+
+    reason = avg_r_reason_of(result, outcome)
+    if reason is not None:
+        return undefined_reading(reason)
+    return _r_cell(value)
 
 
 def _r_cell(value: Decimal | None) -> str:
