@@ -18,9 +18,11 @@ from typing import Any
 
 from keel_core.trade_scope import READ_ONLY, TRADING, TradeScopeState, VenueTradeScope
 
+from keel import attestations
 from keel.commands._products import _default_sim_products
 from keel.commands.doctor import (
     OK,
+    WARN,
     AdmissibilityRow,
     Finding,
     SeriesHealth,
@@ -30,6 +32,7 @@ from keel.commands.doctor import (
     backup_footprint_findings,
     balance_drift_findings,
     data_health_findings,
+    dca_cadence_findings,
     doctor_exit_code,
     doctor_lines,
     gather_findings,
@@ -604,6 +607,7 @@ def test_gather_findings_covers_every_check_over_a_seeded_db(tmp_path, valid_con
         "install.identity",
         "attest.subscription",
         "attest.withdrawals",
+        "attest.dca_cadence",
         "attest.asset_window",
         "attest.instrument_window",
         "audit.chain",
@@ -1814,3 +1818,33 @@ def test_importing_doctor_does_not_import_the_executor() -> None:
         [sys.executable, "-c", program], capture_output=True, text=True, check=True
     ).stdout.split()
     assert out == ["False", "False"]
+
+
+def test_dca_cadence_finding_is_ok_when_nothing_is_uncovered() -> None:
+    (f,) = dca_cadence_findings(())
+    assert (f.name, f.status) == ("attest.dca_cadence", OK)
+
+
+def test_dca_cadence_finding_warns_and_names_every_uncovered_rule() -> None:
+    windows = attestations.dca_windows_after_expiry(
+        [(9, "PAXG-USD", 14), (10, "ADA-USD", 14), (6, "BTC-USD", 7)],
+        attested_at=1_791_660_300,
+        now_ts=1_791_660_300,
+    )
+    (f,) = dca_cadence_findings(windows)
+    assert f.status == WARN and f.headline.startswith("2 live DCA buy(s)")
+    assert f.detail.count("rule ") == 2
+    assert "rule 9 PAXG-USD" in f.detail and "rule 10 ADA-USD" in f.detail
+    assert f.fix == "keel withdrawals attest --enabled"
+
+
+def test_gather_findings_wires_the_dca_cadence_check(tmp_path, valid_config_path) -> None:
+    repo = _seeded_repo(tmp_path / "keel.db")
+    repo.set_state("withdrawals_enabled", True)
+    repo.set_state("withdrawals_attested_at", NOW - 6 * 86_400)  # EXPIRING, still fresh
+    repo.insert_rule("dca", {"product_id": "BTC-USD", "cadence_days": 14}, status="live")
+    findings = gather_findings(repo, load_config(valid_config_path), [], NOW)
+    (f,) = [x for x in findings if x.name == "attest.dca_cadence"]
+    assert f.status == WARN
+    assert f.headline.startswith("1 live DCA buy(s)")
+    assert "BTC-USD" in f.detail

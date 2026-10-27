@@ -235,6 +235,42 @@ def attestation_findings(
 ATTEST_WINDOW_APPROACHING_SEC = DOCTOR_WINDOW_SEC
 
 
+def dca_cadence_findings(
+    windows: Iterable[attestations.DcaWindowAfterExpiry],
+) -> list[Finding]:
+    """Rail 17 vs the DCA cadence -- always exactly one finding (#1010).
+
+    The 7-day withdrawal attestation can lapse before a 14-day DCA rule's next buy, and rail 17
+    then vetoes that buy. `attest.withdrawals` is green while the attestation is fresh, so this
+    names each live rule whose next buy falls after the expiry, with the date to re-attest from
+    (the wording is `DcaWindowAfterExpiry.line`, written once). WARN, never FAIL: the attestation
+    is valid today and the exit code must not move for a buy that is days away. Always emitted,
+    OK included, so a clean deployment shows the check ran. The computation, and the rule that it
+    stays silent for an expired, suspended or absent attestation (already halts), live in
+    `attestations.live_dca_windows_after_expiry`; this only words the result.
+    """
+    found = list(windows)
+    if not found:
+        return [
+            Finding(
+                "attest.dca_cadence",
+                OK,
+                "no live DCA buy falls after the withdrawal attestation expires",
+                "-",
+                "-",
+            )
+        ]
+    return [
+        Finding(
+            "attest.dca_cadence",
+            WARN,
+            f"{len(found)} live DCA buy(s) fall after the withdrawal attestation expires",
+            "; ".join(w.line() for w in found),
+            "keel withdrawals attest --enabled",
+        )
+    ]
+
+
 def _attestation_window_findings(
     rows: Iterable[dict[str, Any]],
     *,
@@ -2396,6 +2432,7 @@ def gather_findings(repo: Any, config: Any, log_lines: Iterable[str], now_ts: in
         withdrawals_enabled=repo.get_state("withdrawals_enabled", default=None),
         now_ts=now_ts,
     )
+    findings += dca_cadence_findings(attestations.live_dca_windows_after_expiry(repo, now_ts))
     # #718: a RECORDED window (`--attest-due`) that nothing reads back is a column nobody
     # benefits from. Reporting only -- see `_attestation_window_findings`'s docstring for why
     # this never fails the run.
