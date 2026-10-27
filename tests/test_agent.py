@@ -7101,6 +7101,36 @@ def test_a_paper_era_signal_does_not_retry_after_promotion(repo, monkeypatch):
     assert repo.get_orders(mode="live", product_id=PRODUCT) == []
 
 
+def test_a_live_era_signal_on_the_promotion_day_still_retries(repo, monkeypatch):
+    """R13 floor, lower edge: `signals.ts` is the BAR's 00:00, so a rule promoted on day P at
+    10:00 must still count its own live signal for bar P (00:00 < promoted_at). A floor at
+    `promoted_at` itself drops it and the vetoed window is never retried."""
+    _keep_venue_attestations_fresh(repo)
+    rid = repo.insert_rule("dca", {"product_id": PRODUCT}, status="candidate")
+    _promote(monkeypatch, repo, rid, 105 * DAY + 36_000)  # promoted day 105 (a cadence bar), 10:00
+    # the day-106 cycle signalled for bar 105 and a guard vetoed it: signal, no order
+    repo.insert_signal({"rule_id": rid, "product_id": PRODUCT, "ts": 105 * DAY, "fired": 1})
+    assert repo.signal_ts_since(rid, 0) == [105 * DAY], "fixture: the live signal is stored"
+    repo.set_state("withdrawals_attested_at", 10**12)
+    r = run_once(FakeBroker(series=_series(106)), repo, _config(), now_ts=107 * DAY + 3_600)
+    assert [s.setup.context.get("dca_retry") for s in r.enter_signals] == [True]
+    assert len(repo.get_orders(mode="live", product_id=PRODUCT)) == 1
+
+
+def test_a_paper_era_signal_the_day_before_promotion_does_not_retry(repo, monkeypatch):
+    """R13 floor, upper edge: the paper-era signal for bar P - 1 sits in the same window as the
+    first live bars; a floor one day early would count it and buy on a paper signal."""
+    _keep_venue_attestations_fresh(repo)
+    rid = repo.insert_rule("dca", {"product_id": PRODUCT}, status="paper")
+    repo.insert_signal({"rule_id": rid, "product_id": PRODUCT, "ts": 99 * DAY, "fired": 1})
+    assert repo.signal_ts_since(rid, 0) == [99 * DAY], "fixture: the paper-era signal is stored"
+    _promote(monkeypatch, repo, rid, 100 * DAY + 36_000)  # promoted day 100, 10:00
+    repo.set_state("withdrawals_attested_at", 10**12)
+    r = run_once(FakeBroker(series=_series(100)), repo, _config(), now_ts=101 * DAY + 3_600)
+    assert r.enter_signals == []
+    assert repo.get_orders(mode="live", product_id=PRODUCT) == []
+
+
 def test_a_ledger_read_failure_falls_back_to_cadence_only(repo, monkeypatch, caplog):
     _keep_venue_attestations_fresh(repo)
     rid = repo.insert_rule("dca", {"product_id": PRODUCT}, status="candidate")
