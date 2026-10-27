@@ -1053,6 +1053,16 @@ def test_last_live_buy_created_at_counts_filled_and_pending_buys_of_that_rule_on
     assert repo.last_live_buy_created_at(other) == 904
 
 
+def test_last_live_buy_created_at_counts_a_partially_filled_buy(repo):
+    # reconcile moves a part-executed order to the non-terminal `partially_filled`; it is
+    # still that window's buy, or the next fresh bar retries and buys twice (#1015)
+    rid = repo.insert_rule("dca", {"product_id": "BTC-USD"}, status="live")
+    repo.insert_order(_dca_order(rid, 100))
+    repo.insert_order(_dca_order(rid, 300, status="partially_filled"))
+    assert len(repo.get_orders(status="partially_filled")) == 1
+    assert repo.last_live_buy_created_at(rid) == 300
+
+
 def test_signal_ts_since_is_inclusive_ordered_and_per_rule(repo):
     rid = repo.insert_rule("dca", {"product_id": "BTC-USD"}, status="live")
     other = repo.insert_rule("dca", {"product_id": "ETH-USD"}, status="live")

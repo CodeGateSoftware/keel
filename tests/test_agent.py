@@ -7073,6 +7073,32 @@ def test_dca_retry_does_not_double_buy_on_a_same_day_rerun_or_later_in_the_windo
     assert len(repo.get_orders(mode="live", product_id=PRODUCT)) == 2
 
 
+def test_a_partially_filled_buy_satisfies_the_window_and_is_not_retried(repo, monkeypatch):
+    """#1015: reconcile leaves a part-executed DCA buy `partially_filled`; it is the window's buy,
+    so the next fresh bar must not retry and buy a second time."""
+    rid = _vetoed_first_window(repo, monkeypatch)
+    repo.set_state("withdrawals_attested_at", 10**12)
+    repo.insert_order(
+        dict(
+            mode="live",
+            product_id=PRODUCT,
+            side=Side.BUY.value,
+            order_type="market",
+            qty=Decimal("1"),
+            status="partially_filled",
+            fee=Decimal("0"),
+            confirmation="autonomous",
+            rule_id=rid,
+            created_at=99 * DAY + 3_600,
+            updated_at=99 * DAY + 3_600,
+        )
+    )
+    assert len(repo.get_orders(mode="live", status="partially_filled")) == 1, "fixture: seeded"
+    r = run_once(FakeBroker(series=_series(99)), repo, _config(), now_ts=100 * DAY + 3_600)
+    assert r.enter_signals == []
+    assert len(repo.get_orders(mode="live", product_id=PRODUCT)) == 1
+
+
 def test_an_unfilled_window_is_reported_not_back_filled(repo, caplog, monkeypatch):
     _vetoed_first_window(repo, monkeypatch)
     repo.set_state("withdrawals_attested_at", 10**12)

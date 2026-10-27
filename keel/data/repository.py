@@ -791,14 +791,16 @@ class Repository:
     def last_live_buy_created_at(self, rule_id: int) -> int | None:
         """`created_at` of the rule's newest COUNTED live BUY, or `None` (#1010).
 
-        Counted means `status IN ('filled', 'pending')`. A DCA market order is written `pending`
-        at insert and `filled` on success, so a `pending` row is one whose outcome nobody has
-        observed yet; treating it as unfilled is exactly the double-buy hazard a window retry
-        must avoid. `rejected` and `canceled` do not count, so that window is retried.
+        Counted means `status IN ('filled', 'pending', 'partially_filled')`. A DCA market order is
+        written `pending` at insert and `filled` on success, so a `pending` row is one whose
+        outcome nobody has observed yet; treating it as unfilled is exactly the double-buy hazard
+        a window retry must avoid. Reconcile moves a part-executed order to the non-terminal
+        `partially_filled`, which is the same hazard: money is already spent in that window.
+        `rejected` and `canceled` do not count, so that window is retried.
         """
         row = self._conn.execute(
             "SELECT MAX(created_at) FROM orders WHERE mode = 'live' AND side = 'BUY' "
-            "AND rule_id = ? AND status IN ('filled', 'pending')",
+            "AND rule_id = ? AND status IN ('filled', 'pending', 'partially_filled')",
             (rule_id,),
         ).fetchone()
         return None if row is None or row[0] is None else int(row[0])
