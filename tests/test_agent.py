@@ -3929,6 +3929,9 @@ def test_equity_finds_cash_for_a_HELD_product_whose_rule_was_retired(repo, monke
 
 # -- CHARACTERIZATION: same-UTC-day re-entry is NOT deduped on the live path -------------------
 #
+# (#1010: the DCA half of this hazard is now closed by the window ledger -- see
+# `test_two_cycles_in_one_utc_day_place_one_dca_order`. The text below is the original record.)
+#
 # These two tests are deliberately NOT regression tests for a bug fix -- they PIN a hazard that
 # exists today in the live path, on purpose, so it cannot regress into "nobody noticed it was
 # there" without a test going red.
@@ -3962,23 +3965,15 @@ def test_equity_finds_cash_for_a_HELD_product_whose_rule_was_retired(repo, monke
 # this is the only thing in the test suite that would notice its absence.
 
 
-def test_two_cycles_in_one_utc_day_place_two_dca_orders(repo):
-    """CHARACTERIZATION, not a spec: pins the DCA half of the live day-stamp hazard described
-    in the section header above. See that comment for the full mechanism.
+def test_two_cycles_in_one_utc_day_place_one_dca_order(repo):
+    """REWRITTEN by #1010 (was `..._place_two_dca_orders`, a characterization of the hazard in
+    the section header above). A live cycle now arms each DCA rule with a window ledger, and the
+    first cycle's counted BUY satisfies the window, so a same-day second cycle does not buy.
 
     Template: `test_run_once_polls_evaluates_and_executes_a_real_dca_rule` (single day-0 daily
-    candle, `Dca`'s cadence-boundary fixture -- `latest.ts // 86_400 % cadence_days == 0` with
-    `cadence_days=7`, and `0 % 7 == 0`). `market_feed._latest_closed_ts(now_ts, 86_400)` resolves
-    to that same day-0 candle for ANY `now_ts` inside calendar day 1 (`[86_400, 172_800)`), so
-    both cycles below evaluate the identical `Setup` off the identical candle -- the rule does
-    not "know" it already fired.
-
-    `EARLY`/`LATE` model the runner's own two-trigger-in-one-day shape (an hourly-launchd
-    detector re-armed after a missed day-stamp -- see `keel-live-run.sh`'s header): `EARLY` is
-    the first cycle of day 1, `LATE` is a much later cycle the SAME day. `LATE` is kept inside
-    rail 12's staleness window (`config.auto_trade.interval_sec(50_000) * FEED_STALENESS_CYCLES
-    (3) = 150_000` seconds past the day-0 candle) so the second cycle still finds the feed fresh
-    and reaches the rule at all -- a stale-feed skip would prove nothing about this hazard.
+    candle, cadence 7, `0 % 7 == 0`). Both cycles run inside calendar day 1 and see the identical
+    day-0 candle; `EARLY` is the day's first cycle, `LATE` a much later one the SAME day, kept
+    inside rail 12's staleness window so the second cycle still reaches the rule at all.
     """
     repo.insert_rule("dca", {"product_id": PRODUCT}, status="live")
     broker = FakeBroker(series={(PRODUCT, Granularity.ONE_DAY): [_candle(0, "100")]})
@@ -3990,16 +3985,11 @@ def test_two_cycles_in_one_utc_day_place_two_dca_orders(repo):
     first = run_once(broker, repo, config, now_ts=EARLY)
     second = run_once(broker, repo, config, now_ts=LATE)
 
-    # The hazard, stated as an assertion: BOTH cycles place. A real dedupe would make the second
-    # `placed is False` (or the signal never fire at all); today it does not.
     assert first.enter_results[0].placed is True
-    assert second.enter_results[0].placed is True
+    assert second.enter_signals == [], "the satisfied window must not fire a second signal"
 
     orders = repo.get_orders(mode="live", product_id=PRODUCT)
-    assert len(orders) == 2, (
-        "expected the SAME dca signal to place twice in one UTC day -- if this is 1, a dedupe "
-        "now exists and this test must be REWRITTEN (not deleted) to assert that instead"
-    )
+    assert len(orders) == 1
     assert all(o["side"] == "BUY" for o in orders)
 
 
@@ -7012,3 +7002,118 @@ def test_a_sleeve_exit_rules_longer_window_sizes_the_backfill_on_a_sleeve_only_p
     assert result.sleeve_only_products == [_PAXG], "fixture: PAXG is a sleeve-only product"
     cached = repo.get_candles(_PAXG, Granularity.ONE_DAY)
     assert (len(cached), cached[-1].ts) == (300, 399 * DAY)
+
+
+# -- #1010: DCA window retry ---------------------------------------------------------------------
+#
+# Rail 17's 7-day attestation can expire under a 14-day DCA cadence, vetoing the one cadence bar.
+# A live cycle arms each DCA rule with a `DcaWindowLedger`, so a signalled-but-unfilled window is
+# retried on a later fresh bar of the same window (one buy per window) and a missed one is logged.
+# Cadence 7, cadence bar day 98 (98 % 7 == 0); a cycle on day X runs at X * DAY + 3_600.
+
+
+def _events(caplog) -> list[tuple[str, dict]]:
+    return [(r.getMessage(), getattr(r, _FIELDS_ATTR, {})) for r in caplog.records]
+
+
+def _series(last_day: int) -> dict[tuple[str, Granularity], list[Candle]]:
+    return {(PRODUCT, Granularity.ONE_DAY): [_candle(d * DAY) for d in range(98, last_day + 1)]}
+
+
+def _promote(monkeypatch, repo, rule_id, at_ts):
+    """Promote `rule_id` to live with `promoted_at` pinned to `at_ts` (R13 reads it)."""
+    with monkeypatch.context() as m:
+        m.setattr("keel.data.repository.time.time", lambda: at_ts)
+        repo.update_rule_status(rule_id, "live")
+
+
+def _keep_venue_attestations_fresh(repo) -> None:
+    """The `repo` fixture attests cash posture at ts 0; these cycles run ~99 days later, where
+    rail 22 would veto on EXPIRY rather than rail 17. Push its due date out so rail 17 is the
+    only guard under test."""
+    attest_cash_posture(repo, now_ts=0, attest_due_ts=10**12)
+
+
+def _vetoed_first_window(repo, monkeypatch) -> int:
+    """Rule promoted long before the window; rail 17 stale so the day-99 cycle signals but is
+    vetoed. Returns the rule id."""
+    _keep_venue_attestations_fresh(repo)
+    rid = repo.insert_rule("dca", {"product_id": PRODUCT}, status="candidate")
+    _promote(monkeypatch, repo, rid, 90 * DAY)
+    repo.set_state("withdrawals_attested_at", 1)
+    r1 = run_once(FakeBroker(series=_series(98)), repo, _config(), now_ts=99 * DAY + 3_600)
+    assert len(r1.enter_signals) == 1 and r1.enter_results[0].placed is False
+    assert [v.split(":")[0] for v in r1.enter_results[0].vetoed_by] == ["withdrawal_capability"]
+    assert repo.get_orders(mode="live", product_id=PRODUCT) == []
+    return rid
+
+
+def test_dca_vetoed_window_is_retried_on_the_next_fresh_bar(repo, monkeypatch):
+    rid = _vetoed_first_window(repo, monkeypatch)
+    repo.set_state("withdrawals_attested_at", 10**12)  # operator re-attests
+    r2 = run_once(FakeBroker(series=_series(99)), repo, _config(), now_ts=100 * DAY + 3_600)
+    assert r2.enter_results[0].placed is True
+    assert r2.enter_signals[0].setup.context["dca_retry"] is True
+    orders = repo.get_orders(mode="live", product_id=PRODUCT)
+    assert len(orders) == 1 and orders[0]["rule_id"] == rid
+
+
+def test_dca_retry_does_not_double_buy_on_a_same_day_rerun_or_later_in_the_window(
+    repo, monkeypatch
+):
+    _vetoed_first_window(repo, monkeypatch)
+    repo.set_state("withdrawals_attested_at", 10**12)
+    run_once(FakeBroker(series=_series(99)), repo, _config(), now_ts=100 * DAY + 3_600)
+    assert len(repo.get_orders(mode="live", product_id=PRODUCT)) == 1
+    run_once(FakeBroker(series=_series(99)), repo, _config(), now_ts=100 * DAY + 7_200)
+    run_once(FakeBroker(series=_series(100)), repo, _config(), now_ts=101 * DAY + 3_600)
+    assert len(repo.get_orders(mode="live", product_id=PRODUCT)) == 1
+    r5 = run_once(FakeBroker(series=_series(105)), repo, _config(), now_ts=106 * DAY + 3_600)
+    assert r5.enter_results[0].placed is True  # next window buys normally
+    assert len(repo.get_orders(mode="live", product_id=PRODUCT)) == 2
+
+
+def test_an_unfilled_window_is_reported_not_back_filled(repo, caplog, monkeypatch):
+    _vetoed_first_window(repo, monkeypatch)
+    repo.set_state("withdrawals_attested_at", 10**12)
+    with caplog.at_level(logging.WARNING):
+        r = run_once(FakeBroker(series=_series(105)), repo, _config(), now_ts=106 * DAY + 3_600)
+    assert [s.setup.context.get("dca_retry") for s in r.enter_signals] == [False]
+    assert len(repo.get_orders(mode="live", product_id=PRODUCT)) == 1
+    missed = [e for e in _events(caplog) if e[0] == "agent.dca_window_missed"]
+    assert len(missed) == 1 and missed[0][1]["window_start_ts"] == 98 * DAY
+
+
+def test_a_rule_promoted_mid_window_waits_for_its_cadence_bar(repo):
+    repo.insert_rule("dca", {"product_id": PRODUCT}, status="live")
+    r = run_once(FakeBroker(series=_series(100)), repo, _config(), now_ts=101 * DAY + 3_600)
+    assert r.enter_signals == [] and repo.get_orders(mode="live", product_id=PRODUCT) == []
+
+
+def test_a_paper_era_signal_does_not_retry_after_promotion(repo, monkeypatch):
+    rid = repo.insert_rule("dca", {"product_id": PRODUCT}, status="paper")
+    # the paper era emitted (and nobody filled) the window's cadence signal for bar 98
+    repo.insert_signal({"rule_id": rid, "product_id": PRODUCT, "ts": 98 * DAY, "fired": 1})
+    assert repo.signal_ts_since(rid, 0) == [98 * DAY], "fixture: the paper-era signal is stored"
+    _promote(monkeypatch, repo, rid, 100 * DAY + 36_000)  # promoted day 100, 10:00
+    r = run_once(FakeBroker(series=_series(100)), repo, _config(), now_ts=101 * DAY + 3_600)
+    assert r.enter_signals == []
+    assert repo.get_orders(mode="live", product_id=PRODUCT) == []
+
+
+def test_a_ledger_read_failure_falls_back_to_cadence_only(repo, monkeypatch, caplog):
+    _keep_venue_attestations_fresh(repo)
+    rid = repo.insert_rule("dca", {"product_id": PRODUCT}, status="candidate")
+    _promote(monkeypatch, repo, rid, 90 * DAY)
+
+    def _boom(*_a, **_k):
+        raise RuntimeError("database is locked")
+
+    monkeypatch.setattr(repo, "last_live_buy_created_at", _boom)
+    with caplog.at_level(logging.WARNING):
+        r = run_once(FakeBroker(series=_series(98)), repo, _config(), now_ts=99 * DAY + 3_600)
+    assert r.enter_results[0].placed is True  # bar 98 is a cadence bar
+    assert "dca_retry" not in r.enter_signals[0].setup.context  # ledger was None
+    failed = [e for e in _events(caplog) if e[0] == "agent.dca_window_ledger_failed"]
+    assert len(failed) == 1
+    assert failed[0][1]["rule_id"] == rid and "database is locked" in failed[0][1]["error"]

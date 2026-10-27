@@ -94,7 +94,7 @@ from keel.strategy.reduction import Reduction
 from keel.strategy.rules import sleeve_exit as sleeve_exit_rule
 from keel.strategy.rules.base import Action, Rule, Setup, Signal, completed_days
 from keel.strategy.rules.cusum_event import CusumEvent
-from keel.strategy.rules.dca import Dca
+from keel.strategy.rules.dca import Dca, DcaWindowLedger
 from keel.strategy.rules.profit_take import ProfitTake
 from keel.strategy.rules.pullback_continuation import PullbackContinuation
 from keel.strategy.rules.reverse_dca import ReverseDca
@@ -361,6 +361,63 @@ def _finest_granularity(granularities: list[Granularity]) -> Granularity | None:
     return min(granularities, key=lambda g: _GRANULARITY_ORDER.get(g, 0))
 
 
+_SECONDS_PER_DAY = 86_400
+
+
+def _dca_window_ledger(repo: Repository, rule: Dca, now_ts: int) -> DcaWindowLedger:
+    """The `DcaWindowLedger` a LIVE cycle hands one DCA rule (#1010).
+
+    WHY: rail 17's 7-day attestation can expire under a 14-day cadence and veto the single
+    cadence bar, losing the window. `Dca.detect` stays pure, so this is where the two database
+    facts it needs are read: the bar day of the rule's newest counted (filled or pending) live
+    BUY (a live order acts on yesterday's bar, hence `- 1`), and the bar days it signalled.
+
+    A persisted signal proves the window was due, but `signals` has no mode column and a
+    promoted rule keeps its id, so only signals from the rule's live era count (R13): the lower
+    bound is raised to the start of the UTC day it was promoted (`signals.ts` is the BAR's
+    00:00, so flooring keeps the first live bar). A rule with no `promoted_at` (inserted straight
+    at `live`) has no provable live era, so no signal counts and it stays cadence-only.
+    """
+    assert rule.rule_id is not None  # the caller arms only persisted rules
+    last = repo.last_live_buy_created_at(rule.rule_id)
+    last_counted_bar_day = None if last is None else last // _SECONDS_PER_DAY - 1
+    promoted_at = next(
+        (row.get("promoted_at") for row in repo.get_rules("live") if row["id"] == rule.rule_id),
+        None,
+    )
+    if promoted_at is None:
+        return DcaWindowLedger(last_counted_bar_day, frozenset())
+    cadence = int(rule.params["cadence_days"])
+    since = max(
+        (now_ts // _SECONDS_PER_DAY - 2 * cadence - 1) * _SECONDS_PER_DAY,
+        (int(promoted_at) // _SECONDS_PER_DAY) * _SECONDS_PER_DAY,
+    )
+    return DcaWindowLedger(
+        last_counted_bar_day,
+        frozenset(ts // _SECONDS_PER_DAY for ts in repo.signal_ts_since(rule.rule_id, since)),
+    )
+
+
+def _arm_dca_ledger(repo: Repository, rule: Dca, now_ts: int) -> None:
+    """Set `rule.window_ledger` for this cycle; never raises (#1010, R14).
+
+    A failed read costs the retry, never the cycle: on any exception the rule keeps no ledger
+    (today's cadence-only behaviour) and a WARNING says why. Wrapped like `_sleeve_rules` is in
+    `run_once` -- a broken read must not cost the cadence buy.
+    """
+    try:
+        rule.window_ledger = _dca_window_ledger(repo, rule, now_ts)
+    except Exception as exc:  # noqa: BLE001 -- a broken ledger read must not cost the cycle
+        rule.window_ledger = None
+        log_event(
+            logger,
+            logging.WARNING,
+            "agent.dca_window_ledger_failed",
+            rule_id=rule.rule_id,
+            error=str(exc),
+        )
+
+
 def _entry_gate_granularity(rule: Rule, granularities: list[Granularity]) -> Granularity | None:
     """Which granularity's freshness should gate `rule`'s ENTRIES (Finding 1, HIGH)?
 
@@ -379,7 +436,9 @@ def _entry_gate_granularity(rule: Rule, granularities: list[Granularity]) -> Gra
     stale while FIFTEEN_MINUTE stayed perfectly fresh. The coarsest granularity is the fallback
     that fails in the safe direction for any rule that does not tell us what it actually reads:
     it is the input most likely to be what a rule silent about its timeframe is keying off, per
-    this codebase's rules so far.
+    this codebase's rules so far. (Since #1010 a live cycle's window ledger also stops that
+    double-buy -- a window with a counted BUY never fires again -- but the freshness gate is still
+    what keeps a stale bar out.)
 
     Returns `None` only when `granularities` itself is empty -- nothing to gate on at all.
     """
@@ -2693,6 +2752,12 @@ def run_once(
                 # persisted, or logged, and `enter_signals` stays empty for the whole cycle.
                 continue
 
+            if paper_trader is None:
+                # Live cycles only (#1010, R7): paper and sim stay cadence-only. Rules are
+                # rebuilt every cycle, so the ledger never outlives it.
+                for dca_rule in product_rules:
+                    if isinstance(dca_rule, Dca) and dca_rule.rule_id is not None:
+                        _arm_dca_ledger(repo, dca_rule, now_ts)
             product_signals = engine.evaluate(product_rules, candles_by_tf, repo=repo)
             log_event(
                 logger,
@@ -2704,6 +2769,23 @@ def run_once(
             )
             for signal in product_signals:
                 enter_signals.append(signal)
+                missed_ts = (
+                    signal.setup.context.get("previous_window_missed_ts")
+                    if signal.setup is not None
+                    else None
+                )
+                if missed_ts is not None:
+                    # #1010 R4: the previous DCA window was signalled but never bought. Reported,
+                    # never back-filled, never routed to notifications.
+                    log_event(
+                        logger,
+                        logging.WARNING,
+                        "agent.dca_window_missed",
+                        product=product_id,
+                        rule=signal.rule_name,
+                        rule_id=signal.rule_id,
+                        window_start_ts=missed_ts,
+                    )
                 if paper_trader is not None:
                     if paper_equity is None:
                         log_event(
