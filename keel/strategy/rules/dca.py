@@ -14,10 +14,19 @@ the per-asset concentration cap (rail 6). It remains bounded by the halal allowl
 kill-switch and every other rail -- among them the per-order, per-day, correlated-size, cash and
 monthly-buy rails (2, 3, 5, 13, 14). `execution/guards.py`'s module docstring is the authoritative
 list; this rule (like every Phase 2 rule) only emits *intents*.
+
+**Window retry (#1010).** A cadence buy a guard vetoed (rail 17's 7-day attestation expiring
+under a 14-day cadence is the motivating case) used to be lost until the next window. A live
+cycle may now hand the rule a `DcaWindowLedger` (`Dca.window_ledger`): with it, a window the
+rule already signalled for an EARLIER bar but never got a counted buy for is retried on each
+later fresh bar of that window, and a window with a counted buy never fires again -- one buy per
+window. With no ledger (backtest, account sim, paper, every existing caller) `detect` is exactly
+the cadence-only rule above.
 """
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from decimal import Decimal
 
 from keel.strategy.rules.base import Rule, Setup, completed_days
@@ -59,8 +68,28 @@ def next_dca_bar_ts(now_ts: int, cadence_days: int) -> int:
     return next_cadence_day_ts(now_ts - _SECONDS_PER_DAY, cadence_days)
 
 
+@dataclass(frozen=True)
+class DcaWindowLedger:
+    """What a live cycle knows about a DCA rule's cadence windows (#1010), as plain values.
+
+    WHY a value object the caller fills: `Dca.detect` must stay pure (no repo, no clock), yet a
+    retry needs two facts only the database holds. `last_counted_bar_day` is the bar day
+    (`created_at // 86400 - 1`, because a live order acts on yesterday's completed bar) of the
+    rule's newest filled-or-pending live BUY; `signalled_bar_days` are the bar days the rule
+    emitted a signal for (a persisted signal proves a guard or the broker, not the calendar,
+    stopped the window). The agent builds it per cycle; nothing else sets it.
+    """
+
+    last_counted_bar_day: int | None
+    signalled_bar_days: frozenset[int]
+
+
 class Dca(Rule):
     """Cadence-based dip-buy accumulation rule.
+
+    `window_ledger` (class-level default `None`, set per live cycle by `agent.run_once`, #1010)
+    switches on the window-retry behaviour described in the module docstring. It is deliberately
+    not a constructor parameter, so `params` / `describe()` / the rule contract are unchanged.
 
     One `Dca` instance is bound to a single `product_id` -- the candles passed to `detect` are
     assumed to already be for that product, matching how the Task 7 evaluation engine will
@@ -96,6 +125,8 @@ class Dca(Rule):
     #: (`_is_dca_setup`) and rests nothing behind the buy. Declared so the bracket column reads
     #: "no stop by design" for its tranches rather than WARNing on every one (#961).
     places_bracket = False
+    #: Per-cycle window ledger (#1010); `None` = today's cadence-only behaviour.
+    window_ledger: DcaWindowLedger | None = None
 
     def __init__(
         self,
@@ -136,6 +167,11 @@ class Dca(Rule):
     def detect(self, candles_by_tf: dict[Granularity, list[Candle]]) -> Setup | None:
         """Pure. On a cadence boundary, a market-buy long `Setup` sized to `budget_usd` (scaled
         up on dips); off-cadence (or with no daily candles), `None`.
+
+        Still pure (#1010): the optional `window_ledger` is an INPUT the caller supplies per
+        cycle (`agent.run_once`; never the sim), not something `detect` reads or clocks itself.
+        With it, a window already satisfied returns `None`, and a signalled-but-unsatisfied
+        window fires on later bars (`dca_retry`); see the module docstring.
         """
         # COMPLETED days only (#821): the account sim's last daily bar is the still-forming day,
         # stored with the completed day's OHLC -- reading it from hour 0 bought at a close that
@@ -147,8 +183,38 @@ class Dca(Rule):
 
         latest = candles[-1]
         cadence_days = self.params["cadence_days"]
-        if not is_cadence_day(latest.ts, cadence_days):
-            return None  # off-cadence: no buy today
+        ledger = self.window_ledger
+        window_context: dict = {}
+        if ledger is None:
+            if not is_cadence_day(latest.ts, cadence_days):
+                return None  # off-cadence: no buy today
+        else:
+            day = latest.ts // _SECONDS_PER_DAY
+            window_start = day - day % cadence_days
+            window_start_ts = window_start * _SECONDS_PER_DAY
+            counted = ledger.last_counted_bar_day
+            if counted is not None and counted >= window_start:
+                self.last_rejection = {
+                    "gate": "dca_window_satisfied",
+                    "window_start_ts": window_start_ts,
+                }
+                return None
+            if day == window_start:
+                window_context = {"window_start_ts": window_start_ts, "dca_retry": False}
+                previous = window_start - cadence_days
+                if any(previous <= s < window_start for s in ledger.signalled_bar_days) and (
+                    counted is None or counted < previous
+                ):
+                    window_context["previous_window_missed_ts"] = previous * _SECONDS_PER_DAY
+            elif any(window_start <= s < day for s in ledger.signalled_bar_days):
+                window_context = {"window_start_ts": window_start_ts, "dca_retry": True}
+            else:
+                self.last_rejection = {
+                    "gate": "dca_off_cadence",
+                    "window_start_ts": window_start_ts,
+                }
+                return None
+            self.last_rejection = None
 
         budget_usd: Decimal = self.params["budget_usd"]
         dip_bonus_pct: Decimal = self.params["dip_bonus_pct"]
@@ -174,6 +240,7 @@ class Dca(Rule):
             "recent_high": recent_high,
             "size_usd": size_usd,
             "no_stop": True,
+            **window_context,
         }
 
         return Setup(
