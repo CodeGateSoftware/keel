@@ -118,10 +118,10 @@ live entry may proceed lives on the record itself (`VenueTradeScope.may_place_li
 (`repo.get_venue_trade_scope`, keyed exactly like rail 14's `current_venue() or DEFAULT_VENUE`)
 so the state machine has exactly one place to disagree with itself. Fails CLOSED on a missing
 record, like rails 12/13/17: a never-recorded venue is not evidence it can trade. ENTRIES ONLY,
-like rails 11/16/17 -- existing holdings are already ours, and vetoing an EXIT over a fact about
-the credential would strand a position that wanted out. Listed in `LIVE_STATE_RAILS`: paper has
-no live account to verify a credential's trade scope against, so it is skipped there, and the
-skip is recorded like rails 13/17's.
+like rails 11/16/17 (11 and 16 exempt DCA; 17 does not) -- existing holdings are already ours, and
+vetoing an EXIT over a fact about the credential would strand a position that wanted out. Listed
+in `LIVE_STATE_RAILS`: paper has no live account to verify a credential's trade scope against,
+so it is skipped there, and the skip is recorded like rails 13/17's.
 
 **#633: the record can now outlive the credential it was collected under, and this rail is where
 that gets caught.** A `CONFIRMED` or `ATTESTED`-for-`TRADING` record proves nothing about a
@@ -910,13 +910,15 @@ def check(
     #     ENTRIES ONLY, exactly like rails 11/16: existing holdings are already ours, and forcing
     #     a sale to "fix" a withdrawal freeze would be strictly worse than holding through it.
     #     Fails CLOSED on None, like rails 12/13 — silence is not evidence of possession.
+    #     DCA is NOT exempt: a DCA buy is an acquisition like any other (#1010).
     if is_buy and not offline:
         if intent.withdrawals_enabled is None:
             violations.append(
                 "withdrawal_capability: UNKNOWN (no fresh attestation, or the broker did not "
                 "report). Under §65.4 possession requires that nothing prevents withdrawal on "
                 "demand; an unverified state is not evidence that it holds. Attest with "
-                "`keel withdrawals attest` (exits and DCA-exempt paths are unaffected)."
+                "`keel withdrawals attest --enabled` (exits are unaffected; DCA buys are NOT "
+                "exempt)."
             )
         elif intent.withdrawals_enabled is False:
             violations.append(
