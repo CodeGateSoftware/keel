@@ -68,6 +68,11 @@ The warning appears only while the attestation is fresh. An expired, suspended o
 attestation is already reported as a halt by `attest.withdrawals` and the rail-17 status line,
 so the cadence warning stays silent then. The web console banner does not show it yet.
 
+"Next due" means a bar whose buy is not yet placed. On a placement day, after the 01:20 cycle has
+bought yesterday's bar, that bar no longer counts: the warning looks at the following cadence
+bar, so it neither misses a window that falls after expiry nor says rail 17 "will veto" a buy
+already in (#1014). The check reads the rule's newest filled or pending live BUY.
+
 A DCA window that a guard vetoes is no longer lost until the next cadence multiple. On a live
 cycle, each later fresh daily bar of the same window retries the buy, with at most one buy per
 window per rule: a filled or pending live BUY for a bar of the window closes it, so a same-day

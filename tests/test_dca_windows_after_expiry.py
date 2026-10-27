@@ -142,3 +142,67 @@ def test_live_wrapper_never_raises() -> None:
             raise RuntimeError("locked")
 
     assert attestations.live_dca_windows_after_expiry(_Broken(), ATTESTED) == ()
+
+
+# -- #1014: the placement day ----------------------------------------------------------------
+# 2026-10-09 19:25Z is the day of the issue's first veto: the 01:20 cycle already acted on the
+# 2026-10-08 cadence bar (20_734), and the attestation made now expires 10-16, before the
+# 2026-10-22 bar's placement day (10-23).
+PLACEMENT_DAY_AT = 20_735 * DAY + 69_900
+
+
+def test_on_a_placement_day_the_following_bar_is_checked_when_nothing_is_known() -> None:
+    found = attestations.dca_windows_after_expiry(
+        [(9, "PAXG-USD", 14)], attested_at=PLACEMENT_DAY_AT, now_ts=PLACEMENT_DAY_AT
+    )
+    assert [(w.rule_id, w.bar_ts) for w in found] == [(9, 20_748 * DAY)]
+
+
+def test_a_bar_with_a_counted_buy_is_not_the_next_due_one() -> None:
+    rules = [(9, "PAXG-USD", 14)]
+    at = PLACEMENT_DAY_AT
+    # yesterday's bar (20_734) was bought at 01:20 today: the next due bar is 20_748
+    found = attestations.dca_windows_after_expiry(
+        rules, attested_at=at, now_ts=at, counted_bar_days={9: 20_734}
+    )
+    assert [w.bar_ts for w in found] == [20_748 * DAY]
+
+
+def test_a_known_absence_of_buys_checks_only_yesterdays_bar() -> None:
+    rules = [(9, "PAXG-USD", 14)]
+    at = PLACEMENT_DAY_AT
+    # no counted buy, attestation covers yesterday's bar (placement day 20_735): nothing to say
+    assert (
+        attestations.dca_windows_after_expiry(
+            rules, attested_at=at, now_ts=at, counted_bar_days={9: None}
+        )
+        == ()
+    )
+
+
+def test_live_wrapper_skips_a_bar_the_rule_already_bought(repo) -> None:
+    from decimal import Decimal
+
+    repo.set_state("withdrawals_enabled", True)
+    repo.set_state("withdrawals_attested_at", PLACEMENT_DAY_AT)
+    rid = repo.insert_rule("dca", {"product_id": "PAXG-USD", "cadence_days": 14}, status="live")
+    # before the 01:20 buy is in, yesterday's bar is the due one and the attestation covers it
+    assert attestations.live_dca_windows_after_expiry(repo, PLACEMENT_DAY_AT) == ()
+    placed = 20_735 * DAY + 4_800  # the 01:20 cycle's live buy, acting on bar 20_734
+    repo.insert_order(
+        dict(
+            mode="live",
+            product_id="PAXG-USD",
+            side="BUY",
+            order_type="market",
+            qty=Decimal("1"),
+            status="filled",
+            fee=Decimal("0"),
+            confirmation="autonomous",
+            rule_id=rid,
+            created_at=placed,
+            updated_at=placed,
+        )
+    )
+    found = attestations.live_dca_windows_after_expiry(repo, PLACEMENT_DAY_AT)
+    assert [w.bar_ts for w in found] == [20_748 * DAY]

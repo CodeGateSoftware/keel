@@ -48,7 +48,7 @@ notification alert-once windows and the web banners, which this does not change.
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from typing import Any
@@ -339,7 +339,11 @@ class DcaWindowAfterExpiry:
 
 
 def dca_windows_after_expiry(
-    rules: Iterable[tuple[int, str, int]], *, attested_at: int, now_ts: int
+    rules: Iterable[tuple[int, str, int]],
+    *,
+    attested_at: int,
+    now_ts: int,
+    counted_bar_days: Mapping[int, int | None] | None = None,
 ) -> tuple[DcaWindowAfterExpiry, ...]:
     """Which `(rule_id, product_id, cadence_days)` rules buy after the attestation lapses (#1010).
 
@@ -349,6 +353,14 @@ def dca_windows_after_expiry(
     A rule is reported when the attestation does not last through the WHOLE placement day:
     `expires_at < due_ts + 1 day`. The live cycle runs at 01:20 UTC rather than 00:00, so this is
     the conservative test. Output keeps input order.
+
+    "Next due" is a bar whose buy has NOT been placed (#1014). `counted_bar_days` maps a rule id
+    to the bar day of its newest counted (filled or pending) live BUY, `None` meaning it has none;
+    a bar at or before that day is already bought, so the rule's next due bar is the following
+    cadence bar (a warning about a placed buy would say "rail 17 will veto" what is already in).
+    A rule absent from the mapping (or no mapping) is UNKNOWN: on a placement day, when
+    yesterday's cadence bar may or may not have been acted on yet, the following bar is checked
+    too, and the first of the two the attestation does not cover is reported.
     """
     from keel.strategy.rules.dca import next_dca_bar_ts
 
@@ -357,20 +369,30 @@ def dca_windows_after_expiry(
     found: list[DcaWindowAfterExpiry] = []
     for rule_id, product_id, cadence_days in rules:
         bar_ts = next_dca_bar_ts(now_ts, cadence_days)
-        due_ts = bar_ts + 86_400
-        if expires_at >= due_ts + 86_400:
-            continue
-        found.append(
-            DcaWindowAfterExpiry(
-                rule_id=rule_id,
-                product_id=product_id,
-                cadence_days=cadence_days,
-                bar_ts=bar_ts,
-                due_ts=due_ts,
-                expires_at=expires_at,
-                reattest_from_ts=due_ts + 86_400 - ttl,
+        candidates = [bar_ts]
+        if counted_bar_days is not None and rule_id in counted_bar_days:
+            counted = counted_bar_days[rule_id]
+            if counted is not None and bar_ts // 86_400 <= counted:
+                candidates = [bar_ts + cadence_days * 86_400]
+        elif bar_ts == (now_ts // 86_400 - 1) * 86_400:
+            # unknown, and the bar is yesterday's (a placement day): the following bar too
+            candidates.append(bar_ts + cadence_days * 86_400)
+        for bar in candidates:
+            due_ts = bar + 86_400
+            if expires_at >= due_ts + 86_400:
+                continue
+            found.append(
+                DcaWindowAfterExpiry(
+                    rule_id=rule_id,
+                    product_id=product_id,
+                    cadence_days=cadence_days,
+                    bar_ts=bar,
+                    due_ts=due_ts,
+                    expires_at=expires_at,
+                    reattest_from_ts=due_ts + 86_400 - ttl,
+                )
             )
-        )
+            break
     return tuple(found)
 
 
@@ -392,14 +414,23 @@ def live_dca_windows_after_expiry(repo: Any, now_ts: int) -> tuple[DcaWindowAfte
         if att.state(now_ts) not in (OK, EXPIRING) or att.attested_at is None:
             return ()
         rules: list[tuple[int, str, int]] = []
+        counted: dict[int, int | None] = {}
         for row in repo.get_rules("live"):
             if row["kind"] != "dca":
                 continue
             try:
                 rule = build_rule_from_params(row["kind"], row["params"] or {})
-                rules.append((int(row["id"]), rule.product_id, int(rule.params["cadence_days"])))
+                rule_id = int(row["id"])
+                rules.append((rule_id, rule.product_id, int(rule.params["cadence_days"])))
+                # the bar day of the newest counted live BUY, as `agent._dca_window_ledger`
+                # derives it (a live order acts on yesterday's bar); a failed read leaves the
+                # rule UNKNOWN to the helper, which then checks the following bar as well
+                last = repo.last_live_buy_created_at(rule_id)
+                counted[rule_id] = None if last is None else last // 86_400 - 1
             except Exception:
                 continue
-        return dca_windows_after_expiry(rules, attested_at=att.attested_at, now_ts=now_ts)
+        return dca_windows_after_expiry(
+            rules, attested_at=att.attested_at, now_ts=now_ts, counted_bar_days=counted
+        )
     except Exception:
         return ()
