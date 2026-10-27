@@ -24,7 +24,7 @@ import pytest
 from click.testing import CliRunner
 
 from keel.cli import cli
-from keel.commands.status import gather_status, render_human
+from keel.commands.status import _report_to_jsonable, gather_status, render_human
 from keel.config import (
     AutoTradeConfig,
     Caps,
@@ -676,3 +676,36 @@ def test_status_command_json_flag_emits_parseable_json(tmp_path, valid_config_pa
     assert "open_positions" in payload
     assert "rule_counts" in payload
     assert "data_freshness" in payload
+
+
+LIVE = _config(auto_trade=AutoTradeConfig(mode="confirm"))
+
+
+def test_status_lists_each_live_dca_rule_due_after_the_attestation_expires(repo):
+    repo.set_state("withdrawals_enabled", True)
+    repo.set_state("withdrawals_attested_at", 1_791_660_300)
+    rid14 = repo.insert_rule("dca", {"product_id": "BTC-USD", "cadence_days": 14}, status="live")
+    repo.insert_rule("dca", {"product_id": "ETH-USD", "cadence_days": 7}, status="live")
+    report = gather_status(repo, LIVE, now_ts=1_791_660_300)
+    assert [w.rule_id for w in report.dca_windows_after_expiry] == [rid14]
+    lines = render_human(report)
+    i = next(n for n, ln in enumerate(lines) if ln.startswith("rail 17 (withdrawal capability)"))
+    assert lines[i + 1] == f"  WARNING: {report.dca_windows_after_expiry[0].line()}"
+    assert sum(ln.startswith("  WARNING: rule ") for ln in lines) == 1
+
+
+def test_status_json_carries_the_windows(repo):
+    repo.set_state("withdrawals_enabled", True)
+    repo.set_state("withdrawals_attested_at", 1_791_660_300)
+    rid14 = repo.insert_rule("dca", {"product_id": "BTC-USD", "cadence_days": 14}, status="live")
+    report = gather_status(repo, LIVE, now_ts=1_791_660_300)
+    assert _report_to_jsonable(report)["dca_windows_after_expiry"][0]["rule_id"] == rid14
+
+
+def test_status_in_paper_mode_emits_no_cadence_warning(repo):
+    repo.set_state("withdrawals_enabled", True)
+    repo.set_state("withdrawals_attested_at", 1_791_660_300)
+    repo.insert_rule("dca", {"product_id": "BTC-USD", "cadence_days": 14}, status="live")
+    report = gather_status(repo, _config(), now_ts=1_791_660_300)  # mode="paper"
+    assert report.dca_windows_after_expiry == ()
+    assert not any(ln.startswith("  WARNING: rule ") for ln in render_human(report))
