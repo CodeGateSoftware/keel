@@ -29,7 +29,7 @@ from typing import Any
 
 import click
 
-from keel import agent
+from keel import agent, attestations
 from keel.commands._common import DISCLAIMER, _load_cfg, _open_repo
 from keel.commands._products import _default_sim_products
 from keel.config import Config
@@ -164,6 +164,10 @@ class StatusReport:
     #: `LoopResult` uses for its later-added fields. Last for the same reason: a defaulted
     #: field anywhere earlier would force a default on every field after it.
     market_session: MarketSessionStatus = MarketSessionStatus(state=None, recorded_ts=None)
+    #: #1010: live DCA rules whose next buy falls after rail 17's attestation expires. Defaulted
+    #: and last for the same reason as `market_session`. Always `()` in paper mode, where rail 17
+    #: is not evaluated.
+    dca_windows_after_expiry: tuple[attestations.DcaWindowAfterExpiry, ...] = ()
 
 
 # -- gather (pure) ------------------------------------------------------------------------------
@@ -382,6 +386,11 @@ def gather_status(repo: Repository, config: Config, now_ts: int) -> StatusReport
         data_freshness=_data_freshness(repo, config, now_ts),
         subscriptions=_subscription_rows(repo, config, now_ts),
         market_session=_market_session(repo, config, now_ts),
+        dca_windows_after_expiry=(
+            ()
+            if config.auto_trade.mode == "paper"
+            else attestations.live_dca_windows_after_expiry(repo, now_ts)
+        ),
     )
 
 
@@ -618,6 +627,7 @@ def render_human(report: StatusReport) -> list[str]:
     )
     lines.append(f"rail11 (drawdown breaker): {report.rail11_status}")
     lines.append(_rail17_line(report.withdrawal_attestation, report.mode != "paper"))
+    lines.extend(f"  WARNING: {w.line()}" for w in report.dca_windows_after_expiry)
     if report.mode == "paper":
         lines.append(f"paper_cash_usdc: {report.paper_cash_usdc}")
 

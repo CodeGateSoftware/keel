@@ -11,6 +11,7 @@ import time
 
 import click
 
+from keel import attestations
 from keel.commands._common import _open_repo, _require_interactive_confirmation, with_disclaimer
 from keel.execution import executor
 
@@ -55,6 +56,9 @@ def withdrawals_attest(ctx: click.Context, enabled: bool) -> None:
     bypass-arm token no longer exists, and with `keel autonomy on` the confirm gate is not there
     either -- so without this, a cron line could clear a rail-17 halt and the next cycle would
     place live orders with no human anywhere in the loop.
+
+    On `--enabled` it also prints a `WARNING:` per live DCA rule whose next buy falls after this
+    attestation expires, so the operator learns now that the TTL will not cover it (#1010).
     """
     repo = _open_repo(ctx)
     if enabled:
@@ -65,6 +69,9 @@ def withdrawals_attest(ctx: click.Context, enabled: bool) -> None:
     ttl_days = executor.WITHDRAWAL_ATTESTATION_TTL_SEC // 86400
     state = "ENABLED" if enabled else "SUSPENDED"
     click.echo(f"withdrawals attested {state}; expires in {ttl_days} days")
+    if enabled:
+        for window in attestations.live_dca_windows_after_expiry(repo, now_ts):
+            click.echo(f"WARNING: {window.line()}")
     if not enabled:
         click.echo("new ENTRIES are now halted (rail 17). Exits are deliberately unaffected.")
 

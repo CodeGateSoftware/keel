@@ -1523,6 +1523,14 @@ def test_rail17_fails_CLOSED_on_unknown(repo: Repository) -> None:
     assert "withdrawal_capability" in _keys(result)
 
 
+def test_rail17_unknown_text_does_not_imply_dca_is_exempt(repo: Repository) -> None:
+    for is_dca in (False, True):
+        result = check(_intent(withdrawals_enabled=None, is_dca=is_dca), repo, _config(), NOW_TS)
+        (text,) = [v for v in result.violations if v.startswith("withdrawal_capability:")]
+        assert "DCA-exempt" not in text
+        assert "DCA buys are NOT exempt" in text
+
+
 def test_rail17_passes_when_withdrawals_are_attested_enabled(repo: Repository) -> None:
     result = check(_intent(withdrawals_enabled=True), repo, _config(), NOW_TS)
     assert "withdrawal_capability" not in _keys(result)
