@@ -37,6 +37,10 @@
 - **R6: The web console does not get this for free.** `attestations.survey()` is left unchanged. It feeds `notifications` alert-once windows and `web/api.py` banners, and adding entries there would change both. A follow-up issue can surface it on the web. This PR does not plan JS.
 - **R7: Paper cycles never get a ledger.** The ledger is set only when `paper_trader is None` (live cycles). Paper and sim stay on today's cadence-only behaviour.
 - **R8: Doctor always emits `attest.dca_cadence`.** It is OK when nothing is affected and WARN (not FAIL) when something is. This follows doctor's every-check-by-name convention (`test_gather_findings_covers_every_check_over_a_seeded_db`). WARN, because the rail is not vetoing yet.
+- **R13 (cold read B1): Only signals from the rule's live era prove a window was due.** `signals` has no mode column (`keel/data/db.py:271-280`), and promotion keeps the rule id. Without this, a cadence signal from the paper era would make a freshly promoted rule buy on promotion day. The agent reads `rules.promoted_at` for the rule. When it is `NULL` (e.g. a row inserted straight at `live`), no signal counts and the rule stays cadence-only. Otherwise the lower bound passed to `signal_ts_since` is `max(window_lower_bound, (promoted_at // 86400) * 86400)`. **Planner's refinement of the coordinator's `ts >= promoted_at`:** `signals.ts` is the BAR's 00:00 timestamp, not the evaluation time. A literal `ts >= promoted_at` would drop the first live signal of a rule promoted at, say, 10:00 on day `P`: its bar `P` is evaluated live on day `P + 1`, but `ts = P * 86400 < promoted_at`. Flooring `promoted_at` to its day start keeps that signal, and still excludes every bar before the promotion day. A bar `P - 1` evaluated before a same-day promotion is excluded, so the error is always toward not buying.
+- **R14 (cold read B2): A failed ledger read costs the retry, never the cycle.** `_arm_dca_ledger` wraps `_dca_window_ledger` the way `run_once` wraps `_sleeve_rules` (`agent.py:2326-2334`). On any exception it sets `rule.window_ledger = None` (cadence-only, today's behaviour) and logs `log_event(logger, logging.WARNING, "agent.dca_window_ledger_failed", rule_id=rule.rule_id, error=str(exc))`. It never raises.
+- **R15 (cold read B3): D1 warnings only while the attestation is fresh.** `live_dca_windows_after_expiry` returns `()` unless rail 17's attestation state is `OK` or `EXPIRING` AND `withdrawals_enabled` is truthy. `EXPIRED`, suspended (`REFUSED`) and absent (`MISSING`) stay silent, because doctor `attest.withdrawals` and status `_rail17_line` already report each of those as a halt. `keel withdrawals attest --enabled` checks the attestation it has just written, which is fresh, so its behaviour is unchanged.
+- **R16 (cold read, folded into D3): the guards module docstring.** `keel/execution/guards.py:121` reads "ENTRIES ONLY, like rails 11/16/17", which groups rail 17 with two DCA-exempt rails. Task 8 rewrites that one line.
 - **R9: No CHANGELOG.** The repo has no `CHANGELOG.md`. Release notes come from PR bodies (`docs/RELEASING.md` §"Release notes come from PRs"), so the docs task updates `docs/rails/rail-17-withdrawal-attestation.md` instead.
 
 ## Review Focus
@@ -44,7 +48,9 @@
 - A second cycle on the same UTC day after a successful retry must not buy again. Task 4's `test_dca_retry_does_not_double_buy_on_a_same_day_rerun` pins this.
 - A rule promoted to live mid-window must not buy before its next cadence bar. Task 3's `test_an_unsignalled_window_never_retries` and Task 4's `test_a_rule_promoted_mid_window_waits_for_its_cadence_bar` pin this.
 - A cadence-1 (daily) rule must still buy every day once the ledger is on. Task 3's `test_cadence_one_buys_every_day_with_the_ledger_on` pins this.
-- An attestation of `--suspended`, or none at all, must not produce cadence warnings, because doctor and status already report those as halts. Task 1's `test_live_wrapper_is_silent_without_an_enabled_attestation` pins this.
+- An attestation that is `--suspended`, expired or absent must not produce cadence warnings, because doctor and status already report those as halts (R15). Task 1's `test_live_wrapper_is_silent_without_an_enabled_attestation` pins this.
+- A paper-era cadence signal must not make a freshly promoted rule buy on promotion day (R13). Task 4's `test_a_paper_era_signal_does_not_retry_after_promotion` pins this.
+- A broken repo read while building the ledger must not cost the cycle's cadence buy (R14). Task 4's `test_a_ledger_read_failure_falls_back_to_cadence_only` pins this.
 - A retry day can coincide with another rule's cadence day, so one day can now carry more DCA spend than `keel dca plan`'s busiest-day figure. Rails 3 and 14 still bound it. No code change; the docs task (Task 9) states it.
 
 ---
@@ -61,7 +67,7 @@
   - `keel.strategy.rules.dca.next_dca_bar_ts(now_ts: int, cadence_days: int) -> int`: `next_cadence_day_ts(now_ts - _SECONDS_PER_DAY, cadence_days)`. Raises `ValueError` on non-positive cadence (inherited).
   - `keel.attestations.DcaWindowAfterExpiry`: frozen dataclass with fields `rule_id: int`, `product_id: str`, `cadence_days: int`, `bar_ts: int`, `due_ts: int`, `expires_at: int`, `reattest_from_ts: int`, and a method `line() -> str`.
   - `keel.attestations.dca_windows_after_expiry(rules: Iterable[tuple[int, str, int]], *, attested_at: int, now_ts: int) -> tuple[DcaWindowAfterExpiry, ...]`. Pure. `rules` are `(rule_id, product_id, cadence_days)`. `expires_at` comes from `withdrawal_expiry(attested_at=...)`, so the TTL is read at call time. Applies Ruling R5. Output is in input order.
-  - `keel.attestations.live_dca_windows_after_expiry(repo: Any, now_ts: int) -> tuple[DcaWindowAfterExpiry, ...]`. Never raises (returns `()` on any exception, like `survey`). Returns `()` unless `withdrawals_attested_at` is truthy AND `withdrawals_enabled` is truthy. Rules come from `repo.get_rules("live")` filtered to `kind == "dca"`. Each row is built with a lazy-imported `keel.agent.build_rule_from_params(row["kind"], row["params"] or {})`, the single coercion boundary, so the default cadence is never restated. A row that fails to build is skipped. Tuples are `(int(row["id"]), rule.product_id, int(rule.params["cadence_days"]))`.
+  - `keel.attestations.live_dca_windows_after_expiry(repo: Any, now_ts: int) -> tuple[DcaWindowAfterExpiry, ...]`. Never raises (returns `()` on any exception, like `survey`). Returns `()` unless rail 17's attestation is fresh (Ruling R15). The freshness test is built from the module's own model, never restated: `dates = _withdrawal_dates(repo)`, `att = replace(definition("withdrawal"), **dates)`, and the function proceeds only if `att.state(now_ts) in (OK, EXPIRING)`. `REFUSED` covers an `enabled` of `False`, `MISSING` covers never attested or `enabled` of `None`, and `EXPIRED` covers a lapsed attestation; all three return `()`. `dca_windows_after_expiry` is then called with `attested_at=att.attested_at`. Rules come from `repo.get_rules("live")` filtered to `kind == "dca"`. Each row is built with a lazy-imported `keel.agent.build_rule_from_params(row["kind"], row["params"] or {})`, the single coercion boundary, so the default cadence is never restated. A row that fails to build is skipped. Tuples are `(int(row["id"]), rule.product_id, int(rule.params["cadence_days"]))`.
 - `line()` exact format, with dates in UTC (`datetime.fromtimestamp(ts, UTC)`):
   `rule {rule_id} {product_id} (every {cadence_days}d): next DCA buy due {due:%Y-%m-%d} (bar {bar:%Y-%m-%d}), after the withdrawal attestation expires {expires:%Y-%m-%d %H:%M}Z; rail 17 will veto it -- re-attest on or after {reattest:%Y-%m-%d} to cover it`
 
@@ -110,7 +116,10 @@ def test_live_wrapper_reads_only_live_dca_rows(repo) -> None:
     found = attestations.live_dca_windows_after_expiry(repo, ATTESTED)
     assert [w.rule_id for w in found] == [live14]
 
-@pytest.mark.parametrize("enabled, attested_at", [(False, ATTESTED), (None, ATTESTED), (True, 0)])
+@pytest.mark.parametrize(
+    "enabled, attested_at",
+    [(False, ATTESTED), (None, ATTESTED), (True, 0), (True, ATTESTED - 8 * DAY)],  # suspended, unknown, never, EXPIRED
+)
 def test_live_wrapper_is_silent_without_an_enabled_attestation(repo, enabled, attested_at) -> None:
     repo.insert_rule("dca", {"product_id": "PAXG-USD", "cadence_days": 14}, status="live")
     if enabled is not None:
@@ -123,6 +132,8 @@ def test_live_wrapper_never_raises() -> None:
         def get_state(self, *a, **k): raise RuntimeError("locked")
     assert attestations.live_dca_windows_after_expiry(_Broken(), ATTESTED) == ()
 ```
+
+Cold-read note N4 was accepted as planned, so Task 1 is unchanged by it.
 
 - [ ] **Step 2: Run the tests to verify they fail**
 Run: `uv run pytest tests/test_dca_windows_after_expiry.py -q`
@@ -149,7 +160,7 @@ git commit -m "feat(#1010): compute which live DCA windows fall after rail 17's 
 **Interfaces:**
 - Produces:
   - `Repository.last_live_buy_created_at(self, rule_id: int) -> int | None`: `SELECT MAX(created_at) FROM orders WHERE mode = 'live' AND side = 'BUY' AND rule_id = ? AND status IN ('filled', 'pending')`. Applies Ruling R2. The docstring cites R2's double-buy reasoning.
-  - `Repository.signal_ts_since(self, rule_id: int, since_ts: int) -> list[int]`: `SELECT ts FROM signals WHERE rule_id = ? AND ts >= ? ORDER BY ts`. Inclusive.
+  - `Repository.signal_ts_since(self, rule_id: int, since_ts: int) -> list[int]`: `SELECT ts FROM signals WHERE rule_id = ? AND ts >= ? ORDER BY ts`. Inclusive. The method knows nothing about promotion. The caller (Task 4's `_dca_window_ledger`) passes `since_ts` already raised to the floored `promoted_at` (Ruling R13), and the docstring says so.
 
 - [ ] **Step 1: Write the failing tests** (use the module's existing `repo` fixture; insert a real rule first, because `orders.rule_id` has a foreign key to `rules.id`)
 
@@ -158,15 +169,16 @@ def test_last_live_buy_created_at_counts_filled_and_pending_buys_of_that_rule_on
     rid = repo.insert_rule("dca", {"product_id": "BTC-USD"}, status="live")
     other = repo.insert_rule("dca", {"product_id": "ETH-USD"}, status="live")
     assert repo.last_live_buy_created_at(rid) is None
-    # helper `_order(rule_id, created_at, status="filled", side="BUY", mode="live")` builds the
+    # helper `_dca_order(rule_id, created_at, status="filled", side="BUY", mode="live")` -- NOT
+    # `_order`, which this module already defines (~line 141) -- builds the
     # same dict `tests/execution/test_guards.py::_seed_filled_order` does, with these overrides
-    repo.insert_order(_order(rid, 100))
-    repo.insert_order(_order(rid, 200, status="pending"))
-    repo.insert_order(_order(rid, 900, status="rejected"))
-    repo.insert_order(_order(rid, 901, status="canceled"))
-    repo.insert_order(_order(rid, 902, side="SELL"))
-    repo.insert_order(_order(rid, 903, mode="paper"))
-    repo.insert_order(_order(other, 904))
+    repo.insert_order(_dca_order(rid, 100))
+    repo.insert_order(_dca_order(rid, 200, status="pending"))
+    repo.insert_order(_dca_order(rid, 900, status="rejected"))
+    repo.insert_order(_dca_order(rid, 901, status="canceled"))
+    repo.insert_order(_dca_order(rid, 902, side="SELL"))
+    repo.insert_order(_dca_order(rid, 903, mode="paper"))
+    repo.insert_order(_dca_order(other, 904))
     assert repo.last_live_buy_created_at(rid) == 200
 
 def test_signal_ts_since_is_inclusive_ordered_and_per_rule(repo):
@@ -209,7 +221,9 @@ git commit -m "feat(#1010): repository reads for a DCA rule's counted buys and r
   2. `L.last_counted_bar_day is not None and L.last_counted_bar_day >= ws`: set `self.last_rejection = {"gate": "dca_window_satisfied", "window_start_ts": ws * 86400}` and return `None`.
   3. `d == ws`: fire as today. Add `context["window_start_ts"] = ws * 86400` and `context["dca_retry"] = False`. If `any(ws - c <= s < ws for s in L.signalled_bar_days)` and (`L.last_counted_bar_day is None or L.last_counted_bar_day < ws - c`), also add `context["previous_window_missed_ts"] = (ws - c) * 86400` (Ruling R4).
   4. `any(ws <= s < d for s in L.signalled_bar_days)`: fire with the same sizing as a cadence hit. Add `context["window_start_ts"] = ws * 86400` and `context["dca_retry"] = True`.
-  5. Otherwise return `None`.
+  5. Otherwise set `self.last_rejection = {"gate": "dca_off_cadence", "window_start_ts": ws * 86400}` and return `None`.
+  The two gate strings are exactly `"dca_window_satisfied"` and `"dca_off_cadence"`. `engine.evaluate` merges them into its `engine.no_signal` event (cold-read N3). On the `L is None` path, `last_rejection` is left as today's code leaves it.
+  Cold-read N6, accepted: any outcome that leaves a signal but no counted BUY is retried the next day. That includes a spread-gate refusal, a declined confirm prompt, or a broker rejection, as well as a guard veto. This is intended.
   Every fired path sets `self.last_rejection = None`, as `cusum_event.py:246` does. Sizing (dip bonus, lookback) is unchanged and computed on the current bar.
 
 - [ ] **Step 1: Write the failing tests**
@@ -247,6 +261,7 @@ def test_an_unsignalled_window_never_retries() -> None:
     rule = Dca("BTC-USD", cadence_days=7)
     rule.window_ledger = DcaWindowLedger(last_counted_bar_day=None, signalled_bar_days=frozenset())
     assert _detect(rule, 100) is None
+    assert rule.last_rejection == {"gate": "dca_off_cadence", "window_start_ts": 98 * 86_400}
     assert _detect(rule, 98) is not None
 
 def test_the_bars_own_signal_does_not_justify_a_retry_on_that_bar() -> None:
@@ -292,23 +307,34 @@ git commit -m "feat(#1010): Dca retries a vetoed window from a caller-supplied l
 ### Task 4: The live agent arms the ledger and reports a missed window
 
 **Files:**
-- Modify: `keel/agent.py`. Add `_dca_window_ledger`. Call it in `run_once`'s main pass. Add the `agent.dca_window_missed` log. Extend the `_entry_gate_granularity` docstring's DCA paragraph (~line 372) with one sentence: the stale-bar double-buy is now also stopped by the window ledger, while the freshness gate is still what keeps a stale bar out.
+- Modify: `keel/agent.py`. Add `_dca_window_ledger` and its never-raising wrapper `_arm_dca_ledger`. Call the wrapper in `run_once`'s main pass. Add the `agent.dca_window_missed` log. Extend the `_entry_gate_granularity` docstring's DCA paragraph (~line 372) with one sentence: the stale-bar double-buy is now also stopped by the window ledger, while the freshness gate is still what keeps a stale bar out.
 - Test: `tests/test_agent.py` (append a `# -- #1010: DCA window retry` section; reuse `repo`, `FakeBroker`, `_config`, `_candle`, `run_once`, `PRODUCT`)
 
 **Interfaces:**
 - Consumes: `Repository.last_live_buy_created_at`, `Repository.signal_ts_since` (Task 2); `DcaWindowLedger`, `Dca.window_ledger` (Task 3).
 - Produces: `keel.agent._dca_window_ledger(repo: Repository, rule: Dca, now_ts: int) -> DcaWindowLedger`:
   - `last = repo.last_live_buy_created_at(rule.rule_id)`, giving `last_counted_bar_day = None if last is None else last // 86400 - 1`.
-  - `c = int(rule.params["cadence_days"])` and `since = (now_ts // 86400 - 2 * c - 1) * 86400`, giving `signalled_bar_days = frozenset(ts // 86400 for ts in repo.signal_ts_since(rule.rule_id, since))`.
-- Wiring in `run_once`'s MAIN PASS, after the `if not entries_allowed: continue` and before `engine.evaluate(product_rules, ...)`: when `paper_trader is None`, set `rule.window_ledger = _dca_window_ledger(repo, rule, now_ts)` for each `rule` in `product_rules` with `isinstance(rule, Dca) and rule.rule_id is not None` (Ruling R7). Rules are rebuilt every cycle, so the attribute never outlives the cycle.
-- After `engine.evaluate` returns, for each signal whose `setup.context` has `previous_window_missed_ts`, emit `log_event(logger, logging.WARNING, "agent.dca_window_missed", product=product_id, rule=signal.rule_name, rule_id=signal.rule_id, window_start_ts=<that value>)`.
+  - `promoted_at = next((row.get("promoted_at") for row in repo.get_rules("live") if row["id"] == rule.rule_id), None)` (Ruling R13).
+  - If `promoted_at is None`, then `signalled_bar_days = frozenset()`. Otherwise `c = int(rule.params["cadence_days"])`, `since = max((now_ts // 86400 - 2 * c - 1) * 86400, (int(promoted_at) // 86400) * 86400)`, and `signalled_bar_days = frozenset(ts // 86400 for ts in repo.signal_ts_since(rule.rule_id, since))`.
+- Produces: `keel.agent._arm_dca_ledger(repo: Repository, rule: Dca, now_ts: int) -> None`. It sets `rule.window_ledger = _dca_window_ledger(repo, rule, now_ts)`. On any `Exception` it sets `rule.window_ledger = None` and logs WARNING `agent.dca_window_ledger_failed` with `rule_id=rule.rule_id, error=str(exc)` (Ruling R14). It carries `# noqa: BLE001`, and a comment cites the `_sleeve_rules` wrapper at `agent.py:2326-2334`.
+- Wiring in `run_once`'s MAIN PASS, after the `if not entries_allowed: continue` and before `engine.evaluate(product_rules, ...)`: when `paper_trader is None`, call `_arm_dca_ledger(repo, rule, now_ts)` for each `rule` in `product_rules` with `isinstance(rule, Dca) and rule.rule_id is not None` (Ruling R7). Rules are rebuilt every cycle, so the attribute never outlives the cycle.
+- After `engine.evaluate` returns, for each signal whose `setup.context` has `previous_window_missed_ts`, emit `log_event(logger, logging.WARNING, "agent.dca_window_missed", product=product_id, rule=signal.rule_name, rule_id=signal.rule_id, window_start_ts=<that value>)`. Cold-read N5: the event is logged once per cycle that sees it. A same-day rerun logs it again, which is acceptable. It is never routed to `notifications`.
+- Cold-read N6, accepted: a next-day retry after a spread-gate refusal or a declined confirm is intended behaviour, not a bug.
 - The freshness gate (`entry_bar_ready` pre-pass, `entries_allowed`) is untouched. A retry can only fire on a bar that gate admitted (Constraint 3).
 
-- [ ] **Step 1: Write the failing tests.** The module already defines `DAY = 86_400` (~line 5342). Reuse it, and append the new section after that definition. Use cadence 7 and cadence bar day 98. Each cycle gets its own broker serving days `98..bar_day`, built as `_series(last_day) = {(PRODUCT, Granularity.ONE_DAY): [_candle(d * 86_400) for d in range(98, last_day + 1)]}`. A cycle on day `X` runs at `now_ts = X * 86_400 + 3_600`. Rail 17 is made stale with `repo.set_state("withdrawals_attested_at", 1)` and fresh with `repo.set_state("withdrawals_attested_at", 10**12)`.
+- [ ] **Step 1: Write the failing tests.** The module already defines `DAY = 86_400` (~line 5342). Reuse it, and append the new section after that definition. Use cadence 7 and cadence bar day 98. Each cycle gets its own broker serving days `98..bar_day`, built as `_series(last_day) = {(PRODUCT, Granularity.ONE_DAY): [_candle(d * 86_400) for d in range(98, last_day + 1)]}`. A cycle on day `X` runs at `now_ts = X * 86_400 + 3_600`. Rail 17 is made stale with `repo.set_state("withdrawals_attested_at", 1)` and fresh with `repo.set_state("withdrawals_attested_at", 10**12)`. Because of Ruling R13, a retry needs `promoted_at`. Every retry test therefore inserts the rule at `status="candidate"` and promotes it with a new helper that pins the clock `update_rule_status` stamps:
 
 ```python
-def test_dca_vetoed_window_is_retried_on_the_next_fresh_bar(repo):
-    rid = repo.insert_rule("dca", {"product_id": PRODUCT}, status="live")
+def _promote(monkeypatch, repo, rule_id, at_ts):
+    with monkeypatch.context() as m:
+        m.setattr("keel.data.repository.time.time", lambda: at_ts)
+        repo.update_rule_status(rule_id, "live")
+```
+
+```python
+def test_dca_vetoed_window_is_retried_on_the_next_fresh_bar(repo, monkeypatch):
+    rid = repo.insert_rule("dca", {"product_id": PRODUCT}, status="candidate")
+    _promote(monkeypatch, repo, rid, 90 * DAY)
     repo.set_state("withdrawals_attested_at", 1)                       # rail 17 vetoes
     r1 = run_once(FakeBroker(series=_series(98)), repo, _config(), now_ts=99 * DAY + 3_600)
     assert len(r1.enter_signals) == 1 and r1.enter_results[0].placed is False
@@ -320,7 +346,7 @@ def test_dca_vetoed_window_is_retried_on_the_next_fresh_bar(repo):
     orders = repo.get_orders(mode="live", product_id=PRODUCT)
     assert len(orders) == 1 and orders[0]["rule_id"] == rid
 
-def test_dca_retry_does_not_double_buy_on_a_same_day_rerun_or_later_in_the_window(repo):
+def test_dca_retry_does_not_double_buy_on_a_same_day_rerun_or_later_in_the_window(repo, monkeypatch):
     # same setup as above through r2, then:
     run_once(FakeBroker(series=_series(99)), repo, _config(), now_ts=100 * DAY + 7_200)   # same bar
     run_once(FakeBroker(series=_series(100)), repo, _config(), now_ts=101 * DAY + 3_600)  # later bar
@@ -329,8 +355,9 @@ def test_dca_retry_does_not_double_buy_on_a_same_day_rerun_or_later_in_the_windo
     assert r5.enter_results[0].placed is True                          # next window buys normally
     assert len(repo.get_orders(mode="live", product_id=PRODUCT)) == 2
 
-def test_an_unfilled_window_is_reported_not_back_filled(repo, caplog):
-    repo.insert_rule("dca", {"product_id": PRODUCT}, status="live")
+def test_an_unfilled_window_is_reported_not_back_filled(repo, caplog, monkeypatch):
+    rid = repo.insert_rule("dca", {"product_id": PRODUCT}, status="candidate")
+    _promote(monkeypatch, repo, rid, 90 * DAY)
     repo.set_state("withdrawals_attested_at", 1)
     run_once(FakeBroker(series=_series(98)), repo, _config(), now_ts=99 * DAY + 3_600)
     repo.set_state("withdrawals_attested_at", 10**12)
@@ -347,13 +374,36 @@ def test_a_rule_promoted_mid_window_waits_for_its_cadence_bar(repo):
     repo.insert_rule("dca", {"product_id": PRODUCT}, status="live")
     r = run_once(FakeBroker(series=_series(100)), repo, _config(), now_ts=101 * DAY + 3_600)
     assert r.enter_signals == [] and repo.get_orders(mode="live", product_id=PRODUCT) == []
+
+def test_a_paper_era_signal_does_not_retry_after_promotion(repo, monkeypatch):
+    rid = repo.insert_rule("dca", {"product_id": PRODUCT}, status="paper")
+    # the paper era emitted (and nobody filled) the window's cadence signal for bar 98
+    repo.insert_signal({"rule_id": rid, "product_id": PRODUCT, "ts": 98 * DAY, "fired": 1})
+    _promote(monkeypatch, repo, rid, 100 * DAY + 36_000)               # promoted day 100, 10:00
+    r = run_once(FakeBroker(series=_series(100)), repo, _config(), now_ts=101 * DAY + 3_600)
+    assert r.enter_signals == []
+    assert repo.get_orders(mode="live", product_id=PRODUCT) == []
+
+def test_a_ledger_read_failure_falls_back_to_cadence_only(repo, monkeypatch, caplog):
+    rid = repo.insert_rule("dca", {"product_id": PRODUCT}, status="candidate")
+    _promote(monkeypatch, repo, rid, 90 * DAY)
+    def _boom(*_a, **_k):
+        raise RuntimeError("database is locked")
+    monkeypatch.setattr(repo, "last_live_buy_created_at", _boom)
+    with caplog.at_level(logging.WARNING):
+        r = run_once(FakeBroker(series=_series(98)), repo, _config(), now_ts=99 * DAY + 3_600)
+    assert r.enter_results[0].placed is True                           # bar 98 is a cadence bar
+    assert "dca_retry" not in r.enter_signals[0].setup.context         # ledger was None
+    failed = [e for e in _events(caplog) if e[0] == "agent.dca_window_ledger_failed"]
+    assert len(failed) == 1
+    assert failed[0][1]["rule_id"] == rid and "database is locked" in failed[0][1]["error"]
 ```
 
 - [ ] **Step 2: Run the tests to verify they fail**
-Run: `uv run pytest tests/test_agent.py -q -k "dca_vetoed_window or double_buy_on_a_same_day or reported_not_back_filled or promoted_mid_window"`
-Expected: the first three FAIL (no retry: `r2.enter_signals` is empty; no `agent.dca_window_missed` event). `test_a_rule_promoted_mid_window_waits_for_its_cadence_bar` already passes today and is a guard against regression. Note that in its Step 2 output.
+Run: `uv run pytest tests/test_agent.py -q -k "dca_vetoed_window or double_buy_on_a_same_day or reported_not_back_filled or promoted_mid_window or paper_era_signal or ledger_read_failure"`
+Expected: `dca_vetoed_window`, `double_buy_on_a_same_day`, `reported_not_back_filled` and `ledger_read_failure` FAIL (no retry; no `agent.dca_window_missed` or `agent.dca_window_ledger_failed` event). `promoted_mid_window` and `paper_era_signal` already pass today and are regression guards for R3 and R13. Note both in the Step 2 output.
 
-- [ ] **Step 3: Implement** `_dca_window_ledger` and the wiring above.
+- [ ] **Step 3: Implement** `_dca_window_ledger`, `_arm_dca_ledger`, the `_events` and `_promote` test helpers, and the wiring above.
 
 - [ ] **Step 4: Run the tests to verify they pass**
 Run: `uv run pytest tests/test_agent.py tests/test_hostile_rule_rails.py tests/strategy/test_paper.py -q`
@@ -373,7 +423,7 @@ git commit -m "feat(#1010): live cycles retry a vetoed DCA window and report a m
 
 **Interfaces:**
 - Consumes: `attestations.live_dca_windows_after_expiry(repo, now_ts)` (Task 1).
-- Behaviour: only on `--enabled`, after the existing `withdrawals attested ENABLED; expires in 7 days` echo, call `click.echo(f"WARNING: {w.line()}")` for each window returned for `now_ts`. `--suspended` prints nothing new.
+- Behaviour: only on `--enabled`, after the existing `withdrawals attested ENABLED; expires in 7 days` echo, call `click.echo(f"WARNING: {w.line()}")` for each window returned for `now_ts`. `--suspended` prints nothing new. Ruling R15 does not change this: the attestation just written is fresh, so the wrapper reports against it.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -417,9 +467,9 @@ git commit -m "feat(#1010): withdrawals attest warns when a live DCA buy falls a
 
 **Interfaces:**
 - Consumes: `attestations.live_dca_windows_after_expiry`, `DcaWindowAfterExpiry` (Task 1).
-- Produces: `StatusReport.dca_windows_after_expiry: tuple[DcaWindowAfterExpiry, ...] = ()`, declared as the LAST field with a default, so every existing `StatusReport(...)` construction (TUI tests, `pulse`) stays valid. This is the pattern `market_session` documents. `gather_status` fills it with `attestations.live_dca_windows_after_expiry(repo, now_ts)`. `render_human` appends `f"  WARNING: {w.line()}"` for each window, immediately after the `_rail17_line(...)` line. `--json` carries it through `asdict` unchanged.
+- Produces: `StatusReport.dca_windows_after_expiry: tuple[DcaWindowAfterExpiry, ...] = ()`, declared as the LAST field with a default, so every existing `StatusReport(...)` construction (TUI tests, `pulse`) stays valid. This is the pattern `market_session` documents. `gather_status` fills it with `attestations.live_dca_windows_after_expiry(repo, now_ts)`. In paper mode (`config.auto_trade.mode == "paper"`), `gather_status` sets `()` and does not call the wrapper, consistent with "rail 17 not evaluated in paper" (`status.py:424-436`; cold-read N2). `render_human` appends `f"  WARNING: {w.line()}"` for each window, immediately after the `_rail17_line(...)` line. `--json` carries it through `asdict` unchanged.
 
-- [ ] **Step 1: Write the failing tests** (module `repo` fixture and `_config()`; seed `withdrawals_enabled=True`, `withdrawals_attested_at=1_791_660_300`, one live 14-day DCA rule and one live 7-day DCA rule; `now_ts=1_791_660_300`)
+- [ ] **Step 1: Write the failing tests** (module `repo` fixture; the module's `_config()` defaults to `mode="paper"`, so the live tests pass `_config(auto_trade=AutoTradeConfig(mode="confirm"))`. `"confirm"` is the live deployment's mode string, as `test_status.py:97` uses it; `AutoTradeConfig` has no `"live"` mode. Below this is `LIVE = _config(auto_trade=AutoTradeConfig(mode="confirm"))`; seed `withdrawals_enabled=True`, `withdrawals_attested_at=1_791_660_300`, one live 14-day DCA rule and one live 7-day DCA rule; `now_ts=1_791_660_300`)
 
 ```python
 def test_status_lists_each_live_dca_rule_due_after_the_attestation_expires(repo):
@@ -427,7 +477,7 @@ def test_status_lists_each_live_dca_rule_due_after_the_attestation_expires(repo)
     repo.set_state("withdrawals_attested_at", 1_791_660_300)
     rid14 = repo.insert_rule("dca", {"product_id": "BTC-USD", "cadence_days": 14}, status="live")
     repo.insert_rule("dca", {"product_id": "ETH-USD", "cadence_days": 7}, status="live")
-    report = gather_status(repo, _config(), now_ts=1_791_660_300)
+    report = gather_status(repo, LIVE, now_ts=1_791_660_300)
     assert [w.rule_id for w in report.dca_windows_after_expiry] == [rid14]
     lines = render_human(report)
     i = next(n for n, l in enumerate(lines) if l.startswith("rail 17 (withdrawal capability)"))
@@ -435,9 +485,19 @@ def test_status_lists_each_live_dca_rule_due_after_the_attestation_expires(repo)
     assert sum(l.startswith("  WARNING: rule ") for l in lines) == 1
 
 def test_status_json_carries_the_windows(repo):
-    # same four seeding lines as above
-    report = gather_status(repo, _config(), now_ts=1_791_660_300)
+    repo.set_state("withdrawals_enabled", True)
+    repo.set_state("withdrawals_attested_at", 1_791_660_300)
+    rid14 = repo.insert_rule("dca", {"product_id": "BTC-USD", "cadence_days": 14}, status="live")
+    report = gather_status(repo, LIVE, now_ts=1_791_660_300)
     assert _report_to_jsonable(report)["dca_windows_after_expiry"][0]["rule_id"] == rid14
+
+def test_status_in_paper_mode_emits_no_cadence_warning(repo):
+    repo.set_state("withdrawals_enabled", True)
+    repo.set_state("withdrawals_attested_at", 1_791_660_300)
+    repo.insert_rule("dca", {"product_id": "BTC-USD", "cadence_days": 14}, status="live")
+    report = gather_status(repo, _config(), now_ts=1_791_660_300)        # mode="paper"
+    assert report.dca_windows_after_expiry == ()
+    assert not any(l.startswith("  WARNING: rule ") for l in render_human(report))
 ```
 `"rail 17 (withdrawal capability)"` is `_rail17_line`'s own `prefix`. The module's `NOW_TS` is not used here, because these tests pin the live-evidence clock.
 
@@ -488,7 +548,7 @@ def test_dca_cadence_finding_warns_and_names_every_uncovered_rule():
 def test_gather_findings_wires_the_dca_cadence_check(tmp_path, valid_config_path):
     repo = _seeded_repo(tmp_path / "keel.db")
     repo.set_state("withdrawals_enabled", True)
-    repo.set_state("withdrawals_attested_at", NOW - 6 * 86_400)
+    repo.set_state("withdrawals_attested_at", NOW - 6 * 86_400)   # EXPIRING, still fresh: R15 lets it warn
     repo.insert_rule("dca", {"product_id": "BTC-USD", "cadence_days": 14}, status="live")
     findings = gather_findings(repo, load_config(valid_config_path), [], NOW)
     (f,) = [x for x in findings if x.name == "attest.dca_cadence"]
@@ -515,7 +575,7 @@ git commit -m "feat(#1010): doctor reports live DCA buys due after rail 17's exp
 ### Task 8: Rail 17's veto text stops implying DCA is exempt (D3)
 
 **Files:**
-- Modify: `keel/execution/guards.py` (rail 17 UNKNOWN message, ~line 916-920; the rail-17 comment block ~905-912 gains one line: "DCA is NOT exempt: a DCA buy is an acquisition like any other (#1010).")
+- Modify: `keel/execution/guards.py` (rail 17 UNKNOWN message, ~line 916-920; the rail-17 comment block ~905-912 gains one line: "DCA is NOT exempt: a DCA buy is an acquisition like any other (#1010)."; and, per Ruling R16, the module docstring at ~line 121, where `ENTRIES ONLY,\nlike rails 11/16/17 --` becomes `ENTRIES ONLY,\nlike rails 11/16/17 (11 and 16 exempt DCA; 17 does not) --`, re-wrapped to the docstring's line width)
 - Test: `tests/execution/test_guards.py` (rail-17 section)
 
 **Interfaces:** None. Text only. The violation key `withdrawal_capability` and every branch condition stay byte-identical.
@@ -538,7 +598,7 @@ def test_rail17_unknown_text_does_not_imply_dca_is_exempt(repo: Repository) -> N
 Run: `uv run pytest tests/execution/test_guards.py -q -k does_not_imply_dca`
 Expected: FAIL (`"DCA-exempt" in text`)
 
-- [ ] **Step 3: Replace the string** with the exact text above. Search for anything that matched the old wording: `grep -rn "DCA-exempt paths" keel tests docs`. It must return nothing afterwards.
+- [ ] **Step 3: Replace the string** with the exact text above. Search for anything that matched the old wording: `grep -rn "DCA-exempt paths" keel tests docs`. It must return nothing afterwards. Then `grep -n -A1 "like rails 11/16/17" keel/execution/guards.py` must show "(11 and 16 exempt DCA; 17 does not)" on the matched line or the line after it (R16).
 
 - [ ] **Step 4: Run to verify it passes**
 Run: `uv run pytest tests/execution/ tests/test_notifications.py tests/commands/ -q -k "rail17 or withdrawal or activity or pulse"`
@@ -556,11 +616,12 @@ git commit -m "fix(#1010): rail 17's veto text no longer implies DCA is exempt"
 - Modify: `docs/rails/rail-17-withdrawal-attestation.md` (new section "## The TTL and the DCA cadence (#1010)")
 
 The new section must state:
-1. The 7-day TTL vs the 14-day cadence, with the live 2026-10-10 → 2026-10-23 sequence from the issue.
+1. The 7-day TTL vs the 14-day cadence, with the live sequence as this plan states it (cold-read N9). Attested 2026-10-10 19:25Z. The weekly rules filled on 2026-10-16. The attestation expired 2026-10-17 19:25Z. All seven DCA signals were vetoed on 2026-10-23, the 2026-10-22 bar. The 14-day rules 9-13 have never filled live.
 2. That `keel withdrawals attest --enabled`, `keel status` and `keel doctor` (`attest.dca_cadence`) now name each live DCA rule whose next buy is due after expiry, with the date to re-attest from.
 3. That a window vetoed by a guard is retried on each later fresh daily bar of the same window, at most one buy per window per rule. A window that ends unfilled is logged as `agent.dca_window_missed` and is not back-filled.
 4. That a retry day can coincide with another rule's cadence day, so one day may now carry more DCA spend than `keel dca plan`'s busiest-day figure, still bounded by rails 3 and 14.
-5. That the web console banner does not yet show this (Ruling R6).
+5. That the web console banner does not yet show this (Ruling R6), and that the warning appears only while the attestation is fresh. An expired, suspended or absent attestation is already reported as a halt (R15).
+6. One sentence: `keel pulse` (and the console's next-buy line) shows the next cadence day, not a pending retry (cold-read N8).
 
 Also edit the "What the rail permits" bullet so that no sentence there implies DCA is exempt. It already says "DCA buys included"; keep it.
 
@@ -575,7 +636,7 @@ uv run pytest -q
 ```
 Expected: every command exits 0. If `ruff format --check` flags a file you touched, run `uv run ruff format <file>` and re-run the check. Do not reformat files you did not touch.
 - [ ] **Step 3: Verify nothing live was touched**
-Run: `git diff --stat origin/main -- '*.yaml' '*.plist' '*.db' keel/execution/executor.py`
+Run: `git diff --stat origin/main...HEAD -- '*.yaml' '*.plist' '*.db' keel/execution/executor.py` (cold-read N7)
 Expected: empty output. `WITHDRAWAL_ATTESTATION_TTL_SEC` is unchanged, and no config or DB file appears.
 - [ ] **Step 4: Commit**
 ```bash
@@ -588,8 +649,9 @@ git commit -m "docs(#1010): rail 17 TTL vs DCA cadence, the retry and the warnin
 ## Self-review against the definition of done
 
 - **D1** (attest/status/doctor warn, naming rule, due date, expiry): Task 1 has the single computation and the exact `line()` text with rule id, product, due date and expiry. Tasks 5, 6 and 7 are the three surfaces, and each one calls `live_dca_windows_after_expiry` without restating any arithmetic. The live 10-10/10-17/10-23 lapse is reproduced in Task 1's headline test.
-- **D2** (vetoed window retried on the next fresh bar, one buy per window, no stale double-buy): Task 2 adds the reads, Task 3 the pure decision, and Task 4 the live wiring plus the same-day rerun, later-bar, next-window, reported-not-back-filled and promoted-mid-window tests. The freshness gate is untouched, so a retry only ever runs on an admitted bar.
-- **D3** (veto text): Task 8, with an exact-string test over both `is_dca` values.
+- **D2** (vetoed window retried on the next fresh bar, one buy per window, no stale double-buy): Task 2 adds the reads, Task 3 the pure decision, and Task 4 the live wiring plus the same-day rerun, later-bar, next-window, reported-not-back-filled promoted-mid-window, paper-era-signal (R13) and ledger-read-failure (R14) tests. The freshness gate is untouched, so a retry only ever runs on an admitted bar.
+- **D3** (veto text): Task 8, with an exact-string test over both `is_dca` values, plus the R16 docstring line and its grep.
+- **Cold-read rulings:** R13 is in Tasks 2 and 4 (`test_a_paper_era_signal_does_not_retry_after_promotion`). R14 is in Task 4 (`test_a_ledger_read_failure_falls_back_to_cadence_only`). R15 is in Task 1 (the expired case of `test_live_wrapper_is_silent_without_an_enabled_attestation`), with notes in Tasks 5 and 7. R16 is in Task 8. N1 is Task 2 (`_dca_order`). N2 is Task 6 (`test_status_in_paper_mode_emits_no_cadence_warning`). N3 is Task 3 (`dca_off_cadence` in `test_an_unsignalled_window_never_retries`). N4 is noted in Task 1. N5 and N6 are noted in Tasks 3 and 4. N7, N8 and N9 are in Task 9. N10 is Task 6's JSON test.
 - **D4** (TDD, green proof, live untouched): every task opens with a failing test and the command that shows it failing. Task 4 names the one regression guard that passes before the change. Task 9 runs the five CI commands and checks with a diff that no config, plist, DB or TTL changed.
 - **Constraints 1–7:** `Dca.detect` stays pure, and a `None` ledger is today's path (Task 3, Step 4 runs `tests/strategy` and `tests/sim`). The window definition is per Ruling R1 (the literal one would break cadence 1 and steal the next window's buy). The freshness gate is kept (Task 4). The D1 arithmetic is in one place (Task 1). The TTL, guard semantics and configs are unchanged (Task 9, Step 3). It is one PR, in the ordered task sequence. Every task has a failing-test step.
 - **Type consistency:** `DcaWindowLedger.last_counted_bar_day` / `signalled_bar_days`, `Repository.last_live_buy_created_at` / `signal_ts_since`, `attestations.DcaWindowAfterExpiry` / `dca_windows_after_expiry` / `live_dca_windows_after_expiry`, `dca.next_dca_bar_ts`, `doctor.dca_cadence_findings`, and `StatusReport.dca_windows_after_expiry` are spelled the same in every task.
