@@ -91,3 +91,40 @@ def test_cli_roundtrip_and_suspension_message(tmp_path, monkeypatch):
     shown = runner.invoke(cli, ["--db", str(db_path), "withdrawals", "show"])
     assert "SUSPENDED" in shown.output
     assert "exits are unaffected" in shown.output
+
+
+def test_attest_enabled_names_each_live_dca_rule_whose_next_buy_falls_after_expiry(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr("keel.commands._common._is_interactive", lambda: True)
+    monkeypatch.setattr("keel.commands.withdrawals.time.time", lambda: 1_791_660_300)
+    db = tmp_path / "t.db"
+    conn = connect(str(db))
+    migrate(conn)
+    repo = Repository(conn)
+    rid = repo.insert_rule("dca", {"product_id": "PAXG-USD", "cadence_days": 14}, status="live")
+    repo.insert_rule("dca", {"product_id": "BTC-USD", "cadence_days": 7}, status="live")
+    assert len(repo.get_rules("live")) == 2  # the fixture reaches the reader
+    out = CliRunner().invoke(
+        cli, ["--db", str(db), "withdrawals", "attest", "--enabled"], input="yes\n"
+    )
+    assert out.exit_code == 0, out.output
+    warnings = [line for line in out.output.splitlines() if line.startswith("WARNING: ")]
+    assert len(warnings) == 1
+    assert warnings[0].startswith(
+        f"WARNING: rule {rid} PAXG-USD (every 14d): next DCA buy due 2026-10-23"
+    )
+    assert "expires 2026-10-17 19:25Z" in warnings[0]
+
+
+def test_attest_suspended_prints_no_dca_warning(tmp_path, monkeypatch):
+    monkeypatch.setattr("keel.commands.withdrawals.time.time", lambda: 1_791_660_300)
+    db = tmp_path / "t.db"
+    conn = connect(str(db))
+    migrate(conn)
+    repo = Repository(conn)
+    repo.insert_rule("dca", {"product_id": "PAXG-USD", "cadence_days": 14}, status="live")
+    assert len(repo.get_rules("live")) == 1
+    out = CliRunner().invoke(cli, ["--db", str(db), "withdrawals", "attest", "--suspended"])
+    assert out.exit_code == 0, out.output
+    assert "WARNING" not in out.output
