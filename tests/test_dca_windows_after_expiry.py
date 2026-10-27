@@ -206,3 +206,83 @@ def test_live_wrapper_skips_a_bar_the_rule_already_bought(repo) -> None:
     )
     found = attestations.live_dca_windows_after_expiry(repo, PLACEMENT_DAY_AT)
     assert [w.bar_ts for w in found] == [20_748 * DAY]
+
+
+def test_a_counted_buy_older_than_the_due_bar_does_not_skip_it() -> None:
+    rules = [(9, "PAXG-USD", 14)]
+    at = PLACEMENT_DAY_AT
+    # the newest counted buy is for bar 20_720, long before yesterday's bar 20_734: that bar is
+    # still the due one, and the attestation covers its placement day (20_735)
+    assert (
+        attestations.dca_windows_after_expiry(
+            rules, attested_at=at, now_ts=at, counted_bar_days={9: 20_720}
+        )
+        == ()
+    )
+    # the same mapping with the bar itself counted skips to the following bar (20_748)
+    found = attestations.dca_windows_after_expiry(
+        rules, attested_at=at, now_ts=at, counted_bar_days={9: 20_734}
+    )
+    assert [w.bar_ts for w in found] == [20_748 * DAY]
+
+
+def test_an_unknown_rule_whose_yesterdays_bar_is_uncovered_gets_exactly_one_window() -> None:
+    # expires 20_735 * DAY: before yesterday's bar (20_734) is placed-through (needs 20_736 * DAY),
+    # and the following bar (20_748) is uncovered too -- only the first is reported
+    at = 20_728 * DAY
+    found = attestations.dca_windows_after_expiry(
+        [(9, "PAXG-USD", 14)], attested_at=at, now_ts=PLACEMENT_DAY_AT
+    )
+    assert [(w.rule_id, w.bar_ts, w.due_ts) for w in found] == [(9, 20_734 * DAY, 20_735 * DAY)]
+
+
+def _insert_live_buy(repo, rid: int, created_at: int) -> None:
+    from decimal import Decimal
+
+    repo.insert_order(
+        dict(
+            mode="live",
+            product_id="BTC-USD",
+            side="BUY",
+            order_type="market",
+            qty=Decimal("1"),
+            status="filled",
+            fee=Decimal("0"),
+            confirmation="autonomous",
+            rule_id=rid,
+            created_at=created_at,
+            updated_at=created_at,
+        )
+    )
+
+
+def test_live_wrapper_counts_a_buy_against_the_bar_before_its_own_day(repo) -> None:
+    # cadence 1, buy placed on day 20_735 (acting on bar 20_734), viewed on day 20_736: the due
+    # bar is 20_735, NOT yet bought, placed on 20_736. The attestation expires inside day 20_737,
+    # so it covers that placement day: silent. Counting the buy's own day as its bar (20_735)
+    # would mark the due bar bought and report the following one (needs expiry past 20_738).
+    now = 20_736 * DAY + 69_900
+    repo.set_state("withdrawals_enabled", True)
+    repo.set_state(
+        "withdrawals_attested_at", 20_730 * DAY + 50_000
+    )  # expires 20_737 * DAY + 50_000
+    rid = repo.insert_rule("dca", {"product_id": "BTC-USD", "cadence_days": 1}, status="live")
+    _insert_live_buy(repo, rid, 20_735 * DAY + 4_800)
+    assert repo.last_live_buy_created_at(rid) == 20_735 * DAY + 4_800, "fixture: the buy is read"
+    assert attestations.live_dca_windows_after_expiry(repo, now) == ()
+
+
+def test_live_wrapper_treats_a_failed_buy_read_as_unknown_and_checks_both_bars(
+    repo, monkeypatch
+) -> None:
+    repo.set_state("withdrawals_enabled", True)
+    repo.set_state("withdrawals_attested_at", PLACEMENT_DAY_AT)
+    rid = repo.insert_rule("dca", {"product_id": "PAXG-USD", "cadence_days": 14}, status="live")
+
+    def _boom(rule_id):
+        raise RuntimeError("locked")
+
+    monkeypatch.setattr(repo, "last_live_buy_created_at", _boom)
+    found = attestations.live_dca_windows_after_expiry(repo, PLACEMENT_DAY_AT)
+    # yesterday's bar (20_734) is covered; unknown means the following bar is checked as well
+    assert [(w.rule_id, w.bar_ts) for w in found] == [(rid, 20_748 * DAY)]
