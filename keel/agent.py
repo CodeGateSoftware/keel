@@ -375,8 +375,12 @@ def _dca_window_ledger(repo: Repository, rule: Dca, now_ts: int) -> DcaWindowLed
     A persisted signal proves the window was due, but `signals` has no mode column and a
     promoted rule keeps its id, so only signals from the rule's live era count (R13): the lower
     bound is raised to the start of the UTC day it was promoted (`signals.ts` is the BAR's
-    00:00, so flooring keeps the first live bar). A rule with no `promoted_at` (inserted straight
-    at `live`) has no provable live era, so no signal counts and it stays cadence-only.
+    00:00, so flooring keeps a signal for the bar dated the promotion day itself). It does not
+    keep the bar before that: a rule promoted earlier on the same UTC day as its first live
+    cycle has that cycle act on yesterday's bar, which the floor excludes, so a veto on it is
+    never retried. That errs toward NOT buying and is accepted. A rule with no `promoted_at`
+    (inserted straight at `live`) has no provable live era, so no signal counts and it stays
+    cadence-only.
     """
     assert rule.rule_id is not None  # the caller arms only persisted rules
     last = repo.last_live_buy_created_at(rule.rule_id)
