@@ -46,6 +46,19 @@ def next_cadence_day_ts(now_ts: int, cadence_days: int) -> int:
     return (day if remainder == 0 else day + cadence_days - remainder) * _SECONDS_PER_DAY
 
 
+def next_dca_bar_ts(now_ts: int, cadence_days: int) -> int:
+    """00:00 UTC of the next cadence BAR a live cycle has not yet acted on (#1010).
+
+    `next_cadence_day_ts(now_ts)` answers "which cadence day is today or later" -- but a live
+    order placed on UTC day P acts on the completed bar of day P - 1 (`freshness.entry_bar_ready`
+    admits only yesterday's bar). So on a cadence day itself, yesterday's bar is the due one and
+    the buy has not been placed yet; counting from `now_ts - 1 day` keeps that bar in view. The
+    caller adds one day to get the day the order is actually placed, and that is the day rail 17
+    must still be fresh on.
+    """
+    return next_cadence_day_ts(now_ts - _SECONDS_PER_DAY, cadence_days)
+
+
 class Dca(Rule):
     """Cadence-based dip-buy accumulation rule.
 

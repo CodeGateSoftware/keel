@@ -35,12 +35,22 @@ happened.
 
 `EXPIRING` is the state that did not exist. An attestation was healthy until the instant it was
 refused, so the only warning was the halt itself.
+
+── #1010: TTL VS CADENCE ─────────────────────────────────────────────────────────────────────
+
+Rail 17's 7-day TTL is shorter than a 14-day DCA cadence, so a biweekly rule's window can open
+after the attestation has lapsed and the rail vetoes it -- on 2026-10-17 exactly that happened,
+silently. `dca_windows_after_expiry` is the ONE place that decides whether a live DCA rule's next
+buy falls after the expiry; `keel withdrawals attest`, `keel status` and `keel doctor` render its
+answer and never restate the arithmetic. `survey()` is deliberately untouched: it feeds the
+notification alert-once windows and the web banners, which this does not change.
 """
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, replace
+from datetime import UTC, datetime
 from typing import Any
 
 from keel_core.cash_posture import ATTESTATION_TTL_SEC as _POSTURE_TTL_SEC
@@ -292,3 +302,104 @@ def _posture_holds(record: Any) -> bool:
     if record.state is CashPostureState.REFUTED:
         return False
     return record.attested_posture != MARGIN_ENABLED
+
+
+@dataclass(frozen=True)
+class DcaWindowAfterExpiry:
+    """One live DCA rule whose next buy is placed after rail 17's attestation stops counting.
+
+    #1010: the data a surface needs to name the rule, the due date, the expiry and the date from
+    which a fresh attestation would cover it -- computed once, here, so three commands cannot
+    word the same fact three ways.
+    """
+
+    rule_id: int
+    product_id: str
+    cadence_days: int
+    #: 00:00 UTC of the cadence BAR the buy acts on.
+    bar_ts: int
+    #: 00:00 UTC of the day the order is placed (`bar_ts` + 1 day: the freshness gate).
+    due_ts: int
+    expires_at: int
+    #: The earliest attestation time whose expiry reaches the end of the placement day.
+    reattest_from_ts: int
+
+    def line(self) -> str:
+        """The one-line warning every surface prints, dates in UTC."""
+        due = datetime.fromtimestamp(self.due_ts, UTC)
+        bar = datetime.fromtimestamp(self.bar_ts, UTC)
+        expires = datetime.fromtimestamp(self.expires_at, UTC)
+        reattest = datetime.fromtimestamp(self.reattest_from_ts, UTC)
+        return (
+            f"rule {self.rule_id} {self.product_id} (every {self.cadence_days}d): "
+            f"next DCA buy due {due:%Y-%m-%d} (bar {bar:%Y-%m-%d}), "
+            f"after the withdrawal attestation expires {expires:%Y-%m-%d %H:%M}Z; "
+            f"rail 17 will veto it -- re-attest on or after {reattest:%Y-%m-%d} to cover it"
+        )
+
+
+def dca_windows_after_expiry(
+    rules: Iterable[tuple[int, str, int]], *, attested_at: int, now_ts: int
+) -> tuple[DcaWindowAfterExpiry, ...]:
+    """Which `(rule_id, product_id, cadence_days)` rules buy after the attestation lapses (#1010).
+
+    Pure. Takes `attested_at` and not `expires_at` so the TTL is read at call time through
+    `withdrawal_expiry`, the way every surface here reads it. The due day is the cadence bar plus
+    one day, because a live order acts on yesterday's completed bar (`freshness.entry_bar_ready`).
+    A rule is reported when the attestation does not last through the WHOLE placement day:
+    `expires_at < due_ts + 1 day`. The live cycle runs at 01:20 UTC rather than 00:00, so this is
+    the conservative test. Output keeps input order.
+    """
+    from keel.strategy.rules.dca import next_dca_bar_ts
+
+    expires_at = withdrawal_expiry(attested_at=attested_at)
+    ttl = expires_at - int(attested_at)
+    found: list[DcaWindowAfterExpiry] = []
+    for rule_id, product_id, cadence_days in rules:
+        bar_ts = next_dca_bar_ts(now_ts, cadence_days)
+        due_ts = bar_ts + 86_400
+        if expires_at >= due_ts + 86_400:
+            continue
+        found.append(
+            DcaWindowAfterExpiry(
+                rule_id=rule_id,
+                product_id=product_id,
+                cadence_days=cadence_days,
+                bar_ts=bar_ts,
+                due_ts=due_ts,
+                expires_at=expires_at,
+                reattest_from_ts=due_ts + 86_400 - ttl,
+            )
+        )
+    return tuple(found)
+
+
+def live_dca_windows_after_expiry(repo: Any, now_ts: int) -> tuple[DcaWindowAfterExpiry, ...]:
+    """`dca_windows_after_expiry` over this deployment's live DCA rules (#1010). Never raises.
+
+    Silent unless rail 17's attestation is fresh (`OK` or `EXPIRING`) AND says withdrawals are
+    enabled: `EXPIRED`, suspended and never-attested are already reported as halts by doctor
+    `attest.withdrawals` and status `_rail17_line`, and a cadence warning on top would say the
+    same thing worse. Freshness comes from this module's own model (`_withdrawal_dates` and the
+    rail's `Attestation`), never restated. Rules are built through
+    `keel.agent.build_rule_from_params`, the single coercion boundary, so the default cadence is
+    never restated here; a row that will not build is skipped. Imported lazily to avoid a cycle.
+    """
+    try:
+        from keel.agent import build_rule_from_params
+
+        att = replace(definition("withdrawal"), **_withdrawal_dates(repo))
+        if att.state(now_ts) not in (OK, EXPIRING) or att.attested_at is None:
+            return ()
+        rules: list[tuple[int, str, int]] = []
+        for row in repo.get_rules("live"):
+            if row["kind"] != "dca":
+                continue
+            try:
+                rule = build_rule_from_params(row["kind"], row["params"] or {})
+                rules.append((int(row["id"]), rule.product_id, int(rule.params["cadence_days"])))
+            except Exception:
+                continue
+        return dca_windows_after_expiry(rules, attested_at=att.attested_at, now_ts=now_ts)
+    except Exception:
+        return ()
