@@ -7117,3 +7117,33 @@ def test_a_ledger_read_failure_falls_back_to_cadence_only(repo, monkeypatch, cap
     failed = [e for e in _events(caplog) if e[0] == "agent.dca_window_ledger_failed"]
     assert len(failed) == 1
     assert failed[0][1]["rule_id"] == rid and "database is locked" in failed[0][1]["error"]
+
+
+def test_a_paper_cycle_gets_no_window_ledger_and_stays_cadence_only(repo):
+    """R7: only live cycles are armed. The DCA rule here is a `paper` row on its cadence bar 98,
+    and a live filled BUY exists for the same rule id whose bar day (98) satisfies the window.
+    A paper cycle must ignore that live fact and place its paper buy; an armed ledger would read
+    the BUY, call the window satisfied and withhold the signal."""
+    rid = repo.insert_rule("dca", {"product_id": PRODUCT}, status="paper")
+    repo.insert_order(
+        dict(
+            mode="live",
+            product_id=PRODUCT,
+            side=Side.BUY.value,
+            order_type="market",
+            qty=Decimal("1"),
+            status="filled",
+            fee=Decimal("0"),
+            confirmation="autonomous",
+            rule_id=rid,
+            created_at=99 * DAY,
+            updated_at=99 * DAY,
+        )
+    )
+    assert repo.last_live_buy_created_at(rid) == 99 * DAY, "fixture: the live BUY is readable"
+    broker = _MarketDataOnlyBroker(series=_series(98))
+    cfg = _paper_config(paper=PaperConfig(starting_equity_usd=Decimal("100000")))
+    result = run_once(broker, repo, cfg, now_ts=99 * DAY + 3_600)
+    assert len(result.enter_signals) == 1
+    assert "dca_retry" not in result.enter_signals[0].setup.context
+    assert len(repo.get_orders(mode="paper")) == 1

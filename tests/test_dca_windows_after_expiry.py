@@ -81,6 +81,37 @@ def test_live_wrapper_reads_only_live_dca_rows(repo) -> None:
     assert [w.rule_id for w in found] == [live14]
 
 
+def test_live_wrapper_skips_a_live_row_that_will_not_build_and_reports_the_rest(repo) -> None:
+    repo.set_state("withdrawals_enabled", True)
+    repo.set_state("withdrawals_attested_at", ATTESTED)
+    # `Dca.__init__` refuses cadence_days <= 0, so build_rule_from_params raises on this row
+    repo.insert_rule("dca", {"product_id": "BTC-USD", "cadence_days": 0}, status="live")
+    good = repo.insert_rule("dca", {"product_id": "PAXG-USD", "cadence_days": 14}, status="live")
+    assert len(repo.get_rules("live")) == 2, "fixture: both rows reach the wrapper"
+    found = attestations.live_dca_windows_after_expiry(repo, ATTESTED)
+    assert [w.rule_id for w in found] == [good]
+
+
+def test_live_wrapper_filters_on_kind_not_on_having_a_cadence(repo, monkeypatch) -> None:
+    """Only `kind == "dca"` rows are DCA rules. A live row of another kind that happens to build
+    a rule carrying `cadence_days` must not be reported; no shipped kind has one, so the probe
+    kind is a registered `Dca` subclass."""
+    from keel import agent
+    from keel.strategy.rules.dca import Dca
+
+    class _DcaLike(Dca):
+        pass
+
+    monkeypatch.setitem(agent.RULE_REGISTRY, "dca_like", _DcaLike)
+    repo.set_state("withdrawals_enabled", True)
+    repo.set_state("withdrawals_attested_at", ATTESTED)
+    repo.insert_rule("dca_like", {"product_id": "BTC-USD", "cadence_days": 14}, status="live")
+    real = repo.insert_rule("dca", {"product_id": "PAXG-USD", "cadence_days": 14}, status="live")
+    assert [r["kind"] for r in repo.get_rules("live")] == ["dca_like", "dca"]
+    found = attestations.live_dca_windows_after_expiry(repo, ATTESTED)
+    assert [w.rule_id for w in found] == [real]
+
+
 @pytest.mark.parametrize(
     "enabled, attested_at",
     # suspended, unknown, never attested, EXPIRED
