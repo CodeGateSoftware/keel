@@ -200,9 +200,9 @@ applies the confirm/autonomy gate, then places and logs. There is deliberately n
   per-day spend caps, exposure and concentration caps, correlation-aware sizing, a
   minimum-move floor, no-martingale/no-stop-widening, a fails-closed kill-switch, total and
   weekly drawdown breakers, a consecutive-loss/edge-decay breaker, feed-staleness and
-  quote-balance checks, venue **subscription/withdrawal attestations** — rail 17 encodes
+  quote-balance checks, venue **subscription attestation**, and rail 17, which encodes
   §65.4 *qabd*: an asset that cannot be withdrawn may not have been validly possessed, so
-  withdrawal capability is attested and enforced, not assumed. A rail veto names itself and
+  every live buy reads the venue's own withdrawal flag and fails closed if it cannot. A rail veto names itself and
   the command that clears it. Beside the rails sits one routing-time check that needs the
   venue's own book, which a broker-less rail cannot see: the **max-spread entry gate** (#350)
   refuses a live BUY whose previewed `(best_ask − best_bid) / mid` is at or beyond

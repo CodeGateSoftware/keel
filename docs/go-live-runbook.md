@@ -70,12 +70,12 @@ unattested venue or asset is treated as unknown, not as fine.
 ```bash
 keel assets list                       # what is attested, and what is not
 keel subscription show                 # rail 14's spend allowance comes from this record
-keel withdrawals show                  # rail 17: withdrawal capability is a compliance precondition
+keel withdrawals show                  # rail 17: manual suspension + the venue's per-wallet answer
 keel scope show                        # rail 20: can this venue's credential place a live ENTRY?
 ```
 
 Attest anything missing (`keel assets attest`, `keel subscription attest`,
-`keel withdrawals attest`, `keel scope attest --trading`) before continuing. If a rail vetoes
+`keel scope attest --trading`); rail 17 needs no attestation, it reads the venue on every live BUY before continuing. If a rail vetoes
 later, its message names the command that fixes it.
 
 Rail 20 exists because a credential that *reads* fine is not evidence it can *trade*: a
@@ -235,7 +235,7 @@ unreadable state halts trading rather than permitting it.
 | `keel resume-entries` | a consecutive-loss halt (rail 16) |
 | `keel record-flow --amount ±N` | rebases rail 11's high-water mark |
 | `keel reset-hwm` | rail 11's high-water mark, clearing a stuck drawdown halt |
-| `keel withdrawals attest --enabled` | rail 17's entry halt |
+| `keel withdrawals attest --enabled` | rail 17's manual entry halt (set by `--suspended`; no expiry) |
 
 The de-risking direction of each is always allowed and needs no terminal: `keel kill`,
 `keel withdrawals attest --suspended`, `keel autonomy off`.
