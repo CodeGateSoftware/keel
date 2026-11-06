@@ -63,7 +63,6 @@ def _fresh_repo() -> Repository:
     r = Repository(conn)
     r.set_state("kill_switch", False)
     r.set_state("withdrawals_enabled", True)
-    r.set_state("withdrawals_attested_at", 10**12)
     r.set_autonomous(True, now_ts=0)
     attest_subscription(r, now_ts=0, free_volume_usd=Decimal("10000000"))
     attest_trade_scope(r, now_ts=0)

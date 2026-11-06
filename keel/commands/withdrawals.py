@@ -1,23 +1,39 @@
-"""`keel withdrawals` -- withdrawal-capability attestation, rail 17's input (KB §65.4 qabd).
+"""`keel withdrawals` -- rail 17's manual switch and a view of what the venue says (§65.4 qabd).
+
+Rail 17 no longer asks the operator to vouch for withdrawals on a clock (#1010): it reads
+Coinbase's per-wallet `allow_withdrawals` on every BUY (`executor._withdrawal_capability`). What
+is left for a human is one manual brake: `--suspended` halts entries regardless of what the venue
+says, and `--enabled` clears it. Neither carries an expiry.
 
 `--enabled` RELEASES a rail-17 entry halt, so it demands a typed `yes` at a terminal via the
-shared confirmation gate; `--suspended` only ever reduces capability and stays ungated. The group
-reads and writes attestation state through the repository seam and never touches the broker.
+shared confirmation gate; `--suspended` only ever reduces capability and stays ungated. `attest`
+reads and writes through the repository seam; only `show` touches the broker, to print what the
+venue answers.
 """
 
 from __future__ import annotations
 
-import time
-
 import click
+from keel_core.products import quote_currency_of
 
-from keel.commands._common import _open_repo, _require_interactive_confirmation, with_disclaimer
+from keel.commands._common import (
+    _build_broker,
+    _load_cfg,
+    _open_repo,
+    _require_interactive_confirmation,
+    with_disclaimer,
+)
+from keel.data.repository import Repository
 from keel.execution import executor
+
+#: How long `show` waits on the venue. Bounded because `show` is a viewer an operator runs by
+#: hand: a hung network call must degrade to "venue unreadable", not hang the terminal.
+SHOW_VENUE_TIMEOUT_SEC = 15
 
 
 @click.group("withdrawals")
 def withdrawals_group() -> None:
-    """Withdrawal-capability attestation -- rail 17's input (KB §65.4 qabd/possession)."""
+    """Rail 17's manual withdrawal switch and the venue's answer (KB §65.4 qabd/possession)."""
 
 
 #: The typed gate's exact action/detail wording (O3), module-level so the console's
@@ -35,16 +51,17 @@ WITHDRAWALS_ATTEST_DETAIL = (
     "--enabled/--suspended",
     "enabled",
     required=True,
-    help="Are BTC/ETH/PAXG/USDC balances withdrawable on demand right now?",
+    help="--suspended halts new entries by hand; --enabled clears that suspension.",
 )
 @click.pass_context
 @with_disclaimer
 def withdrawals_attest(ctx: click.Context, enabled: bool) -> None:
-    """Attest the account's current withdrawal state.
+    """Set or clear rail 17's manual suspension.
 
     Under §65.4 possession (`qabd`) holds only while "there is nothing to prevent the buyer from
-    taking physical possession whenever he desires". An asset we cannot withdraw is an asset we
-    may not validly possess -- so rail 17 halts new ENTRIES when this is suspended or unknown.
+    taking physical possession whenever he desires". Rail 17 now asks the VENUE that on every
+    buy; this switch is the operator's own brake on top of it. `--suspended` halts new ENTRIES
+    until cleared, whatever the venue says. Neither direction expires.
 
     **Asymmetric, like `autonomy`.** `--suspended` only ever REDUCES capability and is ungated,
     usable from anywhere. `--enabled` RELEASES a rail-17 entry halt, so it demands a typed `yes`
@@ -59,32 +76,59 @@ def withdrawals_attest(ctx: click.Context, enabled: bool) -> None:
     repo = _open_repo(ctx)
     if enabled:
         _require_interactive_confirmation(WITHDRAWALS_ATTEST_ACTION, WITHDRAWALS_ATTEST_DETAIL)
-    now_ts = int(time.time())
     repo.set_state("withdrawals_enabled", bool(enabled))
-    repo.set_state("withdrawals_attested_at", now_ts)
-    ttl_days = executor.WITHDRAWAL_ATTESTATION_TTL_SEC // 86400
-    state = "ENABLED" if enabled else "SUSPENDED"
-    click.echo(f"withdrawals attested {state}; expires in {ttl_days} days")
-    if not enabled:
-        click.echo("new ENTRIES are now halted (rail 17). Exits are deliberately unaffected.")
+    if enabled:
+        click.echo(
+            "manual suspension cleared; rail 17 reads withdrawal capability from the venue "
+            "on every buy."
+        )
+    else:
+        click.echo("manual suspension set. new ENTRIES are now halted (rail 17).")
+        click.echo(
+            "Exits are deliberately unaffected. Clear it with: keel withdrawals attest --enabled"
+        )
+
+
+#: What the venue's answer for one wallet reads as, keyed by the adapter's tri-state.
+_WALLET_WORDS = {True: "allowed", False: "withdrawals disabled", None: "no wallet"}
+
+
+def _suspension_line(suspended: bool | None) -> str:
+    """The stored brake, tri-state: an unreadable store is `unknown`, never `off` -- the rail
+    itself fails closed on it, so a display saying `off` would be green for a refused buy."""
+    if suspended is None:
+        return "manual suspension: unknown (store unreadable)"
+    return "manual suspension: ON -- entries halted" if suspended else "manual suspension: off"
+
+
+def _wallet_currencies(repo: Repository) -> list[str]:
+    """The quote currency plus the base of every LIVE rule's product, in first-seen order."""
+    currencies: list[str] = []
+    for row in repo.get_rules(status="live"):
+        product_id = (row.get("params") or {}).get("product_id")
+        quote = quote_currency_of(product_id)
+        if not quote:
+            continue
+        for currency in (quote, str(product_id).rpartition("-")[0].upper()):
+            if currency and currency not in currencies:
+                currencies.append(currency)
+    return currencies or ["USD"]
 
 
 @withdrawals_group.command("show")
 @click.pass_context
 def withdrawals_show(ctx: click.Context) -> None:
-    """Show the current attestation and whether it is still fresh."""
+    """Show the manual suspension and what the venue says about each wallet rail 17 reads."""
     repo = _open_repo(ctx)
-    now_ts = int(time.time())
-    resolved = executor._withdrawals_enabled(repo, now_ts)
-    attested_at = int(repo.get_state("withdrawals_attested_at", default=0) or 0)
-
-    if resolved is None and not attested_at:
-        click.echo("withdrawals: UNKNOWN (never attested) -- rail 17 blocks new entries")
+    click.echo(_suspension_line(executor._stored_suspension(repo)))
+    try:
+        config = _load_cfg(ctx)
+        broker = _build_broker(config, timeout=SHOW_VENUE_TIMEOUT_SEC, repo=repo)
+        answers = broker.withdrawals_allowed(_wallet_currencies(repo))
+    except Exception:
+        # A viewer, not a gate: a venue that cannot be asked is reported, never raised, so the
+        # operator can still read the manual-suspension line above it.
+        click.echo("venue unreadable -- rail 17 refuses entries while it cannot read the venue")
         return
-    age_days = (now_ts - attested_at) / 86400 if attested_at else 0
-    stale = resolved is None and attested_at
-    label = {True: "ENABLED", False: "SUSPENDED", None: "UNKNOWN (attestation STALE)"}[resolved]
-    click.echo(f"withdrawals: {label}")
-    click.echo(f"attested {age_days:.1f} days ago")
-    if stale or resolved is False:
-        click.echo("rail 17 is blocking new entries; exits are unaffected")
+    for currency, allowed in answers.items():
+        click.echo(f"  {currency:<8}{_WALLET_WORDS[allowed]}")

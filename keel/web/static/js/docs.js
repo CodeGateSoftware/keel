@@ -108,7 +108,7 @@ export const TERMS = {
   "autonomy lapses": { slug: "glossary", anchor: "autonomy" },
   "kill switch": { slug: "glossary", anchor: "kill-switch" },
   "rail 11": { slug: "glossary", anchor: "rail" },
-  "withdrawal attestation (rail 17)": { slug: "glossary", anchor: "attestation" },
+  "manual withdrawal suspension (rail 17)": { slug: "glossary", anchor: "attestation" },
   "market session": { slug: "glossary", anchor: "market-clock" },
   "paper stage": { slug: "glossary", anchor: "paper-mode" },
 };

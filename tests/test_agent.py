@@ -201,12 +201,9 @@ def repo() -> Repository:
     migrate(conn)
     r = Repository(conn)
     r.set_state("kill_switch", False)
-    # Rail 17 (§65.4) fails closed without a fresh withdrawal attestation. Seeded here for the
-    # same reason the kill-switch is: these tests are not ABOUT rail 17, and a fail-closed rail
-    # would otherwise veto every BUY in the module. A huge attested_at keeps it fresh regardless
-    # of each test's `now_ts`.
+    # Rail 17 (§65.4) reads the venue per buy (#1010); the module's FakeBroker answers "allowed".
+    # The manual brake is stated as off for the same reason the kill-switch is.
     r.set_state("withdrawals_enabled", True)
-    r.set_state("withdrawals_attested_at", 10**12)
     # Autonomy is a PROFILE choice now. Most tests in this module were written against "it just
     # places"; opting the profile in here preserves that, and the tests that are specifically
     # about the confirm/autonomous decision set the profile themselves.
@@ -3709,7 +3706,6 @@ def _live_ready_repo(repo):
     """Clear every live-BUY rail that isn't the confirmation itself."""
     repo.set_state("kill_switch", False)
     repo.set_state("withdrawals_enabled", True)
-    repo.set_state("withdrawals_attested_at", 10**12)
     attest_subscription(repo, now_ts=0, free_volume_usd=Decimal("10000000"))
     return repo
 
@@ -4829,12 +4825,11 @@ def test_retry_after_a_blocked_cycle_does_not_duplicate_an_already_placed_exit(r
 # done. These two tests pin the two contract halves -- disabled means ZERO transport calls,
 # and a warn-state cycle with the event opted in delivers exactly that event.
 
-# A realistic epoch (2026-09-13 08:00 UTC), so the rail-17 fixture below is genuinely the
-# WARN branch: attested 5 days before NOW, i.e. 2 of the 7 TTL days remain. A negative
-# `withdrawals_attested_at` would take doctor's never-attested FAIL branch instead -- a
-# different (sharper) finding than the comments and assertions here describe.
+# A realistic epoch (2026-09-13 08:00 UTC), so the rail-22 fixture below is genuinely the WARN
+# branch: a posture attestation with 10 days left, inside its 15-day warning window. (Rail 17 has
+# no clock any more -- #1010 -- so the attestation event can only come from rail 22.)
 _NOTIFY_NOW = 1_800_000_000
-_NOTIFY_ATTESTED_AT = _NOTIFY_NOW - 5 * 86_400
+_NOTIFY_POSTURE_DUE = _NOTIFY_NOW + 10 * 86_400
 # The latest CLOSED daily candle as of NOW (day 20_833 opens at 1_799_971_200), on a DCA
 # cadence boundary (20_832 % 7 == 0) and inside rail 12's staleness window (< 150_000s old).
 _NOTIFY_CANDLE_TS = 1_799_884_800
@@ -4860,7 +4855,7 @@ def _notify_config(events: frozenset[str]) -> Config:
 def _notify_re_attest_subscription(repo) -> None:
     """The fixture's subscription (attested at ts 0, due 31.5M) is long EXPIRED by the
     realistic epoch these tests run at -- rail 14 would veto the BUY and the test would stop
-    being about rail 17's notification. Re-attest a valid one for the same reason the fixture
+    being about the notification. Re-attest a valid one for the same reason the fixture
     attests at all: rail 14 is not what these tests are about."""
     attest_subscription(repo, now_ts=_NOTIFY_NOW - 60 * 86_400, free_volume_usd=Decimal("10000000"))
 
@@ -4872,12 +4867,11 @@ def test_a_cycle_with_notifications_disabled_makes_zero_transport_calls(repo, mo
     sink = _NotifySink()
     monkeypatch.setattr("keel_core.notifications.post_json", sink)
     monkeypatch.setenv("KEEL_ALERT_WEBHOOK", "https://alerts.example/hook")
-    # rail 17 at 5 of its 7 days (2 remain): the WARN state an opted-in deployment would be
-    # told about -- doctor's `attest.withdrawals` WARN, not the never-attested FAIL.
-    repo.set_state("withdrawals_attested_at", _NOTIFY_ATTESTED_AT)
     # The module fixture attests the cash posture at ts 0, which is already expired by
-    # `_NOTIFY_NOW`. Rail 22 is not what this test is about, so re-attest on its clock (#691).
-    attest_cash_posture(repo, now_ts=_NOTIFY_NOW)
+    # `_NOTIFY_NOW`. Re-attest on this clock with 10 days left: the WARN state an opted-in
+    # deployment would be told about -- doctor's `attest.cash_posture` WARN, still admitted by
+    # rail 22 (#691).
+    attest_cash_posture(repo, now_ts=_NOTIFY_NOW, attest_due_ts=_NOTIFY_POSTURE_DUE)
     _notify_re_attest_subscription(repo)
     repo.insert_rule("dca", {"product_id": PRODUCT}, status="live")
     broker = FakeBroker(
@@ -4898,12 +4892,11 @@ def test_a_warn_state_cycle_emits_exactly_the_opted_in_events(repo, monkeypatch)
     sink = _NotifySink()
     monkeypatch.setattr("keel_core.notifications.post_json", sink)
     monkeypatch.setenv("KEEL_ALERT_WEBHOOK", "https://alerts.example/hook")
-    # attested 5 days before NOW: 2 of the 7 TTL days remain -> doctor WARNs (not the
-    # never-attested FAIL a negative epoch would take).
-    repo.set_state("withdrawals_attested_at", _NOTIFY_ATTESTED_AT)
     # The module fixture attests the cash posture at ts 0, which is already expired by
-    # `_NOTIFY_NOW`. Rail 22 is not what this test is about, so re-attest on its clock (#691).
-    attest_cash_posture(repo, now_ts=_NOTIFY_NOW)
+    # `_NOTIFY_NOW`. Re-attest on this clock with 10 days left: the WARN state an opted-in
+    # deployment would be told about -- doctor's `attest.cash_posture` WARN, still admitted by
+    # rail 22 (#691).
+    attest_cash_posture(repo, now_ts=_NOTIFY_NOW, attest_due_ts=_NOTIFY_POSTURE_DUE)
     _notify_re_attest_subscription(repo)
     repo.insert_rule("dca", {"product_id": PRODUCT}, status="live")
     broker = FakeBroker(

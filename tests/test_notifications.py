@@ -29,7 +29,11 @@ from keel_core.notifications import (
 )
 
 from keel import notifications
-from keel.commands.doctor import attestation_findings, rail_state_findings
+from keel.commands.doctor import (
+    attestation_findings,
+    cash_posture_findings,
+    rail_state_findings,
+)
 from keel.config import AutoTradeConfig, Caps, Config, MarketDataConfig
 from keel.execution.executor import ReduceResult
 from keel.execution.sleeve_exit import ExitWatch
@@ -48,21 +52,11 @@ NOW = 1_800_000_000  # a fixed, realistic epoch: no fixture clock drift
 # -- builders ---------------------------------------------------------------------------------
 
 
-def _attestation(withdrawals_attested_at: int, now: int = NOW, *, enabled: bool | None = True):
+def _attestation(*, suspended: bool | None = False, now: int = NOW):
     """doctor's own computation, fed a `None` subscription (rail 14 is not what these events
-    are about) and the withdrawal-attestation freshness under test.
-
-    `enabled=True` explicitly. `attestation_findings` used to default it to `True` and #794
-    changed that to `None` -- "nobody has checked" -- because a defaulted `True` on a
-    safety-reporting function reports `ok` for an account whose broker has frozen withdrawals.
-    These tests are about the CLOCK, so they state the verdict rather than inherit it.
-    """
-    return attestation_findings(
-        subscription=None,
-        withdrawals_attested_at=withdrawals_attested_at,
-        withdrawals_enabled=enabled,
-        now_ts=now,
-    )
+    are about) and the manual-suspension state under test. Rail 17 carries no clock any more
+    (#1010), so the only inputs are the three states of the stored brake."""
+    return attestation_findings(subscription=None, now_ts=now, withdrawals_suspended=suspended)
 
 
 def _rails(
@@ -94,7 +88,7 @@ def _state(
     watch: tuple[ExitWatch, ...] = (),
 ):
     return events_from_state(
-        attestation_findings=attestation if attestation is not None else _attestation(NOW),
+        attestation_findings=attestation if attestation is not None else _attestation(),
         rail_findings=rails if rails is not None else _rails(),
         month_to_date_spend=month_to_date_spend,
         allowance=allowance,
@@ -107,28 +101,42 @@ def _state(
     )
 
 
-# -- rail 17: attestation nearing expiry ------------------------------------------------------
+# -- rail 17 has no expiry event (#1010) ------------------------------------------------------
 
 
-def test_an_attestation_due_within_two_days_fires_and_a_fresh_one_does_not():
-    """The issue's sharpest silent failure: rail 17 has a 7-day TTL, fails closed, and the
-    veto is a WARNING -- not a CRITICAL. doctor WARNs at <=2 days remaining; the notification
-    fires on exactly that threshold, from exactly that computation."""
-    due_soon = _state(attestation=_attestation(NOW - 5 * DAY))  # 2 of 7 days remain
-    assert [e.key for e in due_soon] == ["attestation.expiring"]
-    assert "2 day(s)" in due_soon[0].message  # doctor's own detail, numbers included
-    assert due_soon[0].fields["status"] == "warn"
-
-    fresh = _state(attestation=_attestation(NOW))  # 7 days remain
-    assert fresh == []
+@pytest.mark.parametrize("suspended", [False, True, None])
+def test_rail_17_never_raises_an_attestation_event(suspended):
+    """Rail 17 reads the venue per buy: there is no attestation to expire, so there is no
+    `attestation.expiring` for it -- not even when the operator's own suspension is set (the
+    person who set it knows, the way they know about the kill switch) or unreadable."""
+    assert _state(attestation=_attestation(suspended=suspended)) == []
 
 
-def test_an_expired_attestation_fires_too():
-    """Expired is the sharper case the WARN threshold exists to precede: rail 17 is already
-    vetoing every entry at that point."""
-    expired = _state(attestation=_attestation(NOW - 8 * DAY))
+def test_the_notification_registry_does_not_list_rail_17():
+    assert "attest.withdrawals" not in _ATTESTATION_FINDINGS
+    assert "attest.withdrawals" not in notifications._RAIL_LABEL
+    assert "attest.withdrawals" not in notifications._ATTESTATION_MODEL_KEY
 
-    assert [e.key for e in expired] == ["attestation.expiring"]
+
+def test_notifications_never_emit_withdrawal_expiry_even_when_attested_long_ago():
+    """A database that still carries a 30-day-old `withdrawals_attested_at` from the TTL era must
+    say nothing about it: with a healthy posture the cycle is silent."""
+    calls: list[tuple[str, str]] = []
+    repo = _Repo(legacy_attested_at=NOW - 30 * DAY)
+    repo.cash_posture = _healthy_posture()
+    config = _config_with(NotificationSettings(events=frozenset({"attestation.expiring"})))
+
+    sent = notify_after_cycle(
+        repo,
+        config,
+        _LoopResult(),
+        NOW,
+        url="https://alerts.example/hook",
+        transport=_recording_transport(calls),
+    )
+
+    assert sent == 0
+    assert calls == []
 
 
 # -- rails arming -----------------------------------------------------------------------------
@@ -283,11 +291,12 @@ class _Repo:
     def __init__(
         self,
         *,
-        withdrawals_attested_at: int,
         held: tuple[str, ...] = (),
         withdrawals_enabled: bool | None = True,
+        legacy_attested_at: int | None = None,
     ) -> None:
-        self._withdrawals_attested_at = withdrawals_attested_at
+        #: The TTL-era timestamp, kept only so a test can prove it is no longer read.
+        self._legacy_attested_at = legacy_attested_at
         self._withdrawals_enabled = withdrawals_enabled
         self._held = held
         self.state_writes: list[tuple[str, object]] = []
@@ -298,10 +307,7 @@ class _Repo:
 
     def get_state(self, key: str, default: object = None) -> object:
         if key == "withdrawals_attested_at":
-            return self._withdrawals_attested_at
-        # Rail 17's second key (#793). The double is a deployment that HAS attested, so the
-        # answer is the attestation's verdict; without it every fixture here reads as an account
-        # nobody ever attested for, and these tests are about the expiry clock.
+            return self._legacy_attested_at if self._legacy_attested_at is not None else default
         if key == "withdrawals_enabled":
             return self._withdrawals_enabled
         if key == "kill_switch":
@@ -359,13 +365,10 @@ def _recording_transport(calls: list[tuple[str, str]]):
 
 def test_notify_after_cycle_reads_doctor_seams_and_sends_only_opted_in_events():
     calls: list[tuple[str, str]] = []
-    repo = _Repo(withdrawals_attested_at=NOW - 5 * DAY)  # rail 17: 2 days remain
-    # A HEALTHY posture, so this test stays about rail 17 alone. #732 wired
-    # `cash_posture_findings` into the same path, and the default double carries no posture at
-    # all -- which `doctor` reports as "cash posture never attested", a FAIL, because rail 22
-    # vetoes on it. That is a real second event, not a fixture artefact, and it belongs to the
-    # tests below rather than to this one.
-    repo.cash_posture = _healthy_posture()
+    # A LAPSED posture: the one attestation finding this path can still deliver (#1010 took rail
+    # 17's out), so the test has exactly one event to count. The default double carries no posture
+    # at all -- "cash posture never attested", also a FAIL -- which belongs to its own test below.
+    repo = _lapsed_posture_repo()
     settings = NotificationSettings(events=frozenset({"attestation.expiring"}))
     config = _config_with(settings)
 
@@ -390,7 +393,7 @@ def test_notify_after_cycle_reads_doctor_seams_and_sends_only_opted_in_events():
 
 def test_notify_after_cycle_without_a_url_makes_zero_network_calls(monkeypatch):
     calls: list[tuple[str, str]] = []
-    repo = _Repo(withdrawals_attested_at=NOW - 5 * DAY)
+    repo = _Repo()
     config = _config_with(NotificationSettings(events=frozenset({"attestation.expiring"})))
 
     sent = notify_after_cycle(
@@ -413,7 +416,7 @@ def test_notify_after_cycle_never_raises_into_the_trading_path():
     config = _config_with(NotificationSettings(events=frozenset({"attestation.expiring"})))
 
     sent = notify_after_cycle(
-        _ExplodingRepo(withdrawals_attested_at=NOW),
+        _ExplodingRepo(),
         config,
         _LoopResult(),
         NOW,
@@ -434,7 +437,7 @@ def test_notify_after_cycle_lets_base_exceptions_through_to_the_operator():
     def _interrupt(url: str, body: bytes) -> None:
         raise KeyboardInterrupt
 
-    repo = _Repo(withdrawals_attested_at=NOW - 5 * DAY)
+    repo = _Repo()
     config = _config_with(NotificationSettings(events=frozenset({"attestation.expiring"})))
 
     with pytest.raises(KeyboardInterrupt):
@@ -475,7 +478,8 @@ class TestEveryTaxonomyEventSurvivesDelivery:
     @staticmethod
     def _all_five_events():
         return _state(
-            attestation=_attestation(NOW - 5 * DAY),  # rail 17: 2 of 7 days remain -> WARN
+            # rail 22: never attested -> FAIL. Rail 17 has no event of its own any more (#1010).
+            attestation=cash_posture_findings(None, venue="coinbase", now_ts=NOW),
             rails=_rails(streak_halt_until=NOW + DAY),  # rail 16's halt is armed
             month_to_date_spend=Decimal("850"),
             allowance=Decimal("1000"),  # 85% used -- the event that used to carry a Decimal
@@ -548,11 +552,11 @@ def _healthy_posture():
 # -- the registry and the call site must agree (#732) ----------------------------------------------
 
 
-def _lapsed_posture_repo(*, withdrawals_attested_at: int) -> _Repo:
-    """A book where BOTH registered attestation findings are unhealthy at once."""
+def _lapsed_posture_repo() -> _Repo:
+    """A book whose rail-22 posture attestation has lapsed."""
     from keel_core.cash_posture import CashPostureState, VenueCashPosture
 
-    repo = _Repo(withdrawals_attested_at=withdrawals_attested_at)
+    repo = _Repo()
     repo.cash_posture = VenueCashPosture(
         venue="coinbase",
         state=CashPostureState.ATTESTED,
@@ -584,7 +588,7 @@ def test_every_registered_attestation_finding_is_actually_deliverable():
     gatherer fails here rather than in production quiet.
     """
     calls: list[tuple[str, str]] = []
-    repo = _lapsed_posture_repo(withdrawals_attested_at=NOW - 5 * DAY)
+    repo = _lapsed_posture_repo()
     config = _config_with(NotificationSettings(events=frozenset({"attestation.expiring"})))
 
     notify_after_cycle(
@@ -601,13 +605,13 @@ def test_every_registered_attestation_finding_is_actually_deliverable():
         assert name in delivered, f"{name} is registered and nothing delivers it"
 
 
-def test_both_attestation_rails_are_notified_when_both_are_unhealthy():
-    """The `break` said "one event per cycle: the finding list carries one rail-17 verdict" --
-    true when the registry held rail 17 alone. With rail 22 in it, a break makes a cash-posture
-    problem invisible whenever a withdrawals problem also exists: the same silence, one layer
-    down."""
+def test_only_rail_22_is_notified_when_the_posture_has_lapsed():
+    """Rail 17 once shared this path (one event per unhealthy rail, so a withdrawals problem could
+    not hide a cash-posture one). It left in #1010; what must hold now is that a lapsed posture
+    still arrives alone, and that nothing about rail 17 does -- whatever its suspension says."""
     calls: list[tuple[str, str]] = []
-    repo = _lapsed_posture_repo(withdrawals_attested_at=NOW - 5 * DAY)
+    repo = _lapsed_posture_repo()
+    repo._withdrawals_enabled = False  # a manual suspension is set: still no event for it
     config = _config_with(NotificationSettings(events=frozenset({"attestation.expiring"})))
 
     sent = notify_after_cycle(
@@ -619,16 +623,16 @@ def test_both_attestation_rails_are_notified_when_both_are_unhealthy():
         transport=_recording_transport(calls),
     )
 
-    assert sent == 2, f"expected one event per unhealthy rail, got {sent}"
+    assert sent == 1, f"expected one event, for rail 22, got {sent}"
     delivered = " ".join(body for _url, body in calls)
-    assert "rail 17" in delivered
     assert "rail 22" in delivered
+    assert "rail 17" not in delivered
 
 
 def test_a_healthy_cash_posture_notifies_nothing():
     """The other direction: an alert that fired on a healthy posture is the alert nobody reads."""
     calls: list[tuple[str, str]] = []
-    repo = _Repo(withdrawals_attested_at=NOW - DAY)  # rail 17 comfortably in date
+    repo = _Repo()
     repo.cash_posture = _healthy_posture()
     config = _config_with(NotificationSettings(events=frozenset({"attestation.expiring"})))
 
@@ -650,7 +654,7 @@ def test_a_deployment_that_never_attested_a_posture_is_told(monkeypatch):
     vetoes live entries on it. This is the standing case #732 is really about: nothing lapsed,
     nothing broke, the agent simply cannot enter and had no way to say so."""
     calls: list[tuple[str, str]] = []
-    repo = _Repo(withdrawals_attested_at=NOW - DAY)  # rail 17 fine; no posture at all
+    repo = _Repo()  # no posture at all
     config = _config_with(NotificationSettings(events=frozenset({"attestation.expiring"})))
 
     sent = notify_after_cycle(
@@ -735,7 +739,7 @@ def test_the_wiring_derives_sleeve_proposals_from_the_cycle_result():
     """`notify_after_cycle` reads `result.reduce_results` (R19) and writes nothing new: the
     write list is still exactly the #793 ledger key, and here not even that."""
     calls: list[tuple[str, str]] = []
-    repo = _Repo(withdrawals_attested_at=NOW)
+    repo = _Repo()
     repo.cash_posture = _healthy_posture()
     config = _config_with(NotificationSettings(events=frozenset({"sleeve.proposal"})))
 
@@ -759,7 +763,7 @@ def test_the_wiring_reads_which_stale_products_only_a_sleeve_rule_watches():
     """`notify_after_cycle` hands `result.sleeve_only_products` to the pure derivation, so a
     stale, held product that only a sleeve rule watches is worded as paused proposals."""
     calls: list[tuple[str, str]] = []
-    repo = _Repo(withdrawals_attested_at=NOW, held=("PAXG-USD", "BTC-USD"))
+    repo = _Repo(held=("PAXG-USD", "BTC-USD"))
     repo.cash_posture = _healthy_posture()
     config = _config_with(NotificationSettings(events=frozenset({"feed.stale_open_position"})))
 
@@ -832,7 +836,7 @@ def test_the_wiring_derives_exit_watch_events_from_the_cycle_result():
     """`notify_after_cycle` reads `result.exit_watch_transitions` and writes nothing new: the
     write list is still exactly the #793 ledger key, and here not even that."""
     calls: list[tuple[str, str]] = []
-    repo = _Repo(withdrawals_attested_at=NOW)
+    repo = _Repo()
     repo.cash_posture = _healthy_posture()
     config = _config_with(NotificationSettings(events=frozenset({"sleeve.exit_watch"})))
 

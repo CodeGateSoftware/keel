@@ -70,44 +70,45 @@ class FakeSubscription:
         return self._status
 
 
-def test_rail17_fresh_reports_days_remaining() -> None:
-    findings = attestation_findings(
-        subscription=None,
-        withdrawals_attested_at=NOW - 4 * DAY,
-        withdrawals_enabled=True,
-        now_ts=NOW,
-    )
+def _rail17(suspended: bool | None) -> Any:
+    findings = attestation_findings(subscription=None, now_ts=NOW, withdrawals_suspended=suspended)
     (rail17,) = [f for f in findings if f.name == "attest.withdrawals"]
+    return rail17
+
+
+def test_doctor_rail17_passes_without_any_attestation() -> None:
+    """#1010: rail 17 reads the venue per buy; nothing was ever attested and that is fine."""
+    rail17 = _rail17(False)
     assert rail17.status == "ok"
-    assert "3 day" in rail17.detail
-    assert rail17.fix
+    assert "venue" in rail17.detail
+    assert "attest" not in rail17.headline.lower()
+    assert "expire" not in (rail17.headline + rail17.detail).lower()
 
 
-def test_rail17_absent_fails_and_names_the_attest_command() -> None:
-    findings = attestation_findings(
-        subscription=None, withdrawals_attested_at=0, withdrawals_enabled=True, now_ts=NOW
-    )
-    (rail17,) = [f for f in findings if f.name == "attest.withdrawals"]
+def test_doctor_rail17_fails_on_manual_suspension() -> None:
+    rail17 = _rail17(True)
     assert rail17.status == "fail"
+    assert "suspen" in rail17.headline.lower()
     assert "keel withdrawals attest --enabled" in rail17.fix
 
 
-def test_rail17_expired_fails_with_days_over() -> None:
-    findings = attestation_findings(
-        subscription=None,
-        withdrawals_attested_at=NOW - 9 * DAY,
-        withdrawals_enabled=True,
-        now_ts=NOW,
-    )
-    (rail17,) = [f for f in findings if f.name == "attest.withdrawals"]
-    assert rail17.status == "fail"
-    assert "expired" in rail17.detail.lower()
+def test_doctor_rail17_warns_when_the_store_is_unreadable() -> None:
+    """`None` is not `False`: the rail fails closed on it, so doctor cannot call it a pass."""
+    rail17 = _rail17(None)
+    assert rail17.status == "warn"
+    assert "unreadable" in (rail17.headline + rail17.detail).lower()
+
+
+def test_doctor_never_reads_the_old_attestation_timestamp() -> None:
+    import inspect
+
+    from keel.commands import doctor
+
+    assert '"withdrawals_attested_at"' not in inspect.getsource(doctor)
 
 
 def test_rail14_absent_fails_naming_the_venue() -> None:
-    findings = attestation_findings(
-        subscription=None, withdrawals_attested_at=0, withdrawals_enabled=True, now_ts=NOW
-    )
+    findings = attestation_findings(subscription=None, now_ts=NOW, withdrawals_suspended=False)
     (rail14,) = [f for f in findings if f.name == "attest.subscription"]
     assert rail14.status == "fail"
     assert "keel subscription attest" in rail14.fix
@@ -115,9 +116,7 @@ def test_rail14_absent_fails_naming_the_venue() -> None:
 
 def test_rail14_attestation_due_soon_warns_with_days() -> None:
     record = FakeSubscription(Decimal("500"), NOW + 2 * DAY, "attested")
-    findings = attestation_findings(
-        subscription=record, withdrawals_attested_at=NOW, withdrawals_enabled=True, now_ts=NOW
-    )
+    findings = attestation_findings(subscription=record, now_ts=NOW, withdrawals_suspended=False)
     (rail14,) = [f for f in findings if f.name == "attest.subscription"]
     assert rail14.status == "warn"
     assert "2 day" in rail14.detail
@@ -321,9 +320,11 @@ def test_exit_code_fails_only_on_real_faults() -> None:
 
 
 def test_every_finding_names_a_fix_or_says_none_needed() -> None:
-    samples = attestation_findings(
-        subscription=None, withdrawals_attested_at=NOW, withdrawals_enabled=True, now_ts=NOW
-    ) + rail_state_findings(
+    samples = [
+        *attestation_findings(subscription=None, now_ts=NOW, withdrawals_suspended=False),
+        *attestation_findings(subscription=None, now_ts=NOW, withdrawals_suspended=True),
+        *attestation_findings(subscription=None, now_ts=NOW, withdrawals_suspended=None),
+    ] + rail_state_findings(
         kill_switch=False, streak_halt_until=0, drawdown_total=Decimal("0"), now_ts=NOW
     )
     for finding in samples:
@@ -1692,21 +1693,44 @@ def test_an_unmigrated_posture_table_is_not_reported_as_an_unattested_posture(
     assert "never attested" not in posture.headline
 
 
-def test_gather_findings_hands_rail_17_both_of_its_keys(tmp_path, valid_config_path) -> None:
-    """`attestation_findings` grew a `withdrawals_enabled` parameter and `gather_findings` grew
-    the read that feeds it. Delete that one line and every other test stays green while
-    `keel doctor` reports `ok` for an account whose broker has frozen withdrawals -- the exact
-    defect the parameter was added to fix.
+def test_gather_findings_hands_rail_17_its_stored_suspension(tmp_path, valid_config_path) -> None:
+    """`gather_findings` reads the stored suspension and hands it to `attestation_findings`.
+    Delete that read and every other test stays green while `keel doctor` reports `ok` for an
+    account the operator has manually suspended. Only the one key is seeded: the timestamp the
+    attestation used to carry is gone (#1010).
     """
     repo = _seeded_repo(tmp_path / "keel.db")
     now = NOW
-    repo.set_state("withdrawals_attested_at", str(now - DAY))
     repo.set_state("withdrawals_enabled", False)
 
     findings = gather_findings(repo, load_config(valid_config_path), [], now)
     (rail17,) = [f for f in findings if f.name == "attest.withdrawals"]
     assert rail17.status == "fail"
     assert "suspend" in rail17.headline.lower()
+
+
+def test_gather_findings_rail_17_passes_on_a_database_that_never_attested(
+    tmp_path, valid_config_path
+) -> None:
+    repo = _seeded_repo(tmp_path / "keel.db")
+
+    findings = gather_findings(repo, load_config(valid_config_path), [], NOW)
+    (rail17,) = [f for f in findings if f.name == "attest.withdrawals"]
+    assert rail17.status == "ok"
+
+
+def test_gather_findings_rail_17_warns_on_an_unreadable_store(
+    tmp_path, valid_config_path, monkeypatch
+) -> None:
+    """The display reads the tri-state, so an unreadable store is `warn`, never a green `ok`."""
+    from keel.execution import executor
+
+    repo = _seeded_repo(tmp_path / "keel.db")
+    monkeypatch.setattr(executor, "_stored_suspension", lambda _repo: None)
+
+    findings = gather_findings(repo, load_config(valid_config_path), [], NOW)
+    (rail17,) = [f for f in findings if f.name == "attest.withdrawals"]
+    assert rail17.status == "warn"
 
 
 # -- ledger venue drift: the ledger against the venue's recorded holding (#798, plan R3) ----------

@@ -35,7 +35,6 @@ from keel.config import (
 )
 from keel.data.db import connect, migrate
 from keel.data.repository import Repository
-from keel.execution.executor import WITHDRAWAL_ATTESTATION_TTL_SEC
 from keel.types import Candle, Granularity
 
 NOW_TS = 1_800_000_000
@@ -522,108 +521,68 @@ def test_market_session_state_is_json_serialisable_for_the_tui(repo: Repository)
 # -- rail 17 (withdrawal attestation, §65.4) -------------------------------------------------
 
 
-def _attest(repo: Repository, enabled: bool, age_sec: int) -> None:
-    repo.set_state("withdrawals_enabled", enabled)
-    repo.set_state("withdrawals_attested_at", NOW_TS - age_sec)
+def _suspend(repo: Repository, suspended: bool) -> None:
+    repo.set_state("withdrawals_enabled", not suspended)
 
 
-def test_rail17_attested_fresh_shows_time_remaining(repo: Repository) -> None:
-    """A fresh attestation is visible BEFORE it vetoes: 4 days of the 7 spent -> 3 days left."""
-    _attest(repo, enabled=True, age_sec=4 * 86400)
+def test_rail17_default_is_off_and_says_the_venue_decides(repo: Repository) -> None:
+    """#1010: no attestation exists to be missing. A fresh database reads `manual suspension:
+    off`, and status makes no venue call (it takes no broker at all)."""
+    report = gather_status(repo, _config(auto_trade=AutoTradeConfig(mode="confirm")), now_ts=NOW_TS)
 
+    assert report.withdrawal_attestation.suspended is False
+    assert "rail 17 (withdrawal capability): manual suspension: off" in "\n".join(
+        render_human(report)
+    )
+
+
+def test_rail17_manual_suspension_names_the_halt_and_the_release(repo: Repository) -> None:
+    _suspend(repo, True)
+    report = gather_status(repo, _config(auto_trade=AutoTradeConfig(mode="confirm")), now_ts=NOW_TS)
+
+    assert report.withdrawal_attestation.suspended is True
+    text = "\n".join(render_human(report))
+    assert (
+        "rail 17 (withdrawal capability): manual suspension: ON -- entries halted; "
+        "clear with keel withdrawals attest --enabled" in text
+    )
+
+
+def test_rail17_suspension_in_paper_names_the_state_not_a_halt(repo: Repository) -> None:
+    """Paper mode never evaluates rail 17 (`LIVE_STATE_RAILS`), so it must not claim a halt."""
+    _suspend(repo, True)
+    text = "\n".join(render_human(gather_status(repo, _config(), now_ts=NOW_TS)))
+
+    assert "manual suspension: ON (rail 17 not evaluated in paper)" in text
+    assert "entries halted" not in text
+
+
+def test_rail17_unreadable_store_is_unknown_never_off(
+    repo: Repository, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from keel.execution import executor
+
+    monkeypatch.setattr(executor, "_stored_suspension", lambda _repo: None)
+    report = gather_status(repo, _config(auto_trade=AutoTradeConfig(mode="confirm")), now_ts=NOW_TS)
+
+    assert report.withdrawal_attestation.suspended is None
+    text = "\n".join(render_human(report))
+    assert "manual suspension: unknown (store unreadable)" in text
+    assert "manual suspension: off" not in text
+
+
+def test_rail17_status_carries_no_expiry_fields(repo: Repository) -> None:
+    """No days-to-expiry, no attested-at: the shape itself cannot render an expiry."""
     report = gather_status(repo, _config(), now_ts=NOW_TS)
 
-    w = report.withdrawal_attestation
-    assert w.state == "attested"
-    assert w.expires_in_sec == 3 * 86400
-    assert "rail 17 (withdrawal capability): attested, expires in 3d" in render_human(report)
-
-
-def test_rail17_expired_names_the_halt_and_the_fix(repo: Repository) -> None:
-    """19 days since attestation against the 7-day TTL -> expired 12 days ago, with the command
-    that releases it -- the 2026-08-14 event, visible in status instead of in a veto log.
-
-    The halt wording is the LIVE-mode rendering: rail 17 is a LIVE_STATE rail, so the line is
-    asserted under a non-paper mode, and the paper variant (which cannot claim a halt the rail
-    will not run) is pinned by its own test below."""
-    _attest(repo, enabled=True, age_sec=19 * 86400)
-    live = _config(auto_trade=AutoTradeConfig(mode="confirm"))
-
-    report = gather_status(repo, live, now_ts=NOW_TS)
-
-    w = report.withdrawal_attestation
-    assert w.state == "expired"
-    assert w.expired_for_sec == 12 * 86400
-    assert (
-        "rail 17 (withdrawal capability): EXPIRED 12d ago -- entries halted; "
-        "re-attest with keel withdrawals attest" in render_human(report)
-    )
-
-
-def test_rail17_expired_in_paper_names_the_state_not_a_halt(repo: Repository) -> None:
-    """Paper mode never evaluates rail 17 (`LIVE_STATE_RAILS`), so claiming "entries halted"
-    there would be a permanently-red alert for a halt that cannot occur -- alert fatigue,
-    the exact failure #340 exists to fix. The paper rendering names the state and says the
-    rail is not evaluated, keeping only the re-attest nudge."""
-    _attest(repo, enabled=True, age_sec=19 * 86400)
-
-    report = gather_status(repo, _config(), now_ts=NOW_TS)  # _config() defaults to paper
-
-    assert (
-        "rail 17 (withdrawal capability): EXPIRED 12d ago "
-        "(rail 17 not evaluated in paper); "
-        "re-attest with keel withdrawals attest" in render_human(report)
-    )
-
-
-def test_rail17_never_attested_is_said_as_such(repo: Repository) -> None:
-    """A fresh DB has no attestation at all -- rail 17 fails closed on that too, so status
-    must not render the silence as health."""
-    report = gather_status(repo, _config(auto_trade=AutoTradeConfig(mode="confirm")), now_ts=NOW_TS)
-
-    w = report.withdrawal_attestation
-    assert w.state == "unattested"
-    assert w.attested_at is None
-    assert (
-        "rail 17 (withdrawal capability): never attested -- entries halted; "
-        "re-attest with keel withdrawals attest" in render_human(report)
-    )
-
-
-def test_rail17_suspended_attestation_still_names_the_halt(repo: Repository) -> None:
-    """A FRESH `--suspended` attestation is a deliberate rail-17 halt, not staleness -- the
-    line must say which, because the release is the same command with `--enabled`."""
-    _attest(repo, enabled=False, age_sec=3600)
-
-    report = gather_status(repo, _config(auto_trade=AutoTradeConfig(mode="confirm")), now_ts=NOW_TS)
-
-    w = report.withdrawal_attestation
-    assert w.state == "suspended"
-    assert (
-        "rail 17 (withdrawal capability): SUSPENDED -- entries halted; "
-        "re-attest with keel withdrawals attest --enabled" in render_human(report)
-    )
-
-
-def test_rail17_freshness_uses_the_executors_own_ttl(repo: Repository) -> None:
-    """Pin the boundary to `WITHDRAWAL_ATTESTATION_TTL_SEC` itself, at ±1s: status must age the
-    attestation with the SAME constant the executor vetoes on, never a restated 7 days -- a
-    drift between the two would report "attested" on the very cycle rail 17 vetoes."""
-    _attest(repo, enabled=True, age_sec=WITHDRAWAL_ATTESTATION_TTL_SEC - 1)
-    fresh = gather_status(repo, _config(), now_ts=NOW_TS).withdrawal_attestation
-    assert fresh.state == "attested"
-    assert fresh.expires_in_sec == 1
-
-    _attest(repo, enabled=True, age_sec=WITHDRAWAL_ATTESTATION_TTL_SEC + 1)
-    stale = gather_status(repo, _config(), now_ts=NOW_TS).withdrawal_attestation
-    assert stale.state == "expired"
-    assert stale.expired_for_sec == 1
+    assert set(asdict(report.withdrawal_attestation)) == {"suspended"}
+    (line,) = [ln for ln in render_human(report) if ln.startswith("rail 17")]
+    assert "expire" not in line.lower() and "attested" not in line.lower()
 
 
 def test_rail17_line_sits_beside_rail11(repo: Repository) -> None:
     """The two halt-rails render adjacently, so one glance answers "can the agent enter today?"
     for both the drawdown breaker and the possession rail."""
-    _attest(repo, enabled=True, age_sec=3600)
     lines = render_human(gather_status(repo, _config(), now_ts=NOW_TS))
 
     rail11_at = next(i for i, line in enumerate(lines) if line.startswith("rail11"))
@@ -652,9 +611,8 @@ def test_status_command_runs_read_only_and_prints_key_facts(tmp_path, valid_conf
     assert "mode: paper" in result.output
     assert "kill_switch: clear" in result.output.lower() or "clear" in result.output.lower()
     assert "no open positions" in result.output.lower()
-    # A fresh DB has never been attested -- rail 17 is halting entries, and status says so
-    # rather than rendering the silence as health.
-    assert "rail 17 (withdrawal capability): never attested" in result.output
+    # Rail 17 reads the venue per buy (#1010); a fresh DB has no manual suspension.
+    assert "rail 17 (withdrawal capability): manual suspension: off" in result.output
 
 
 def test_status_command_json_flag_emits_parseable_json(tmp_path, valid_config_path) -> None:
@@ -672,7 +630,7 @@ def test_status_command_json_flag_emits_parseable_json(tmp_path, valid_config_pa
     assert payload["mode"] == "paper"
     assert payload["kill_switch_engaged"] is False
     assert payload["rail11_status"] in {"ok", "HALTED", "unknown"}
-    assert payload["withdrawal_attestation"]["state"] == "unattested"
+    assert payload["withdrawal_attestation"] == {"suspended": False}
     assert "open_positions" in payload
     assert "rule_counts" in payload
     assert "data_freshness" in payload

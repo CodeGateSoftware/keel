@@ -199,19 +199,22 @@ def test_the_bare_holder_semantics_are_pinned_to_the_experiment_record():
     )
 
 
-def test_rail_17s_seven_day_ttl_is_pinned_to_the_executor():
-    """The doc names the TTL by its constant, two-sided with the executor that defines it.
+def test_rail_17s_venue_read_is_pinned_to_the_executor():
+    """The doc names the mechanism by its symbol, two-sided with the executor that defines it.
 
-    'Fresh attestation' is a rubbery phrase; `WITHDRAWAL_ATTESTATION_TTL_SEC` is 7 days, and a
-    reader auditing the rail needs the number and the symbol that owns it.
+    Rail 17 reads the venue per buy and has no TTL (#1010); a reader auditing the rail needs the
+    function that does the reading, and a rename must fail here rather than orphan the citation.
     """
-    assert "WITHDRAWAL_ATTESTATION_TTL_SEC" in _doc(), (
-        f"{_DOC} must name rail 17's TTL as WITHDRAWAL_ATTESTATION_TTL_SEC (7 days), so the "
-        "number is traceable to the constant that enforces it"
+    assert "_withdrawal_capability" in _doc(), (
+        f"{_DOC} must name rail 17's mechanism as `_withdrawal_capability`, so the claim is "
+        "traceable to the function that enforces it"
     )
-    assert "WITHDRAWAL_ATTESTATION_TTL_SEC" in _rel("keel/execution/executor.py"), (
-        "keel/execution/executor.py must still define WITHDRAWAL_ATTESTATION_TTL_SEC -- "
-        "the doc cites it, so a rename must fail here rather than orphan the citation"
+    assert "def _withdrawal_capability" in _rel("keel/execution/executor.py"), (
+        "keel/execution/executor.py must still define _withdrawal_capability -- the doc cites "
+        "it, so a rename must fail here rather than orphan the citation"
+    )
+    assert "WITHDRAWAL_ATTESTATION_TTL_SEC" not in _doc(), (
+        f"{_DOC} still cites the 7-day TTL constant that #1010 deleted"
     )
 
 

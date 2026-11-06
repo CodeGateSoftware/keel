@@ -99,20 +99,19 @@ class SubscriptionStatusRow:
 
 @dataclass(frozen=True)
 class WithdrawalAttestationStatus:
-    """Rail 17's input, as a displayable state (§65.4) -- the same reading `keel withdrawals
-    show` prints, so the two commands can never disagree about whether entries are halted.
+    """Rail 17's operator-set input, as a displayable state (§65.4) -- the manual suspension.
 
-    `expires_in_sec` is set only when `state == "attested"` (a fresh `--enabled` attestation);
-    `expired_for_sec` only when `state == "expired"` -- how long ago the 7-day TTL lapsed, not
-    how old the attestation is, because "unknown for 12 days" is the fact that matters to an
-    operator deciding how urgently to re-attest.
+    Rail 17 decides from the VENUE's own `allow_withdrawals` on every buy (#1010), and this
+    dashboard is "local DB + config only", so it makes no venue call and shows only what an
+    operator can set: the `keel withdrawals attest --suspended` brake. There is no expiry to
+    show because there is no attestation to age.
+
+    `suspended` is `executor._stored_suspension`'s tri-state: `True` (set), `False` (not set),
+    `None` (the store could not be read -- rendered `unknown`, never `off`, because the rail
+    fails closed on it).
     """
 
-    state: str  # "attested" | "suspended" | "expired" | "unattested"
-    enabled: bool | None
-    attested_at: int | None
-    expires_in_sec: int | None
-    expired_for_sec: int | None
+    suspended: bool | None
 
 
 @dataclass(frozen=True)
@@ -301,45 +300,11 @@ def _market_session(repo: Repository, config: Config, now_ts: int) -> MarketSess
     )
 
 
-def _withdrawal_attestation(repo: Repository, now_ts: int) -> WithdrawalAttestationStatus:
-    """Rail 17's input, resolved and aged for display.
-
-    Resolution goes through the executor's OWN `_withdrawals_enabled` and expiry math goes
-    through the executor's OWN `WITHDRAWAL_ATTESTATION_TTL_SEC` -- never a restated 7 days --
-    so this display can never call an attestation fresh on the very cycle the rail vetoes it.
-    Staleness takes precedence over suspension, matching `withdrawals show`: a stale attested
-    suspension is UNKNOWN, not a fresh claim that withdrawals are down.
-
-    The corrupt-state read is guarded the way the executor guards its own (`try/except` ->
-    unknown): a dashboard must not inherit a crash path the rail deliberately does not have.
-    """
-    resolved = executor._withdrawals_enabled(repo, now_ts)
-    try:
-        attested_at = int(repo.get_state("withdrawals_attested_at", default=0) or 0)
-    except TypeError, ValueError:
-        attested_at = 0
-
-    if not attested_at:
-        return WithdrawalAttestationStatus("unattested", None, None, None, None)
-    enabled_flag = repo.get_state("withdrawals_enabled", default=None)
-    if resolved is None and enabled_flag is None:
-        # `withdrawals show`'s UNKNOWN corner, kept word-for-word: an attested_at exists but
-        # the enabled flag itself is unreadable/absent, which only DB surgery produces (the
-        # CLI writes both keys). Not "expired" -- the staleness question was never reached.
-        return WithdrawalAttestationStatus("unknown", None, attested_at, None, None)
-    if resolved is None:
-        expired_for = max((now_ts - attested_at) - executor.WITHDRAWAL_ATTESTATION_TTL_SEC, 0)
-        return WithdrawalAttestationStatus(
-            "expired",
-            enabled_flag,
-            attested_at,
-            None,
-            expired_for,
-        )
-    if resolved is False:
-        return WithdrawalAttestationStatus("suspended", False, attested_at, None, None)
-    expires_in = max((attested_at + executor.WITHDRAWAL_ATTESTATION_TTL_SEC) - now_ts, 0)
-    return WithdrawalAttestationStatus("attested", True, attested_at, expires_in, None)
+def _withdrawal_attestation(repo: Repository) -> WithdrawalAttestationStatus:
+    """Rail 17's manual suspension, resolved through the executor's OWN `_stored_suspension` so
+    this display can never disagree with the rail about whether the brake is set, and keeping the
+    tri-state: an unreadable store is `None`, not `False`."""
+    return WithdrawalAttestationStatus(executor._stored_suspension(repo))
 
 
 def gather_status(repo: Repository, config: Config, now_ts: int) -> StatusReport:
@@ -372,7 +337,7 @@ def gather_status(repo: Repository, config: Config, now_ts: int) -> StatusReport
         max_total_dd_pct=max_total,
         max_weekly_dd_pct=max_weekly,
         rail11_status=_rail11_status(dd_total, dd_weekly, max_total, max_weekly),
-        withdrawal_attestation=_withdrawal_attestation(repo, now_ts),
+        withdrawal_attestation=_withdrawal_attestation(repo),
         paper_cash_usdc=(
             repo.get_state("paper_cash_usdc") if config.auto_trade.mode == "paper" else None
         ),
@@ -417,31 +382,21 @@ def _human_remaining(remaining_sec: int) -> str:
 
 
 def _rail17_line(w: WithdrawalAttestationStatus, rail_evaluated: bool) -> str:
-    """The rail-17 line, naming the halt and the release in the same breath whenever entries
-    are halted -- the 2026-08-14 event was invisible until the veto fired precisely because
-    nothing surfaced the attestation's age BEFORE rail 17 acted on it (#340).
+    """The rail-17 line: the manual suspension, on, off or unknown.
 
-    `rail_evaluated` is False in paper mode: rail 17 is a LIVE_STATE rail, skipped offline,
-    so a stale attestation halts nothing there. Claiming "entries halted" on a paper
-    dashboard would be a permanently-red alert for a halt that cannot occur -- the exact
-    alert-fatigue failure #340 exists to fix -- so the paper rendering names the state and
-    says the rail is not evaluated, and the re-attest prompt is kept (the LIVE deployment's
-    attestation is refreshed by the same typed command, and paper status should still nudge).
+    `rail_evaluated` is False in paper mode: rail 17 is a LIVE_STATE rail, skipped offline, so a
+    suspension halts nothing there. Claiming "entries halted" on a paper dashboard would be a
+    permanently-red alert for a halt that cannot occur (#340), so the paper rendering names the
+    state and says the rail is not evaluated.
     """
-    prefix = "rail 17 (withdrawal capability)"
-    if w.state == "attested":
-        return f"{prefix}: attested, expires in {_human_remaining(w.expires_in_sec or 0)}"
-    if w.state == "unknown":
-        return f"{prefix}: UNKNOWN (state unreadable); re-attest with keel withdrawals attest"
-    halt = " -- entries halted" if rail_evaluated else " (rail 17 not evaluated in paper)"
-    if w.state == "suspended":
-        return f"{prefix}: SUSPENDED{halt}; re-attest with keel withdrawals attest --enabled"
-    if w.state == "expired":
-        return (
-            f"{prefix}: EXPIRED {_human_age(w.expired_for_sec or 0)}{halt}; "
-            "re-attest with keel withdrawals attest"
-        )
-    return f"{prefix}: never attested{halt}; re-attest with keel withdrawals attest"
+    prefix = "rail 17 (withdrawal capability): manual suspension"
+    if w.suspended is None:
+        return f"{prefix}: unknown (store unreadable)"
+    if not w.suspended:
+        return f"{prefix}: off"
+    if not rail_evaluated:
+        return f"{prefix}: ON (rail 17 not evaluated in paper)"
+    return f"{prefix}: ON -- entries halted; clear with keel withdrawals attest --enabled"
 
 
 def _session_line(s: MarketSessionStatus) -> str | None:

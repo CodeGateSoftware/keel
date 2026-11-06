@@ -477,38 +477,6 @@ def _dca_budget(context: dict[str, Any], fallback: Decimal) -> tuple[Decimal, st
     return amount, "rule"
 
 
-#: How long a withdrawal-capability attestation stays fresh (§65.4). Deliberately short: the
-#: attestation is about the account's CURRENT state, and a freeze can appear at any time, so a
-#: stale attestation is no better than none. 7 days.
-WITHDRAWAL_ATTESTATION_TTL_SEC = 7 * 24 * 3600
-
-
-def _withdrawals_enabled(repo: Any, now_ts: int) -> bool | None:
-    """Rail 17's input: is the account currently in a withdrawable state (§65.4)?
-
-    Read LIVE from the operator's attestation on every intent -- never cached -- so
-    `keel withdrawals attest` (or a revocation) takes effect on the very next order, the same
-    posture rail 14 takes with the subscription record.
-
-    Returns `None` when there is no attestation or it has gone stale, which fails rail 17 closed.
-    An expired attestation is treated as UNKNOWN rather than as `False`: the difference matters
-    in the message the operator sees, and "nobody has checked recently" is not the same claim as
-    "the broker says withdrawals are suspended".
-    """
-    try:
-        attested_at = int(repo.get_state("withdrawals_attested_at", default=0) or 0)
-        enabled = repo.get_state("withdrawals_enabled", default=None)
-    except Exception:
-        log_exception(logger, "executor.withdrawal_attestation_read_failed")
-        return None
-
-    if not attested_at or enabled is None:
-        return None
-    if now_ts - attested_at > WITHDRAWAL_ATTESTATION_TTL_SEC:
-        return None
-    return bool(enabled)
-
-
 def _stored_suspension(repo: Any) -> bool | None:
     """The stored `--suspended` brake: `True` (set), `False` (not set), `None` (unreadable).
 

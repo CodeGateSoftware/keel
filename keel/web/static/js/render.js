@@ -774,11 +774,7 @@ function pulseState(data) {
 
   fragment.append(
     gridCard([
-      kv("withdrawal attestation (rail 17)", data.withdrawal_attestation.state),
-      kv("withdrawals", data.withdrawal_attestation.enabled),
-      kv("attested at", data.withdrawal_attestation.attested_at),
-      kv("expires in", data.withdrawal_attestation.expires_in),
-      kv("expired for", data.withdrawal_attestation.expired_for),
+      kv("manual withdrawal suspension (rail 17)", data.withdrawal_attestation.suspended),
     ]),
   );
 

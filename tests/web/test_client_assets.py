@@ -1370,7 +1370,7 @@ def test_the_pulse_key_scan_found_the_keys_it_claims_to_check() -> None:
     keys = _view_keys("pulseView", "data")
     assert "equity.high_water_mark" in keys
     assert "autonomy.live" in keys
-    assert "withdrawal_attestation.state" in keys
+    assert "withdrawal_attestation.suspended" in keys
     assert len(keys) >= 15, keys
 
     # The two filters, asserted rather than assumed -- both were added because this test failed

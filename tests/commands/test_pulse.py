@@ -179,31 +179,28 @@ def test_why_not_takes_the_newest_cycle_first_and_keeps_only_the_named_prefixes(
 
 
 def test_why_not_omits_rail_17_in_paper_and_names_it_in_live() -> None:
-    lapsed = WithdrawalAttestationStatus("expired", True, NOW - 9 * _DAY, None, 2 * _DAY)
-    assert _pulse(mode="paper", withdrawal_attestation=lapsed).why_not == ()
-    assert _pulse(mode="live", withdrawal_attestation=lapsed).why_not == (
-        "rail 17: withdrawal attestation expired",
+    suspended = WithdrawalAttestationStatus(True)
+    assert _pulse(mode="paper", withdrawal_attestation=suspended).why_not == ()
+    assert _pulse(mode="live", withdrawal_attestation=suspended).why_not == (
+        "rail 17: manual withdrawal suspension is on",
     )
-    unattested = WithdrawalAttestationStatus("unattested", None, None, None, None)
-    assert _pulse(mode="live", withdrawal_attestation=unattested).why_not == (
-        "rail 17: withdrawal attestation unattested",
+    assert (
+        _pulse(mode="live", withdrawal_attestation=WithdrawalAttestationStatus(False)).why_not == ()
     )
-    attested = WithdrawalAttestationStatus("attested", True, NOW - 3600, 6 * _DAY, None)
-    assert _pulse(mode="live", withdrawal_attestation=attested).why_not == ()
 
 
 def test_why_not_names_rail_17_wherever_status_says_entries_are_halted() -> None:
-    """`status._rail17_line` evaluates rail 17 in every non-paper mode and says "entries halted"
-    for suspended, expired and never-attested alike; the why-not list must not be narrower."""
-    lapsed = WithdrawalAttestationStatus("expired", True, NOW - 9 * _DAY, None, 2 * _DAY)
-    assert _pulse(mode="confirm", withdrawal_attestation=lapsed).why_not == (
-        "rail 17: withdrawal attestation expired",
+    """`status._rail17_line` evaluates rail 17 in every non-paper mode; the why-not list must not
+    be narrower. An unreadable store fails the rail closed, so it is a blocker too."""
+    assert _pulse(
+        mode="confirm", withdrawal_attestation=WithdrawalAttestationStatus(True)
+    ).why_not == ("rail 17: manual withdrawal suspension is on",)
+    assert _pulse(
+        mode="live", withdrawal_attestation=WithdrawalAttestationStatus(None)
+    ).why_not == ("rail 17: manual suspension unknown (store unreadable); buys fail closed",)
+    assert (
+        _pulse(mode="paper", withdrawal_attestation=WithdrawalAttestationStatus(None)).why_not == ()
     )
-    suspended = WithdrawalAttestationStatus("suspended", False, NOW - 3600, None, None)
-    assert _pulse(mode="live", withdrawal_attestation=suspended).why_not == (
-        "rail 17: withdrawal attestation suspended",
-    )
-    assert _pulse(mode="paper", withdrawal_attestation=suspended).why_not == ()
 
 
 # -- next DCA buy -------------------------------------------------------------------------------

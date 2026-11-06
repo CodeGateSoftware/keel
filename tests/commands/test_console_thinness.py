@@ -21,7 +21,7 @@ The pin is an AST scan enforcing six rules -- five that hold across the whole la
   report), `keel.analysis.*` (FIFO/P&L math) -- EXCEPT (a) CONSTANTS and TYPES, read
   from the source module's own AST (a class, or an ALL_CAPS module-level assignment):
   the console modules legitimately import gate WORDING constants and screen vocabulary
-  (e.g. `KNOWN_BACKINGS`, `WITHDRAWAL_ATTESTATION_TTL_SEC`) and constructing a frozen
+  (e.g. `KNOWN_BACKINGS`, `WITHDRAWALS_ATTEST_ACTION`) and constructing a frozen
   parameter dataclass is keyword passthrough, not math; (b) submodules (their CALLS are
   Rule 2's business); (c) the audited `IMPORT_ALLOWLIST` below, whose every entry also
   carries a Rule-2 call allowance.

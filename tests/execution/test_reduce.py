@@ -46,7 +46,6 @@ def repo() -> Repository:
     r.set_state("kill_switch", False)
     r.set_state("last_feed_ts", NOW_TS)
     r.set_state("withdrawals_enabled", True)
-    r.set_state("withdrawals_attested_at", NOW_TS)
     _attest(r, free_volume_usd=D("10000000"))
     attest_trade_scope(r, now_ts=NOW_TS)
     attest_cash_posture(r, now_ts=NOW_TS)

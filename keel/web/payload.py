@@ -662,16 +662,6 @@ def _rail_state(status: str | None) -> str:
     return GOOD
 
 
-#: Rail 17's four states, judged. `expired` and `suspended` are the two that halt live entries;
-#: `unattested` has never been answered at all, which is a gap rather than a breach.
-_ATTESTATION_STATES: Mapping[str, str] = {
-    "attested": GOOD,
-    "suspended": BAD,
-    "expired": BAD,
-    "unattested": WARN,
-    "unknown": UNKNOWN,
-}
-
 #: The venue clock, judged. `clock_unavailable` is a WARNING and not an error: the agent
 #: fails closed on it (cycles skip), so the deployment is safe but not trading, and an operator
 #: needs to know which of those two it is looking at.
@@ -723,16 +713,18 @@ def _autonomy_payload(autonomy: AutonomyStatus) -> dict[str, Any]:
 
 
 def _attestation_payload(attestation: WithdrawalAttestationStatus) -> dict[str, Any]:
-    return {
-        "state": label(
-            attestation.state,
-            state=_ATTESTATION_STATES.get(attestation.state or "", UNKNOWN),
-        ),
-        "enabled": flag(attestation.enabled, on="enabled", off="disabled"),
-        "attested_at": moment(attestation.attested_at),
-        "expires_in": duration(attestation.expires_in_sec, elapsed=False),
-        "expired_for": duration(attestation.expired_for_sec),
-    }
+    """Rail 17's manual suspension, tri-state and judged (#1010).
+
+    Rail 17 decides from the venue and has no expiry, so the card carries the one thing an operator
+    sets. `unknown` is its own word, never `off`: the rail fails closed on an unreadable store.
+    """
+    if attestation.suspended is None:
+        suspended = label("unknown", display="unknown (store unreadable)", state=WARN)
+    elif attestation.suspended:
+        suspended = label("on", display="ON — entries halted", state=BAD)
+    else:
+        suspended = label("off", display="off", state=NEUTRAL)
+    return {"suspended": suspended}
 
 
 def attestation_alerts(surveyed: Sequence[Any], now_ts: int) -> list[dict[str, Any]]:
