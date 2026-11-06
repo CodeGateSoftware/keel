@@ -14,6 +14,7 @@ it's modeled on -- against an in-memory `Repository` (`connect(":memory:")`).
 from __future__ import annotations
 
 import logging
+from collections.abc import Sequence
 from dataclasses import replace
 from decimal import Decimal, InvalidOperation
 from types import SimpleNamespace
@@ -70,8 +71,18 @@ class FakeBroker:
     `CoinbaseClient`-shaped responses (like `test_executor.FakeBroker`).
     """
 
-    def __init__(self, series: dict[tuple[str, Granularity], list[Candle]] | None = None) -> None:
+    def __init__(
+        self,
+        series: dict[tuple[str, Granularity], list[Candle]] | None = None,
+        withdrawals: dict[str, bool | None] | None = None,
+        withdrawals_raises: BaseException | None = None,
+    ) -> None:
         self._series = series or {}
+        # Rail 17 reads per-wallet `allow_withdrawals` from the venue (#1010). `None` means every
+        # currency answers True; a dict answers per currency (`None` = no wallet).
+        self._withdrawals = withdrawals
+        self._withdrawals_raises = withdrawals_raises
+        self.withdrawals_calls = 0
         self.get_candles_calls: list[tuple[str, Granularity, int, int]] = []
         self.preview_calls: list[dict[str, Any]] = []
         self.place_calls: list[dict[str, Any]] = []
@@ -90,6 +101,14 @@ class FakeBroker:
             Balance(currency="USD", available=Decimal("1000000"), total=Decimal("1000000")),
             Balance(currency="USDC", available=Decimal("1000000"), total=Decimal("1000000")),
         ]
+
+    def withdrawals_allowed(self, currencies: Sequence[str]) -> dict[str, bool | None]:
+        self.withdrawals_calls += 1
+        if self._withdrawals_raises is not None:
+            raise self._withdrawals_raises
+        if self._withdrawals is None:
+            return {c: True for c in currencies}
+        return {c: self._withdrawals.get(c) for c in currencies}
 
     def get_candles(
         self, product_id: str, granularity: Granularity, start: int, end: int

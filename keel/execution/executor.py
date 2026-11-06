@@ -509,14 +509,73 @@ def _withdrawals_enabled(repo: Any, now_ts: int) -> bool | None:
     return bool(enabled)
 
 
+def manual_withdrawal_suspension(repo: Any) -> bool:
+    """Has the operator frozen entries with `keel withdrawals attest --suspended`?
+
+    `True` iff the stored `withdrawals_enabled` is exactly `False`. No timestamp is read: the
+    attestation no longer carries a TTL (#1010) because the VENUE, not the operator, is now the
+    source of truth for whether withdrawals work -- this flag is only the one-way brake that
+    reduces capability. An unreadable repo is NOT a suspension (it is not evidence of one), so
+    this returns `False` and the venue read decides.
+    """
+    try:
+        return repo.get_state("withdrawals_enabled", default=None) is False
+    except Exception:
+        log_exception(logger, "executor.withdrawal_attestation_read_failed")
+        return False
+
+
+def _withdrawal_capability(broker: Any, repo: Any, product_id: str) -> tuple[bool | None, str]:
+    """Rail 17's input: `(verdict, detail)` for whether `product_id` is withdrawable (§65.4).
+
+    Read LIVE from the venue on every BUY -- never cached -- so a freeze takes effect on the very
+    next order and its lifting on the next one after, the same posture rail 14 takes with the
+    subscription record. The operator's manual suspension is checked first and wins without
+    touching the venue.
+
+    `True` means every requested wallet answered allowed; `False` means one answered disabled;
+    `None` (UNKNOWN, which fails rail 17 closed) means the venue could not be asked or could not
+    answer for the QUOTE leg. The requested wallets are the product's quote leg (what the order
+    spends) and its base leg (what it acquires). A missing BASE wallet is normal -- the first
+    buy of an asset the account has never held -- and does not decide; a missing QUOTE wallet is
+    not, because then the account cannot be funded from a wallet we can verify.
+
+    `detail` says why, for the veto message; it is `""` on a pass.
+    """
+    if manual_withdrawal_suspension(repo):
+        return False, "manual suspension (keel withdrawals attest --suspended)"
+
+    reader = getattr(broker, "withdrawals_allowed", None)
+    if reader is None:
+        return None, "venue adapter cannot report withdrawals"
+
+    quote = quote_currency_of(product_id)
+    if not quote:
+        return None, f"no quote currency in {product_id!r}"
+    base = product_id.rpartition("-")[0].upper()
+    currencies = [quote] if not base or base == quote else [quote, base]
+
+    try:
+        answers = reader(currencies)
+    except Exception as exc:
+        log_venue_failure(logger, "executor.withdrawal_read_failed", product=product_id)
+        return None, f"venue unreadable: {type(exc).__name__}"
+
+    if answers.get(quote) is None:
+        return None, f"no {quote} wallet reported"
+    for currency in currencies:
+        if answers.get(currency) is False:
+            return False, f"{currency} withdrawals disabled at venue"
+    return True, ""
+
+
 #: `agent_state` key prefix for a product's venue-declared `base_increment` (#516).
 BASE_INCREMENT_PREFIX = "base_increment:"
 
 #: How long a cached increment is trusted. Increments change rarely -- a venue re-scaling a
 #: product is an announced event -- so this is long, and the cost of being wrong is bounded:
 #: a stale increment is still a multiple the venue accepts unless it got FINER, and a finer one
-#: only means we round a little more than needed. Matches rail 17's 7-day attestation TTL rather
-#: than inventing a second cadence.
+#: only means we round a little more than needed. 7 days.
 BASE_INCREMENT_TTL_SEC = 7 * 24 * 60 * 60
 
 
@@ -929,7 +988,22 @@ def _build_intent(
 
         # The PRODUCT's quote leg -- what this order actually spends.
         available_quote = _fetch_available_quote(broker, quote_currency_of(signal.product_id))
-        withdrawals = _withdrawals_enabled(repo, now_ts)
+        # Live only: paper passes no broker and rail 17 is skipped offline, so there is nothing
+        # to ask. The read is per BUY and never cached (see `_withdrawal_capability`).
+        if broker is None:
+            withdrawals, withdrawals_detail = None, "no venue read (offline)"
+        else:
+            withdrawals, withdrawals_detail = _withdrawal_capability(
+                broker, repo, signal.product_id
+            )
+            log_event(
+                logger,
+                logging.INFO if withdrawals else logging.WARNING,
+                "executor.withdrawal_capability",
+                product=signal.product_id,
+                verdict=withdrawals,
+                detail=withdrawals_detail,
+            )
 
         return OrderIntent(
             product_id=signal.product_id,
@@ -943,6 +1017,7 @@ def _build_intent(
             rule_id=signal.rule_id,
             available_quote=available_quote,
             withdrawals_enabled=withdrawals,
+            withdrawals_detail=withdrawals_detail,
         )
 
     # EXIT: sell the currently held position, reconstructed from the orders audit log.

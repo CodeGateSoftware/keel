@@ -215,10 +215,13 @@ class OrderIntent:
     available_quote: Decimal | None = None
 
     # Rail 17 (§65.4 qabd/possession). Whether the account is currently in a state where the
-    # asset could be withdrawn on demand. Supplied by the caller (the executor) from the
-    # operator's attestation and any broker-reported restriction -- guards has no broker or
-    # clock access of its own. `None` means "unknown" and fails the BUY closed.
+    # asset could be withdrawn on demand. Supplied by the caller (the executor) from the VENUE's
+    # per-wallet `allow_withdrawals` read (or the operator's manual suspension) -- guards has no
+    # broker access of its own. `None` means "unknown" and fails the BUY closed.
     withdrawals_enabled: bool | None = None
+    # WHY the verdict above is what it is ("venue unreadable: ReadTimeout", "USD withdrawals
+    # disabled at venue"), so the veto message can name the cause instead of a generic remedy.
+    withdrawals_detail: str = ""
 
     # Rail 9, for a PROTECTIVE order (`place_bracket`/`_roll_stop`): the price this order
     # triggers at. A bracket carries that price in `entry` and leaves `stop` unset, because it is
@@ -913,17 +916,16 @@ def check(
     if is_buy and not offline:
         if intent.withdrawals_enabled is None:
             violations.append(
-                "withdrawal_capability: UNKNOWN (no fresh attestation, or the broker did not "
-                "report). Under §65.4 possession requires that nothing prevents withdrawal on "
-                "demand; an unverified state is not evidence that it holds. Attest with "
-                "`keel withdrawals attest` (exits and DCA-exempt paths are unaffected)."
+                f"withdrawal_capability: UNKNOWN ({intent.withdrawals_detail}). Under §65.4 "
+                "possession requires that nothing prevents withdrawal on demand; an unverified "
+                "state is not evidence that it holds. Buy skipped; it is retried next cycle "
+                "within its window."
             )
         elif intent.withdrawals_enabled is False:
             violations.append(
-                "withdrawal_capability: withdrawals are suspended/restricted for this account. "
-                "Under §65.4 an asset that cannot be withdrawn may not have been validly "
-                "possessed, so new ENTRIES are halted. Existing holdings and exits are "
-                "deliberately unaffected."
+                f"withdrawal_capability: SUSPENDED ({intent.withdrawals_detail}). Under §65.4 "
+                "an asset that cannot be withdrawn may not have been validly possessed, so new "
+                "entries are halted. Existing holdings and exits are deliberately unaffected."
             )
 
     # 18. Settlement currency — the order's settlement leg must be one the operator configured

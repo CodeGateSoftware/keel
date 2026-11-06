@@ -13,6 +13,7 @@ read-only commands (`db import`, `monitor`, `rules list`, `pnl`) need no confirm
 from __future__ import annotations
 
 import time
+from collections.abc import Sequence
 from decimal import Decimal
 from pathlib import Path
 from types import SimpleNamespace
@@ -55,12 +56,29 @@ def _repo_at(db_path: Path) -> Repository:
 class FakeBroker:
     """No-network fake: canned (empty) candles + always-successful order responses."""
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        withdrawals: dict[str, bool | None] | None = None,
+        withdrawals_raises: BaseException | None = None,
+    ) -> None:
         self.get_candles_calls: list[tuple] = []
+        # Rail 17 reads per-wallet `allow_withdrawals` from the venue (#1010). `None` means every
+        # currency answers True; a dict answers per currency (`None` = no wallet).
+        self._withdrawals = withdrawals
+        self._withdrawals_raises = withdrawals_raises
+        self.withdrawals_calls = 0
 
     def get_candles(self, product_id: str, granularity: Any, start: int, end: int) -> list:
         self.get_candles_calls.append((product_id, granularity, start, end))
         return []
+
+    def withdrawals_allowed(self, currencies: Sequence[str]) -> dict[str, bool | None]:
+        self.withdrawals_calls += 1
+        if self._withdrawals_raises is not None:
+            raise self._withdrawals_raises
+        if self._withdrawals is None:
+            return {c: True for c in currencies}
+        return {c: self._withdrawals.get(c) for c in currencies}
 
     def preview_order(self, spec: OrderSpec) -> Preview:
         return Preview(

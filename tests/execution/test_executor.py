@@ -16,6 +16,7 @@ import json
 import logging
 import re
 import sqlite3
+from collections.abc import Sequence
 from decimal import Decimal
 from typing import Any
 from unittest import mock
@@ -106,11 +107,18 @@ class FakeBroker:
         place_order_id: str = "broker-order-1",
         usdc_balance: Decimal | None = Decimal("1000000"),
         balances: dict[str, Decimal | None] | None = None,
+        withdrawals: dict[str, bool | None] | None = None,
+        withdrawals_raises: BaseException | None = None,
     ) -> None:
         # `balances` models a REAL account: one entry per currency. Without it the fake funds
         # both USD and USDC with `usdc_balance`, so tests that only mean "the account is funded"
         # keep meaning that -- the mismatch tests below set the two independently on purpose.
         self._balances = balances
+        # Rail 17 reads per-wallet `allow_withdrawals` from the venue (#1010). `None` means every
+        # currency answers True; a dict answers per currency (`None` = no wallet).
+        self._withdrawals = withdrawals
+        self._withdrawals_raises = withdrawals_raises
+        self.withdrawals_calls = 0
         # The default preview carries BOTH sides of a TIGHT book, because that is what the
         # real venue returns (`cb_client.preview_order` maps `best_bid`/`best_ask` to
         # `Decimal`; see `tests/fixtures/cb_preview_order.json`) and #350's spread gate fails
@@ -154,6 +162,14 @@ class FakeBroker:
             Balance(currency="USD", available=self._usdc_balance, total=self._usdc_balance),
             Balance(currency="USDC", available=self._usdc_balance, total=self._usdc_balance),
         ]
+
+    def withdrawals_allowed(self, currencies: Sequence[str]) -> dict[str, bool | None]:
+        self.withdrawals_calls += 1
+        if self._withdrawals_raises is not None:
+            raise self._withdrawals_raises
+        if self._withdrawals is None:
+            return {c: True for c in currencies}
+        return {c: self._withdrawals.get(c) for c in currencies}
 
     def preview_order(self, spec: OrderSpec) -> Preview:
         self.preview_calls.append({"spec": spec})
@@ -3950,6 +3966,16 @@ class _FixtureTransport:
             if row["currency"] == "USD":
                 row["available_balance"]["value"] = "1000000.00"
         return accounts
+
+    def get(self, path: str, params: dict[str, Any] | None = None, **kwargs: Any) -> Any:
+        """Rail 17's per-wallet `allow_withdrawals` read (`/v2/accounts`), every wallet open."""
+        assert path == "/v2/accounts", path
+        return {
+            "data": [
+                {"currency": {"code": code}, "allow_withdrawals": True} for code in ("USD", "BTC")
+            ],
+            "pagination": {"next_starting_after": None},
+        }
 
     def get_product(self, product_id: str, **kwargs: Any) -> Any:
         return self._fixture("cb_product.json")
