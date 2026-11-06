@@ -264,7 +264,7 @@ def test_the_gate_vocabulary_is_stated_and_bounded() -> None:
 def test_only_the_two_halt_releases_are_reachable_from_the_browser() -> None:
     """**Which actions the second gate covers, named, so widening it is an edit here.**
 
-    Eight of the ten remain CLI-only. The two that are not are the halt releases, and each
+    Nine of the eleven remain CLI-only. The two that are not are the halt releases, and each
     appears twice in the inventory -- once as its CLI row, once as the `web` row mirroring it."""
     web = {cap.mirrors for cap in CAPABILITIES if cap.gate == BROWSER.name}
 
@@ -366,3 +366,12 @@ def test_render_lines_names_the_surfaces_that_read_it() -> None:
     assert importers, "render_lines has a reader; this test reads the import graph to find it"
     doc = render_lines.__doc__ or ""
     assert sorted(m for m in importers if f"`{m}`" not in doc) == []
+
+
+def test_the_withdrawals_row_describes_the_manual_suspension_not_an_attestation() -> None:
+    """F9: since #1010 the venue answers rail 17 on every buy; `--enabled` clears the operator's
+    own brake. The row must say what is released, not the retired "operator attests" model."""
+    [row] = [c for c in CAPABILITIES if c.function == "withdrawals_attest"]
+    assert "attests that withdrawals are possible" not in row.increases
+    assert "manual suspension" in row.increases
+    assert "venue" in row.increases

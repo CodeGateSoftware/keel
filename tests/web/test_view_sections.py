@@ -637,11 +637,7 @@ _PULSE_KEYS = (
     "unbracketed_count",
     "why_not",
     "why_not_none",
-    "withdrawal_attestation.attested_at",
-    "withdrawal_attestation.enabled",
-    "withdrawal_attestation.expired_for",
-    "withdrawal_attestation.expires_in",
-    "withdrawal_attestation.state",
+    "withdrawal_attestation.suspended",
 )
 
 

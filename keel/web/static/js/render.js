@@ -774,11 +774,7 @@ function pulseState(data) {
 
   fragment.append(
     gridCard([
-      kv("withdrawal attestation (rail 17)", data.withdrawal_attestation.state),
-      kv("withdrawals", data.withdrawal_attestation.enabled),
-      kv("attested at", data.withdrawal_attestation.attested_at),
-      kv("expires in", data.withdrawal_attestation.expires_in),
-      kv("expired for", data.withdrawal_attestation.expired_for),
+      kv("manual withdrawal suspension (rail 17)", data.withdrawal_attestation.suspended),
     ]),
   );
 
@@ -865,7 +861,7 @@ function pulseNextDca(data) {
         { label: "cadence", numeric: false },
         { label: "budget", numeric: true },
         { label: "budget basis", numeric: false },
-        { label: "next cadence day (UTC)", numeric: false },
+        { label: "next buy day (UTC)", numeric: false },
       ],
       data.next_dca.map(
         /** @param {any} row */ (row) => [
@@ -1549,7 +1545,7 @@ function stepCard(step, actions, notAutomated) {
  *
  * **The gate did not move with the button, and that is the property to keep in view.** What may be
  * performed here is `keel.commands.setup.ACTIONS` and nothing else: idempotent, non-destructive,
- * `MECHANICAL` steps, asserted disjoint from the ten capability-increasing actions. A client
+ * `MECHANICAL` steps, asserted disjoint from the eleven capability-increasing actions. A client
  * that hides a button is not a gate, so nothing is hidden -- and nothing needed to be, because the
  * server refuses what is not in that set regardless of what this file draws.
  *

@@ -12,7 +12,7 @@ wrong.
 **Not a bypass, and not a seam in the TTY gate.** `_is_interactive` is untouched, has no env-var
 or flag override, and the CLI path still requires a real terminal. This is a SECOND kind of
 evidence for the same fact -- a human, present, who typed something a script would not. The other
-eight are refused here as firmly as they are refused to cron.
+nine are refused here as firmly as they are refused to cron.
 
 **Not the whole gate either.** The typed phrase proves intent, not locality, and on its own it is
 the weakest of the seven checks a release must pass. `security.gated_action_permitted` decides

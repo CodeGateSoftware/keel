@@ -7,7 +7,7 @@ separate seams:
 * `events_from_state` is PURE. It takes doctor's own finding lists
   (`keel.commands.doctor.attestation_findings`/`rail_state_findings` outputs), the allowance
   numbers doctor's `allowance_findings` receives, and the cycle facts the agent loop already
-  records. It re-implements NO threshold math -- rail 17's WARN-at-<=2-days and the rails'
+  records. It re-implements NO threshold math -- rail 22's WARN window and the rails'
   armed/healthy verdicts are read off doctor's findings, so the notification layer cannot
   drift from the surface an operator diagnoses with.
 
@@ -69,24 +69,25 @@ if TYPE_CHECKING:
 #: learn about the rail the hard way, when it vetoes the next setup.
 ALLOWANCE_NEARING_USED_PCT = Decimal("80")
 
-#: The doctor findings rail-17's event reads. Rail 14's `attest.subscription` is deliberately
-#: absent: a lapsed (or never-attested) subscription surfaces through the ALLOWANCE event
-#: instead -- the unsubscribed allowance (0 by default) with month-to-date spend IS that
+#: The doctor findings the attestation event reads. Rail 14's `attest.subscription` is
+#: deliberately absent: a lapsed (or never-attested) subscription surfaces through the ALLOWANCE
+#: event instead -- the unsubscribed allowance (0 by default) with month-to-date spend IS that
 #: event's zero-runway case, so a rail-14 finding here would double-notify the same fact.
-#: `attest.cash_posture` (#691) joins rail 17 here because it has the same failure shape and
-#: a longer fuse: nothing re-confirms it, so it lapses on a clock, and the live profile runs
-#: unattended. A doctor finding nobody is told about is only marginally better than the veto.
-_ATTESTATION_FINDINGS = frozenset({"attest.withdrawals", "attest.cash_posture"})
+#: **Rail 17's `attest.withdrawals` is absent too (#1010).** It reads the venue per buy and has no
+#: expiry to warn about; what the finding still says is the operator's OWN manual suspension (or
+#: an unreadable store), which the person who set it knows -- the reasoning that keeps the kill
+#: switch out of `rail.armed`. `attest.cash_posture` (#691) stays: nothing re-confirms it, so it
+#: lapses on a clock, and the live profile runs unattended.
+_ATTESTATION_FINDINGS = frozenset({"attest.cash_posture"})
 
 #: Which rail each attestation finding belongs to, for the event message.
-_RAIL_LABEL = {"attest.withdrawals": "rail 17", "attest.cash_posture": "rail 22"}
+_RAIL_LABEL = {"attest.cash_posture": "rail 22"}
 
 #: Each attestation finding's key in `keel.attestations`, which is where its expiry lives.
 #: Two tables rather than one because they answer to different modules and a finding can be in
 #: `_ATTESTATION_FINDINGS` without the model knowing it -- `test_every_finding_that_can_fire_the
 #: _event_has_a_window` is the pin that says they must agree.
 _ATTESTATION_MODEL_KEY = {
-    "attest.withdrawals": "withdrawal",
     "attest.cash_posture": "cash_posture",
 }
 
@@ -403,14 +404,9 @@ def notify_after_cycle(
         venue = current_venue() or guards.DEFAULT_VENUE
         subscription = repo.get_broker_subscription(venue)
         attestation = [
-            *doctor.attestation_findings(
-                subscription=subscription,
-                withdrawals_attested_at=int(
-                    repo.get_state("withdrawals_attested_at", default=0) or 0
-                ),
-                withdrawals_enabled=repo.get_state("withdrawals_enabled", default=None),
-                now_ts=now_ts,
-            ),
+            # No `doctor.attestation_findings` here since #1010: its only deliverable finding
+            # was rail 17's, which no longer has an expiry (see `_ATTESTATION_FINDINGS`), and
+            # rail 14's is the allowance event's.
             # #732. `attest.cash_posture` was in `_ATTESTATION_FINDINGS` and this call was not
             # here, so the registration was real and the delivery path was not: an operator who
             # wired a webhook for it would never have been told.

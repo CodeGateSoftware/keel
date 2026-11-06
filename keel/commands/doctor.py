@@ -30,7 +30,7 @@ from __future__ import annotations
 import json
 import re
 from collections.abc import Callable, Iterable
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from decimal import ROUND_CEILING, ROUND_HALF_UP, Decimal, InvalidOperation
 from pathlib import Path
@@ -46,7 +46,6 @@ from keel_core.cash_posture import (
 from keel_core.telemetry import current_venue
 from keel_core.trade_scope import READ_ONLY, TRADING, TradeScopeState, VenueTradeScope
 
-from keel import attestations
 from keel.data.feed_scope import reports_consolidated_volume
 from keel.data.freshness import Freshness
 from keel.execution import guards, sizing
@@ -90,26 +89,20 @@ def _days(seconds: float) -> int:
 
 def attestation_findings(
     subscription: Any | None,
-    withdrawals_attested_at: int,
     now_ts: int,
-    withdrawals_enabled: bool | None = None,
+    withdrawals_suspended: bool | None,
 ) -> list[Finding]:
-    """Rails 14 and 17 -- days remaining, not just valid/invalid.
+    """Rails 14 and 17 -- rail 14 by days remaining, rail 17 by the manual suspension alone.
 
-    Rail 17's TTL and its warning window both come from `keel.attestations`, which reads the
-    executor's constant. There was a `ttl_sec: int = TTL_SEC` parameter here and a module-level
-    `TTL_SEC = 7 * 86_400` above it under a comment reading "doctor only READS it" -- a second
-    copy of a number the comment promised was an import. Both callers used the default.
+    Rail 17 reads the venue's own `allow_withdrawals` on every buy (#1010), so there is no
+    attestation to age and this function never reads `withdrawals_attested_at`. What it reports
+    is the one thing an operator still sets: the manual `--suspended` brake.
 
-    `withdrawals_enabled` is the rail's OTHER key, and its absence here was the same lie one
-    column over: rail 17 vetoes on `enabled is False` with its own sentence, and this function,
-    handed the timestamp alone, reported `ok · 6 day(s) remain` for an account whose broker had
-    frozen withdrawals. It defaults to **`None`**, not `True`: `None` is the rail's own word for
-    "nobody has checked", it routes to the never-attested FAIL below, and a caller who forgets
-    the argument therefore gets a finding that is too LOUD rather than one that is green for a
-    frozen account. `cash_posture.py:91-94` states the rule for exactly this shape -- "inventing
-    one at read time would let a writer forget to set one and have the reader quietly cover for
-    it". `bool | None` rather than `Any`, so mypy can object.
+    `withdrawals_suspended` is `executor._stored_suspension`'s tri-state, passed through
+    unchanged and with no default: `True` FAILs (entries are halted), `False` passes, and
+    `None` -- the store could not be read -- WARNs, never passes. The rail fails closed on an
+    unreadable store, so a doctor that called it `ok` would be green while every BUY was refused.
+    This function cannot see the venue, so its pass says only what rail 17 will do.
     """
     findings: list[Finding] = []
 
@@ -157,73 +150,38 @@ def attestation_findings(
                 )
             )
 
-    # `enabled is None` joins a missing timestamp rather than becoming a REFUSED, and the rail's
-    # own words are why: it vetoes UNKNOWN with "no fresh attestation, or the broker did not
-    # report" and `False` with "withdrawals are suspended/restricted for this account". Those are
-    # different facts about the account and an operator acts on them differently.
-    if withdrawals_attested_at <= 0 or withdrawals_enabled is None:
+    if withdrawals_suspended is None:
+        findings.append(
+            Finding(
+                "attest.withdrawals",
+                WARN,
+                "manual withdrawal suspension unreadable",
+                "the stored switch could not be read, so rail 17 fails closed and halts every "
+                "BUY entry until it can be",
+                "keel withdrawals show",
+            )
+        )
+    elif withdrawals_suspended:
         findings.append(
             Finding(
                 "attest.withdrawals",
                 FAIL,
-                "withdrawal capability never attested",
-                "rail 17 (qabd) halts every BUY entry until it is",
+                "withdrawals manually suspended",
+                "rail 17 halts every BUY entry until the suspension is cleared; exits are "
+                "unaffected",
                 "keel withdrawals attest --enabled",
             )
         )
     else:
-        rail17 = replace(
-            attestations.definition("withdrawal"),
-            attested_at=withdrawals_attested_at,
-            expires_at=attestations.withdrawal_expiry(attested_at=withdrawals_attested_at),
-            satisfied=bool(withdrawals_enabled),
+        findings.append(
+            Finding(
+                "attest.withdrawals",
+                OK,
+                "no manual withdrawal suspension",
+                "rail 17 reads withdrawal capability from the venue on every buy",
+                "-",
+            )
         )
-        assert rail17.expires_at is not None
-        ttl_sec = rail17.expires_at - withdrawals_attested_at
-        age = now_ts - withdrawals_attested_at
-        remaining = _days(ttl_sec - age)
-        state = rail17.state(now_ts)
-        if state == attestations.REFUSED:
-            findings.append(
-                Finding(
-                    "attest.withdrawals",
-                    FAIL,
-                    "withdrawals suspended for this account",
-                    "the attestation is fresh and says NO; rail 17 halts entries until it says "
-                    "otherwise",
-                    "keel withdrawals attest --enabled",
-                )
-            )
-        elif state == attestations.EXPIRED:
-            findings.append(
-                Finding(
-                    "attest.withdrawals",
-                    FAIL,
-                    "withdrawal attestation expired",
-                    f"expired {abs(_days(age - ttl_sec))} day(s) ago; rail 17 halts entries",
-                    "keel withdrawals attest --enabled",
-                )
-            )
-        elif state == attestations.EXPIRING:
-            findings.append(
-                Finding(
-                    "attest.withdrawals",
-                    WARN,
-                    "withdrawal attestation due soon",
-                    f"{remaining} day(s) remain on the {ttl_sec // 86_400}-day TTL",
-                    "keel withdrawals attest --enabled",
-                )
-            )
-        else:
-            findings.append(
-                Finding(
-                    "attest.withdrawals",
-                    OK,
-                    "withdrawal capability attested",
-                    f"{remaining} day(s) remain on the {ttl_sec // 86_400}-day TTL",
-                    "-",
-                )
-            )
     return findings
 
 
@@ -233,42 +191,6 @@ def attestation_findings(
 #: `ATTESTATION_TTL_SEC // 6`, there is no fixed TTL to be proportional to here -- the window is
 #: whatever the operator typed at `--attest-due` -- so a flat horizon is the honest choice.
 ATTEST_WINDOW_APPROACHING_SEC = DOCTOR_WINDOW_SEC
-
-
-def dca_cadence_findings(
-    windows: Iterable[attestations.DcaWindowAfterExpiry],
-) -> list[Finding]:
-    """Rail 17 vs the DCA cadence -- always exactly one finding (#1010).
-
-    The 7-day withdrawal attestation can lapse before a 14-day DCA rule's next buy, and rail 17
-    then vetoes that buy. `attest.withdrawals` is green while the attestation is fresh, so this
-    names each live rule whose next buy falls after the expiry, with the date to re-attest from
-    (the wording is `DcaWindowAfterExpiry.line`, written once). WARN, never FAIL: the attestation
-    is valid today and the exit code must not move for a buy that is days away. Always emitted,
-    OK included, so a clean deployment shows the check ran. The computation, and the rule that it
-    stays silent for an expired, suspended or absent attestation (already halts), live in
-    `attestations.live_dca_windows_after_expiry`; this only words the result.
-    """
-    found = list(windows)
-    if not found:
-        return [
-            Finding(
-                "attest.dca_cadence",
-                OK,
-                "no live DCA buy falls after the withdrawal attestation expires",
-                "-",
-                "-",
-            )
-        ]
-    return [
-        Finding(
-            "attest.dca_cadence",
-            WARN,
-            f"{len(found)} live DCA buy(s) fall after the withdrawal attestation expires",
-            "; ".join(w.line() for w in found),
-            "keel withdrawals attest --enabled",
-        )
-    ]
 
 
 def _attestation_window_findings(
@@ -2426,13 +2348,11 @@ def gather_findings(repo: Any, config: Any, log_lines: Iterable[str], now_ts: in
     subscription = repo.get_broker_subscription(venue)
     findings += attestation_findings(
         subscription=subscription,
-        withdrawals_attested_at=int(repo.get_state("withdrawals_attested_at", default=0) or 0),
-        # Rail 17's other key. `None` -- never attested either way -- reaches the finding as the
-        # falsey it is, and `_withdrawals_attested_at` being 0 gets there first anyway.
-        withdrawals_enabled=repo.get_state("withdrawals_enabled", default=None),
         now_ts=now_ts,
+        # The tri-state, so an unreadable store reaches the finding as `None` (WARN), never as
+        # an `off` that reads green.
+        withdrawals_suspended=executor_mod._stored_suspension(repo),
     )
-    findings += dca_cadence_findings(attestations.live_dca_windows_after_expiry(repo, now_ts))
     # #718: a RECORDED window (`--attest-due`) that nothing reads back is a column nobody
     # benefits from. Reporting only -- see `_attestation_window_findings`'s docstring for why
     # this never fails the run.

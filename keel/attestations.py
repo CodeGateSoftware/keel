@@ -1,69 +1,49 @@
 """When each attestation expires, and how long is left -- the one place that knows (#793).
 
 Live stopped placing orders on 2026-08-25 and nobody noticed for seventeen days. The exposure
-caps were the primary cause, but rail 17's attestation expired on 09-08 and stacked on top, and
+caps were the primary cause, but an attestation expired on 09-08 and stacked on top, and
 **nothing anywhere said so**. keel fails closed on a stale attestation, which is correct; it
-failed closed SILENTLY, which is the hazard. An operator had to remember a 7-day TTL, or read
+failed closed SILENTLY, which is the hazard. An operator had to remember the TTL, or read
 `guards.check_failed` records, to learn the agent was paused.
 
-── WHY A MODEL AND NOT THREE WARNINGS ────────────────────────────────────────────────────────
+── WHY A MODEL AND NOT A WARNING PER SURFACE ─────────────────────────────────────────────────
 
-Before this module there were four TTL constants in four places, across two incompatible shapes,
-and one of them was a copy that claimed not to be:
+Before this module there were four TTL constants in four places, and one of them was a copy that
+claimed not to be. A banner, a doctor state and a webhook built on that would have been a fifth.
+So the model comes first: every attestation reduces to the same two facts -- **when it was made,
+and when it stops counting** -- and every surface renders those without computing either.
 
-    executor.WITHDRAWAL_ATTESTATION_TTL_SEC   7d    rail 17, freshness derived at read time
-    cash_posture.ATTESTATION_TTL_SEC         90d    rail 22, due date STORED at attest time
-    executor.BASE_INCREMENT_TTL_SEC           7d    sizing
-    doctor.TTL_SEC                            7d    a duplicate, under the comment
-                                                    "doctor only READS it" -- it did not
-
-A banner, a doctor state and a webhook built on that would have been a fifth copy. So the model
-comes first: every attestation reduces to the same two facts -- **when it was made, and when it
-stops counting** -- and every surface renders those without computing either.
-
-The two shapes are preserved rather than converted. Rail 17 derives its expiry from the TTL the
-executor declares; rail 22 reads `attest_due_ts`, which is written at attest time because "a
-record with no due date is a claim that never expires, which this record does not permit". This
-module reads each the way its own rail does, and returns one shape.
+**Rail 17 left this model in #1010.** It used to be the first definition here, a 7-day
+attestation whose TTL the executor declared. Rail 17 now reads the venue's own
+`allow_withdrawals` on every buy, so there is nothing to renew and nothing to expire; the only
+thing an operator still sets is a manual suspension, which has no date. What remains is rail 22,
+whose due date is STORED at attest time because "a record with no due date is a claim that never
+expires, which this record does not permit".
 
 ── FOUR STATES, AND THE TWO ABSENCES ARE DIFFERENT ───────────────────────────────────────────
 
-`MISSING` is not `EXPIRED`. `_withdrawals_enabled` already keeps them apart -- "nobody has
-checked recently" is not the claim "the broker says withdrawals are suspended" -- and a banner
-that called a never-attested rail "expired" would send an operator hunting a lapse that never
-happened.
+`MISSING` is not `EXPIRED`. A banner that called a never-attested rail "expired" would send an
+operator hunting a lapse that never happened.
 
 `EXPIRING` is the state that did not exist. An attestation was healthy until the instant it was
 refused, so the only warning was the halt itself.
-
-── #1010: TTL VS CADENCE ─────────────────────────────────────────────────────────────────────
-
-Rail 17's 7-day TTL is shorter than a 14-day DCA cadence, so a biweekly rule's window can open
-after the attestation has lapsed and the rail vetoes it -- on 2026-10-17 exactly that happened,
-silently. `dca_windows_after_expiry` is the ONE place that decides whether a live DCA rule's next
-buy falls after the expiry; `keel withdrawals attest`, `keel status` and `keel doctor` render its
-answer and never restate the arithmetic. `survey()` is deliberately untouched: it feeds the
-notification alert-once windows and the web banners, which this does not change.
 """
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Sequence
 from dataclasses import dataclass, replace
-from datetime import UTC, datetime
 from typing import Any
 
 from keel_core.cash_posture import ATTESTATION_TTL_SEC as _POSTURE_TTL_SEC
 
-#: The default warning window, and the one rail 17 uses. 48 hours: long enough that a daily agent
-#: run and a daily doctor run each get a chance to say so before the halt, short enough that the
-#: warning is not background noise for most of a 7-day TTL.
+#: The default warning window. 48 hours: long enough that a daily agent run and a daily doctor
+#: run each get a chance to say so before the halt.
 #:
-#: **Per-attestation and not global, which the first draft got wrong.** A single window looks
-#: tidy until it meets rail 22, whose TTL is 90 days: 48 hours' notice on a quarterly attestation
-#: is no notice at all, and `doctor` already knew that -- it warns rail 22 at
-#: `ATTESTATION_TTL_SEC // 6` and says why, "proportional to" a fixed TTL. The window belongs to
-#: the attestation, so each keeps the schedule its own rail reasoned itself into.
+#: **Per-attestation and not global.** 48 hours' notice on rail 22's 90-day attestation is no
+#: notice at all, and `doctor` already knew that -- it warns rail 22 at `ATTESTATION_TTL_SEC // 6`
+#: and says why, "proportional to" a fixed TTL. The window belongs to the attestation, so each
+#: keeps the schedule its own rail reasoned itself into.
 WARN_WITHIN_SEC = 48 * 3_600
 
 #: Nobody has ever attested this. Distinct from `EXPIRED` -- see the module note.
@@ -75,10 +55,9 @@ EXPIRING = "expiring"
 #: Past its expiry. The rail is vetoing now.
 EXPIRED = "expired"
 
-#: Attested, unexpired, and the answer was NO. Not an expiry and not an absence: rail 17 tells
-#: the two apart in the operator's own words -- "nobody has checked recently" is not the same
-#: claim as "the broker says withdrawals are suspended" -- and a surface that reported this one
-#: as `ok` would be green while every BUY was refused. `keel doctor` was, until #793.
+#: Attested, unexpired, and the answer was NO (rail 22: refuted, margin-enabled, or no due date).
+#: Not an expiry and not an absence, and a surface that reported it as `ok` would be green while
+#: every BUY was refused.
 REFUSED = "refused"
 
 
@@ -92,9 +71,9 @@ class Attestation:
     rail: str
     #: What to call it on screen.
     label: str
-    #: The command that refreshes it. A TTY command: rails 17 and 22 are Tier 2 and deliberately
-    #: not admitted to the browser, so a cockpit banner has to TELL the operator what to type --
-    #: an alarm with no action is worse than the silence it replaces.
+    #: The command that refreshes it. A TTY command: rail 22 is Tier 2 and deliberately not
+    #: admitted to the browser, so a cockpit banner has to TELL the operator what to type -- an
+    #: alarm with no action is worse than the silence it replaces.
     remedy: str
     #: When the attestation was made, or `None` if it never was.
     attested_at: int | None = None
@@ -104,24 +83,18 @@ class Attestation:
     #: for a short one -- see `WARN_WITHIN_SEC`.
     warn_within_sec: int = WARN_WITHIN_SEC
 
-    #: The rail's own verdict where the rail has one -- the question the CLOCK does not answer.
-    #: Rail 17's attestation records an ANSWER as well as a date (`withdrawals_enabled`), and
-    #: `False` halts entries exactly as an expiry does; rail 22's record can be REFUTED by venue
-    #: evidence or attest a MARGIN-ENABLED account, both of which halt entries with the due date
-    #: still months away. An earlier draft left rail 22 `True` on the grounds that doctor already
-    #: reported its verdict and a notification already carried it -- which was true until #793
-    #: began suppressing that notification against a window this field is part of.
+    #: The rail's own verdict -- the question the CLOCK does not answer. Rail 22's record can be
+    #: REFUTED by venue evidence or attest a MARGIN-ENABLED account, both of which halt entries
+    #: with the due date still months away.
     satisfied: bool = True
 
     @property
     def effective_warn_sec(self) -> int:
         """The window, never longer than the life of the attestation it guards.
 
-        `withdrawal_expiry` reads the rail's TTL at call time so that changing it moves every
-        surface at once -- but the 48-hour window is flat, so a TTL shortened below 48 hours
-        (the expiry test sets it to three days; a future rail could be tighter still) would make
-        every fresh attestation `EXPIRING` on the instant it was made, and the banner would be
-        permanently lit. Capped at half the TTL, so there is always an `OK` half.
+        The 48-hour window is flat, so an attestation whose whole life is shorter than 48 hours
+        would be `EXPIRING` on the instant it was made and the banner permanently lit. Capped at
+        half the life, so there is always an `OK` half.
         """
         if self.attested_at is None or self.expires_at is None:
             return self.warn_within_sec
@@ -158,30 +131,11 @@ class Attestation:
         return max(0, int(self.expires_at - now_ts))
 
 
-def withdrawal_expiry(*, attested_at: int) -> int:
-    """When a rail-17 attestation made at `attested_at` stops counting.
-
-    Reads `executor.WITHDRAWAL_ATTESTATION_TTL_SEC` AT CALL TIME rather than importing the value
-    into a module constant, so changing the rail's TTL changes every surface at once. That is the
-    property `doctor.TTL_SEC` claimed and did not have, and `tests/test_attestation_expiry.py`
-    mutates the constant to prove this one does.
-    """
-    from keel.execution import executor
-
-    return int(attested_at) + int(executor.WITHDRAWAL_ATTESTATION_TTL_SEC)
-
-
 #: Every attestation a rail can veto on, with no dates filled in. `survey` returns these with the
 #: deployment's own dates attached. Separate so a surface can describe the SET without a database
-#: -- and so `tests/test_attestation_expiry.py` can assert the set is exactly these two, which is
-#: what makes adding a third rail an edit to a test that says why it was not covered.
+#: -- and so `tests/test_attestation_expiry.py` can assert the set is exactly this one, which is
+#: what makes adding a rail an edit to a test that says why it was not covered.
 _DEFINITIONS: tuple[Attestation, ...] = (
-    Attestation(
-        key="withdrawal",
-        rail="17",
-        label="Withdrawal capability",
-        remedy="keel withdrawals attest --enabled",
-    ),
     Attestation(
         key="cash_posture",
         rail="22",
@@ -203,8 +157,7 @@ def survey_definitions() -> tuple[Attestation, ...]:
 def definition(key: str) -> Attestation:
     """One dateless definition, for a surface that already holds the dates.
 
-    `doctor` is that surface: it is handed `withdrawals_attested_at` by its caller and needs the
-    window and the TTL, not another read of the same row.
+    A surface that already holds the dates needs the window, not another read of the same row.
     """
     for candidate in _DEFINITIONS:
         if candidate.key == key:
@@ -220,13 +173,12 @@ def survey(repo: Any, now_ts: int, *, venue: str = "coinbase") -> Sequence[Attes
     briefly locked would be worse than one that says "nobody has attested".
     """
     readers = {
-        "withdrawal": lambda: _withdrawal_dates(repo),
         "cash_posture": lambda: _posture_dates(repo, venue),
     }
-    # By KEY, never by index. `_DEFINITIONS[0]`/`[1]` was the first spelling and it fails two
-    # ways in silence: a third rail appended reaches `survey_definitions()` and never `survey()`,
-    # so it can never be banner, doctor or ledger; and a REORDER attaches rail 17's dates to rail
-    # 22's definition. A rail with no reader here surveys as `MISSING`, which is the safe answer
+    # By KEY, never by index. `_DEFINITIONS[0]` was the first spelling and it fails two ways in
+    # silence: a rail appended reaches `survey_definitions()` and never `survey()`, so it can
+    # never be banner, doctor or ledger; and a REORDER attaches one rail's dates to another's
+    # definition. A rail with no reader here surveys as `MISSING`, which is the safe answer
     # -- it says "nobody has attested" rather than "this is fine".
     return tuple(
         replace(definition, **readers[definition.key]())
@@ -234,32 +186,6 @@ def survey(repo: Any, now_ts: int, *, venue: str = "coinbase") -> Sequence[Attes
         else definition
         for definition in _DEFINITIONS
     )
-
-
-def _withdrawal_dates(repo: Any) -> dict[str, Any]:
-    """Rail 17's dates, read the way `_withdrawals_enabled` reads them.
-
-    `withdrawals_enabled` is checked as well as the timestamp, because the rail treats an
-    attestation with no verdict as no attestation -- and a surface that showed a countdown for
-    one would be counting down to the expiry of nothing.
-    """
-    try:
-        attested_at = int(repo.get_state("withdrawals_attested_at", default=0) or 0)
-        enabled = repo.get_state("withdrawals_enabled", default=None)
-        if not attested_at or enabled is None:
-            return {"attested_at": None, "expires_at": None}
-        # INSIDE the `try`, with the reads. It was outside, which made "never raises" not quite
-        # true -- and the caller that would have worn it is `notify_after_cycle`, whose single
-        # broad `except` would have swallowed the whole cycle's notifications, `rail.armed` and
-        # `setup.unplaced` included, for a fault in the attestation survey.
-        return {
-            "attested_at": attested_at,
-            "expires_at": withdrawal_expiry(attested_at=attested_at),
-            # `bool` of the stored value, matching `executor._withdrawals_enabled`'s last line.
-            "satisfied": bool(enabled),
-        }
-    except Exception:
-        return {"attested_at": None, "expires_at": None}
 
 
 def _posture_dates(repo: Any, venue: str) -> dict[str, Any]:
@@ -302,135 +228,3 @@ def _posture_holds(record: Any) -> bool:
     if record.state is CashPostureState.REFUTED:
         return False
     return record.attested_posture != MARGIN_ENABLED
-
-
-@dataclass(frozen=True)
-class DcaWindowAfterExpiry:
-    """One live DCA rule whose next buy is placed after rail 17's attestation stops counting.
-
-    #1010: the data a surface needs to name the rule, the due date, the expiry and the date from
-    which a fresh attestation would cover it -- computed once, here, so three commands cannot
-    word the same fact three ways.
-    """
-
-    rule_id: int
-    product_id: str
-    cadence_days: int
-    #: 00:00 UTC of the cadence BAR the buy acts on.
-    bar_ts: int
-    #: 00:00 UTC of the day the order is placed (`bar_ts` + 1 day: the freshness gate).
-    due_ts: int
-    expires_at: int
-    #: The earliest attestation time whose expiry reaches the end of the placement day.
-    reattest_from_ts: int
-
-    def line(self) -> str:
-        """The one-line warning every surface prints, dates in UTC."""
-        due = datetime.fromtimestamp(self.due_ts, UTC)
-        bar = datetime.fromtimestamp(self.bar_ts, UTC)
-        expires = datetime.fromtimestamp(self.expires_at, UTC)
-        reattest = datetime.fromtimestamp(self.reattest_from_ts, UTC)
-        return (
-            f"rule {self.rule_id} {self.product_id} (every {self.cadence_days}d): "
-            f"next DCA buy due {due:%Y-%m-%d} (bar {bar:%Y-%m-%d}), "
-            f"after the withdrawal attestation expires {expires:%Y-%m-%d %H:%M}Z; "
-            f"rail 17 will veto it -- re-attest on or after {reattest:%Y-%m-%d} to cover it"
-        )
-
-
-def dca_windows_after_expiry(
-    rules: Iterable[tuple[int, str, int]],
-    *,
-    attested_at: int,
-    now_ts: int,
-    counted_bar_days: Mapping[int, int | None] | None = None,
-) -> tuple[DcaWindowAfterExpiry, ...]:
-    """Which `(rule_id, product_id, cadence_days)` rules buy after the attestation lapses (#1010).
-
-    Pure. Takes `attested_at` and not `expires_at` so the TTL is read at call time through
-    `withdrawal_expiry`, the way every surface here reads it. The due day is the cadence bar plus
-    one day, because a live order acts on yesterday's completed bar (`freshness.entry_bar_ready`).
-    A rule is reported when the attestation does not last through the WHOLE placement day:
-    `expires_at < due_ts + 1 day`. The live cycle runs at 01:20 UTC rather than 00:00, so this is
-    the conservative test. Output keeps input order.
-
-    "Next due" is a bar whose buy has NOT been placed (#1014). `counted_bar_days` maps a rule id
-    to the bar day of its newest counted (filled or pending) live BUY, `None` meaning it has none;
-    a bar at or before that day is already bought, so the rule's next due bar is the following
-    cadence bar (a warning about a placed buy would say "rail 17 will veto" what is already in).
-    A rule absent from the mapping (or no mapping) is UNKNOWN: on a placement day, when
-    yesterday's cadence bar may or may not have been acted on yet, the following bar is checked
-    too, and the first of the two the attestation does not cover is reported.
-    """
-    from keel.strategy.rules.dca import next_dca_bar_ts
-
-    expires_at = withdrawal_expiry(attested_at=attested_at)
-    ttl = expires_at - int(attested_at)
-    found: list[DcaWindowAfterExpiry] = []
-    for rule_id, product_id, cadence_days in rules:
-        bar_ts = next_dca_bar_ts(now_ts, cadence_days)
-        candidates = [bar_ts]
-        if counted_bar_days is not None and rule_id in counted_bar_days:
-            counted = counted_bar_days[rule_id]
-            if counted is not None and bar_ts // 86_400 <= counted:
-                candidates = [bar_ts + cadence_days * 86_400]
-        elif bar_ts == (now_ts // 86_400 - 1) * 86_400:
-            # unknown, and the bar is yesterday's (a placement day): the following bar too
-            candidates.append(bar_ts + cadence_days * 86_400)
-        for bar in candidates:
-            due_ts = bar + 86_400
-            if expires_at >= due_ts + 86_400:
-                continue
-            found.append(
-                DcaWindowAfterExpiry(
-                    rule_id=rule_id,
-                    product_id=product_id,
-                    cadence_days=cadence_days,
-                    bar_ts=bar,
-                    due_ts=due_ts,
-                    expires_at=expires_at,
-                    reattest_from_ts=due_ts + 86_400 - ttl,
-                )
-            )
-            break
-    return tuple(found)
-
-
-def live_dca_windows_after_expiry(repo: Any, now_ts: int) -> tuple[DcaWindowAfterExpiry, ...]:
-    """`dca_windows_after_expiry` over this deployment's live DCA rules (#1010). Never raises.
-
-    Silent unless rail 17's attestation is fresh (`OK` or `EXPIRING`) AND says withdrawals are
-    enabled: `EXPIRED`, suspended and never-attested are already reported as halts by doctor
-    `attest.withdrawals` and status `_rail17_line`, and a cadence warning on top would say the
-    same thing worse. Freshness comes from this module's own model (`_withdrawal_dates` and the
-    rail's `Attestation`), never restated. Rules are built through
-    `keel.agent.build_rule_from_params`, the single coercion boundary, so the default cadence is
-    never restated here; a row that will not build is skipped. Imported lazily to avoid a cycle.
-    """
-    try:
-        from keel.agent import build_rule_from_params
-
-        att = replace(definition("withdrawal"), **_withdrawal_dates(repo))
-        if att.state(now_ts) not in (OK, EXPIRING) or att.attested_at is None:
-            return ()
-        rules: list[tuple[int, str, int]] = []
-        counted: dict[int, int | None] = {}
-        for row in repo.get_rules("live"):
-            if row["kind"] != "dca":
-                continue
-            try:
-                rule = build_rule_from_params(row["kind"], row["params"] or {})
-                rule_id = int(row["id"])
-                rules.append((rule_id, rule.product_id, int(rule.params["cadence_days"])))
-                # the bar day of the newest counted live BUY, as `agent._dca_window_ledger`
-                # derives it (a live order acts on yesterday's bar); a failed read leaves the
-                # rule UNKNOWN to the helper, which then checks the following bar as well
-                last = repo.last_live_buy_created_at(rule_id)
-                counted[rule_id] = None if last is None else last // 86_400 - 1
-            except Exception:
-                continue
-        return dca_windows_after_expiry(
-            rules, attested_at=att.attested_at, now_ts=now_ts, counted_bar_days=counted
-        )
-    except Exception:
-        return ()

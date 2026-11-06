@@ -75,20 +75,38 @@ def test_every_table_this_module_reads_exists(fresh: tuple[Path, Path]) -> None:
 
 
 def test_the_withdrawals_state_key_is_the_one_the_command_writes(fresh: tuple[Path, Path]) -> None:
-    """Same failure mode one level down: a right table with a wrong key reads as unattested."""
+    """Same failure mode one level down: a right table with a wrong key reads as no suspension
+    forever. Rail 17 needs no attestation (#1010), so the step is done on a fresh database and
+    NOT done once the manual suspension -- the only thing the command still writes -- is set."""
     config_path, db_path = fresh
+
+    state = inspect(config_path, db_path)
+    step = next(s for s in state.states if s.step.key == "withdrawals_attested")
+    assert step.done is True, step.detail
+    assert "venue" in step.detail
+
     conn = connect(str(db_path))
     try:
         from keel.data.repository import Repository
 
-        Repository(conn).set_state(WITHDRAWALS_STATE_KEY, True)
+        Repository(conn).set_state(WITHDRAWALS_STATE_KEY, False)
         conn.commit()
     finally:
         conn.close()
 
     state = inspect(config_path, db_path)
     step = next(s for s in state.states if s.step.key == "withdrawals_attested")
-    assert step.done is True, step.detail
+    assert step.done is False
+    assert "suspended" in step.detail
+
+
+def test_the_withdrawals_step_explains_the_venue_read_and_the_manual_switch() -> None:
+    from keel.commands.setup import STEPS
+
+    step = next(s for s in STEPS if s.key == "withdrawals_attested")
+    text = f"{step.title} {step.why} {step.how}".lower()
+    assert "venue" in text and "--suspended" in text
+    assert "7-day" not in text and "ttl" not in text and "week" not in text and "expire" not in text
 
 
 # -- what a brand-new machine looks like ------------------------------------------------------

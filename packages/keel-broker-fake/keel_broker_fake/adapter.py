@@ -24,6 +24,7 @@ All state is in memory. No network, no files, no credentials.
 from __future__ import annotations
 
 import itertools
+from collections.abc import Sequence
 from dataclasses import dataclass
 from decimal import Decimal
 
@@ -94,7 +95,12 @@ class _Trigger:
 class FakeAdapter:
     """An in-memory venue whose shape differs from Coinbase's in five deliberate ways."""
 
-    def __init__(self, *, trade_scope_denied: str | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        trade_scope_denied: str | None = None,
+        withdrawals_allowed: dict[str, bool | None] | None = None,
+    ) -> None:
         """`trade_scope_denied` makes every placement raise `TradeScopeDenied` carrying that
         message (#233).
 
@@ -112,14 +118,23 @@ class FakeAdapter:
         A STRING rather than a bool because the message is the payload: it is written verbatim
         into `venue_trade_scopes.refuted_reason`, so a test driving this knob is testing the
         real path only if it can supply the venue's own words the way a real adapter does.
+
+        `withdrawals_allowed` is what the method of that name answers per currency
+        (`WithdrawalReader`); a currency it does not mention is `True`, so a bare `FakeAdapter()`
+        is a venue where withdrawals are enabled everywhere, as on the live account.
         """
         self._ids = itertools.count(1)
         self.resting: list[_RestingOrder] = []
         self.triggers: list[_Trigger] = []
         self._trade_scope_denied = trade_scope_denied
+        self._withdrawals_allowed = dict(withdrawals_allowed or {})
 
     def capabilities(self) -> BrokerCapabilities:
         return _CAPABILITIES
+
+    def withdrawals_allowed(self, currencies: Sequence[str]) -> dict[str, bool | None]:
+        """Answer from the constructor's dict; unmentioned currencies are `True`."""
+        return {c: self._withdrawals_allowed.get(c, True) for c in currencies}
 
     def market_clock(self) -> SessionState:
         """This venue never closes: `SessionState.OPEN` as a constant, no state to consult.

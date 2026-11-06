@@ -14,6 +14,7 @@ it's modeled on -- against an in-memory `Repository` (`connect(":memory:")`).
 from __future__ import annotations
 
 import logging
+from collections.abc import Sequence
 from dataclasses import replace
 from decimal import Decimal, InvalidOperation
 from types import SimpleNamespace
@@ -49,7 +50,7 @@ from keel.data.repository import Repository
 from keel.execution import executor, sleeve
 from keel.strategy.reduction import Reduction
 from keel.strategy.rules.base import Action, Rule, Setup, Signal, completed_days
-from keel.strategy.rules.dca import Dca
+from keel.strategy.rules.dca import Dca, DcaCatchUp
 from keel.strategy.rules.pullback_continuation import PullbackContinuation
 from keel.strategy.rules.sleeve_exit import SleeveExit
 from keel.strategy.rules.turtle_breakout import TurtleBreakout
@@ -70,8 +71,18 @@ class FakeBroker:
     `CoinbaseClient`-shaped responses (like `test_executor.FakeBroker`).
     """
 
-    def __init__(self, series: dict[tuple[str, Granularity], list[Candle]] | None = None) -> None:
+    def __init__(
+        self,
+        series: dict[tuple[str, Granularity], list[Candle]] | None = None,
+        withdrawals: dict[str, bool | None] | None = None,
+        withdrawals_raises: BaseException | None = None,
+    ) -> None:
         self._series = series or {}
+        # Rail 17 reads per-wallet `allow_withdrawals` from the venue (#1010). `None` means every
+        # currency answers True; a dict answers per currency (`None` = no wallet).
+        self._withdrawals = withdrawals
+        self._withdrawals_raises = withdrawals_raises
+        self.withdrawals_calls = 0
         self.get_candles_calls: list[tuple[str, Granularity, int, int]] = []
         self.preview_calls: list[dict[str, Any]] = []
         self.place_calls: list[dict[str, Any]] = []
@@ -90,6 +101,14 @@ class FakeBroker:
             Balance(currency="USD", available=Decimal("1000000"), total=Decimal("1000000")),
             Balance(currency="USDC", available=Decimal("1000000"), total=Decimal("1000000")),
         ]
+
+    def withdrawals_allowed(self, currencies: Sequence[str]) -> dict[str, bool | None]:
+        self.withdrawals_calls += 1
+        if self._withdrawals_raises is not None:
+            raise self._withdrawals_raises
+        if self._withdrawals is None:
+            return {c: True for c in currencies}
+        return {c: self._withdrawals.get(c) for c in currencies}
 
     def get_candles(
         self, product_id: str, granularity: Granularity, start: int, end: int
@@ -182,12 +201,9 @@ def repo() -> Repository:
     migrate(conn)
     r = Repository(conn)
     r.set_state("kill_switch", False)
-    # Rail 17 (§65.4) fails closed without a fresh withdrawal attestation. Seeded here for the
-    # same reason the kill-switch is: these tests are not ABOUT rail 17, and a fail-closed rail
-    # would otherwise veto every BUY in the module. A huge attested_at keeps it fresh regardless
-    # of each test's `now_ts`.
+    # Rail 17 (§65.4) reads the venue per buy (#1010); the module's FakeBroker answers "allowed".
+    # The manual brake is stated as off for the same reason the kill-switch is.
     r.set_state("withdrawals_enabled", True)
-    r.set_state("withdrawals_attested_at", 10**12)
     # Autonomy is a PROFILE choice now. Most tests in this module were written against "it just
     # places"; opting the profile in here preserves that, and the tests that are specifically
     # about the confirm/autonomous decision set the profile themselves.
@@ -3690,7 +3706,6 @@ def _live_ready_repo(repo):
     """Clear every live-BUY rail that isn't the confirmation itself."""
     repo.set_state("kill_switch", False)
     repo.set_state("withdrawals_enabled", True)
-    repo.set_state("withdrawals_attested_at", 10**12)
     attest_subscription(repo, now_ts=0, free_volume_usd=Decimal("10000000"))
     return repo
 
@@ -3927,10 +3942,7 @@ def test_equity_finds_cash_for_a_HELD_product_whose_rule_was_retired(repo, monke
     assert equity == Decimal("500"), f"cash for a held product's quote leg was missed: {equity!r}"
 
 
-# -- CHARACTERIZATION: same-UTC-day re-entry is NOT deduped on the live path -------------------
-#
-# (#1010: the DCA half of this hazard is now closed by the window ledger -- see
-# `test_two_cycles_in_one_utc_day_place_one_dca_order`. The text below is the original record.)
+# -- CHARACTERIZATION: same-UTC-day re-entry is NOT deduped on the live path (except DCA) ------
 #
 # These two tests are deliberately NOT regression tests for a bug fix -- they PIN a hazard that
 # exists today in the live path, on purpose, so it cannot regress into "nobody noticed it was
@@ -3963,17 +3975,32 @@ def test_equity_finds_cash_for_a_HELD_product_whose_rule_was_retired(repo, monke
 # not just the shell script's stamp), these two tests SHOULD start failing. That failure is the
 # signal to REWRITE them to assert a single entry, not to delete them: until that rail exists,
 # this is the only thing in the test suite that would notice its absence.
+#
+# The DCA half HAS since been deduped (#1010): a DCA rule's buy is decided against its own ledger
+# (`agent._dca_catch_up_state` -- at most one fill per rule per cadence window), so its test is
+# now `test_two_cycles_in_one_utc_day_place_one_dca_order`. The risk-defined half below still
+# pins the hazard: nothing dedupes a Turtle re-entry.
 
 
 def test_two_cycles_in_one_utc_day_place_one_dca_order(repo):
-    """REWRITTEN by #1010 (was `..._place_two_dca_orders`, a characterization of the hazard in
-    the section header above). A live cycle now arms each DCA rule with a window ledger, and the
-    first cycle's counted BUY satisfies the window, so a same-day second cycle does not buy.
+    """REWRITTEN, as the section header asks, now that the DCA half of the hazard is deduped
+    (#1010): this was `..._place_two_dca_orders`, pinning that two cycles in one UTC day bought
+    the same DCA window twice. The DCA catch-up reads the rule's own ledger
+    (`agent._dca_catch_up_state`), and a window the ledger already filled is never bought again
+    -- the window-open day included -- so the second cycle detects nothing.
 
     Template: `test_run_once_polls_evaluates_and_executes_a_real_dca_rule` (single day-0 daily
-    candle, cadence 7, `0 % 7 == 0`). Both cycles run inside calendar day 1 and see the identical
-    day-0 candle; `EARLY` is the day's first cycle, `LATE` a much later one the SAME day, kept
-    inside rail 12's staleness window so the second cycle still reaches the rule at all.
+    candle, `Dca`'s cadence-boundary fixture -- `latest.ts // 86_400 % cadence_days == 0` with
+    `cadence_days=7`, and `0 % 7 == 0`). `market_feed._latest_closed_ts(now_ts, 86_400)` resolves
+    to that same day-0 candle for ANY `now_ts` inside calendar day 1 (`[86_400, 172_800)`), so
+    both cycles below see the identical candle.
+
+    `EARLY`/`LATE` model the runner's own two-trigger-in-one-day shape (an hourly-launchd
+    detector re-armed after a missed day-stamp -- see `keel-live-run.sh`'s header): `EARLY` is
+    the first cycle of day 1, `LATE` is a much later cycle the SAME day. `LATE` is kept inside
+    rail 12's staleness window (`config.auto_trade.interval_sec(50_000) * FEED_STALENESS_CYCLES
+    (3) = 150_000` seconds past the day-0 candle) so the second cycle still finds the feed fresh
+    and reaches the rule at all -- a stale-feed skip would prove nothing about this hazard.
     """
     repo.insert_rule("dca", {"product_id": PRODUCT}, status="live")
     broker = FakeBroker(series={(PRODUCT, Granularity.ONE_DAY): [_candle(0, "100")]})
@@ -3986,11 +4013,12 @@ def test_two_cycles_in_one_utc_day_place_one_dca_order(repo):
     second = run_once(broker, repo, config, now_ts=LATE)
 
     assert first.enter_results[0].placed is True
-    assert second.enter_signals == [], "the satisfied window must not fire a second signal"
+    assert second.enter_signals == [], "the second cycle re-detected a window already filled"
+    assert second.stale_products == [], "fixture: the second cycle must reach the rule at all"
 
     orders = repo.get_orders(mode="live", product_id=PRODUCT)
     assert len(orders) == 1
-    assert all(o["side"] == "BUY" for o in orders)
+    assert orders[0]["side"] == "BUY"
 
 
 def test_two_cycles_in_one_utc_day_reenter_the_same_turtle_breakout(repo, monkeypatch):
@@ -4800,12 +4828,11 @@ def test_retry_after_a_blocked_cycle_does_not_duplicate_an_already_placed_exit(r
 # done. These two tests pin the two contract halves -- disabled means ZERO transport calls,
 # and a warn-state cycle with the event opted in delivers exactly that event.
 
-# A realistic epoch (2026-09-13 08:00 UTC), so the rail-17 fixture below is genuinely the
-# WARN branch: attested 5 days before NOW, i.e. 2 of the 7 TTL days remain. A negative
-# `withdrawals_attested_at` would take doctor's never-attested FAIL branch instead -- a
-# different (sharper) finding than the comments and assertions here describe.
+# A realistic epoch (2026-09-13 08:00 UTC), so the rail-22 fixture below is genuinely the WARN
+# branch: a posture attestation with 10 days left, inside its 15-day warning window. (Rail 17 has
+# no clock any more -- #1010 -- so the attestation event can only come from rail 22.)
 _NOTIFY_NOW = 1_800_000_000
-_NOTIFY_ATTESTED_AT = _NOTIFY_NOW - 5 * 86_400
+_NOTIFY_POSTURE_DUE = _NOTIFY_NOW + 10 * 86_400
 # The latest CLOSED daily candle as of NOW (day 20_833 opens at 1_799_971_200), on a DCA
 # cadence boundary (20_832 % 7 == 0) and inside rail 12's staleness window (< 150_000s old).
 _NOTIFY_CANDLE_TS = 1_799_884_800
@@ -4831,7 +4858,7 @@ def _notify_config(events: frozenset[str]) -> Config:
 def _notify_re_attest_subscription(repo) -> None:
     """The fixture's subscription (attested at ts 0, due 31.5M) is long EXPIRED by the
     realistic epoch these tests run at -- rail 14 would veto the BUY and the test would stop
-    being about rail 17's notification. Re-attest a valid one for the same reason the fixture
+    being about the notification. Re-attest a valid one for the same reason the fixture
     attests at all: rail 14 is not what these tests are about."""
     attest_subscription(repo, now_ts=_NOTIFY_NOW - 60 * 86_400, free_volume_usd=Decimal("10000000"))
 
@@ -4843,12 +4870,11 @@ def test_a_cycle_with_notifications_disabled_makes_zero_transport_calls(repo, mo
     sink = _NotifySink()
     monkeypatch.setattr("keel_core.notifications.post_json", sink)
     monkeypatch.setenv("KEEL_ALERT_WEBHOOK", "https://alerts.example/hook")
-    # rail 17 at 5 of its 7 days (2 remain): the WARN state an opted-in deployment would be
-    # told about -- doctor's `attest.withdrawals` WARN, not the never-attested FAIL.
-    repo.set_state("withdrawals_attested_at", _NOTIFY_ATTESTED_AT)
     # The module fixture attests the cash posture at ts 0, which is already expired by
-    # `_NOTIFY_NOW`. Rail 22 is not what this test is about, so re-attest on its clock (#691).
-    attest_cash_posture(repo, now_ts=_NOTIFY_NOW)
+    # `_NOTIFY_NOW`. Re-attest on this clock with 10 days left: the WARN state an opted-in
+    # deployment would be told about -- doctor's `attest.cash_posture` WARN, still admitted by
+    # rail 22 (#691).
+    attest_cash_posture(repo, now_ts=_NOTIFY_NOW, attest_due_ts=_NOTIFY_POSTURE_DUE)
     _notify_re_attest_subscription(repo)
     repo.insert_rule("dca", {"product_id": PRODUCT}, status="live")
     broker = FakeBroker(
@@ -4869,12 +4895,11 @@ def test_a_warn_state_cycle_emits_exactly_the_opted_in_events(repo, monkeypatch)
     sink = _NotifySink()
     monkeypatch.setattr("keel_core.notifications.post_json", sink)
     monkeypatch.setenv("KEEL_ALERT_WEBHOOK", "https://alerts.example/hook")
-    # attested 5 days before NOW: 2 of the 7 TTL days remain -> doctor WARNs (not the
-    # never-attested FAIL a negative epoch would take).
-    repo.set_state("withdrawals_attested_at", _NOTIFY_ATTESTED_AT)
     # The module fixture attests the cash posture at ts 0, which is already expired by
-    # `_NOTIFY_NOW`. Rail 22 is not what this test is about, so re-attest on its clock (#691).
-    attest_cash_posture(repo, now_ts=_NOTIFY_NOW)
+    # `_NOTIFY_NOW`. Re-attest on this clock with 10 days left: the WARN state an opted-in
+    # deployment would be told about -- doctor's `attest.cash_posture` WARN, still admitted by
+    # rail 22 (#691).
+    attest_cash_posture(repo, now_ts=_NOTIFY_NOW, attest_due_ts=_NOTIFY_POSTURE_DUE)
     _notify_re_attest_subscription(repo)
     repo.insert_rule("dca", {"product_id": PRODUCT}, status="live")
     broker = FakeBroker(
@@ -7004,202 +7029,845 @@ def test_a_sleeve_exit_rules_longer_window_sizes_the_backfill_on_a_sleeve_only_p
     assert (len(cached), cached[-1].ts) == (300, 399 * DAY)
 
 
-# -- #1010: DCA window retry ---------------------------------------------------------------------
-#
-# Rail 17's 7-day attestation can expire under a 14-day DCA cadence, vetoing the one cadence bar.
-# A live cycle arms each DCA rule with a `DcaWindowLedger`, so a signalled-but-unfilled window is
-# retried on a later fresh bar of the same window (one buy per window) and a missed one is logged.
-# Cadence 7, cadence bar day 98 (98 % 7 == 0); a cycle on day X runs at X * DAY + 3_600.
+# -- DCA catch-up until the next window (#1010) -------------------------------------------------
 
 
-def _events(caplog) -> list[tuple[str, dict]]:
-    return [(r.getMessage(), getattr(r, _FIELDS_ATTR, {})) for r in caplog.records]
+def _dca_series(last_day: int, first_day: int = 0) -> list[Candle]:
+    return [_candle(d * DAY, "100") for d in range(first_day, last_day + 1)]
 
 
-def _series(last_day: int) -> dict[tuple[str, Granularity], list[Candle]]:
-    return {(PRODUCT, Granularity.ONE_DAY): [_candle(d * DAY) for d in range(98, last_day + 1)]}
-
-
-def _promote(monkeypatch, repo, rule_id, at_ts):
-    """Promote `rule_id` to live with `promoted_at` pinned to `at_ts` (R13 reads it)."""
-    with monkeypatch.context() as m:
-        m.setattr("keel.data.repository.time.time", lambda: at_ts)
-        repo.update_rule_status(rule_id, "live")
-
-
-def _keep_venue_attestations_fresh(repo) -> None:
-    """The `repo` fixture attests cash posture at ts 0; these cycles run ~99 days later, where
-    rail 22 would veto on EXPIRY rather than rail 17. Push its due date out so rail 17 is the
-    only guard under test."""
-    attest_cash_posture(repo, now_ts=0, attest_due_ts=10**12)
-
-
-def _vetoed_first_window(repo, monkeypatch) -> int:
-    """Rule promoted long before the window; rail 17 stale so the day-99 cycle signals but is
-    vetoed. Returns the rule id."""
-    _keep_venue_attestations_fresh(repo)
-    rid = repo.insert_rule("dca", {"product_id": PRODUCT}, status="candidate")
-    _promote(monkeypatch, repo, rid, 90 * DAY)
-    repo.set_state("withdrawals_attested_at", 1)
-    r1 = run_once(FakeBroker(series=_series(98)), repo, _config(), now_ts=99 * DAY + 3_600)
-    assert len(r1.enter_signals) == 1 and r1.enter_results[0].placed is False
-    assert [v.split(":")[0] for v in r1.enter_results[0].vetoed_by] == ["withdrawal_capability"]
-    assert repo.get_orders(mode="live", product_id=PRODUCT) == []
-    return rid
-
-
-def test_dca_vetoed_window_is_retried_on_the_next_fresh_bar(repo, monkeypatch):
-    rid = _vetoed_first_window(repo, monkeypatch)
-    repo.set_state("withdrawals_attested_at", 10**12)  # operator re-attests
-    r2 = run_once(FakeBroker(series=_series(99)), repo, _config(), now_ts=100 * DAY + 3_600)
-    assert r2.enter_results[0].placed is True
-    assert r2.enter_signals[0].setup.context["dca_retry"] is True
-    orders = repo.get_orders(mode="live", product_id=PRODUCT)
-    assert len(orders) == 1 and orders[0]["rule_id"] == rid
-
-
-def test_dca_retry_does_not_double_buy_on_a_same_day_rerun_or_later_in_the_window(
-    repo, monkeypatch
-):
-    _vetoed_first_window(repo, monkeypatch)
-    repo.set_state("withdrawals_attested_at", 10**12)
-    run_once(FakeBroker(series=_series(99)), repo, _config(), now_ts=100 * DAY + 3_600)
-    assert len(repo.get_orders(mode="live", product_id=PRODUCT)) == 1
-    run_once(FakeBroker(series=_series(99)), repo, _config(), now_ts=100 * DAY + 7_200)
-    run_once(FakeBroker(series=_series(100)), repo, _config(), now_ts=101 * DAY + 3_600)
-    assert len(repo.get_orders(mode="live", product_id=PRODUCT)) == 1
-    r5 = run_once(FakeBroker(series=_series(105)), repo, _config(), now_ts=106 * DAY + 3_600)
-    assert r5.enter_results[0].placed is True  # next window buys normally
-    assert len(repo.get_orders(mode="live", product_id=PRODUCT)) == 2
-
-
-def test_a_partially_filled_buy_satisfies_the_window_and_is_not_retried(repo, monkeypatch):
-    """#1015: reconcile leaves a part-executed DCA buy `partially_filled`; it is the window's buy,
-    so the next fresh bar must not retry and buy a second time."""
-    rid = _vetoed_first_window(repo, monkeypatch)
-    repo.set_state("withdrawals_attested_at", 10**12)
-    repo.insert_order(
-        dict(
-            mode="live",
-            product_id=PRODUCT,
-            side=Side.BUY.value,
-            order_type="market",
-            qty=Decimal("1"),
-            status="partially_filled",
-            fee=Decimal("0"),
-            confirmation="autonomous",
-            rule_id=rid,
-            created_at=99 * DAY + 3_600,
-            updated_at=99 * DAY + 3_600,
-        )
+def test_vetoed_dca_window_buys_on_next_cycle_then_not_again(repo):
+    """Review Focus 2. Cycle 1 sees the window-open bar (day 14) and rail 17 vetoes the buy (the
+    venue read fails). Cycle 2, the next day, buys it -- once. Cycle 3 buys nothing: the ledger,
+    not the candle, says the window is filled. The next window opens as an ordinary buy."""
+    rule_id = repo.insert_rule(
+        "dca", {"product_id": PRODUCT, "cadence_days": 7}, status="live", now_ts=0
     )
-    assert len(repo.get_orders(mode="live", status="partially_filled")) == 1, "fixture: seeded"
-    r = run_once(FakeBroker(series=_series(99)), repo, _config(), now_ts=100 * DAY + 3_600)
-    assert r.enter_signals == []
-    assert len(repo.get_orders(mode="live", product_id=PRODUCT)) == 1
+    series = _dca_series(14)
+    _seed_history(repo, series)
+    unreadable = FakeBroker(
+        series={(PRODUCT, Granularity.ONE_DAY): series},
+        withdrawals_raises=RuntimeError("venue down"),
+    )
+
+    first = run_once(unreadable, repo, _config(), now_ts=15 * DAY + 3_600)
+
+    assert [r.placed for r in first.enter_results] == [False], "fixture: the buy must be vetoed"
+    assert unreadable.withdrawals_calls >= 1, "fixture: rail 17 must have read the venue"
+    assert repo.get_orders(mode="live") == []
+
+    broker = FakeBroker(series={(PRODUCT, Granularity.ONE_DAY): series})
+    series.append(_candle(15 * DAY, "100"))
+    second = run_once(broker, repo, _config(), now_ts=16 * DAY + 3_600)
+
+    assert [s.setup.context["catch_up"] for s in second.enter_signals] == [True]
+    assert [s.setup.context["window_start_day"] for s in second.enter_signals] == [14]
+    assert [o["rule_id"] for o in repo.get_orders(mode="live", status="filled")] == [rule_id]
+
+    series.append(_candle(16 * DAY, "100"))
+    third = run_once(broker, repo, _config(), now_ts=17 * DAY + 3_600)
+
+    assert third.enter_signals == []
+    assert [o["rule_id"] for o in repo.get_orders(mode="live", status="filled")] == [rule_id]
+    assert len(broker.place_calls) == 1
+
+    series.extend(_candle(d * DAY, "100") for d in range(17, 22))
+    fourth = run_once(broker, repo, _config(), now_ts=22 * DAY + 3_600)
+
+    assert [s.setup.context["catch_up"] for s in fourth.enter_signals] == [False]
+    assert len(repo.get_orders(mode="live", status="filled")) == 2
 
 
-def test_an_unfilled_window_is_reported_not_back_filled(repo, caplog, monkeypatch):
-    _vetoed_first_window(repo, monkeypatch)
-    repo.set_state("withdrawals_attested_at", 10**12)
-    with caplog.at_level(logging.WARNING):
-        r = run_once(FakeBroker(series=_series(105)), repo, _config(), now_ts=106 * DAY + 3_600)
-    assert [s.setup.context.get("dca_retry") for s in r.enter_signals] == [False]
-    assert len(repo.get_orders(mode="live", product_id=PRODUCT)) == 1
-    missed = [e for e in _events(caplog) if e[0] == "agent.dca_window_missed"]
-    assert len(missed) == 1 and missed[0][1]["window_start_ts"] == 98 * DAY
+def test_a_window_bought_on_its_open_day_is_not_bought_again_after_a_rerun(repo):
+    """Anti-goal: a cycle that re-runs the next day (or after a crash) never re-buys a window
+    the window-open buy already filled."""
+    repo.insert_rule("dca", {"product_id": PRODUCT, "cadence_days": 7}, status="live", now_ts=0)
+    series = _dca_series(14)
+    _seed_history(repo, series)
+    broker = FakeBroker(series={(PRODUCT, Granularity.ONE_DAY): series})
+
+    run_once(broker, repo, _config(), now_ts=15 * DAY + 3_600)
+    assert len(broker.place_calls) == 1, "fixture: the window-open buy must fill"
+
+    rerun = run_once(broker, repo, _config(), now_ts=15 * DAY + 7_200)
+    series.append(_candle(15 * DAY, "100"))
+    next_day = run_once(broker, repo, _config(), now_ts=16 * DAY + 3_600)
+
+    assert rerun.enter_signals == [] and next_day.enter_signals == []
+    assert len(broker.place_calls) == 1
 
 
-def test_a_rule_promoted_mid_window_waits_for_its_cadence_bar(repo):
-    repo.insert_rule("dca", {"product_id": PRODUCT}, status="live")
-    r = run_once(FakeBroker(series=_series(100)), repo, _config(), now_ts=101 * DAY + 3_600)
-    assert r.enter_signals == [] and repo.get_orders(mode="live", product_id=PRODUCT) == []
+def test_a_window_missed_entirely_is_bought_by_the_first_cycle_after_it(repo):
+    """The machine was off on the window's buying day: the first later cycle in the window buys."""
+    repo.insert_rule("dca", {"product_id": PRODUCT, "cadence_days": 7}, status="live", now_ts=0)
+    series = _dca_series(18)
+    _seed_history(repo, series)
+    broker = FakeBroker(series={(PRODUCT, Granularity.ONE_DAY): series})
+
+    result = run_once(broker, repo, _config(), now_ts=19 * DAY + 3_600)
+
+    assert [s.setup.context["catch_up"] for s in result.enter_signals] == [True]
+    assert len(broker.place_calls) == 1
 
 
-def test_a_paper_era_signal_does_not_retry_after_promotion(repo, monkeypatch):
-    rid = repo.insert_rule("dca", {"product_id": PRODUCT}, status="paper")
-    # the paper era emitted (and nobody filled) the window's cadence signal for bar 98
-    repo.insert_signal({"rule_id": rid, "product_id": PRODUCT, "ts": 98 * DAY, "fired": 1})
-    assert repo.signal_ts_since(rid, 0) == [98 * DAY], "fixture: the paper-era signal is stored"
-    _promote(monkeypatch, repo, rid, 100 * DAY + 36_000)  # promoted day 100, 10:00
-    r = run_once(FakeBroker(series=_series(100)), repo, _config(), now_ts=101 * DAY + 3_600)
-    assert r.enter_signals == []
-    assert repo.get_orders(mode="live", product_id=PRODUCT) == []
+def test_a_rule_promoted_after_the_windows_buying_day_waits_for_the_next_window(repo):
+    """Review Focus 3, through the cycle: `promoted_at` (day 17) is after window 14's buying
+    cycle (day 15), so day 18's bar buys nothing -- even though `created_at` is day 0."""
+    rule_id = repo.insert_rule(
+        "dca", {"product_id": PRODUCT, "cadence_days": 7}, status="live", now_ts=0
+    )
+    repo._conn.execute("UPDATE rules SET promoted_at = ? WHERE id = ?", (17 * DAY + 5, rule_id))
+    repo._conn.commit()
+    series = _dca_series(18)
+    _seed_history(repo, series)
+    broker = FakeBroker(series={(PRODUCT, Granularity.ONE_DAY): series})
+
+    result = run_once(broker, repo, _config(), now_ts=19 * DAY + 3_600)
+
+    assert result.enter_signals == [] and broker.place_calls == []
 
 
-def test_a_live_era_signal_on_the_promotion_day_still_retries(repo, monkeypatch):
-    """R13 floor, lower edge: `signals.ts` is the BAR's 00:00, so a rule promoted on day P at
-    10:00 must still count its own live signal for bar P (00:00 < promoted_at). A floor at
-    `promoted_at` itself drops it and the vetoed window is never retried."""
-    _keep_venue_attestations_fresh(repo)
-    rid = repo.insert_rule("dca", {"product_id": PRODUCT}, status="candidate")
-    _promote(monkeypatch, repo, rid, 105 * DAY + 36_000)  # promoted day 105 (a cadence bar), 10:00
-    # the day-106 cycle signalled for bar 105 and a guard vetoed it: signal, no order
-    repo.insert_signal({"rule_id": rid, "product_id": PRODUCT, "ts": 105 * DAY, "fired": 1})
-    assert repo.signal_ts_since(rid, 0) == [105 * DAY], "fixture: the live signal is stored"
-    repo.set_state("withdrawals_attested_at", 10**12)
-    r = run_once(FakeBroker(series=_series(106)), repo, _config(), now_ts=107 * DAY + 3_600)
-    assert [s.setup.context.get("dca_retry") for s in r.enter_signals] == [True]
-    assert len(repo.get_orders(mode="live", product_id=PRODUCT)) == 1
+def test_paper_window_buy_is_not_re_bought_the_next_day(repo):
+    """The paper ledger stamps a fill with its BAR's ts (`PaperTrader._enter`), not the cycle's
+    clock, so its window is read off that day -- else day 15 would read day 14's fill as the
+    previous window's and buy again."""
+    rule_id = repo.insert_rule(
+        "dca", {"product_id": PRODUCT, "cadence_days": 7}, status="paper", now_ts=0
+    )
+    series = _dca_series(14)
+    _seed_history(repo, series)
+    broker = _MarketDataOnlyBroker(series={(PRODUCT, Granularity.ONE_DAY): series})
+    cfg = _paper_config(paper=PaperConfig(starting_equity_usd=Decimal("100000")))
+
+    run_once(broker, repo, cfg, now_ts=15 * DAY + 3_600)
+    buys = [o for o in repo.get_orders(mode="paper") if o["side"] == Side.BUY.value]
+    assert [o["rule_id"] for o in buys] == [rule_id], "fixture: the paper window buy must fill"
+
+    series.append(_candle(15 * DAY, "100"))
+    result = run_once(broker, repo, cfg, now_ts=16 * DAY + 3_600)
+
+    assert result.enter_signals == []
 
 
-def test_a_paper_era_signal_the_day_before_promotion_does_not_retry(repo, monkeypatch):
-    """R13 floor, upper edge: the paper-era signal for bar P - 1 sits in the same window as the
-    first live bars; a floor one day early would count it and buy on a paper signal."""
-    _keep_venue_attestations_fresh(repo)
-    rid = repo.insert_rule("dca", {"product_id": PRODUCT}, status="paper")
-    repo.insert_signal({"rule_id": rid, "product_id": PRODUCT, "ts": 99 * DAY, "fired": 1})
-    assert repo.signal_ts_since(rid, 0) == [99 * DAY], "fixture: the paper-era signal is stored"
-    _promote(monkeypatch, repo, rid, 100 * DAY + 36_000)  # promoted day 100, 10:00
-    repo.set_state("withdrawals_attested_at", 10**12)
-    r = run_once(FakeBroker(series=_series(100)), repo, _config(), now_ts=101 * DAY + 3_600)
-    assert r.enter_signals == []
-    assert repo.get_orders(mode="live", product_id=PRODUCT) == []
+def test_paper_missed_window_catches_up_from_the_paper_ledger(repo):
+    """The paper path reads its OWN ledger: a live fill of the same rule does not fill the paper
+    window."""
+    rule_id = repo.insert_rule(
+        "dca", {"product_id": PRODUCT, "cadence_days": 7}, status="paper", now_ts=0
+    )
+    repo.insert_order(
+        {
+            "mode": "live",
+            "product_id": PRODUCT,
+            "side": Side.BUY.value,
+            "order_type": "market",
+            "qty": Decimal("0.5"),
+            "status": "filled",
+            "rule_id": rule_id,
+            "created_at": 15 * DAY + 3_600,
+            "updated_at": 15 * DAY + 3_600,
+        }
+    )
+    series = _dca_series(16)
+    _seed_history(repo, series)
+    broker = _MarketDataOnlyBroker(series={(PRODUCT, Granularity.ONE_DAY): series})
+    cfg = _paper_config(paper=PaperConfig(starting_equity_usd=Decimal("100000")))
+
+    result = run_once(broker, repo, cfg, now_ts=17 * DAY + 3_600)
+
+    assert [s.setup.context["catch_up"] for s in result.enter_signals] == [True]
 
 
-def test_a_ledger_read_failure_falls_back_to_cadence_only(repo, monkeypatch, caplog):
-    _keep_venue_attestations_fresh(repo)
-    rid = repo.insert_rule("dca", {"product_id": PRODUCT}, status="candidate")
-    _promote(monkeypatch, repo, rid, 90 * DAY)
+def test_an_unreadable_ledger_disables_catch_up_and_logs_it(repo, monkeypatch, caplog):
+    """Controller ruling 4: never fire a catch-up on a ledger the cycle could not read. The rule
+    falls back to the window-open day alone, and the failure is logged."""
+    repo.insert_rule("dca", {"product_id": PRODUCT, "cadence_days": 7}, status="live", now_ts=0)
+    calls: list[int] = []
 
-    def _boom(*_a, **_k):
+    def _boom(*args: Any, **kwargs: Any) -> DcaCatchUp:
+        calls.append(1)
         raise RuntimeError("database is locked")
 
-    monkeypatch.setattr(repo, "last_live_buy_created_at", _boom)
+    monkeypatch.setattr(agent, "_dca_catch_up_state", _boom)
+    series = _dca_series(16)
+    _seed_history(repo, series)
+    broker = FakeBroker(series={(PRODUCT, Granularity.ONE_DAY): series})
+
     with caplog.at_level(logging.WARNING):
-        r = run_once(FakeBroker(series=_series(98)), repo, _config(), now_ts=99 * DAY + 3_600)
-    assert r.enter_results[0].placed is True  # bar 98 is a cadence bar
-    assert "dca_retry" not in r.enter_signals[0].setup.context  # ledger was None
-    failed = [e for e in _events(caplog) if e[0] == "agent.dca_window_ledger_failed"]
-    assert len(failed) == 1
-    assert failed[0][1]["rule_id"] == rid and "database is locked" in failed[0][1]["error"]
+        off_window = run_once(broker, repo, _config(), now_ts=17 * DAY + 3_600)
+
+    assert calls, "the lookup was never attempted -- this test proves nothing"
+    assert off_window.enter_signals == []
+    assert "agent.dca_catch_up_unreadable" in [r.getMessage() for r in caplog.records]
+
+    series.extend(_candle(d * DAY, "100") for d in range(17, 22))
+    window_open = run_once(broker, repo, _config(), now_ts=22 * DAY + 3_600)
+
+    assert [s.setup.context["catch_up"] for s in window_open.enter_signals] == [False]
 
 
-def test_a_paper_cycle_gets_no_window_ledger_and_stays_cadence_only(repo):
-    """R7: only live cycles are armed. The DCA rule here is a `paper` row on its cadence bar 98,
-    and a live filled BUY exists for the same rule id whose bar day (98) satisfies the window.
-    A paper cycle must ignore that live fact and place its paper buy; an armed ledger would read
-    the BUY, call the window satisfied and withhold the signal."""
-    rid = repo.insert_rule("dca", {"product_id": PRODUCT}, status="paper")
-    repo.insert_order(
-        dict(
-            mode="live",
-            product_id=PRODUCT,
-            side=Side.BUY.value,
-            order_type="market",
-            qty=Decimal("1"),
-            status="filled",
-            fee=Decimal("0"),
-            confirmation="autonomous",
-            rule_id=rid,
-            created_at=99 * DAY,
-            updated_at=99 * DAY,
+def test_catch_up_state_reads_this_rules_buys_in_this_mode(repo):
+    rule_id = repo.insert_rule("dca", {"product_id": PRODUCT, "cadence_days": 7}, now_ts=3 * DAY)
+    other_id = repo.insert_rule("dca", {"product_id": PRODUCT, "cadence_days": 7}, now_ts=0)
+    [row] = [r for r in repo.get_rules() if r["id"] == rule_id]
+    rule = _build_rule(row)
+
+    def _order(mode: str, rid: int, status: str, created_at: int, side: str = "BUY") -> None:
+        repo.insert_order(
+            {
+                "mode": mode,
+                "product_id": PRODUCT,
+                "side": side,
+                "order_type": "market",
+                "qty": Decimal("0.5"),
+                "status": status,
+                "rule_id": rid,
+                "created_at": created_at,
+                "updated_at": created_at,
+            }
         )
+
+    empty = agent._dca_catch_up_state(repo, rule, row, mode="live")
+    assert empty == DcaCatchUp(since_day=3, filled_window_day=None, in_flight=False)
+
+    _order("live", rule_id, "filled", 8 * DAY + 4_800)  # cycle on day 8 buys bar 7: window 7
+    _order("live", rule_id, "filled", 14 * DAY + 4_800)  # cycle on day 14 buys bar 13: window 7
+    _order("live", rule_id, "filled", 7 * DAY + 4_800)  # older (bar 6, window 0), inserted last
+    _order("live", other_id, "filled", 22 * DAY + 4_800)  # another rule
+    _order("paper", rule_id, "filled", 28 * DAY)  # another mode
+    _order("live", rule_id, "filled", 29 * DAY + 4_800, side="SELL")  # not a buy
+    _order("live", rule_id, "rejected", 30 * DAY + 4_800)  # not filled
+
+    state = agent._dca_catch_up_state(repo, rule, row, mode="live")
+    assert state == DcaCatchUp(since_day=3, filled_window_day=7, in_flight=False)
+
+    paper = agent._dca_catch_up_state(repo, rule, row, mode="paper")
+    assert paper == DcaCatchUp(since_day=3, filled_window_day=28, in_flight=False), (
+        "a paper fill is stamped with its bar's ts, so its window is its own day's"
     )
-    assert repo.last_live_buy_created_at(rid) == 99 * DAY, "fixture: the live BUY is readable"
-    broker = _MarketDataOnlyBroker(series=_series(98))
-    cfg = _paper_config(paper=PaperConfig(starting_equity_usd=Decimal("100000")))
-    result = run_once(broker, repo, cfg, now_ts=99 * DAY + 3_600)
-    assert len(result.enter_signals) == 1
-    assert "dca_retry" not in result.enter_signals[0].setup.context
-    assert len(repo.get_orders(mode="paper")) == 1
+
+    for status in executor.RESTING_STATUSES:
+        _order("live", rule_id, status, 31 * DAY)
+    assert agent._dca_catch_up_state(repo, rule, row, mode="live").in_flight is True
+    assert agent._dca_catch_up_state(repo, rule, row, mode="paper").in_flight is False
+
+
+def test_catch_up_since_day_prefers_promoted_at_and_never_guesses_a_missing_one(repo):
+    rule = Dca(PRODUCT, cadence_days=7)
+    rule.rule_id = 1
+    row = {"id": 1, "created_at": 2 * DAY + 5, "promoted_at": 9 * DAY + 5}
+    assert agent._dca_catch_up_state(repo, rule, row, mode="live").since_day == 9
+    row["promoted_at"] = None
+    assert agent._dca_catch_up_state(repo, rule, row, mode="live").since_day == 2
+    row["created_at"] = None
+    assert agent._dca_catch_up_state(repo, rule, row, mode="live").since_day is None
+
+
+# Ported from #1013 (its window-ledger tests) onto `catch_up`: the hazards they pinned outlive the
+# ledger they were written against.
+
+
+def _promoted_live_dca(repo: Repository, promoted_at: int) -> int:
+    """A live 7-day DCA rule created on day 0 and promoted at `promoted_at`."""
+    rule_id = repo.insert_rule(
+        "dca", {"product_id": PRODUCT, "cadence_days": 7}, status="live", now_ts=0
+    )
+    repo._conn.execute("UPDATE rules SET promoted_at = ? WHERE id = ?", (promoted_at, rule_id))
+    repo._conn.commit()
+    return rule_id
+
+
+def _live_buy(
+    repo: Repository,
+    rule_id: int,
+    status: str,
+    created_at: int,
+    mode: str = "live",
+    filled_quantity: Decimal | None = None,
+):
+    return repo.insert_order(
+        {
+            "mode": mode,
+            "product_id": PRODUCT,
+            "side": Side.BUY.value,
+            "order_type": "market",
+            "qty": Decimal("0.5"),
+            "status": status,
+            "filled_quantity": filled_quantity,
+            "rule_id": rule_id,
+            "created_at": created_at,
+            "updated_at": created_at,
+        }
+    )
+
+
+def test_a_partially_filled_buy_blocks_its_windows_catch_up(repo):
+    """Ported from #1013 (#1015): reconcile leaves a part-executed DCA buy `partially_filled`.
+    Money is already spent in that window, so no later cycle of the window may buy again --
+    neither while the row rests nor after reconcile moves it to `filled`."""
+    rule_id = repo.insert_rule(
+        "dca", {"product_id": PRODUCT, "cadence_days": 7}, status="live", now_ts=0
+    )
+    order_id = _live_buy(repo, rule_id, "partially_filled", 15 * DAY + 3_600)  # bought bar 14
+    [row] = [r for r in repo.get_rules() if r["id"] == rule_id]
+    state = agent._dca_catch_up_state(repo, _build_rule(row), row, mode="live")
+    assert state.in_flight is True, "fixture: the partial fill must reach the ledger reader"
+    series = _dca_series(15)
+    _seed_history(repo, series)
+    broker = FakeBroker(series={(PRODUCT, Granularity.ONE_DAY): series})
+
+    resting = run_once(broker, repo, _config(), now_ts=16 * DAY + 3_600)
+
+    assert resting.enter_signals == [] and broker.place_calls == []
+
+    repo.update_order(order_id, status="filled", updated_at=16 * DAY + 7_200)
+    series.append(_candle(16 * DAY, "100"))
+    settled = run_once(broker, repo, _config(), now_ts=17 * DAY + 3_600)
+
+    assert settled.enter_signals == [] and broker.place_calls == []
+    assert len(repo.get_orders(mode="live", product_id=PRODUCT)) == 1
+
+
+def test_a_canceled_buy_that_executed_part_fills_its_window(repo):
+    """A `partially_filled` DCA BUY cancelled through `keel orders cancel` ends `canceled` with
+    its executed `filled_quantity` still on the row (`orders.py` writes the terminal status after
+    the fill readback). Money was spent in window 14, so no later cycle of that window may buy
+    again; window 21 still opens as an ordinary buy."""
+    rule_id = repo.insert_rule(
+        "dca", {"product_id": PRODUCT, "cadence_days": 7}, status="live", now_ts=0
+    )
+    _live_buy(repo, rule_id, "canceled", 15 * DAY + 3_600, filled_quantity=Decimal("0.2"))
+    series = _dca_series(15)
+    _seed_history(repo, series)
+    broker = FakeBroker(series={(PRODUCT, Granularity.ONE_DAY): series})
+
+    in_window = run_once(broker, repo, _config(), now_ts=16 * DAY + 3_600)
+
+    assert in_window.enter_signals == [] and broker.place_calls == []
+
+    series.extend(_candle(d * DAY, "100") for d in range(16, 22))
+    next_window = run_once(broker, repo, _config(), now_ts=22 * DAY + 3_600)
+
+    assert [s.setup.context["catch_up"] for s in next_window.enter_signals] == [False]
+    assert len(broker.place_calls) == 1
+
+
+@pytest.mark.parametrize("status", ["canceled", "rejected"])
+@pytest.mark.parametrize("executed", [None, Decimal("0")])
+def test_a_buy_that_executed_nothing_leaves_its_window_to_catch_up(repo, status, executed):
+    """The other side of the rule above: a terminal BUY that executed nothing spent nothing, so
+    the window is still owed and the next cycle catches it up."""
+    rule_id = repo.insert_rule(
+        "dca", {"product_id": PRODUCT, "cadence_days": 7}, status="live", now_ts=0
+    )
+    _live_buy(repo, rule_id, status, 15 * DAY + 3_600, filled_quantity=executed)
+    assert len(repo.get_orders(mode="live")) == 1, "fixture: the row reaches the ledger"
+    series = _dca_series(15)
+    _seed_history(repo, series)
+    broker = FakeBroker(series={(PRODUCT, Granularity.ONE_DAY): series})
+
+    result = run_once(broker, repo, _config(), now_ts=16 * DAY + 3_600)
+
+    assert [s.setup.context["catch_up"] for s in result.enter_signals] == [True]
+    assert len(broker.place_calls) == 1
+
+
+def test_bought_today_counts_a_canceled_buy_that_executed_part(repo):
+    """The same-day-sale exclusion reads the same fact: a cancelled BUY that executed part of its
+    size bought today; one that executed nothing did not."""
+    rule_id = repo.insert_rule("dca", {"product_id": PRODUCT}, status="live", now_ts=0)
+    now = 15 * DAY + 7_200
+    _live_buy(repo, rule_id, "canceled", 15 * DAY + 3_600, filled_quantity=Decimal("0"))
+    assert agent._bought_today(repo, PRODUCT, now, mode="live") is False
+    _live_buy(repo, rule_id, "canceled", 15 * DAY + 3_600, filled_quantity=Decimal("0.2"))
+    assert agent._bought_today(repo, PRODUCT, now, mode="live") is True
+
+
+def test_paper_era_activity_does_not_make_a_live_window_due(repo):
+    """Ported from #1013 (R13), promotion-boundary half: promoted on day 16, after window 14's
+    buying cycle (day 15), the rule does not catch window 14 up and waits for window 21. The
+    paper-era fill is seeded for realism only -- `since_day` alone decides this case, so it does
+    not prove mode isolation; `test_paper_missed_window_catches_up_from_the_paper_ledger` and the
+    state-level mode test do. (#1013 also seeded a paper-era signal; `catch_up` reads no signals.)
+    """
+    rule_id = _promoted_live_dca(repo, 16 * DAY + 36_000)
+    _live_buy(repo, rule_id, "filled", 14 * DAY, mode="paper")
+    assert len(repo.get_orders(mode="paper")) == 1, "fixture: the paper-era fill is stored"
+    series = _dca_series(16)
+    _seed_history(repo, series)
+    broker = FakeBroker(series={(PRODUCT, Granularity.ONE_DAY): series})
+
+    result = run_once(broker, repo, _config(), now_ts=17 * DAY + 3_600)
+
+    assert result.enter_signals == [] and broker.place_calls == []
+    assert repo.get_orders(mode="live") == []
+
+
+def test_a_rule_promoted_on_its_window_open_day_catches_that_window_up(repo):
+    """Ported from #1013 (R13, lower edge): promoted on day 14 at 10:00, a cadence day. Window 14
+    is bought by the day-15 cycle, which runs after the promotion, so it is the rule's own live
+    window and a missed buy of it is caught up."""
+    _promoted_live_dca(repo, 14 * DAY + 36_000)
+    series = _dca_series(15)
+    _seed_history(repo, series)
+    broker = FakeBroker(series={(PRODUCT, Granularity.ONE_DAY): series})
+
+    result = run_once(broker, repo, _config(), now_ts=16 * DAY + 3_600)
+
+    assert [s.setup.context["catch_up"] for s in result.enter_signals] == [True]
+    assert len(broker.place_calls) == 1
+
+
+def test_a_rule_promoted_on_its_windows_buying_day_catches_that_window_up(repo):
+    """#1013's R13 floor left this window unbought; `catch_up` buys it. Promoted on day 15 at
+    10:00, after that day's cycle bought (or would have bought) bar 14: `since_day` is 15 and
+    the window's buying day is 15, which is not BEFORE the promotion, so the day-16 cycle catches
+    window 14 up -- the rule's first live buy, and its only one for the window."""
+    _promoted_live_dca(repo, 15 * DAY + 36_000)
+    series = _dca_series(15)
+    _seed_history(repo, series)
+    broker = FakeBroker(series={(PRODUCT, Granularity.ONE_DAY): series})
+
+    result = run_once(broker, repo, _config(), now_ts=16 * DAY + 3_600)
+
+    assert [s.setup.context["catch_up"] for s in result.enter_signals] == [True]
+    assert len(broker.place_calls) == 1
+
+
+def test_catch_up_day_counts_as_dca_day_for_sleeve_exclusion(repo, monkeypatch):
+    """Spec §3.4 + catch-up: day 40 is no 7-day window-open day (window 35), but window 35 never
+    filled, so day 40 is a DCA buy day -- even when rail 17 vetoes that buy, the same-day sale
+    beside it is refused."""
+    _seed_rules(
+        repo,
+        monkeypatch,
+        (Dca(product_id=PRODUCT, cadence_days=7), "live"),
+        (_AlwaysReduceRule(PRODUCT), "live"),
+    )
+    repo._conn.execute("UPDATE rules SET created_at = 0")
+    repo._conn.commit()
+    _held_since_day_0(repo)
+    now = _history(repo, 41)
+    broker = _HoldingBroker(withdrawals_raises=RuntimeError("venue down"))
+
+    result = run_once(broker, repo, _config(), now_ts=now)
+
+    assert [s.setup.context["catch_up"] for s in result.enter_signals] == [True]
+    assert [r.placed for r in result.enter_results] == [False], "fixture: the buy must be vetoed"
+    [row] = repo.get_sell_proposals()
+    assert (row["decision"], row["rails"]["sleeve"]) == ("vetoed", "same_day_dca")
+
+
+def test_an_in_flight_dca_buy_still_counts_as_a_dca_day_for_sleeve_exclusion(repo, monkeypatch):
+    """F2, spec §3.4: a DCA BUY of the rule still resting makes `detect` answer `None`, but the
+    day is still a DCA day -- a same-day sale beside an in-flight buy is the round trip the
+    exclusion exists to prevent."""
+    _seed_rules(
+        repo,
+        monkeypatch,
+        (Dca(product_id=PRODUCT, cadence_days=7), "live"),
+        (_AlwaysReduceRule(PRODUCT), "live"),
+    )
+    repo._conn.execute("UPDATE rules SET created_at = 0")
+    repo._conn.commit()
+    [dca_row] = [row for row in repo.get_rules("live") if row["kind"] == "dca"]
+    repo.insert_order(
+        {
+            "mode": "live",
+            "product_id": PRODUCT,
+            "side": Side.BUY.value,
+            "order_type": "market",
+            "qty": Decimal("0.5"),
+            "status": "pending",
+            "rule_id": dca_row["id"],
+            "created_at": 37 * DAY + 3_600,
+            "updated_at": 37 * DAY + 3_600,
+        }
+    )
+    _held_since_day_0(repo)
+    now = _history(repo, 41)
+    broker = _HoldingBroker()
+
+    result = run_once(broker, repo, _config(), now_ts=now)
+
+    assert result.enter_signals == [], "fixture: the in-flight buy blocks the rule"
+    [row] = repo.get_sell_proposals()
+    assert (row["decision"], row["rails"]["sleeve"]) == ("vetoed", "same_day_dca")
+
+
+# -- a macOS notification for every skipped live DCA buy (#1010) ---------------------------------
+
+
+def _spy_post(monkeypatch) -> list[list[agent.SkippedBuy]]:
+    """Replace the cycle's notifier so no test posts anything; records what it was handed."""
+    seen: list[list[agent.SkippedBuy]] = []
+
+    def _record(repo, skipped, now_ts, **_kw):
+        seen.append(list(skipped))
+        return 0
+
+    monkeypatch.setattr(agent, "_post_skipped_buys", _record)
+    return seen
+
+
+def _live_dca_rule(repo) -> int:
+    return repo.insert_rule(
+        "dca", {"product_id": PRODUCT, "cadence_days": 7}, status="live", now_ts=0
+    )
+
+
+def test_skipped_live_dca_buy_posts_once_per_rule_per_day(repo):
+    """Review Focus 5. Once per rule per UTC day -- NOT #793's once-per-window `unreported()`,
+    which would silence every repeat -- and a failed post is not remembered as said."""
+    posted: list[tuple[str, str]] = []
+
+    def _ok(title: str, message: str) -> bool:
+        posted.append((title, message))
+        return True
+
+    reason = "withdrawal_capability: UNKNOWN (venue down)"
+    skip = agent.SkippedBuy(9, "PAXG-USD", reason, retry_until="1970-01-22")
+    now = 15 * DAY + 3_600
+
+    assert agent._post_skipped_buys(repo, [skip, skip], now, post=_ok) == 1
+    assert agent._post_skipped_buys(repo, [skip], now + 3_600, post=_ok) == 0
+    assert len(posted) == 1
+    assert posted[0] == (
+        "keel-live: DCA buy skipped",
+        f"PAXG-USD (rule 9): {reason}. Retrying daily until 1970-01-22.",
+    )
+    assert repo.get_state("dca_skip_notified:9") == "1970-01-16"
+
+    assert agent._post_skipped_buys(repo, [skip], now + DAY, post=_ok) == 1
+    assert len(posted) == 2
+
+    other = agent.SkippedBuy(10, "BTC-USD", "max_per_day")
+    assert agent._post_skipped_buys(repo, [other], now + DAY, post=_ok) == 1
+
+
+def test_skipped_buy_reason_is_cut_to_180_characters(repo):
+    posted: list[str] = []
+    skip = agent.SkippedBuy(1, "BTC-USD", "x" * 500, retry_until="1970-01-22")
+    agent._post_skipped_buys(repo, [skip], DAY, post=lambda t, m: posted.append(m) or True)
+    assert posted == ["BTC-USD (rule 1): " + "x" * 180 + ". Retrying daily until 1970-01-22."]
+
+
+def test_a_failed_post_is_not_remembered_so_the_next_cycle_tries_again(repo):
+    skip = agent.SkippedBuy(1, "BTC-USD", "max_per_day")
+    assert agent._post_skipped_buys(repo, [skip], DAY, post=lambda t, m: False) == 0
+    assert repo.get_state("dca_skip_notified:1") is None
+    assert agent._post_skipped_buys(repo, [skip], DAY + 60, post=lambda t, m: True) == 1
+
+
+def test_cycle_with_vetoed_dca_records_skipped_buy(repo, monkeypatch):
+    seen = _spy_post(monkeypatch)
+    rule_id = _live_dca_rule(repo)
+    series = _dca_series(14)
+    _seed_history(repo, series)
+    broker = FakeBroker(
+        series={(PRODUCT, Granularity.ONE_DAY): series},
+        withdrawals_raises=RuntimeError("venue down"),
+    )
+
+    result = run_once(broker, repo, _config(), now_ts=15 * DAY + 3_600)
+
+    assert [r.placed for r in result.enter_results] == [False], "fixture: the buy is vetoed"
+    [skip] = result.skipped_buys
+    assert (skip.rule_id, skip.product) == (rule_id, PRODUCT)
+    assert skip.reason.startswith("withdrawal_capability:")
+    assert skip.retry_until == "1970-01-22", "the next window (day 21) opens on 1970-01-22"
+    assert seen == [[skip]], "the cycle hands its skipped buys to the notifier"
+
+
+def test_a_placed_dca_buy_records_no_skipped_buy(repo, monkeypatch):
+    seen = _spy_post(monkeypatch)
+    _live_dca_rule(repo)
+    series = _dca_series(14)
+    _seed_history(repo, series)
+    broker = FakeBroker(series={(PRODUCT, Granularity.ONE_DAY): series})
+
+    result = run_once(broker, repo, _config(), now_ts=15 * DAY + 3_600)
+
+    assert [r.placed for r in result.enter_results] == [True], "fixture: the buy places"
+    assert result.skipped_buys == []
+    assert seen in ([], [[]])
+
+
+def test_a_day_the_rule_is_not_due_records_no_skipped_buy(repo, monkeypatch):
+    _spy_post(monkeypatch)
+    _live_dca_rule(repo)
+    series = _dca_series(17)  # day 17 is mid-window and the window-14 buy has filled
+    _seed_history(repo, series)
+    broker = FakeBroker(series={(PRODUCT, Granularity.ONE_DAY): series})
+    run_once(broker, repo, _config(), now_ts=15 * DAY + 3_600)  # window 14 fills
+    assert len(broker.place_calls) == 1, "fixture: the window filled"
+
+    result = run_once(broker, repo, _config(), now_ts=18 * DAY + 3_600)
+
+    assert result.enter_signals == [] and result.skipped_buys == []
+
+
+def test_paper_cycle_records_no_skipped_buys(repo, monkeypatch):
+    seen = _spy_post(monkeypatch)
+    repo.insert_rule("dca", {"product_id": PRODUCT, "cadence_days": 7}, status="paper", now_ts=0)
+    series = _dca_series(14)
+    _seed_history(repo, series)
+    broker = _MarketDataOnlyBroker(series={(PRODUCT, Granularity.ONE_DAY): series})
+    # No synthetic equity -> the paper buy is skipped (placed False): live would record it.
+    cfg = _paper_config(paper=PaperConfig(starting_equity_usd=Decimal("0.01")))
+
+    result = run_once(broker, repo, cfg, now_ts=15 * DAY + 3_600)
+
+    assert [s.setup.context["window_start_day"] for s in result.enter_signals] == [14]
+    assert result.skipped_buys == []
+    assert all(batch == [] for batch in seen)
+
+
+def test_notifier_failure_does_not_fail_cycle(repo, monkeypatch, caplog):
+    def _explode(*_a, **_k):
+        raise RuntimeError("notification centre on fire")
+
+    monkeypatch.setattr(agent, "_post_skipped_buys", _explode)
+    _live_dca_rule(repo)
+    series = _dca_series(14)
+    _seed_history(repo, series)
+    broker = FakeBroker(
+        series={(PRODUCT, Granularity.ONE_DAY): series},
+        withdrawals_raises=RuntimeError("venue down"),
+    )
+
+    result = run_once(broker, repo, _config(), now_ts=15 * DAY + 3_600)
+
+    assert len(result.skipped_buys) == 1
+    assert "agent.skipped_buy_notify_failed" in [r.getMessage() for r in caplog.records]
+
+
+def test_building_the_skipped_buys_failing_does_not_fail_cycle(repo, monkeypatch):
+    def _explode(*_a, **_k):
+        raise RuntimeError("cannot build")
+
+    monkeypatch.setattr(agent, "_skipped_dca_buys", _explode)
+    _live_dca_rule(repo)
+    series = _dca_series(14)
+    _seed_history(repo, series)
+    broker = FakeBroker(series={(PRODUCT, Granularity.ONE_DAY): series})
+
+    result = run_once(broker, repo, _config(), now_ts=15 * DAY + 3_600)
+
+    assert [r.placed for r in result.enter_results] == [True]
+    assert result.skipped_buys == []
+
+
+def test_an_in_flight_order_blocking_a_due_buy_is_a_skip_naming_the_order(repo, monkeypatch):
+    """Controller ruling 1: a due buy blocked by a resting order is NOT silent. The reason names
+    the local order id and says to resolve it, and it notifies every day like any other skip."""
+    _spy_post(monkeypatch)
+    rule_id = _live_dca_rule(repo)
+    order_id = repo.insert_order(
+        {
+            "mode": "live",
+            "product_id": PRODUCT,
+            "side": Side.BUY.value,
+            "order_type": "market",
+            "qty": Decimal("0.5"),
+            "status": "pending",
+            "rule_id": rule_id,
+            "created_at": 8 * DAY + 3_600,
+            "updated_at": 8 * DAY + 3_600,
+        }
+    )
+    series = _dca_series(14)
+    _seed_history(repo, series)
+    broker = FakeBroker(series={(PRODUCT, Granularity.ONE_DAY): series})
+
+    result = run_once(broker, repo, _config(), now_ts=15 * DAY + 3_600)
+
+    assert result.enter_signals == [] and broker.place_calls == [], "fixture: the buy is blocked"
+    [skip] = result.skipped_buys
+    assert (skip.rule_id, skip.product) == (rule_id, PRODUCT)
+    assert f"#{order_id}" in skip.reason
+    assert f"keel orders cancel {order_id}" in skip.reason, "the reason names the way out (F1)"
+    assert skip.blocked_by == (order_id,)
+    assert skip.retry_until == "1970-01-22"
+
+
+def test_a_blocked_skip_says_blocked_and_an_ordinary_skip_says_retrying(repo):
+    """F4: a rule blocked by a resting order does NOT retry daily -- it buys nothing until the
+    order is resolved -- so its banner must not promise a retry. Every other skip keeps it."""
+    posted: list[str] = []
+
+    def _ok(_title: str, message: str) -> bool:
+        posted.append(message)
+        return True
+
+    blocked = agent.SkippedBuy(
+        7, PRODUCT, "previous DCA order #5 is still pending", "1970-01-22", blocked_by=(5,)
+    )
+    vetoed = agent.SkippedBuy(8, PRODUCT, "max_per_day", "1970-01-22")
+
+    assert agent._post_skipped_buys(repo, [blocked, vetoed], 15 * DAY, post=_ok) == 2
+    assert posted[0] == (
+        f"{PRODUCT} (rule 7): previous DCA order #5 is still pending. "
+        "Blocked until that order is resolved: keel orders cancel 5."
+    )
+    assert "Retrying" not in posted[0]
+    assert posted[1] == f"{PRODUCT} (rule 8): max_per_day. Retrying daily until 1970-01-22."
+
+
+def test_a_stuck_order_cancelled_locally_lets_the_rule_catch_up_next_cycle(repo, monkeypatch):
+    """F1: a placement that raised leaves a `pending` row with no venue id, which blocks the rule.
+    After `keel orders cancel N` marks it canceled locally, the NEXT cycle buys the window."""
+    import json
+
+    from keel.commands import orders as orders_mod
+
+    _spy_post(monkeypatch)
+    rule_id = _live_dca_rule(repo)
+    stuck = repo.insert_order(
+        {
+            "mode": "live",
+            "product_id": PRODUCT,
+            "side": Side.BUY.value,
+            "order_type": "market",
+            "qty": Decimal("0.5"),
+            "status": "pending",
+            "rule_id": rule_id,
+            "raw_response": None,
+            "created_at": 15 * DAY + 3_600,
+            "updated_at": 15 * DAY + 3_600,
+        }
+    )
+    series = _dca_series(16)
+    _seed_history(repo, series)
+    broker = FakeBroker(series={(PRODUCT, Granularity.ONE_DAY): series})
+
+    blocked = run_once(broker, repo, _config(), now_ts=16 * DAY + 3_600)
+    assert broker.place_calls == [] and [s.blocked_by for s in blocked.skipped_buys] == [
+        (stuck,)
+    ], "fixture: the stuck row blocks the rule"
+
+    # What `keel orders cancel N` writes on the local-only path (`orders._cancel_locally`).
+    repo.update_order(
+        stuck,
+        status="canceled",
+        raw_response=json.dumps({"local_cancel": orders_mod.LOCAL_CANCEL_NOTE}),
+        updated_at=16 * DAY + 7_200,
+    )
+    series = _dca_series(17)
+    _seed_history(repo, series)
+    broker = FakeBroker(series={(PRODUCT, Granularity.ONE_DAY): series})
+
+    result = run_once(broker, repo, _config(), now_ts=17 * DAY + 3_600)
+
+    assert [s.setup.context["catch_up"] for s in result.enter_signals] == [True]
+    assert [r.placed for r in result.enter_results] == [True]
+    assert len(broker.place_calls) == 1
+    assert result.skipped_buys == []
+
+
+def test_a_pending_buy_reconcile_fills_this_cycle_is_not_counted_in_flight(repo, monkeypatch):
+    """F3: catch-up reads the ledger AFTER reconcile. The previous window's BUY was still
+    `pending` when the cycle began, and the venue says it FILLED; reconcile books that at the top
+    of the cycle, so this cycle's window-14 buy goes out -- read before reconcile, the settled row
+    would have blocked the rule and reported an in-flight skip."""
+    _spy_post(monkeypatch)
+    rule_id = _live_dca_rule(repo)
+    order_id = repo.insert_order(
+        {
+            "mode": "live",
+            "product_id": PRODUCT,
+            "side": Side.BUY.value,
+            "order_type": "market",
+            "qty": Decimal("0.5"),
+            "status": "pending",
+            "rule_id": rule_id,
+            "raw_response": '{"order_id": "venue-prev"}',
+            "created_at": 8 * DAY + 3_600,
+            "updated_at": 8 * DAY + 3_600,
+        }
+    )
+    series = _dca_series(14)
+    _seed_history(repo, series)
+
+    class _FilledAtVenue(FakeBroker):
+        def get_order(self, native_id: str) -> OrderStatus:
+            return OrderStatus(
+                order_id=native_id,
+                status="FILLED",
+                filled_size=Decimal("0.5"),
+                average_filled_price=Decimal("100"),
+                total_fees=Decimal("0.45"),
+            )
+
+    broker = _FilledAtVenue(series={(PRODUCT, Granularity.ONE_DAY): series})
+
+    result = run_once(broker, repo, _config(), now_ts=15 * DAY + 3_600)
+
+    assert repo.get_order(order_id)["status"] == "filled", "fixture: reconcile settled it"
+    assert result.skipped_buys == []
+    assert [r.placed for r in result.enter_results] == [True]
+
+
+def test_withheld_entries_make_every_due_dca_rule_a_skip(repo, monkeypatch):
+    """Controller ruling 2: the whole cycle's entries are withheld (a lagging product's bar), and
+    the due DCA rule beside it is a skip with that reason -- the very silence the operator hit."""
+    _spy_post(monkeypatch)
+    config = _blocked_cycle_config()
+    now_ts = 11 * DAY
+    ready_id = repo.insert_rule("dca", {"product_id": PRODUCT, "cadence_days": 1}, status="live")
+    repo.upsert_candles(PRODUCT, Granularity.ONE_DAY, [_candle(10 * DAY, "100")])
+    repo.insert_rule("dca", {"product_id": _XLM, "cadence_days": 1}, status="live")
+    repo.upsert_candles(_XLM, Granularity.ONE_DAY, [_candle(9 * DAY, "100")])
+    broker = FakeBroker(
+        series={
+            (PRODUCT, Granularity.ONE_DAY): [_candle(10 * DAY, "100")],
+            (_XLM, Granularity.ONE_DAY): [_candle(9 * DAY, "100")],
+        }
+    )
+
+    result = run_once(broker, repo, config, now_ts=now_ts)
+
+    assert result.enter_signals == [], "fixture: entries are withheld"
+    by_product = {s.product: s for s in result.skipped_buys}
+    assert PRODUCT in by_product and by_product[PRODUCT].rule_id == ready_id
+    assert "withheld" in by_product[PRODUCT].reason
+    assert by_product[PRODUCT].retry_until == "1970-01-12", "cadence 1: day 10's next window is 11"
+
+
+def test_a_stale_feed_makes_the_due_dca_rule_a_skip(repo, monkeypatch):
+    _spy_post(monkeypatch)
+    _live_dca_rule(repo)
+    series = _dca_series(14)
+    _seed_history(repo, series)
+    broker = FakeBroker(series={(PRODUCT, Granularity.ONE_DAY): series})
+
+    # 30 days later the stored series is long stale (interval_sec=50_000 -> ~42h tolerance).
+    result = run_once(broker, repo, _config(), now_ts=45 * DAY + 3_600)
+
+    assert PRODUCT in result.stale_products, "fixture: the product is stale"
+    [skip] = result.skipped_buys
+    assert PRODUCT == skip.product and "stale" in skip.reason
+    # Judged by TODAY, not by the stale series: cycle day 45 buys bar 44, window 42, next 49.
+    assert skip.retry_until == "1970-02-19"
+
+
+def test_a_stale_feed_whose_last_bar_window_already_filled_still_reports_the_current_window(
+    repo, monkeypatch
+):
+    """The last stored bar (day 17) sits in window 14, which FILLED -- judged by that bar the rule
+    is not due and the skip would go silent for as long as the feed stays stale. The cycle on day
+    22 is due for window 21, so it must report that, with window 21's next-window date."""
+    _spy_post(monkeypatch)
+    _live_dca_rule(repo)
+    series = _dca_series(17)
+    _seed_history(repo, series)
+    broker = FakeBroker(series={(PRODUCT, Granularity.ONE_DAY): series})
+    run_once(broker, repo, _config(), now_ts=15 * DAY + 3_600)
+    assert len(broker.place_calls) == 1, "fixture: window 14 filled"
+
+    result = run_once(broker, repo, _config(), now_ts=22 * DAY + 3_600)
+
+    assert PRODUCT in result.stale_products, "fixture: the product is stale"
+    [skip] = result.skipped_buys
+    assert "stale" in skip.reason
+    assert skip.retry_until == "1970-01-29", "window 21 -> the next window opens on day 28"

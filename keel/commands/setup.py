@@ -275,15 +275,18 @@ STEPS: tuple[Step, ...] = (
     ),
     Step(
         key="withdrawals_attested",
-        title="Withdrawal capability attested (rail 17)",
+        title="Withdrawal capability (rail 17)",
         kind=StepKind.JUDGEMENT,
         stage=Stage.LIVE,
         why=(
             "Holding a balance at a venue you cannot withdraw from is a compliance precondition, "
-            "not a technical one, so the rail fails closed until a human says otherwise. The "
-            "attestation carries a 7-day TTL and needs a terminal."
+            "not a technical one. Rail 17 asks the venue itself: before every BUY it reads "
+            "Coinbase's per-wallet allow_withdrawals flag and fails closed if it cannot. There "
+            "is nothing to attest and nothing to renew. The only thing left to you is a manual "
+            "brake, `keel withdrawals attest --suspended`, which halts new entries whatever the "
+            "venue says until you clear it (that needs a terminal)."
         ),
-        how="keel withdrawals attest --enabled   (needs an interactive terminal)",
+        how="nothing to do; keel withdrawals show   (what the venue says, per wallet)",
     ),
     Step(
         key="scope_attested",
@@ -629,20 +632,31 @@ def _asset_observation(conn: sqlite3.Connection, config: Any) -> tuple[bool | No
 
 
 def _withdrawals_observation(conn: sqlite3.Connection) -> tuple[bool | None, str]:
-    """Rail 17's attestation, read from the same `state` row `keel withdrawals show` reads.
+    """Rail 17's step: done unless the operator's manual suspension is set.
 
-    Presence is reported, NOT freshness. The attestation carries a 7-day TTL and the status
-    report computes it properly; duplicating that arithmetic here would be a second place to get
-    it wrong, and this checklist's question is "has this ever been done", not "is it fresh now".
+    Rail 17 reads the venue on every buy (#1010), so there is no attestation whose presence or
+    freshness could be reported -- and this checklist is a pure read of the database, so it makes
+    no venue call. It reports the one stored fact an operator controls, read from the same
+    `state` row `keel withdrawals show` reads. An unreadable value is `None`, not done.
     """
     if not _table_exists(conn, STATE_TABLE):
-        return (False, "no withdrawal attestation")
+        return (True, "read from the venue on every buy -- nothing to attest")
     row = conn.execute(
         f"SELECT value FROM {STATE_TABLE} WHERE key = ?", (WITHDRAWALS_STATE_KEY,)
     ).fetchone()
     if row is None:
-        return (False, "no withdrawal attestation")
-    return (True, "attested at some point -- keel status reports whether it is still fresh")
+        return (True, "read from the venue on every buy -- nothing to attest")
+    try:
+        suspended = json.loads(row[0]) is False
+    except TypeError, ValueError:
+        return (None, "the manual-suspension row could not be decoded")
+    if suspended:
+        return (
+            False,
+            "manually suspended -- rail 17 halts entries; clear with keel withdrawals attest "
+            "--enabled",
+        )
+    return (True, "read from the venue on every buy -- nothing to attest")
 
 
 def _utc_date(ts: int) -> str:

@@ -93,13 +93,7 @@ def _status_report(**overrides: Any) -> StatusReport:
         max_total_dd_pct=Decimal("0.20"),
         max_weekly_dd_pct=Decimal("0.08"),
         rail11_status="ok",
-        withdrawal_attestation=WithdrawalAttestationStatus(
-            state="attested",
-            enabled=True,
-            attested_at=NOW_TS - 86400,
-            expires_in_sec=6 * 86400,
-            expired_for_sec=None,
-        ),
+        withdrawal_attestation=WithdrawalAttestationStatus(suspended=False),
         paper_cash_usdc=Decimal("955.25"),
         open_positions=[
             OpenPositionStatus(
@@ -973,23 +967,25 @@ def test_an_unknown_rail_state_is_unknown_and_not_quietly_good() -> None:
     assert ok["drawdown"]["rail11"]["state"] == "good"
 
 
-def test_an_expired_withdrawal_attestation_reads_as_bad() -> None:
-    """Rail 17's state is the one an operator must act on within a TTL; it arrives judged."""
-    expired = _pulse_payload(
-        _status_report(
-            withdrawal_attestation=WithdrawalAttestationStatus(
-                state="expired",
-                enabled=True,
-                attested_at=NOW_TS - 12 * 86400,
-                expires_in_sec=None,
-                expired_for_sec=5 * 86400,
-            )
-        )
+@pytest.mark.parametrize(
+    ("suspended", "value", "display", "state"),
+    [
+        (True, "on", "ON — entries halted", "bad"),
+        (False, "off", "off", "neutral"),
+        (None, "unknown", "unknown (store unreadable)", "warn"),
+    ],
+)
+def test_rail_17_manual_suspension_arrives_judged_and_tri_state(
+    suspended: bool | None, value: str, display: str, state: str
+) -> None:
+    """#1010: rail 17 has no expiry to show. The one thing an operator sets arrives with its word
+    and its tone, and an unreadable store is `unknown`, never `off`."""
+    rail17 = _pulse_payload(
+        _status_report(withdrawal_attestation=WithdrawalAttestationStatus(suspended))
     )["withdrawal_attestation"]
 
-    assert expired["state"]["state"] == "bad"
-    # `_human_age`, exactly as `_rail17_line` prints it -- "EXPIRED 5d ago", not "5d".
-    assert expired["expired_for"]["display"] == "5d ago"
+    assert set(rail17) == {"suspended"}
+    assert rail17["suspended"] == {"value": value, "display": display, "state": state}
 
 
 # -- presentation-ready: displays are built here, never derivable there ---------------------------
@@ -1360,13 +1356,7 @@ def test_every_builder_survives_a_completely_empty_report() -> None:
         drawdown_total_pct=None,
         drawdown_weekly_pct=None,
         rail11_status="unknown",
-        withdrawal_attestation=WithdrawalAttestationStatus(
-            state="unattested",
-            enabled=None,
-            attested_at=None,
-            expires_in_sec=None,
-            expired_for_sec=None,
-        ),
+        withdrawal_attestation=WithdrawalAttestationStatus(suspended=False),
         paper_cash_usdc=None,
         open_positions=[],
         rule_counts={},

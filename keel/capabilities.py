@@ -21,7 +21,7 @@ as deliberate. #541 deleted the TUI and the console layer that was reachable onl
 and those four rows went with their call sites. `mirrors` stays on the dataclass: it describes a
 shape this registry must be able to express the moment a second front-end gates anything again.
 
-**Eight of the ten capability increases in this build are a CLI command run by a person at a
+**Nine of the eleven capability increases in this build are a CLI command run by a person at a
 terminal, and the browser can perform none of those.** That is not a property of what the client
 draws -- "a client that hides a button is not a gate" -- it is a property of the server, which
 implements no verb that would reach one, asserted by scans over `keel/web/`'s own source.
@@ -98,7 +98,7 @@ BROWSER = Gate(
 #: **`BROWSER` is a SECOND gate and never a seam in the first.** `_is_interactive` is untouched,
 #: still has no env-var or flag override, and every CLI path still requires a real terminal. Two
 #: kinds of evidence for one fact -- a human, present, who meant this -- and the browser's kind
-#: is admitted for two actions out of ten.
+#: is admitted for two actions out of eleven.
 GATES: tuple[Gate, ...] = (TTY, BROWSER)
 
 
@@ -191,8 +191,9 @@ CAPABILITIES: tuple[Capability, ...] = (
         surface="cli",
         invocation="keel withdrawals attest --enabled",
         increases=(
-            "rail 17 stops vetoing: the operator attests that withdrawals are possible at the "
-            "venue, which is what makes holding a balance there permissible rather than assumed"
+            "rail 17's manual suspension is cleared, so new entries are no longer halted by the "
+            "operator's own brake; rail 17 still reads the venue's withdrawal flag on every live "
+            "buy and vetoes it when the venue says no or cannot be read"
         ),
     ),
     Capability(
@@ -227,6 +228,17 @@ CAPABILITIES: tuple[Capability, ...] = (
             "counting its notional -- measured exposure SHRINKS, which is headroom for new "
             "entries. Nothing is placed; the operator is vouching for a sale the venue already "
             "made, and a wrong `--price` books a wrong P&L row into rail 16's streak"
+        ),
+    ),
+    Capability(
+        module="keel.commands.orders",
+        function="_cancel_locally",
+        surface="cli",
+        invocation="keel orders cancel <id> (a live entry left pending with no venue order id)",
+        increases=(
+            "a live BUY row the venue never gave an id is marked canceled without asking the "
+            "venue, so the DCA rule it was blocking buys again on the next cycle. Gated because "
+            "the venue cannot be consulted: if that order did in fact fill, the rule buys twice"
         ),
     ),
     Capability(

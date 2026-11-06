@@ -66,10 +66,12 @@ import logging
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field, replace
+from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Any, Literal
 
 from keel_broker_api.results import MarketSchedule, SessionState
+from keel_core import macos_notify
 from keel_core.products import quote_currency_of
 from keel_core.telemetry import (
     bind_cycle,
@@ -94,7 +96,7 @@ from keel.strategy.reduction import Reduction
 from keel.strategy.rules import sleeve_exit as sleeve_exit_rule
 from keel.strategy.rules.base import Action, Rule, Setup, Signal, completed_days
 from keel.strategy.rules.cusum_event import CusumEvent
-from keel.strategy.rules.dca import Dca, DcaWindowLedger
+from keel.strategy.rules.dca import Dca, DcaCatchUp, window_start_day
 from keel.strategy.rules.profit_take import ProfitTake
 from keel.strategy.rules.pullback_continuation import PullbackContinuation
 from keel.strategy.rules.reverse_dca import ReverseDca
@@ -361,67 +363,6 @@ def _finest_granularity(granularities: list[Granularity]) -> Granularity | None:
     return min(granularities, key=lambda g: _GRANULARITY_ORDER.get(g, 0))
 
 
-_SECONDS_PER_DAY = 86_400
-
-
-def _dca_window_ledger(repo: Repository, rule: Dca, now_ts: int) -> DcaWindowLedger:
-    """The `DcaWindowLedger` a LIVE cycle hands one DCA rule (#1010).
-
-    WHY: rail 17's 7-day attestation can expire under a 14-day cadence and veto the single
-    cadence bar, losing the window. `Dca.detect` stays pure, so this is where the two database
-    facts it needs are read: the bar day of the rule's newest counted (filled or pending) live
-    BUY (a live order acts on yesterday's bar, hence `- 1`), and the bar days it signalled.
-
-    A persisted signal proves the window was due, but `signals` has no mode column and a
-    promoted rule keeps its id, so only signals from the rule's live era count (R13): the lower
-    bound is raised to the start of the UTC day it was promoted (`signals.ts` is the BAR's
-    00:00, so flooring keeps a signal for the bar dated the promotion day itself). It does not
-    keep the bar before that: a rule promoted earlier on the same UTC day as its first live
-    cycle has that cycle act on yesterday's bar, which the floor excludes, so a veto on it is
-    never retried. That errs toward NOT buying and is accepted. A rule with no `promoted_at`
-    (inserted straight at `live`) has no provable live era, so no signal counts and it stays
-    cadence-only.
-    """
-    assert rule.rule_id is not None  # the caller arms only persisted rules
-    last = repo.last_live_buy_created_at(rule.rule_id)
-    last_counted_bar_day = None if last is None else last // _SECONDS_PER_DAY - 1
-    promoted_at = next(
-        (row.get("promoted_at") for row in repo.get_rules("live") if row["id"] == rule.rule_id),
-        None,
-    )
-    if promoted_at is None:
-        return DcaWindowLedger(last_counted_bar_day, frozenset())
-    cadence = int(rule.params["cadence_days"])
-    since = max(
-        (now_ts // _SECONDS_PER_DAY - 2 * cadence - 1) * _SECONDS_PER_DAY,
-        (int(promoted_at) // _SECONDS_PER_DAY) * _SECONDS_PER_DAY,
-    )
-    return DcaWindowLedger(
-        last_counted_bar_day,
-        frozenset(ts // _SECONDS_PER_DAY for ts in repo.signal_ts_since(rule.rule_id, since)),
-    )
-
-
-def _arm_dca_ledger(repo: Repository, rule: Dca, now_ts: int) -> None:
-    """Set `rule.window_ledger` for this cycle; never raises (#1010, R14).
-
-    A failed read costs the retry, never the cycle: on any exception the rule keeps no ledger
-    (today's cadence-only behaviour) and a WARNING says why. Wrapped like `_sleeve_rules` is in
-    `run_once` -- a broken read must not cost the cadence buy.
-    """
-    try:
-        rule.window_ledger = _dca_window_ledger(repo, rule, now_ts)
-    except Exception as exc:  # noqa: BLE001 -- a broken ledger read must not cost the cycle
-        rule.window_ledger = None
-        log_event(
-            logger,
-            logging.WARNING,
-            "agent.dca_window_ledger_failed",
-            rule_id=rule.rule_id,
-            error=str(exc),
-        )
-
-
 def _entry_gate_granularity(rule: Rule, granularities: list[Granularity]) -> Granularity | None:
     """Which granularity's freshness should gate `rule`'s ENTRIES (Finding 1, HIGH)?
 
@@ -440,9 +381,7 @@ def _entry_gate_granularity(rule: Rule, granularities: list[Granularity]) -> Gra
     stale while FIFTEEN_MINUTE stayed perfectly fresh. The coarsest granularity is the fallback
     that fails in the safe direction for any rule that does not tell us what it actually reads:
     it is the input most likely to be what a rule silent about its timeframe is keying off, per
-    this codebase's rules so far. (Since #1010 a live cycle's window ledger also stops that
-    double-buy -- a window with a counted BUY never fires again -- but the freshness gate is still
-    what keeps a stale bar out.)
+    this codebase's rules so far.
 
     Returns `None` only when `granularities` itself is empty -- nothing to gate on at all.
     """
@@ -1241,14 +1180,269 @@ _WARMUP_LOGGED_PRODUCTS: set[str] = set()
 _DAY = 86_400
 
 
+def _buy_executed(order: dict[str, Any]) -> bool:
+    """Whether an order row bought anything: `filled`, or any status with a venue-observed
+    `filled_quantity` above zero.
+
+    A `partially_filled` BUY cancelled through `keel orders cancel` ends `canceled` with its
+    executed quantity still on the row, and reconcile's dead-order path writes `filled` only when
+    the venue reports the fill. Reading `status == "filled"` alone would call that window unbought
+    and buy it a second time. A terminal row that executed nothing (`filled_quantity` absent or
+    zero) spent nothing, so its window is still owed."""
+    if order["status"] == "filled":
+        return True
+    executed = order.get("filled_quantity")
+    return executed is not None and Decimal(executed) > 0
+
+
 def _bought_today(repo: Repository, product_id: str, now_ts: int, *, mode: str) -> bool:
-    """Whether a `mode` BUY of `product_id` FILLED on this UTC day -- the half of "DCA fires
-    today" the ledger can see once the cycle's own buy has gone out (reductions run after it)."""
+    """Whether a `mode` BUY of `product_id` executed on this UTC day (`_buy_executed`) -- the
+    half of "DCA fires today" the ledger can see once the cycle's own buy has gone out
+    (reductions run after it)."""
     start = now_ts - now_ts % _DAY
     return any(
-        order["side"] == Side.BUY.value and int(order["created_at"]) >= start
-        for order in repo.get_orders(mode=mode, product_id=product_id, status="filled")
+        order["side"] == Side.BUY.value
+        and int(order["created_at"]) >= start
+        and _buy_executed(order)
+        for order in repo.get_orders(mode=mode, product_id=product_id)
     )
+
+
+def _dca_order_bar_day(order: dict[str, Any], *, mode: str) -> int:
+    """The epoch day of the daily BAR a DCA BUY row in the `mode` ledger bought.
+
+    The two writers stamp `created_at` differently, so the bar is read per mode: a live row is
+    stamped with the cycle's clock (`executor._order_row`'s `now_ts`), and the cycle on day
+    `d + 1` buys bar `d` (`Dca.detect` reads the latest COMPLETED bar, and the stale-bar gate
+    withholds every entry whose bar is not the one just closed) -- so `created_at // 86400 - 1`.
+    A paper row is stamped with the signal's own ts (`PaperTrader._enter`), which IS the bar's
+    -- so `created_at // 86400`. Reading a paper fill with the live offset would put a
+    window-open buy in the previous window and buy the window again the next day.
+
+    A row with no `created_at` raises: the ledger cannot say which window it filled, and a
+    catch-up is never fired on a ledger the cycle cannot read (`_attach_dca_catch_up`).
+    """
+    created_at = order.get("created_at")
+    if created_at is None:
+        raise ValueError(f"order {order.get('id')} has no created_at; its window is unknown")
+    day = int(created_at) // _DAY
+    return day if mode == "paper" else day - 1
+
+
+def _dca_catch_up_state(
+    repo: Repository, rule: Dca, rule_row: dict[str, Any], *, mode: str
+) -> DcaCatchUp:
+    """What `mode`'s own ledger says about DCA `rule` for its catch-up (#1010; `DcaCatchUp`).
+
+    `mode` is the `orders.mode` value this cycle WRITES -- `"live"` for a live cycle (whatever
+    its executor mode: `executor._order_row` always writes `"live"`), `"paper"` for a paper one
+    (`PaperTrader._enter`) -- so a paper rehearsal of a rule never reads the live fills as its
+    own, nor the reverse. Only this rule's (`orders.rule_id`) BUYs count.
+
+    - `since_day`: `promoted_at // 86400`, else `created_at // 86400`, else `None` (catch-up
+      off: a row that cannot say when it went live is never read as "live since forever").
+    - `filled_window_day`: the window of the rule's most recent BUY that executed anything
+      (`_buy_executed`: `filled`, or a cancelled partial), by the bar it bought
+      (`_dca_order_bar_day`), not by row order.
+    - `in_flight`: a BUY of the rule in `executor.RESTING_STATUSES`.
+
+    Raises on an unreadable ledger; `_attach_dca_catch_up` turns that into "catch-up off".
+    """
+    stamp = rule_row.get("promoted_at")
+    if stamp is None:
+        stamp = rule_row.get("created_at")
+    since_day = None if stamp is None else int(stamp) // _DAY
+    cadence_days = int(rule.params["cadence_days"])
+    buys = [
+        order
+        for order in repo.get_orders(mode=mode)
+        if order.get("rule_id") == rule.rule_id and order["side"] == Side.BUY.value
+    ]
+    filled_bar_days = [
+        _dca_order_bar_day(order, mode=mode) for order in buys if _buy_executed(order)
+    ]
+    resting = tuple(
+        int(order["id"]) for order in buys if order["status"] in executor.RESTING_STATUSES
+    )
+    return DcaCatchUp(
+        since_day=since_day,
+        filled_window_day=(
+            window_start_day(max(filled_bar_days), cadence_days) if filled_bar_days else None
+        ),
+        in_flight=bool(resting),
+        resting_order_ids=resting,
+    )
+
+
+def _attach_dca_catch_up(
+    repo: Repository, rules: list[Rule], rule_rows: list[dict[str, Any]], *, mode: str
+) -> None:
+    """Set `catch_up` on every loaded `Dca` from `mode`'s ledger, before this cycle's
+    `engine.evaluate` and `_dca_fires_today` read `Dca.detect` (#1010).
+
+    Set on EVERY cycle, `None` included, so an instance reused across cycles never carries a
+    previous cycle's answer. A rule with no `rules.id` gets `None` (it has no ledger to read).
+    A lookup that raises costs that rule its catch-up THIS cycle -- `None`, the window-open day
+    only -- and is logged; it never fires a catch-up on a ledger it could not read, and never
+    costs the cycle or another rule's buy.
+    """
+    rows_by_id = {row.get("id"): row for row in rule_rows}
+    for rule in rules:
+        if not isinstance(rule, Dca):
+            continue
+        rule.catch_up = None
+        row = rows_by_id.get(rule.rule_id)
+        if rule.rule_id is None or row is None:
+            continue
+        try:
+            rule.catch_up = _dca_catch_up_state(repo, rule, row, mode=mode)
+        except Exception:  # noqa: BLE001 -- an unreadable ledger disables catch-up, not the cycle
+            log_exception(
+                logger,
+                "agent.dca_catch_up_unreadable",
+                product=rule.product_id,
+                rule_id=rule.rule_id,
+                mode=mode,
+            )
+
+
+#: Characters of a skip reason that reach the notification banner; the full reason is in the
+#: cycle's log line.
+_SKIP_REASON_MAX_CHARS = 180
+
+#: The notification title for a skipped buy.
+SKIPPED_BUY_TITLE = "keel-live: DCA buy skipped"
+
+
+def _epoch_day_date(day: int) -> str:
+    return datetime.fromtimestamp(day * _DAY, tz=UTC).strftime("%Y-%m-%d")
+
+
+def _skipped_dca_buys(
+    rules: list[Rule],
+    now_ts: int,
+    *,
+    enter_signals: list[Signal],
+    enter_results: list[ExecutionResult],
+    stale_products: list[str],
+    blocked_entries: list[BlockedEntry],
+    entries_allowed: bool,
+) -> list[SkippedBuy]:
+    """Every LIVE DCA buy that was due this cycle and did not go out, one per rule (#1010).
+
+    "Due" is `Dca`'s own decision, so a rule that is simply between windows (or whose window
+    already filled) is never reported. Four ways a due buy fails to go out, each a skip:
+
+    - it was signalled and not placed: the rails that vetoed it (`vetoed_by`, verbatim -- rail
+      17's `withdrawal_capability: ...` names the wallet or the unreadable venue), else the
+      executor's `reason`;
+    - the product's feed was stale, so it was never evaluated;
+    - the whole cycle's entries were withheld (`entries_allowed` is false -- some product's gating
+      bar was not ready), so it was never evaluated;
+    - a resting BUY of the rule blocks it (`DcaCatchUp.in_flight`): reported with the local order
+      id and the command that resolves it (`blocked_by`), because nothing else will ever say so.
+
+    The caller runs this on a LIVE cycle only. A rule with no `rules.id` is skipped: the
+    notification is per rule.
+    """
+    signal_result = {
+        sig.rule_id: res
+        for sig, res in zip(enter_signals, enter_results, strict=False)
+        if sig.rule_id is not None
+    }
+    signals_by_rule = {sig.rule_id: sig for sig in enter_signals if sig.rule_id is not None}
+    skipped: list[SkippedBuy] = []
+    for rule in rules:
+        if not isinstance(rule, Dca) or rule.rule_id is None:
+            continue
+        cadence_days = int(rule.params["cadence_days"])
+        blocked_by: tuple[int, ...] = ()
+        signal = signals_by_rule.get(rule.rule_id)
+        window_day: int | None
+        reason: str | None
+        if signal is not None:
+            result = signal_result[rule.rule_id]
+            if result.placed:
+                continue
+            reason = "; ".join(result.vetoed_by) or result.reason
+            window_day = (
+                signal.setup.context.get("window_start_day") if signal.setup is not None else None
+            )
+        else:
+            # By the CLOCK, not the stored series: a stale feed's last bar would judge a window
+            # that closed long ago (silent skip, past retry date). The cycle on day D buys bar D-1.
+            window_day = rule.due_window(now_ts // _DAY - 1, ignore_in_flight=True)
+            if window_day is None:
+                continue
+            if rule.product_id in stale_products:
+                reason = f"{rule.product_id} feed is stale; the buy was not evaluated"
+            elif not entries_allowed:
+                lagging = ", ".join(sorted({f"{b.product} ({b.reason})" for b in blocked_entries}))
+                reason = f"entries withheld this cycle (gating bar not ready: {lagging})"
+            elif rule.catch_up is not None and rule.catch_up.in_flight:
+                blocked_by = rule.catch_up.resting_order_ids
+                ids = ", ".join(f"#{i}" for i in blocked_by)
+                commands = "; ".join(f"`keel orders cancel {i}`" for i in blocked_by)
+                # The one command that resolves it either way (#1010 F1): a row with a venue id is
+                # cancelled AT the venue, one with none -- a placement that raised -- is marked
+                # canceled locally after a typed `yes`. Reconcile settles the first kind on its
+                # own; nothing settles the second.
+                reason = (
+                    f"previous DCA order {ids} is still pending; nothing is bought until it is "
+                    f"resolved ({commands})"
+                )
+            else:
+                continue  # due, not blocked, no signal: nothing this function can name
+        skipped.append(
+            SkippedBuy(
+                rule_id=rule.rule_id,
+                product=rule.product_id,
+                reason=reason,
+                retry_until=(
+                    None if window_day is None else _epoch_day_date(window_day + cadence_days)
+                ),
+                blocked_by=blocked_by,
+            )
+        )
+    return skipped
+
+
+def _post_skipped_buys(
+    repo: Repository,
+    skipped: list[SkippedBuy],
+    now_ts: int,
+    *,
+    post: Callable[[str, str], bool] = macos_notify.post,
+) -> int:
+    """Post a macOS notification for each skipped buy, at most once per rule per UTC day.
+    Returns how many were posted (#1010).
+
+    "Once per rule per day, repeating every day the buy stays skipped" is the spec, so this is
+    deliberately NOT #793's `unreported()` once-per-window dedupe, which would go quiet after the
+    first alert. The memory is `agent_state` `dca_skip_notified:<rule_id>` = the UTC date it was
+    last said; nothing reads it but this function, so a wrong value costs one repeat or one
+    silent day. It is written only after a SUCCESSFUL post: a banner that never showed is not
+    "said", and the next cycle that day tries again.
+    """
+    today = datetime.fromtimestamp(now_ts, tz=UTC).strftime("%Y-%m-%d")
+    posted = 0
+    for skip in skipped:
+        key = f"dca_skip_notified:{skip.rule_id}"
+        if repo.get_state(key) == today:
+            continue
+        message = f"{skip.product} (rule {skip.rule_id}): {skip.reason[:_SKIP_REASON_MAX_CHARS]}."
+        if skip.blocked_by:
+            # Blocked, not retrying: the rule buys nothing until the order is resolved, so a
+            # "Retrying daily" promise would be false (#1010 F4). Outside the reason's cut, so
+            # the command always reaches the banner.
+            commands = "; ".join(f"keel orders cancel {i}" for i in skip.blocked_by)
+            message += f" Blocked until that order is resolved: {commands}."
+        elif skip.retry_until is not None:
+            message += f" Retrying daily until {skip.retry_until}."
+        if post(SKIPPED_BUY_TITLE, message):
+            repo.set_state(key, today)
+            posted += 1
+    return posted
 
 
 def _dca_fires_today(
@@ -1267,11 +1461,15 @@ def _dca_fires_today(
     the buy was vetoed or withheld (the day is still a buy day, and a sale beside it would be
     the round trip the exclusion exists to prevent); the ledger answers it for a buy that went out
     under a rule this cycle did not load. A DCA whose `detect` RAISES counts as firing -- the
-    refusal is the direction that costs nothing.
+    refusal is the direction that costs nothing. So does one with a BUY still in flight
+    (`DcaCatchUp.in_flight`, #1010): `detect` answers `None` for it, but a sale beside a buy
+    that may yet fill is the same round trip.
     """
     for rule in product_rules:
         if not isinstance(rule, Dca):
             continue
+        if rule.catch_up is not None and rule.catch_up.in_flight:
+            return True
         try:
             if rule.detect(candles_by_tf) is not None:
                 return True
@@ -2206,6 +2404,27 @@ def _slot_market_closed(repo: Repository, config: Config, now_ts: int, venue: st
 
 
 @dataclass(frozen=True)
+class SkippedBuy:
+    """A live DCA buy that was due this cycle and did not go out (#1010), and why.
+
+    `reason` is for the operator's screen: the rails that vetoed it verbatim, or the executor's
+    own reason, or what withheld it before an order was ever built. `retry_until` is the UTC date
+    (`YYYY-MM-DD`) the rule's NEXT window opens -- the day the daily retries stop -- or `None`
+    when the cycle could not say.
+    """
+
+    rule_id: int
+    product: str
+    reason: str
+    retry_until: str | None = None
+    #: The local `orders.id`s of a resting BUY blocking the rule (`DcaCatchUp.in_flight`). A
+    #: blocked rule does NOT retry daily -- it buys nothing until the order is resolved -- so the
+    #: banner says that instead of `retry_until`'s "Retrying daily until" (#1010 F4). `()` for
+    #: every other skip.
+    blocked_by: tuple[int, ...] = ()
+
+
+@dataclass(frozen=True)
 class LoopResult:
     """The outcome of one `run_once` cycle."""
 
@@ -2242,6 +2461,10 @@ class LoopResult:
     paper_equity: Decimal | None = None
     drawdown_total_pct: Decimal | None = None
     drawdown_weekly_pct: Decimal | None = None
+    # #1010: the live DCA buys that were due this cycle and did not go out, one per rule. Always
+    # empty on a paper cycle (nothing there can be "skipped" in a way the operator must hear
+    # about). Defaulted so every existing `LoopResult(...)` construction stays valid.
+    skipped_buys: list[SkippedBuy] = field(default_factory=list)
 
 
 def _effective_mode(
@@ -2377,13 +2600,10 @@ def run_once(
         # row is built, and loaded on their own by `_sleeve_rules` (which also reads `paper`
         # rows in a live cycle, R16). Their products join the poll set, so the reduction step
         # at the end of the cycle has candles to decide on.
+        rule_rows = [row for row in repo.get_rules(rule_status) if not _is_sleeve_kind(row["kind"])]
         rules = [
             rule
-            for rule in (
-                _build_rule(row)
-                for row in repo.get_rules(rule_status)
-                if not _is_sleeve_kind(row["kind"])
-            )
+            for rule in (_build_rule(row) for row in rule_rows)
             if promotion.promotion_class_of(rule) != promotion.SLEEVE_SELL
         ]
         # `_sleeve_rules` reads `repo.get_rules("paper")` even in a LIVE cycle (R16), and a
@@ -2475,6 +2695,17 @@ def run_once(
         # optional: the rail refuses to PLACE into an empty holding, and this cancels what is
         # already resting. Neither subsumes the other.)
         reconcile.sweep_orphan_brackets(broker, repo, now_ts)
+
+        # DCA catch-up (#1010): each `Dca` reads THIS cycle's ledger -- the `orders.mode` the
+        # cycle writes: "paper" on the paper path, and "live" for BOTH executor modes
+        # (`executor._order_row`), never `mode`/`reported_mode`'s "confirm"/"autonomous" -- before
+        # `engine.evaluate` and `_dca_fires_today` (sleeve reductions) call its `detect`. AFTER
+        # the three reconcile passes above, which never call `detect`: a BUY that filled since the
+        # last cycle is booked there, and read before it the settled row would count as in flight
+        # and block (and report) a buy that is free to go out.
+        _attach_dca_catch_up(
+            repo, rules, rule_rows, mode="paper" if paper_trader is not None else "live"
+        )
 
         # Rail 11's inputs, refreshed BEFORE any entry this cycle. `poll_once` above has already
         # written the candles, so every product's latest price is readable here -- and it has to
@@ -2756,12 +2987,6 @@ def run_once(
                 # persisted, or logged, and `enter_signals` stays empty for the whole cycle.
                 continue
 
-            if paper_trader is None:
-                # Live cycles only (#1010, R7): paper and sim stay cadence-only. Rules are
-                # rebuilt every cycle, so the ledger never outlives it.
-                for dca_rule in product_rules:
-                    if isinstance(dca_rule, Dca) and dca_rule.rule_id is not None:
-                        _arm_dca_ledger(repo, dca_rule, now_ts)
             product_signals = engine.evaluate(product_rules, candles_by_tf, repo=repo)
             log_event(
                 logger,
@@ -2773,23 +2998,6 @@ def run_once(
             )
             for signal in product_signals:
                 enter_signals.append(signal)
-                missed_ts = (
-                    signal.setup.context.get("previous_window_missed_ts")
-                    if signal.setup is not None
-                    else None
-                )
-                if missed_ts is not None:
-                    # #1010 R4: the previous DCA window was signalled but never bought. Reported,
-                    # never back-filled, never routed to notifications.
-                    log_event(
-                        logger,
-                        logging.WARNING,
-                        "agent.dca_window_missed",
-                        product=product_id,
-                        rule=signal.rule_name,
-                        rule_id=signal.rule_id,
-                        window_start_ts=missed_ts,
-                    )
                 if paper_trader is not None:
                     if paper_equity is None:
                         log_event(
@@ -2974,6 +3182,24 @@ def run_once(
         except Exception:  # noqa: BLE001 -- the monitor must never cost the cycle
             log_exception(logger, "agent.exit_watch_failed")
 
+        # #1010: the live DCA buys due this cycle that did not go out. LIVE only -- a paper cycle
+        # has no operator to tell. Wrapped: building the list is a diagnostic, and a failure there
+        # must cost neither the cycle nor (below) the notification of nothing.
+        skipped_buys: list[SkippedBuy] = []
+        if paper_trader is None:
+            try:
+                skipped_buys = _skipped_dca_buys(
+                    rules,
+                    now_ts,
+                    enter_signals=enter_signals,
+                    enter_results=enter_results,
+                    stale_products=stale_products,
+                    blocked_entries=blocked_entries,
+                    entries_allowed=entries_allowed,
+                )
+            except Exception:  # noqa: BLE001 -- a diagnostic must never cost the cycle
+                log_exception(logger, "agent.skipped_buys_failed")
+
         cycle_result = LoopResult(
             ts=now_ts,
             skipped=False,
@@ -2992,6 +3218,7 @@ def run_once(
             paper_equity=result_paper_equity,
             drawdown_total_pct=result_drawdown_total_pct,
             drawdown_weekly_pct=result_drawdown_weekly_pct,
+            skipped_buys=skipped_buys,
         )
 
         # Post-cycle notifications (#444): derive the opted-in events from the same seams
@@ -3003,6 +3230,15 @@ def run_once(
         from keel.notifications import notify_after_cycle
 
         notify_after_cycle(repo, config, cycle_result, now_ts)
+
+        # Then the macOS banner for each skipped live DCA buy (#1010) -- the channel that reaches
+        # the operator on a zero-exit cycle, which `notify_after_cycle` does not on a deployment
+        # with no webhook. LAST, so nothing above waits on it, and wrapped on its own: a
+        # notification failure (the post, or the dedupe write) never fails the cycle.
+        try:
+            _post_skipped_buys(repo, cycle_result.skipped_buys, now_ts)
+        except Exception:  # noqa: BLE001 -- a notification must never cost the cycle
+            log_exception(logger, "agent.skipped_buy_notify_failed")
 
         return cycle_result
     finally:

@@ -1,5 +1,7 @@
 # Rail 17 TTL vs DCA Cadence Implementation Plan (#1010)
 
+> **Superseded by #1016** (`docs/superpowers/specs/2026-11-06-rail-17-venue-read-and-dca-catchup-design.md`). Merged as #1013, then replaced on main: the TTL, its expiry warnings and the window ledger described below no longer exist.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Stop rail 17's 7-day withdrawal-attestation TTL from silently starving the 14-day DCA rules. Three surfaces warn when a live DCA rule's next buy falls after the attestation expires. A DCA window vetoed by a guard is retried on later fresh daily bars of the same window, with at most one buy per window per rule. The rail-17 veto text stops implying that DCA is exempt.

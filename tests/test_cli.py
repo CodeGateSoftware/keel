@@ -13,6 +13,7 @@ read-only commands (`db import`, `monitor`, `rules list`, `pnl`) need no confirm
 from __future__ import annotations
 
 import time
+from collections.abc import Sequence
 from decimal import Decimal
 from pathlib import Path
 from types import SimpleNamespace
@@ -55,12 +56,29 @@ def _repo_at(db_path: Path) -> Repository:
 class FakeBroker:
     """No-network fake: canned (empty) candles + always-successful order responses."""
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        withdrawals: dict[str, bool | None] | None = None,
+        withdrawals_raises: BaseException | None = None,
+    ) -> None:
         self.get_candles_calls: list[tuple] = []
+        # Rail 17 reads per-wallet `allow_withdrawals` from the venue (#1010). `None` means every
+        # currency answers True; a dict answers per currency (`None` = no wallet).
+        self._withdrawals = withdrawals
+        self._withdrawals_raises = withdrawals_raises
+        self.withdrawals_calls = 0
 
     def get_candles(self, product_id: str, granularity: Any, start: int, end: int) -> list:
         self.get_candles_calls.append((product_id, granularity, start, end))
         return []
+
+    def withdrawals_allowed(self, currencies: Sequence[str]) -> dict[str, bool | None]:
+        self.withdrawals_calls += 1
+        if self._withdrawals_raises is not None:
+            raise self._withdrawals_raises
+        if self._withdrawals is None:
+            return {c: True for c in currencies}
+        return {c: self._withdrawals.get(c) for c in currencies}
 
     def preview_order(self, spec: OrderSpec) -> Preview:
         return Preview(
@@ -2309,6 +2327,135 @@ def test_withdrawals_attest_ENABLED_proceeds_on_a_typed_yes(tmp_path, monkeypatc
 
     assert result.exit_code == 0, result.output
     assert _repo_at(db).get_state("withdrawals_enabled") is True
+
+
+def test_attest_enabled_says_it_clears_suspension_and_never_expires(tmp_path, monkeypatch):
+    """#1010: rail 17 reads the venue per buy, so `--enabled` only clears the manual brake. It
+    must not promise a TTL, and must not write the timestamp that used to carry one."""
+    _at_a_terminal(monkeypatch)
+    db = tmp_path / "w4.db"
+    _repo_at(db).set_state("withdrawals_enabled", False)
+
+    result = CliRunner().invoke(
+        cli, ["--db", str(db), "withdrawals", "attest", "--enabled"], input="yes\n"
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "manual suspension cleared" in result.output
+    assert "expires" not in result.output
+    assert _repo_at(db).get_state("withdrawals_attested_at") is None
+
+
+def test_attest_suspended_has_no_expiry(tmp_path, monkeypatch):
+    _at_a_terminal(monkeypatch, yes=False)
+    db = tmp_path / "w5.db"
+    _repo_at(db)
+
+    result = CliRunner().invoke(cli, ["--db", str(db), "withdrawals", "attest", "--suspended"])
+
+    assert result.exit_code == 0, result.output
+    assert "expires" not in result.output
+    assert "entries" in result.output.lower() and "halted" in result.output.lower()
+    from keel.execution import executor
+
+    assert executor.manual_withdrawal_suspension(_repo_at(db)) is True
+    assert _repo_at(db).get_state("withdrawals_attested_at") is None
+
+
+def _withdrawals_show(tmp_path, valid_config_path, monkeypatch, broker, *, rules=("BTC-USD",)):
+    """Run `withdrawals show` against `broker`, recording the kwargs the broker was built with."""
+    built: dict[str, Any] = {}
+
+    def fake_build(config, **kw):
+        built.update(kw)
+        if isinstance(broker, BaseException):
+            raise broker
+        return broker
+
+    monkeypatch.setattr("keel.commands.withdrawals._build_broker", fake_build)
+    db = tmp_path / "show.db"
+    repo = _repo_at(db)
+    for product in rules:
+        repo.insert_rule("dca", {"product_id": product}, status="live")
+    result = CliRunner().invoke(
+        cli, ["--db", str(db), "--config", str(valid_config_path), "withdrawals", "show"]
+    )
+    return result, built, db
+
+
+def test_show_prints_venue_answer_per_wallet(tmp_path, valid_config_path, monkeypatch):
+    import re
+
+    broker = FakeBroker(withdrawals={"USD": True, "BTC": False})
+    result, built, _db = _withdrawals_show(tmp_path, valid_config_path, monkeypatch, broker)
+
+    assert result.exit_code == 0, result.output
+    assert "manual suspension: off" in result.output
+    assert re.search(r"BTC\s+withdrawals disabled", result.output), result.output
+    assert re.search(r"USD\s+allowed", result.output), result.output
+    assert broker.withdrawals_calls == 1
+    assert built.get("timeout"), "the venue read must be bounded"
+    assert built.get("repo") is not None
+
+
+def test_show_says_no_wallet_for_an_unheld_asset(tmp_path, valid_config_path, monkeypatch):
+    import re
+
+    broker = FakeBroker(withdrawals={"USD": True})  # BTC -> None: no wallet
+    result, _built, _db = _withdrawals_show(tmp_path, valid_config_path, monkeypatch, broker)
+
+    assert result.exit_code == 0, result.output
+    assert re.search(r"BTC\s+no wallet", result.output), result.output
+
+
+def test_show_reports_unreadable_venue_without_failing(tmp_path, valid_config_path, monkeypatch):
+    broker = FakeBroker(withdrawals_raises=TimeoutError("boom"))
+    result, _built, _db = _withdrawals_show(tmp_path, valid_config_path, monkeypatch, broker)
+
+    assert result.exit_code == 0, result.output
+    assert "venue unreadable: TimeoutError" in result.output, "F6: say what failed"
+    assert "manual suspension: off" in result.output
+
+
+def test_show_reports_unbuildable_broker_without_failing(tmp_path, valid_config_path, monkeypatch):
+    result, _built, _db = _withdrawals_show(
+        tmp_path, valid_config_path, monkeypatch, RuntimeError("no credentials")
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "venue unreadable: RuntimeError" in result.output
+
+
+def test_show_names_a_manual_suspension(tmp_path, valid_config_path, monkeypatch):
+    broker = FakeBroker()
+    monkeypatch.setattr("keel.commands.withdrawals._build_broker", lambda config, **kw: broker)
+    db = tmp_path / "show2.db"
+    _repo_at(db).set_state("withdrawals_enabled", False)
+
+    result = CliRunner().invoke(
+        cli, ["--db", str(db), "--config", str(valid_config_path), "withdrawals", "show"]
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "manual suspension: ON" in result.output
+
+
+def test_show_renders_an_unreadable_store_as_unknown_never_off(
+    tmp_path, valid_config_path, monkeypatch
+):
+    broker = FakeBroker()
+    monkeypatch.setattr("keel.commands.withdrawals._build_broker", lambda config, **kw: broker)
+    monkeypatch.setattr("keel.execution.executor._stored_suspension", lambda repo: None)
+    db = tmp_path / "show3.db"
+    _repo_at(db)
+
+    result = CliRunner().invoke(
+        cli, ["--db", str(db), "--config", str(valid_config_path), "withdrawals", "show"]
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "manual suspension: unknown (store unreadable)" in result.output
+    assert "manual suspension: off" not in result.output
 
 
 def test_autonomy_on_for_hours_sets_an_expiry_that_lapses(tmp_path, monkeypatch, valid_config_path):

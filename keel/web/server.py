@@ -28,8 +28,8 @@ So `do_POST` exists, and it routes through exactly two tables. `/api/setup/<key>
 switch, ungated on purpose -- refusing a stop is the one failure it must not have) and the gated
 halt releases in `gates.TIER1_ACTIONS` (`resume`, `resume-entries`), which demand a loopback
 session on a loopback bind, the gate token (which no endpoint serves, #968) and a typed phrase;
-the halt takes a halt token of its own. The guarantee is that **eight of the
-ten capability-increasing actions in `keel/capabilities.py` are unreachable from this package and
+the halt takes a halt token of its own. The guarantee is that **nine of the
+eleven capability-increasing actions in `keel/capabilities.py` are unreachable from this package and
 the other two only as that gate table declares them**, asserted by a test that scans this source
 rather than by inspection. "No POST" said the server could not write; this says it cannot arm,
 attest or spend -- which is the property anyone actually cares about.
@@ -243,7 +243,7 @@ SWITCH_PREFIX = "/switch/"
 #:
 #: The action SET is unchanged by all of this, and that is the invariant that matters more than the
 #: path: `keel.commands.setup.ACTIONS` still contains only idempotent, non-destructive,
-#: `MECHANICAL` steps, and a test still asserts it is disjoint from the ten capability-
+#: `MECHANICAL` steps, and a test still asserts it is disjoint from the eleven capability-
 #: increasing actions in `keel/capabilities.py`. A browser can set a deployment up. It still cannot
 #: arm a rule, attest an asset or enable autonomy.
 API_SETUP_PREFIX = "/api/setup/"

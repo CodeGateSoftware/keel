@@ -19,8 +19,7 @@ Design home: `docs/superpowers/specs/2026-07-16-keel-broker-abstraction-design.m
 ## Pre-live checklist
 
 Run through this **before arming the agent for live trading**, and re-check after any change to the
-Coinbase account. Item 3 is not a one-time check: it recurs **weekly** for as long as the agent
-runs.
+Coinbase account. Item 3 is not a checklist step: it says what to do when a DCA buy is skipped.
 
 ### 1. ⛔ Disable interest / rewards on idle balances — **required**
 
@@ -70,39 +69,38 @@ A zakat estimate (~2.5% of holdings' market value per lunar year) is a **positiv
 item 1's prohibition, and it is informational: keel reports, you decide and discharge it. Tracked at
 KB §33.1. No pre-live action; noted here so the account-level obligation set is complete in one place.
 
-### 3. Withdrawal-capability attestation — **weekly refresh** (rail 17)
+### 3. A macOS notification says a DCA buy was skipped
 
-**Why.** Rail 17 (§65.4 *qabd*) halts all BUY entries unless the withdrawal-capability attestation is
-fresh, and "fresh" means a **7-day TTL** (`WITHDRAWAL_ATTESTATION_TTL_SEC`,
-`keel/execution/executor.py`). An expired attestation reads as UNKNOWN, and rail 17 fails closed on
-unknown — live DCA buys are vetoed. That is not hypothetical: on **2026-08-14** it vetoed the only
-live DCA signal because the attestation had lapsed, and as of 2026-08-17 every deployment's
-attestation was weeks stale, so rail 17 was halting entries on the **live** deployment (it is a
-`LIVE_STATE` rail, skipped in paper, where a stale attestation matters only to the status display).
-Each deployment carries its own attestation (they do not share a database), so the live one must be
-refreshed for the rail and the paper ones to quiet their status lines.
+keel itself posts a notification titled "keel-live: DCA buy skipped" when a live DCA buy was due
+and did not place, at most once per rule per UTC day, repeating each day while it stays skipped.
+Set `KEEL_DISABLE_MACOS_NOTIFY` to silence it. A DCA order stuck `pending` is reported daily too,
+naming the order id.
 
-Rail 17 fails closed by itself — what it cannot do is refresh its own input, and that input is
-deliberately human (see the warning below). This entry is the cadence obligation the rail cannot
-enforce, which is why it lives here rather than in `guards.py`.
+**What to do.** Read the reason in the notification; what clears it depends on the reason.
 
-**How to verify.** `keel status` prints the rail-17 line with days-to-expiry (`attested, expires in
-3d`, `EXPIRED 12d ago`, or `never attested`) — staleness is visible there *before* it vetoes, not
-only in the veto log. `keel withdrawals show` reads the same state with the age to one decimal.
+- **A stale feed or a cash shortfall** clears on its own once the feed catches up or the cash
+  arrives. keel retries the buy on each later daily cycle until it fills or the rule's next window
+  opens ("Retrying daily until ..."), at most one fill per rule per window.
+- **A rail veto** names the rail and what clears it, verbatim; follow that. Some rails clear on
+  their own (an unreadable venue on rail 17), others need you (an attestation, a halt release).
+- **A stuck order** ("previous DCA order #N is still pending ... Blocked until that order is
+  resolved") does NOT retry: a resting (`pending`/`partially_filled`) DCA order blocks the rule
+  until it is resolved. Reconcile settles one the venue gave an id on its own cycle. One the venue
+  never gave an id (the placement raised, e.g. a timeout) is settled by nothing, so run
+  `keel orders cancel N` at a terminal: first check in the Coinbase app that no such order exists
+  and nothing filled, then type `yes`. keel marks the row canceled locally without contacting the
+  venue, and the rule catches up on the next cycle.
+- **A manual suspension** (rail 17's `--suspended` switch) stays until you clear it with
+  `keel withdrawals attest --enabled`.
 
-**Cadence.** Re-attest **weekly** — a calendar reminder is the intended mechanism. Confirm the
-balances really are withdrawable on demand, then, per deployment:
+Catch-up only covers windows whose buying cycle ran after the rule went live. `keel dca-plan` states that
+catch-up can add up to one buy per rule to a calendar month; rail 14 still bounds the total.
 
-```bash
-keel withdrawals attest --enabled
-keel --config config.live-sandbox.yaml --db keel-live.db withdrawals attest --enabled
-```
-
-> ⚠️ **The typed confirmation is deliberately human.** `--enabled` RELEASES a rail-17 entry halt and
-> demands a typed `yes` at a terminal — so that a scheduled job can never release a §65.4 halt, the
-> same posture as `keel autonomy on`. Do not script this command and do not pipe a `yes` into it:
-> the weekly habit is the fix for staleness, and automating the release would undo the rail. If a
-> calendar reminder ever feels like it should be a cron job, re-read this warning.
+Rail 17 (withdrawal capability) needs no weekly chore: it reads the venue's `allow_withdrawals`
+flag for the order's wallets on every live BUY (`docs/rails/rail-17-withdrawal-capability.md`).
+`keel withdrawals show` prints the manual suspension and the venue's per-wallet answer;
+`keel withdrawals attest --suspended` is a manual brake with no expiry, and `--enabled` clears it
+(typed `yes` at a terminal).
 
 ---
 
@@ -723,11 +721,12 @@ candidates carries the purification obligation in their own records.
 an ACATS transfer to another broker. It is attested like any venue:
 
 ```bash
-keel --config config.paper-equities.yaml --db keel-equities.db withdrawals attest --enabled
+keel --config config.paper-equities.yaml --db keel-equities.db withdrawals show
 ```
 
-Rail 17 is a live-state rail (skipped in paper), so this is recorded for the day live is ever
-considered, and it lapses weekly like every deployment's attestation.
+Rail 17 is a live-state rail (skipped in paper). It reads the venue's own withdrawal flag, not an
+attestation, so there is nothing to record or renew; the venue read for an equities broker is
+whatever that adapter supports, and a broker without it fails closed on a live BUY.
 
 ### T+1 settlement × daily cadence
 
@@ -1035,8 +1034,9 @@ covers the rest from a plain shell.
 **What the browser cannot do, and that is deliberate.** Every capability-increasing action --
 arming autonomy, releasing the kill-switch, clearing a consecutive-loss halt, re-seeding the
 drawdown high-water mark, declaring a deposit or withdrawal, attesting withdrawal capability, scope
-or posture, declaring an out-of-band close, and replacing the binary -- is a CLI command behind a
-typed confirmation at an interactive terminal. `keel capabilities` lists all ten with the gate
+or posture, declaring an out-of-band close, cancelling a stuck order the venue never gave an id,
+and replacing the binary -- is a CLI command behind a typed confirmation at an interactive
+terminal. `keel capabilities` lists all eleven with the gate
 covering each. The one exception is the console's
 HALT button, which engages the kill-switch (stopping is never gated). The server's gated routes
 under `/api/gates/` can also release the kill-switch and clear the consecutive-loss halt, but only
@@ -1110,7 +1110,7 @@ no handler attached at all: an offline install makes zero network calls. This ch
 unchanged by the notification layer below and stays independent of it.
 
 **Opt-in event notifications (default OFF).** The events an operator most needs are silent
-precisely because they are not errors — rail 17's attestation nearing expiry fails CLOSED and
+precisely because they are not errors — a lapsed attestation fails CLOSED and
 quietly vetoed a real setup for weeks before anyone opened the TUI, the console of the day (#541). The notification layer
 (#444) delivers those over the SAME generic webhook, per-event opt-in in Freqtrade's
 `notification_settings` shape:
@@ -1121,7 +1121,7 @@ quietly vetoed a real setup for weeks before anyone opened the TUI, the console 
 notifications:
   format: plain        # plain = generic JSON (default); slack = {"text": ...} chat payload
   events:
-    attestation.expiring: true
+    attestation.expiring: true     # rail 22 (cash posture) attestation only
     rail.armed: true
     setup.unplaced: true
     allowance.nearing_exhaustion: true
@@ -1135,7 +1135,7 @@ doctor's own findings, so the alert and the diagnostic can never disagree):
 
 | Event key | Fires when | Why it is not a CRITICAL log |
 |---|---|---|
-| `attestation.expiring` | rail-17 withdrawal attestation has ≤2 of its 7 TTL days left (or has expired, or was never attested) | an expired attestation silently vetoes every entry — cycles keep running, nothing errors |
+| `attestation.expiring` | the rail-22 cash-posture attestation is near expiry, expired, or never made (rail 17 no longer has an attestation or an expiry) | an expired attestation silently vetoes every entry — cycles keep running, nothing errors |
 | `rail.armed` | rail 16's consecutive-loss halt arms, or rail 11's drawdown reaches 20% | a halt is a correct state, not a fault; the kill switch is deliberately absent (you engaged it at a terminal — you know) |
 | `setup.unplaced` | a cycle detected an entry setup and could not place it | the veto is a WARNING; the rail-17 incident looked like a quiet week |
 | `allowance.nearing_exhaustion` | month-to-date BUY spend reaches 80% of the in-force rail-14 allowance — or there is spend against an allowance of 0 (no subscription in force: lapsed or never attested) | rail 14 only speaks when it vetoes, which is too late to re-tier |

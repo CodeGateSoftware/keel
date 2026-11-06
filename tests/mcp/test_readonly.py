@@ -85,6 +85,8 @@ FORBIDDEN_SUBSTRINGS: tuple[str, ...] = (
     "place",
     # `keel positions close` (#798, P4): declaring an out-of-band sale shrinks measured exposure.
     "close",
+    # `keel orders cancel` (#1010 F1): a local-only cancel releases a DCA rule a stuck order blocks.
+    "cancel",
 )
 
 #: A lower->Upper boundary is where two words are glued without any separator a human would

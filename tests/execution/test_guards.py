@@ -1523,12 +1523,28 @@ def test_rail17_fails_CLOSED_on_unknown(repo: Repository) -> None:
     assert "withdrawal_capability" in _keys(result)
 
 
-def test_rail17_unknown_text_does_not_imply_dca_is_exempt(repo: Repository) -> None:
-    for is_dca in (False, True):
-        result = check(_intent(withdrawals_enabled=None, is_dca=is_dca), repo, _config(), NOW_TS)
-        (text,) = [v for v in result.violations if v.startswith("withdrawal_capability:")]
-        assert "DCA-exempt" not in text
-        assert "DCA buys are NOT exempt" in text
+def test_rail17_messages_carry_the_venue_detail_and_no_attestation_advice(
+    repo: Repository,
+) -> None:
+    """The remedy is no longer "attest": the verdict comes from the venue, and says why."""
+    for state, word in ((None, "UNKNOWN"), (False, "SUSPENDED")):
+        intent = _intent(withdrawals_enabled=state, withdrawals_detail="USD wallet says no")
+        result = check(intent, repo, _config(), NOW_TS)
+        (msg,) = [v for v in result.violations if v.startswith("withdrawal_capability")]
+        assert word in msg
+        assert "(USD wallet says no)" in msg
+        assert "DCA-exempt" not in msg
+        assert "attest" not in msg
+
+
+def test_rail17_unknown_promises_a_retry_only_to_a_dca_buy(repo: Repository) -> None:
+    """F5: catch-up is DCA-only. A DCA buy refused on an unreadable venue is retried within its
+    window; any other BUY is not, so its message must not say it is."""
+    for is_dca, promised in ((True, True), (False, False)):
+        intent = _intent(withdrawals_enabled=None, withdrawals_detail="venue down", is_dca=is_dca)
+        result = check(intent, repo, _config(), NOW_TS)
+        (msg,) = [v for v in result.violations if v.startswith("withdrawal_capability")]
+        assert ("retried" in msg) is promised, msg
 
 
 def test_rail17_passes_when_withdrawals_are_attested_enabled(repo: Repository) -> None:

@@ -19,6 +19,7 @@ from keel_core.subscription import SubscriptionStatus
 
 from keel.commands import dca_plan as dca_mod
 from keel.commands.dca_plan import (
+    CATCHUP_NOTE,
     RAIL14_NOTE,
     DcaPlanError,
     DcaPlanRefused,
@@ -1553,3 +1554,14 @@ def test_a_locked_database_mid_write_names_the_rows_already_written(
     # Non-vacuous: the patch reached the two calls `apply_dca_plan`'s write loop made before
     # the refusal (one delegated to the real writer, one raised).
     assert calls["n"] == 2
+
+
+def test_the_rendered_plan_says_catch_up_can_add_a_buy_and_rail_14_still_bounds_it(
+    valid_config_path: Path,
+) -> None:
+    lines = render_dca_plan(_plan(valid_config_path))
+    assert sum(CATCHUP_NOTE in line for line in lines) == 1
+    assert "up to one buy per rule" in CATCHUP_NOTE
+    assert "rail 14" in CATCHUP_NOTE.lower()
+    # It sits in the cap block, before the schedule, next to the rail 14 note.
+    assert lines.index(f"  {CATCHUP_NOTE}") < lines.index("== Schedule ==")

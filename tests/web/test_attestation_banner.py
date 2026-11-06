@@ -1,8 +1,10 @@
 """The cockpit's attestation banner (#793).
 
-The evidence this exists for: rail 17 expired on 2026-09-08 and the Status page read
+The evidence this exists for: an attestation expired on 2026-09-08 and the Status page read
 `expired · EXPIRED FOR 2d ago` for three days while live placed no orders and nobody noticed.
 The state was on screen. It was a field in a card, below the fold, on one page of eleven.
+Since #1010 the banner serves rail 22 alone: rail 17 reads the venue per buy and has no expiry,
+so it is never a banner row -- its manual suspension is a card line, not an alert.
 
 So the banner is carried by the ENVELOPE rather than by the status payload -- every page gets
 it, including the ones an operator is actually looking at when the attestation lapses. The key
@@ -29,8 +31,10 @@ HOUR = 3_600
 
 
 def _at(state: str) -> attestations.Attestation:
-    """One attestation of `key` "withdrawal", positioned to be in `state` at `NOW`."""
-    definition = attestations.definition("withdrawal")
+    """One attestation of `key` "cash_posture" (rail 22), positioned to be in `state` at `NOW`."""
+    from keel_core.cash_posture import ATTESTATION_TTL_SEC
+
+    definition = attestations.definition("cash_posture")
     if state == attestations.MISSING:
         return definition
     offsets = {
@@ -39,7 +43,6 @@ def _at(state: str) -> attestations.Attestation:
         attestations.EXPIRED: -3 * 86_400,
     }
     expires_at = NOW + offsets[state]
-    made = expires_at - attestations.withdrawal_expiry(attested_at=0)
     assert definition.__class__ is attestations.Attestation
     return attestations.Attestation(
         key=definition.key,
@@ -47,7 +50,7 @@ def _at(state: str) -> attestations.Attestation:
         label=definition.label,
         remedy=definition.remedy,
         warn_within_sec=definition.warn_within_sec,
-        attested_at=made,
+        attested_at=expires_at - ATTESTATION_TTL_SEC,
         expires_at=expires_at,
     )
 
@@ -68,10 +71,10 @@ def test_anything_but_ok_reaches_the_banner(state: str) -> None:
 
 
 def test_the_banner_names_the_remedy_because_the_browser_cannot_run_it() -> None:
-    """Rails 17 and 22 are attested from a TTY and #781 deliberately did not put them behind the
-    browser gate. A banner that says "expired" without the command is a dead end."""
+    """Rail 22 is attested from a TTY and #781 deliberately did not put it behind the browser
+    gate. A banner that says "expired" without the command is a dead end."""
     (alert,) = payload.attestation_alerts([_at(attestations.EXPIRED)], NOW)
-    assert alert["remedy"] == "keel withdrawals attest --enabled"
+    assert alert["remedy"] == "keel posture attest --spot-cash"
 
 
 def test_an_expiry_is_bad_and_an_approaching_one_is_a_warning() -> None:
@@ -134,30 +137,28 @@ def _cfg(deployment: tuple[str, str]) -> Any:
 def test_every_endpoint_answers_with_the_banner_not_just_the_status_one(
     deployment: tuple[str, str],
 ) -> None:
-    """The point of putting it on the envelope. A fresh deployment has attested nothing, so rails
-    17 and 22 are both `MISSING` and every page says so."""
+    """The point of putting it on the envelope. A fresh deployment has attested no posture, so
+    rail 22 is `MISSING` and every page says so -- and rail 17 is never among them (#1010)."""
     from keel.web import api as web_api
 
     for path in ("/api/pulse", "/api/orders", "/api/holdings"):
         _, document = web_api.respond(_cfg(deployment), path, {})
         rails = {alert["rail"] for alert in document["attestations"]}
-        assert rails == {"17", "22"}, path
+        assert rails == {"22"}, path
 
 
-def test_an_attested_deployment_raises_no_banner(deployment: tuple[str, str]) -> None:
-    """The negative control: without it the test above passes on a `respond` that always returns
-    both rails regardless of what the database says."""
-    import time
-
+def test_rail_17_state_never_raises_a_banner(deployment: tuple[str, str]) -> None:
+    """The negative control, both ways: neither an ancient attestation left over from the 7-day
+    era nor a manual suspension is a banner row. The suspension is a line on the status card; the
+    banner is for dates that lapse, and rail 17 has none."""
     from keel.data.db import connect
     from keel.data.repository import Repository
     from keel.web import api as web_api
 
     db_path, _ = deployment
     repo = Repository(connect(db_path))
-    now = int(time.time())
-    repo.set_state("withdrawals_attested_at", str(now))
-    repo.set_state("withdrawals_enabled", "true")
+    repo.set_state("withdrawals_attested_at", "1")
+    repo.set_state("withdrawals_enabled", False)
     web_api.close_repo(repo)
 
     _, document = web_api.respond(_cfg(deployment), "/api/pulse", {})
@@ -250,7 +251,7 @@ def test_one_expired_attestation_tones_the_whole_banner_as_an_outage() -> None:
 
 
 def test_every_alert_row_carries_its_remedy() -> None:
-    """Rejects dropping the `<code>`: rails 17 and 22 are attested from a TTY, so a banner
+    """Rejects dropping the `<code>`: rail 22 is attested from a TTY, so a banner
     without the command is a dead end for the one person who can act on it."""
     body = _decl(_code("render.js"), "attestationLine")
     assert body.count('el("code", "remedy", plain(alert.remedy))') == 1
@@ -291,10 +292,10 @@ def test_the_banner_has_words_for_every_state_the_model_can_be_in() -> None:
         assert states - (set(table) | {attestations.OK}) == set(), sorted(table)
 
 
-def test_a_suspended_attestation_reads_as_the_refusal_it_is() -> None:
-    """Rail 17 with a fresh attestation that says NO. The expiry is in the future, so the date
+def test_a_refused_attestation_reads_as_the_refusal_it_is() -> None:
+    """Rail 22 with a fresh attestation that says NO. The expiry is in the future, so the date
     that means anything is when it was asked."""
-    definition = attestations.definition("withdrawal")
+    definition = attestations.definition("cash_posture")
     refused = attestations.Attestation(
         key=definition.key,
         rail=definition.rail,

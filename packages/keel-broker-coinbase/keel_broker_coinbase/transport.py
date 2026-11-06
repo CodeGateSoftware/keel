@@ -27,6 +27,11 @@ class Transport(Protocol):
 
     def get_accounts(self, **kwargs: Any) -> Any: ...
 
+    #: The raw authenticated GET, for the v2 `/v2/accounts` read (`allow_withdrawals`, rail 17).
+    #: The Advanced Trade `get_accounts` above does not carry that flag; only the v2 wallet
+    #: listing does, and the SDK has no named method for it.
+    def get(self, url_path: str, params: dict[str, Any] | None = None, **kwargs: Any) -> Any: ...
+
     #: The portfolio list, for the cash-account posture check (#666). Declared here rather than
     #: called off an untyped client, because this Protocol IS the adapter's statement of what it
     #: needs from a transport -- a method reached without declaring it is a dependency the test

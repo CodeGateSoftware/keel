@@ -57,7 +57,7 @@ from decimal import Decimal, InvalidOperation
 from typing import Any
 
 import click
-from keel_core.telemetry import log_exception
+from keel_core.telemetry import log_event, log_exception
 
 from keel.commands._common import _open_repo_ro, with_disclaimer
 from keel.data.repository import Repository
@@ -1115,6 +1115,77 @@ def orders_list(ctx: click.Context, scope: str, limit: int) -> None:
 CANCEL_EXIT_PHRASE = "remove protection from order {order_id}"
 
 
+#: The typed gate's wording for the LOCAL-ONLY cancel (#1010): a live entry left `pending` with
+#: no venue order id. Module-level so the docs and the in-flight skip banner name one command.
+LOCAL_CANCEL_ACTION = "mark order {order_id} canceled locally, without asking the venue"
+LOCAL_CANCEL_DETAIL = (
+    "Order {order_id} has no venue order id, so keel cannot ask the venue about it. First check "
+    "in the Coinbase app that no such order exists and nothing filled -- if it did fill, do not "
+    "cancel it here. Marking it canceled lets its DCA rule buy again on the next cycle."
+)
+#: What the row's `raw_response` records about why it is canceled. Under `local_cancel`, never
+#: `order_id`: `executor._native_order_id` reads that key alone, so the note can never be
+#: mistaken for an id the venue issued.
+LOCAL_CANCEL_NOTE = (
+    "canceled locally by the operator via `keel orders cancel`: the placement left no venue "
+    "order id, and the operator confirmed at a terminal that the venue holds no such order"
+)
+
+
+def _is_local_only_cancel(decision: CancelDecision, row: dict[str, Any]) -> bool:
+    """A live ENTRY still `pending` that the venue never gave an id (#1010).
+
+    `executor._run_order` inserts the row BEFORE `broker.place_order`, so a placement that raises
+    (a timeout) leaves it here: `reconcile` cannot ask about it and `_cancel_at_exchange` refuses
+    it, and a resting BUY blocks its DCA rule (`DcaCatchUp.in_flight`) for good. ENTRIES ONLY: an
+    exit or a protective leg marked canceled locally would have reconcile re-place protection
+    over it, so those keep the venue path and its named refusal. `pending` only: a
+    `partially_filled` row is one the venue answered about, so it has an id to cancel by.
+    """
+    from keel.execution.executor import _native_order_id
+
+    return (
+        decision.kind == "entry"
+        and row.get("mode") == "live"
+        and row.get("status") == "pending"
+        and _native_order_id(row) is None
+    )
+
+
+def _cancel_locally(repo: Repository, order_id: int) -> None:
+    """Mark a local-only `pending` entry canceled without touching the venue, after a typed `yes`.
+
+    The one place this command writes a terminal status the venue did not confirm, so it takes
+    the heavier gate (`_require_interactive_confirmation`, the full word `yes`, a terminal), and
+    the detail tells the operator to settle the question the venue cannot be asked first. RE-READ
+    after the prompt, like the venue path: a row that gained an id or moved while the operator
+    answered is a refusal, not a proceed. No broker is built.
+    """
+    from keel.commands._common import _require_interactive_confirmation
+
+    _require_interactive_confirmation(
+        LOCAL_CANCEL_ACTION.format(order_id=order_id),
+        LOCAL_CANCEL_DETAIL.format(order_id=order_id),
+    )
+    row = repo.get_order(order_id)
+    if row is None:
+        raise click.ClickException(f"order {order_id} vanished from the book while you answered.")
+    fresh = classify_cancel(repo, order_id, row=row)
+    if not fresh.cancellable or not _is_local_only_cancel(fresh, row):
+        raise click.ClickException(
+            f"not cancelling order {order_id}: it changed while you were answering."
+        )
+    now_ts = int(time.time())
+    repo.update_order(
+        order_id,
+        status="canceled",
+        raw_response=json.dumps({"local_cancel": LOCAL_CANCEL_NOTE}),
+        updated_at=now_ts,
+    )
+    log_event(logger, logging.WARNING, "orders.cancelled_locally", order_id=order_id)
+    click.echo(f"marked order {order_id} canceled locally; the venue was not contacted.")
+
+
 @orders_cmd.command("cancel")
 @click.argument("order_id", type=int)
 @click.pass_context
@@ -1133,6 +1204,10 @@ def orders_cancel(ctx: click.Context, order_id: int) -> None:
     Needs a terminal either way. The venue is reached only after the confirmation, and only the
     venue's own confirmation lets the local row be marked -- `executor._cancel_at_exchange` owns
     that rule and this calls it rather than restating it.
+
+    ONE EXCEPTION, and it is gated harder rather than softer: a live entry still `pending` with
+    no venue order id (`_is_local_only_cancel`) has nothing the venue can be asked about, so it
+    is marked canceled locally after a typed `yes` (`_cancel_locally`) and no broker is built.
     """
     from keel.commands._common import _build_broker, _is_interactive, _load_cfg, _open_repo
     from keel.execution.executor import CancelPending, CancelUnavailable, _cancel_at_exchange
@@ -1150,6 +1225,10 @@ def orders_cancel(ctx: click.Context, order_id: int) -> None:
         raise click.ClickException(decision.reason)
 
     click.echo(f"order {order_id}: {decision.kind} on {decision.product_id}")
+    row = repo.get_order(order_id)
+    if row is not None and _is_local_only_cancel(decision, row):
+        _cancel_locally(repo, order_id)
+        return
     if decision.typed:
         phrase = CANCEL_EXIT_PHRASE.format(order_id=order_id)
         click.echo(

@@ -34,6 +34,16 @@ breakers, the allowlist, settlement-currency, spot-shape and trade-scope checks.
 
 Source: keel's own vocabulary -- docs/fiqh-basis.md's rails table (the prudential rails 2-14, 16, 20) plus its prose sections for rails 1, 17, 18 and 19
 
+## withdrawal capability
+
+Whether the account's wallets allow withdrawals right now, the test rail 17 applies on every live
+BUY. keel reads it from the venue (Coinbase `allow_withdrawals` for the order's quote wallet and
+the bought coin's wallet) rather than from an operator attestation; unreadable means veto. The
+flag has only been observed `true`. `keel withdrawals attest --suspended` is a manual brake with
+no expiry.
+
+Source: docs/rails/rail-17-withdrawal-capability.md
+
 ## attestation
 
 market facts are computed, Shariah classifications are **ATTESTED, never inferred**.

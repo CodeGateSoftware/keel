@@ -1156,6 +1156,14 @@ RAIL14_NOTE = (
     "order pays the venue's fee."
 )
 
+#: A buy that was due and did not fill is retried on later daily cycles until the rule's next
+#: window opens, so a month can carry one more fill per rule than the schedule below counts.
+#: Rail 14's monthly cap still bounds the total.
+CATCHUP_NOTE = (
+    "Catch-up can add up to one buy per rule to a calendar month (a missed buy is retried "
+    "until the next window); rail 14's monthly cap still bounds the total."
+)
+
 
 def worst_month_text(plan: DcaPlan) -> str:
     """What rail 14's cap was checked against (R6, amended #847), as ONE sentence both
@@ -1184,6 +1192,7 @@ def render_dca_plan(plan: DcaPlan) -> list[str]:
         # a total recomputed (and possibly larger) than what the blocker check actually used.
         f"  checked against the cap: {worst_month_text(plan)}",
         f"  {RAIL14_NOTE}",
+        f"  {CATCHUP_NOTE}",
         "",
         "== Schedule ==",
         f"  {'asset':<8} {'weight':>7} {'cadence':<14} {'per buy':>10} {'monthly':>10} "

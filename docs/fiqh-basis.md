@@ -105,9 +105,11 @@ test: possession is the ability to dispose, not physical custody (§65.4 Ayub ·
 Abuzaid & Oweida's *Handbook of Islamic Finance* (2022) quoting the OIC Fiqh Academy
 resolution (Res. 53/4-6) that holds electronic constructive possession sufficient.
 
-Mechanics: the operator attests with `keel withdrawals attest`; the attestation is live-read
-on every intent and expires after 7 days (`WITHDRAWAL_ATTESTATION_TTL_SEC`,
-`keel/execution/executor.py`) — "a stale attestation is no better than none". ENTRIES ONLY,
+Mechanics: on every BUY the executor asks the venue whether the wallets the order touches
+allow withdrawals (`_withdrawal_capability`, `keel/execution/executor.py`; Coinbase's
+`allow_withdrawals`), so a freeze takes effect on the next order and its lifting on the one
+after. There is no attestation and no expiry. The operator keeps one manual brake,
+`keel withdrawals attest --suspended`, which halts entries whatever the venue says. ENTRIES ONLY,
 like rails 11/16: existing holdings are already ours, and forcing a sale to "fix" a
 withdrawal freeze would be strictly worse than holding through it. Unknown fails closed.
 

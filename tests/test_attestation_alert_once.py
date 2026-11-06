@@ -1,10 +1,11 @@
 """One alert per attestation per window (#793).
 
 `attestation.expiring` has fired since #444 and it fires on EVERY cycle in which doctor's
-finding is WARN or FAIL. On the live deployment on 2026-09-11 that is both rails at once, every
-cycle, for as long as they stay lapsed -- rail 17 expired on 09-08 and rail 22 has never been
-attested at all. An alert that repeats until it is fixed is an alert nobody reads by the third
-day, which is the failure mode this issue is named after.
+finding is WARN or FAIL. On the live deployment on 2026-09-11 that was two rails at once, every
+cycle, for as long as they stayed lapsed. An alert that repeats until it is fixed is an alert
+nobody reads by the third day, which is the failure mode this issue is named after. (Rail 17 has
+since left this path -- #1010 -- so the cases below are rail 22's, the rail with a stored due
+date and a never-attested state.)
 
 So the event is suppressed once it has been reported for the window it is in. A **window** is
 the attestation's state paired with its expiry, so:
@@ -13,8 +14,8 @@ the attestation's state paired with its expiry, so:
 * actually expiring reports again -- it is a different state and a different sentence ("entries
   are halted" is not "entries will be"), and an operator who missed the warning gets the halt;
 * renewing and lapsing again reports again, because the new attestation has a new expiry;
-* a never-attested rail reports once and then holds its tongue, which is the only shape that
-  works for rail 22 -- it has no expiry to cross and would otherwise alert forever.
+* a never-attested rail reports once and then holds its tongue -- it has no expiry to cross and
+  would otherwise alert forever.
 
 The ledger is a repo key, and writing it is a departure from `notify_after_cycle`'s documented
 "never writes". `notifications.py` carries the reasoning; the tests here pin the behaviour.
@@ -53,6 +54,24 @@ def _events(*names: str) -> list[Any]:
     ]
 
 
+def _posture(repo: Repository, *, due_ts: int, attested_ts: int = NOW - DAY) -> None:
+    """Attest rail 22's cash posture with a STORED due date -- the only dated attestation left."""
+    from keel_core.cash_posture import CashPostureState, VenueCashPosture
+
+    repo.upsert_venue_cash_posture(
+        VenueCashPosture(
+            venue="coinbase",
+            state=CashPostureState.ATTESTED,
+            attested_posture="spot_cash",
+            attested_ts=attested_ts,
+            attest_due_ts=due_ts,
+            refuted_ts=None,
+            refuted_reason=None,
+            credential_fingerprint="fp-1",
+        )
+    )
+
+
 def _windows(repo: Repository, now_ts: int) -> dict[str, str]:
     return notifications.attestation_windows(attestations.survey(repo, now_ts), now_ts)
 
@@ -64,25 +83,31 @@ def test_a_window_is_the_state_and_the_expiry_together(repo: Repository) -> None
     """Either half alone is wrong. The state alone never changes while a rail stays expired, so
     a renewal that lapses again would be silent; the expiry alone does not move when EXPIRING
     becomes EXPIRED, so the halt itself would be."""
-    repo.set_state("withdrawals_attested_at", str(NOW - 6 * DAY))
-    repo.set_state("withdrawals_enabled", "true")
+    _posture(repo, due_ts=NOW + 10 * DAY)
 
-    expiring = _windows(repo, NOW)["attest.withdrawals"]
-    expired = _windows(repo, NOW + 2 * DAY)["attest.withdrawals"]
+    expiring = _windows(repo, NOW)["attest.cash_posture"]
+    expired = _windows(repo, NOW + 11 * DAY)["attest.cash_posture"]
     assert expiring != expired
 
-    repo.set_state("withdrawals_attested_at", str(NOW + 2 * DAY))
-    renewed = _windows(repo, NOW + 8 * DAY)["attest.withdrawals"]
+    _posture(repo, due_ts=NOW + 200 * DAY)
+    renewed = _windows(repo, NOW + 11 * DAY)["attest.cash_posture"]
     assert renewed not in (expiring, expired)
 
 
 def test_the_window_holds_still_across_the_cycles_inside_it(repo: Repository) -> None:
-    """The property the whole feature rests on: an hourly wrapper inside the final 48 hours must
+    """The property the whole feature rests on: an hourly wrapper inside the warning window must
     compute the SAME id every time, or suppression suppresses nothing."""
-    repo.set_state("withdrawals_attested_at", str(NOW - 6 * DAY))
-    repo.set_state("withdrawals_enabled", "true")
-    ids = {_windows(repo, NOW + n * HOUR)["attest.withdrawals"] for n in range(24)}
+    _posture(repo, due_ts=NOW + 10 * DAY)
+    ids = {_windows(repo, NOW + n * HOUR)["attest.cash_posture"] for n in range(24)}
     assert len(ids) == 1
+
+
+def test_rail_17_has_no_window_whatever_its_old_keys_say(repo: Repository) -> None:
+    """#1010: a database still carrying the TTL-era timestamp must not grow a rail-17 window."""
+    repo.set_state("withdrawals_attested_at", str(NOW - 6 * DAY))
+    repo.set_state("withdrawals_enabled", True)
+
+    assert "attest.withdrawals" not in _windows(repo, NOW)
 
 
 def test_every_finding_that_can_fire_the_event_has_a_window(repo: Repository) -> None:
@@ -96,40 +121,41 @@ def test_every_finding_that_can_fire_the_event_has_a_window(repo: Repository) ->
 
 
 def test_the_first_report_of_a_window_goes_out() -> None:
-    windows = {"attest.withdrawals": "expiring:100"}
-    assert notifications.unreported(_events("attest.withdrawals"), windows=windows, already={})
+    windows = {"attest.cash_posture": "expiring:100"}
+    assert notifications.unreported(_events("attest.cash_posture"), windows=windows, already={})
 
 
 def test_the_second_report_of_the_same_window_does_not() -> None:
-    windows = {"attest.withdrawals": "expiring:100"}
-    already = {"attest.withdrawals": "expiring:100"}
+    windows = {"attest.cash_posture": "expiring:100"}
+    already = {"attest.cash_posture": "expiring:100"}
     assert (
-        notifications.unreported(_events("attest.withdrawals"), windows=windows, already=already)
+        notifications.unreported(_events("attest.cash_posture"), windows=windows, already=already)
         == []
     )
 
 
 def test_a_new_window_reports_again_over_a_stale_ledger_entry() -> None:
-    windows = {"attest.withdrawals": "expired:100"}
-    already = {"attest.withdrawals": "expiring:100"}
+    windows = {"attest.cash_posture": "expired:100"}
+    already = {"attest.cash_posture": "expiring:100"}
     assert (
         len(
             notifications.unreported(
-                _events("attest.withdrawals"), windows=windows, already=already
+                _events("attest.cash_posture"), windows=windows, already=already
             )
         )
         == 1
     )
 
 
-def test_suppressing_one_rail_does_not_suppress_the_other() -> None:
-    """The #732 bug one layer down: rail 17 reported and rail 22 silenced by it."""
-    windows = {"attest.withdrawals": "expired:100", "attest.cash_posture": "missing:None"}
-    already = {"attest.withdrawals": "expired:100"}
+def test_suppressing_one_finding_does_not_suppress_another() -> None:
+    """The #732 bug one layer down: one rail reported and another silenced by it. Two findings,
+    though only one rail is registered today -- the property is about the keying."""
+    windows = {"attest.cash_posture": "expired:100", "attest.next_rail": "missing:None"}
+    already = {"attest.cash_posture": "expired:100"}
     sent = notifications.unreported(
-        _events("attest.withdrawals", "attest.cash_posture"), windows=windows, already=already
+        _events("attest.cash_posture", "attest.next_rail"), windows=windows, already=already
     )
-    assert [event.fields["finding"] for event in sent] == ["attest.cash_posture"]
+    assert [event.fields["finding"] for event in sent] == ["attest.next_rail"]
 
 
 @pytest.mark.parametrize("already", [{}, {"rail.streak_halt": "x"}])
@@ -162,11 +188,25 @@ def test_an_event_carrying_no_finding_at_all_is_never_suppressed() -> None:
 
 def test_a_delivered_report_is_recorded_and_an_undelivered_one_is_not(repo: Repository) -> None:
     """A webhook that was down must not cost the only alert for this window."""
-    notifications.record_reported(repo, {"attest.withdrawals": "expiring:100"})
-    assert json.loads(str(repo.get_state(LEDGER))) == {"attest.withdrawals": "expiring:100"}
+    notifications.record_reported(repo, {"attest.cash_posture": "expiring:100"})
+    assert json.loads(str(repo.get_state(LEDGER))) == {"attest.cash_posture": "expiring:100"}
 
     notifications.record_reported(repo, {})
-    assert json.loads(str(repo.get_state(LEDGER))) == {"attest.withdrawals": "expiring:100"}
+    assert json.loads(str(repo.get_state(LEDGER))) == {"attest.cash_posture": "expiring:100"}
+
+
+def test_recording_a_window_merges_into_the_ledger_rather_than_replacing_it(
+    repo: Repository,
+) -> None:
+    """Rejects a `record_reported` that REPLACES the ledger: the second rail's alert would evict
+    the first's entry, invisible until the next cycle reads a ledger that has forgotten it."""
+    notifications.record_reported(repo, {"attest.cash_posture": "expiring:100"})
+    notifications.record_reported(repo, {"attest.next_rail": "missing:None"})
+
+    assert json.loads(str(repo.get_state(LEDGER))) == {
+        "attest.cash_posture": "expiring:100",
+        "attest.next_rail": "missing:None",
+    }
 
 
 def test_an_unreadable_ledger_reports_rather_than_staying_silent(repo: Repository) -> None:
@@ -187,14 +227,9 @@ def _config() -> Any:
     return _config_with(NotificationSettings(events=frozenset({"attestation.expiring"})))
 
 
-def _rail17(calls: list[Any]) -> int:
-    """Deliveries mentioning rail 17.
-
-    Counted per RAIL rather than per cycle because a fresh deployment has attested no cash
-    posture either, so rail 22 alerts alongside on the first cycle -- which is right, and is the
-    live deployment's own state on 2026-09-11, but it is not what these tests are about.
-    """
-    return len([call for call in calls if "rail 17" in json.dumps(call)])
+def _rail22(calls: list[Any]) -> int:
+    """Deliveries mentioning rail 22 -- the one rail whose attestation still has a window."""
+    return len([call for call in calls if "rail 22" in json.dumps(call)])
 
 
 def _cycle(repo: Repository, calls: list[Any], now_ts: int) -> int:
@@ -216,55 +251,68 @@ def _cycle(repo: Repository, calls: list[Any], now_ts: int) -> int:
 def test_a_lapsed_rail_alerts_on_the_first_cycle_and_not_on_the_next(repo: Repository) -> None:
     """The whole point. The wrapper fires hourly; without this the operator gets the same two
     sentences 24 times a day for as long as the rail stays lapsed."""
-    repo.set_state("withdrawals_attested_at", str(NOW - 6 * DAY))
-    repo.set_state("withdrawals_enabled", True)
+    _posture(repo, due_ts=NOW + 10 * DAY)
     calls: list[Any] = []
 
     for hour in range(3):
         _cycle(repo, calls, NOW + hour * HOUR)
 
-    assert _rail17(calls) == 1
+    assert _rail22(calls) == 1
+
+
+def test_a_never_attested_rail_alerts_once_and_holds_its_tongue(repo: Repository) -> None:
+    calls: list[Any] = []
+
+    for hour in range(3):
+        _cycle(repo, calls, NOW + hour * HOUR)
+
+    assert _rail22(calls) == 1
+
+
+def test_rail_17_never_alerts_from_a_database_that_still_carries_its_old_keys(
+    repo: Repository,
+) -> None:
+    repo.set_state("withdrawals_attested_at", str(NOW - 30 * DAY))
+    repo.set_state("withdrawals_enabled", True)
+    _posture(repo, due_ts=NOW + 200 * DAY)
+    calls: list[Any] = []
+
+    _cycle(repo, calls, NOW)
+
+    assert calls == []
 
 
 def test_the_halt_itself_alerts_even_though_the_warning_already_did(repo: Repository) -> None:
     """ "Entries are halted" is not "entries will be", and an operator who missed the warning has
     exactly one more chance to hear about it."""
-    repo.set_state("withdrawals_attested_at", str(NOW - 6 * DAY))
-    repo.set_state("withdrawals_enabled", True)
+    _posture(repo, due_ts=NOW + DAY)
     calls: list[Any] = []
 
     _cycle(repo, calls, NOW)
-    assert _rail17(calls) == 1
+    assert _rail22(calls) == 1
     _cycle(repo, calls, NOW + 2 * DAY)
-    assert _rail17(calls) == 2
-    # And rail 22, whose own window never moved, stays quiet through all of it -- INCLUDING the
-    # cycle after rail 17's second alert, which is the one that matters. Rejects a
-    # `record_reported` that REPLACES the ledger instead of merging into it: rail 17's second
-    # alert evicts rail 22's entry, and the eviction is invisible until the next cycle reads a
-    # ledger that has forgotten rail 22. Measured: without this third cycle the mutant survives.
+    assert _rail22(calls) == 2
     _cycle(repo, calls, NOW + 2 * DAY + HOUR)
-    assert len([call for call in calls if "rail 22" in json.dumps(call)]) == 1
+    assert _rail22(calls) == 2, "the halt is reported once, not every cycle"
 
 
 def test_renewing_and_lapsing_again_alerts_again(repo: Repository) -> None:
     """Rejects a ledger keyed on the finding name alone: one alert, ever, per deployment."""
-    repo.set_state("withdrawals_attested_at", str(NOW - 6 * DAY))
-    repo.set_state("withdrawals_enabled", True)
+    _posture(repo, due_ts=NOW + 10 * DAY)
     calls: list[Any] = []
     _cycle(repo, calls, NOW)
-    assert _rail17(calls) == 1
+    assert _rail22(calls) == 1
 
-    repo.set_state("withdrawals_attested_at", str(NOW + DAY))
+    _posture(repo, due_ts=NOW + 200 * DAY)
     _cycle(repo, calls, NOW + DAY)
-    assert _rail17(calls) == 1, "renewed: nothing to say"
-    _cycle(repo, calls, NOW + 6 * DAY)
-    assert _rail17(calls) == 2, "lapsing again is news again"
+    assert _rail22(calls) == 1, "renewed: nothing to say"
+    _cycle(repo, calls, NOW + 190 * DAY)
+    assert _rail22(calls) == 2, "lapsing again is news again"
 
 
 def test_an_undelivered_alert_is_retried_on_the_next_cycle(repo: Repository) -> None:
     """A webhook that was down must not cost the only alert for this window."""
-    repo.set_state("withdrawals_attested_at", str(NOW - 6 * DAY))
-    repo.set_state("withdrawals_enabled", True)
+    _posture(repo, due_ts=NOW + 10 * DAY)
 
     def _dead(url: str, body: bytes) -> None:
         raise OSError("connection refused")
@@ -279,7 +327,7 @@ def test_an_undelivered_alert_is_retried_on_the_next_cycle(repo: Repository) -> 
     )
     calls: list[Any] = []
     _cycle(repo, calls, NOW + HOUR)
-    assert _rail17(calls) == 1
+    assert _rail22(calls) == 1
 
 
 def test_the_alert_reads_the_venue_the_cycle_is_bound_to(repo: Repository) -> None:
