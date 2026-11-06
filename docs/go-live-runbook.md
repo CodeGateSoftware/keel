@@ -74,9 +74,9 @@ keel withdrawals show                  # rail 17: manual suspension + the venue'
 keel scope show                        # rail 20: can this venue's credential place a live ENTRY?
 ```
 
-Attest anything missing (`keel assets attest`, `keel subscription attest`,
-`keel scope attest --trading`); rail 17 needs no attestation, it reads the venue on every live BUY before continuing. If a rail vetoes
-later, its message names the command that fixes it.
+Attest anything missing with `keel assets attest`, `keel subscription attest` and
+`keel scope attest --trading`. Rail 17 needs no attestation: it reads the venue's withdrawal flag
+on every live BUY. If a rail vetoes later, its message names the command that fixes it.
 
 Rail 20 exists because a credential that *reads* fine is not evidence it can *trade*: a
 well-formed `ROBINHOOD_API_KEY` passed every read this deployment ever made, and the first live

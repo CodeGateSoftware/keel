@@ -23,6 +23,12 @@ read the key can already make; nothing new is granted.
   withdrawal freeze would be strictly worse than holding through it. Exits, stop-outs and
   protective orders are unaffected.
 
+**Only the Coinbase adapter can answer.** `withdrawals_allowed` is implemented by the Coinbase
+broker adapter alone; the Alpaca, Kraken and Robinhood adapters do not have it. On a live
+deployment against any of those venues the rail cannot read the venue, so **every live BUY is
+refused** (`withdrawal_capability: UNKNOWN (venue adapter cannot report withdrawals)`). That is the fail-closed rule above, not a fault to
+attest around; SELLs on those venues are unaffected.
+
 In paper trading the rail is *skipped* (it describes the real account, which a paper rehearsal
 cannot see) — recorded as skipped, never silently omitted. SELLs and paper never read the venue.
 
@@ -44,7 +50,7 @@ only ever reduces capability and is ungated.
 Per deployment (each has its own database):
 
 ```bash
-keel withdrawals attest --suspended
+keel --config config.live-sandbox.yaml --db keel-live.db withdrawals attest --suspended
 keel --config config.live-sandbox.yaml --db keel-live.db withdrawals attest --enabled
 ```
 
@@ -70,5 +76,6 @@ been validly possessed at all — so **acquiring more of it** is the thing to st
 
 A rail-17 veto skips that day's DCA buy. DCA catch-up retries a buy that was due and did not fill
 on each later daily cycle until it fills or the rule's next window opens, so a short freeze does
-not cost the window. A skipped live DCA buy also posts a macOS notification ("keel-live: DCA buy
+not cost the window. A manual suspension is different: it is retried the same way, but nothing
+clears it except `keel withdrawals attest --enabled`. A skipped live DCA buy also posts a macOS notification ("keel-live: DCA buy
 skipped") with the reason; see `docs/operator-runbook.md`.
