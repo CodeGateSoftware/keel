@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import logging
 import time
+from collections.abc import Sequence
 from decimal import Decimal
 from typing import Any
 
@@ -150,6 +151,9 @@ class CashAccountRequired(RuntimeError):
     DIFFERENT evidence and with different confidence -- see `verify_cash_account` -- and the
     difference is a property of the venues, not of the engine.
     """
+
+
+_MAX_V2_ACCOUNT_PAGES = 20
 
 
 class CoinbaseAdapter:
@@ -390,6 +394,57 @@ class CoinbaseAdapter:
         reason = _field(error_response, "message") or _field(error_response, "error")
         return PlaceResult(
             success=False, broker_order_id=None, reason=reason, client_order_id=client_order_id
+        )
+
+    def withdrawals_allowed(self, currencies: Sequence[str]) -> dict[str, bool | None]:
+        """Read each wallet's `allow_withdrawals` from `GET /v2/accounts` (rail 17).
+
+        Implements `WithdrawalReader`. Returns `True`/`False` per requested currency as the
+        venue states it, or `None` when the account holds no wallet for it. Currency codes are
+        compared upper-cased; `currency` may be a `{"code": ...}` object or a bare string.
+
+        A 2026-11-06 read-only probe of the live account saw the flag `true` on every wallet
+        and never saw it flip, so what `false` looks like in practice is inferred from the
+        field's name, not observed. `can_transfer: false` on a wallet is a different flag and
+        does not affect this one.
+
+        **Fails closed, unlike `verify_cash_account`, and for the opposite reason.** That check
+        can only refute, so silence is harmless; this one is asked to AFFIRM that withdrawals
+        are off-limits to the key, so a read that did not happen proves nothing. Every failure
+        raises: transport errors propagate, a flag that is not a real bool on a wallet we were
+        asked about raises `ValueError` (a string `"yes"` is not an answer), and so does still
+        paginating after 20 pages -- the caller decides what an unreadable venue means.
+
+        Pages of 100 wallets, following `pagination.next_starting_after` via `starting_after`.
+        """
+        wanted = {c.upper() for c in currencies}
+        found: dict[str, bool] = {}
+        transport = self._require_transport()
+        starting_after: str | None = None
+        for _ in range(_MAX_V2_ACCOUNT_PAGES):
+            params: dict[str, Any] = {"limit": 100}
+            if starting_after is not None:
+                params["starting_after"] = starting_after
+            response = transport.get("/v2/accounts", params=params)
+            for row in _field(response, "data", []) or []:
+                currency = _field(row, "currency")
+                code = _field(currency, "code") if not isinstance(currency, str) else currency
+                code = str(code or "").upper()
+                if code not in wanted:
+                    continue
+                flag = _field(row, "allow_withdrawals")
+                if not isinstance(flag, bool):
+                    raise ValueError(
+                        f"Coinbase wallet {code} has an unreadable allow_withdrawals: {flag!r}"
+                    )
+                # Several wallets for one code is not expected; if it happens, any wallet
+                # that can withdraw makes the code withdrawable.
+                found[code] = found.get(code, False) or flag
+            starting_after = _field(_field(response, "pagination"), "next_starting_after")
+            if not starting_after:
+                return {c: found.get(c.upper()) for c in currencies}
+        raise RuntimeError(
+            f"Coinbase /v2/accounts still paginating after {_MAX_V2_ACCOUNT_PAGES} pages"
         )
 
     def verify_cash_account(self) -> None:

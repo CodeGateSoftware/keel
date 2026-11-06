@@ -10,7 +10,7 @@ from decimal import Decimal
 
 import pytest
 from keel_broker_api.orders import LimitGTC, MarketIOCByBase, MarketIOCByQuote, StopLimitGTC
-from keel_broker_api.port import TradeScopeDenied, UnsupportedOrder
+from keel_broker_api.port import TradeScopeDenied, UnsupportedOrder, WithdrawalReader
 from keel_broker_api.results import Balance, CancelOutcome, OrderStatus, PlaceResult, SessionState
 from keel_broker_fake import FakeAdapter
 from keel_broker_fake.adapter import MAX_CANDLES_PER_CALL
@@ -255,3 +255,13 @@ def test_an_unsupported_kind_is_still_refused_as_unsupported_first() -> None:
         adapter.place_order(
             MarketIOCByQuote(product_id="BTC-USD", side=Side.BUY, quote_size=Decimal("100"))
         )
+
+
+def test_fake_withdrawals_allowed_defaults_true_and_honours_overrides():
+    fake = FakeAdapter(withdrawals_allowed={"BTC": False, "FET": None})
+    assert isinstance(fake, WithdrawalReader)
+    assert fake.withdrawals_allowed(["USDC", "BTC", "FET"]) == {
+        "USDC": True,
+        "BTC": False,
+        "FET": None,
+    }

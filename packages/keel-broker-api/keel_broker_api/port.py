@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import uuid
-from typing import Protocol
+from collections.abc import Sequence
+from typing import Protocol, runtime_checkable
 
 from keel_core.types import Candle, Granularity
 
@@ -230,12 +231,32 @@ class Broker(Protocol):
         ...
 
 
+@runtime_checkable
+class WithdrawalReader(Protocol):
+    """A venue that can say whether withdrawals are enabled on the account's wallets.
+
+    Separate from `Broker` because it is optional: only a venue that exposes a per-wallet
+    withdrawal flag can implement it, and rail 17 reads it per buy instead of trusting a human
+    attestation that lapses.
+    """
+
+    def withdrawals_allowed(self, currencies: Sequence[str]) -> dict[str, bool | None]:
+        """Map each requested currency to the venue's `allow_withdrawals` flag.
+
+        `True`/`False` is the venue's answer; `None` means the account has no wallet for that
+        currency. **Raises on any failure to read** (network, auth, unparseable) -- a caller
+        gating a buy on this must treat silence as "not proven", never as "allowed".
+        """
+        ...
+
+
 __all__ = [
     "CLIENT_ORDER_ID_NAMESPACE",
     "Broker",
     "CancelOutcome",
     "TradeScopeDenied",
     "UnsupportedOrder",
+    "WithdrawalReader",
     "default_market_schedule",
     "resolve_client_order_id",
 ]

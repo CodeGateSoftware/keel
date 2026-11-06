@@ -15,7 +15,7 @@ from typing import Any
 
 import pytest
 from keel_broker_api.orders import LimitGTC, MarketIOCByBase, MarketIOCByQuote
-from keel_broker_api.port import TradeScopeDenied
+from keel_broker_api.port import TradeScopeDenied, WithdrawalReader
 from keel_broker_api.results import (
     Balance,
     CancelOutcome,
@@ -51,7 +51,12 @@ class FakeTransport:
         order: dict[str, Any] | None = None,
         product: dict[str, Any] | None = None,
         products: dict[str, Any] | None = None,
+        v2_pages: list[dict[str, Any]] | None = None,
+        v2_raises: Exception | None = None,
     ) -> None:
+        self._v2_pages = list(v2_pages or [])
+        self._v2_raises = v2_raises
+        self.get_calls: list[tuple[str, dict[str, Any]]] = []
         self._candles = candles
         self._accounts = accounts
         self._preview = preview
@@ -65,6 +70,12 @@ class FakeTransport:
         # a genuine order apart from one the suite's unknown-id test made up -- the same
         # distinction the real venue draws, and the whole point of that assertion.
         self._issued_order_ids: set[str] = set()
+
+    def get(self, url_path: str, params: dict[str, Any] | None = None, **kwargs: Any) -> Any:
+        self.get_calls.append((url_path, dict(params or {})))
+        if self._v2_raises is not None:
+            raise self._v2_raises
+        return self._v2_pages[len(self.get_calls) - 1]
 
     def get_products(self, product_type: str = "SPOT", **kwargs: Any) -> Any:
         self.calls["get_products"] = {"product_type": product_type}
@@ -918,3 +929,72 @@ def test_a_missing_or_unusable_quote_increment_still_yields_an_instrument(bad: o
     assert instrument is not None, "an unusable price tick must not lose the size tick"
     assert instrument.base_increment == Decimal("0.00000001")
     assert instrument.quote_increment is None
+
+
+def _v2_page(rows: list[dict[str, Any]], next_after: str | None = None) -> dict[str, Any]:
+    return {"data": rows, "pagination": {"next_starting_after": next_after}}
+
+
+def test_withdrawals_allowed_reads_v2_accounts_flags():
+    transport = FakeTransport(
+        v2_pages=[
+            _v2_page(
+                [
+                    {"id": "a1", "currency": {"code": "USDC"}, "allow_withdrawals": True},
+                    {"id": "a2", "currency": "btc", "allow_withdrawals": False},
+                ]
+            )
+        ]
+    )
+    got = CoinbaseAdapter(transport).withdrawals_allowed(["USDC", "BTC", "FET"])
+    assert got == {"USDC": True, "BTC": False, "FET": None}
+    assert transport.get_calls[0][0] == "/v2/accounts"
+    assert transport.get_calls[0][1]["limit"] == 100
+
+
+def test_withdrawals_allowed_follows_pagination():
+    transport = FakeTransport(
+        v2_pages=[
+            _v2_page([{"id": "a1", "currency": {"code": "BTC"}, "allow_withdrawals": True}], "a1"),
+            _v2_page([{"id": "a2", "currency": {"code": "USDC"}, "allow_withdrawals": True}]),
+        ]
+    )
+    got = CoinbaseAdapter(transport).withdrawals_allowed(["USDC", "BTC"])
+    assert got == {"USDC": True, "BTC": True}
+    assert len(transport.get_calls) == 2
+    assert "starting_after" not in transport.get_calls[0][1]
+    assert transport.get_calls[1][1]["starting_after"] == "a1"
+
+
+def test_withdrawals_allowed_raises_when_still_paginating_after_20_pages():
+    pages = [
+        _v2_page([{"id": f"a{i}", "currency": {"code": "X"}, "allow_withdrawals": True}], f"a{i}")
+        for i in range(25)
+    ]
+    transport = FakeTransport(v2_pages=pages)
+    with pytest.raises(RuntimeError):
+        CoinbaseAdapter(transport).withdrawals_allowed(["USDC"])
+    assert len(transport.get_calls) == 20
+
+
+def test_withdrawals_allowed_raises_when_unreadable():
+    transport = FakeTransport(v2_raises=ConnectionError("reset"))
+    with pytest.raises(ConnectionError):
+        CoinbaseAdapter(transport).withdrawals_allowed(["USDC"])
+
+
+@pytest.mark.parametrize(
+    "row",
+    [
+        {"currency": {"code": "USDC"}, "allow_withdrawals": "yes"},
+        {"currency": {"code": "USDC"}},
+    ],
+)
+def test_withdrawals_allowed_treats_non_bool_flag_as_unreadable(row: dict[str, Any]):
+    transport = FakeTransport(v2_pages=[_v2_page([row])])
+    with pytest.raises(ValueError):
+        CoinbaseAdapter(transport).withdrawals_allowed(["USDC"])
+
+
+def test_coinbase_adapter_satisfies_withdrawal_reader():
+    assert isinstance(CoinbaseAdapter(FakeTransport()), WithdrawalReader)
