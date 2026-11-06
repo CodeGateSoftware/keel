@@ -219,7 +219,7 @@ def _stated_count(text: str, pattern: str) -> int:
 
 def test_the_gates_module_counts_the_actions_it_refuses_from_the_inventory() -> None:
     """`gates`' docstring says how many capability increases the browser gate refuses outright.
-    That is every action in `keel.capabilities` that no `web` row mirrors -- eight of the ten
+    That is every action in `keel.capabilities` that no `web` row mirrors -- nine of the eleven
     since the inventory grew, while the docstring still said seven."""
     browser_mirrored = {cap.mirrors for cap in CAPABILITIES if cap.gate == BROWSER.name}
     terminal_only = [

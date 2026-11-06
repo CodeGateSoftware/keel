@@ -20,7 +20,7 @@ now is stronger than the one it replaced, and it is the one anyone actually care
   machine with no terminal can create a deployment, and `/api/gates/*` through the gate table
   (the halt and the two releases below). "No POST at all" was a clean property that was also
   satisfied by a server which could not set anything up.
-* **Eight of the ten capability-increasing actions in `keel/capabilities.py` are unreachable
+* **Nine of the eleven capability-increasing actions in `keel/capabilities.py` are unreachable
   from this package, and the other two are reachable only as the gate table declares them**,
   asserted by tests that scan this source rather than by inspection. The server cannot arm or
   spend, and it can release exactly two halts -- through `gates.TIER1_ACTIONS`, which holds the

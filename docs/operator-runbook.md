@@ -76,11 +76,24 @@ and did not place, at most once per rule per UTC day, repeating each day while i
 Set `KEEL_DISABLE_MACOS_NOTIFY` to silence it. A DCA order stuck `pending` is reported daily too,
 naming the order id.
 
-**What to do.** Read the reason in the notification. Most reasons (a rail veto, a stale feed, a
-cash shortfall) clear on their own. keel retries the buy on each later daily cycle until it fills
-or the rule's next window opens, at most one fill per rule per window; a resting
-(`pending`/`partially_filled`) DCA order blocks the retry until it fills or is cancelled. Catch-up
-only covers windows whose buying cycle ran after the rule went live. `keel dca-plan` states that
+**What to do.** Read the reason in the notification; what clears it depends on the reason.
+
+- **A stale feed or a cash shortfall** clears on its own once the feed catches up or the cash
+  arrives. keel retries the buy on each later daily cycle until it fills or the rule's next window
+  opens ("Retrying daily until ..."), at most one fill per rule per window.
+- **A rail veto** names the rail and what clears it, verbatim; follow that. Some rails clear on
+  their own (an unreadable venue on rail 17), others need you (an attestation, a halt release).
+- **A stuck order** ("previous DCA order #N is still pending ... Blocked until that order is
+  resolved") does NOT retry: a resting (`pending`/`partially_filled`) DCA order blocks the rule
+  until it is resolved. Reconcile settles one the venue gave an id on its own cycle. One the venue
+  never gave an id (the placement raised, e.g. a timeout) is settled by nothing, so run
+  `keel orders cancel N` at a terminal: first check in the Coinbase app that no such order exists
+  and nothing filled, then type `yes`. keel marks the row canceled locally without contacting the
+  venue, and the rule catches up on the next cycle.
+- **A manual suspension** (rail 17's `--suspended` switch) stays until you clear it with
+  `keel withdrawals attest --enabled`.
+
+Catch-up only covers windows whose buying cycle ran after the rule went live. `keel dca-plan` states that
 catch-up can add up to one buy per rule to a calendar month; rail 14 still bounds the total.
 
 Rail 17 (withdrawal capability) needs no weekly chore: it reads the venue's `allow_withdrawals`
@@ -1021,8 +1034,9 @@ covers the rest from a plain shell.
 **What the browser cannot do, and that is deliberate.** Every capability-increasing action --
 arming autonomy, releasing the kill-switch, clearing a consecutive-loss halt, re-seeding the
 drawdown high-water mark, declaring a deposit or withdrawal, attesting withdrawal capability, scope
-or posture, declaring an out-of-band close, and replacing the binary -- is a CLI command behind a
-typed confirmation at an interactive terminal. `keel capabilities` lists all ten with the gate
+or posture, declaring an out-of-band close, cancelling a stuck order the venue never gave an id,
+and replacing the binary -- is a CLI command behind a typed confirmation at an interactive
+terminal. `keel capabilities` lists all eleven with the gate
 covering each. The one exception is the console's
 HALT button, which engages the kill-switch (stopping is never gated). The server's gated routes
 under `/api/gates/` can also release the kill-switch and clear the consecutive-loss halt, but only

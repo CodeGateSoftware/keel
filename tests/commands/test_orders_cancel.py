@@ -668,3 +668,98 @@ def test_a_venue_that_refuses_the_cancel_is_a_message_not_a_traceback(
     conn = connect(str(db_path))
     migrate(conn)
     assert Repository(conn).get_order(entry)["status"] == "pending"
+
+
+# -- a pending BUY with no venue order id: the local-only cancel (#1010 F1) -----------------------
+#
+# `executor._run_order` inserts the `pending` row BEFORE `broker.place_order`, so a placement
+# that raises (a timeout) leaves a row with no venue id. Reconcile cannot ask about it and
+# `_cancel_at_exchange` refuses it, so without this path the row blocks its DCA rule forever.
+
+
+def _stuck(deployment, **overrides: Any) -> int:
+    repo = _book(deployment)
+    order_id = _order(repo, **{"side": "buy", "raw_response": None, **overrides})
+    repo._conn.close()  # noqa: SLF001
+    return order_id
+
+
+def _count_broker_builds(monkeypatch: pytest.MonkeyPatch, broker: Any) -> list[int]:
+    built: list[int] = []
+
+    def _build(_cfg: Any) -> Any:
+        built.append(1)
+        return broker
+
+    monkeypatch.setattr("keel.commands._common._build_broker", _build)
+    return built
+
+
+def test_a_pending_buy_with_no_venue_id_is_marked_canceled_locally_after_a_typed_yes(
+    deployment, monkeypatch
+) -> None:
+    built = _count_broker_builds(monkeypatch, deployment[2])
+    order_id = _stuck(deployment)
+
+    result = _run(deployment, ["orders", "cancel", str(order_id)], stdin="yes\n")
+
+    assert result.exit_code == 0, result.output
+    assert "Coinbase app" in result.output, "the prompt must say to check the venue first"
+    assert deployment[2].cancelled == [] and built == [], "the venue is never reached"
+    row = _book(deployment).get_order(order_id)
+    assert row["status"] == "canceled"
+    import json
+
+    from keel.execution.executor import _native_order_id
+
+    assert json.loads(row["raw_response"])["local_cancel"], "why it was cancelled is recorded"
+    assert _native_order_id(row) is None, "the note must never read as a venue order id"
+
+
+def test_the_local_cancel_wants_the_word_yes_not_the_entry_prompts_y(deployment) -> None:
+    order_id = _stuck(deployment)
+
+    result = _run(deployment, ["orders", "cancel", str(order_id)], stdin="y\n")
+
+    assert result.exit_code != 0
+    assert "confirmation not given" in result.output
+    assert _book(deployment).get_order(order_id)["status"] == "pending"
+
+
+def test_the_local_cancel_is_refused_off_a_terminal(deployment, monkeypatch) -> None:
+    monkeypatch.setattr("keel.commands._common._is_interactive", lambda: False)
+    order_id = _stuck(deployment)
+
+    result = _run(deployment, ["orders", "cancel", str(order_id)], stdin="yes\n")
+
+    assert result.exit_code != 0
+    assert "interactive terminal" in result.output
+    assert _book(deployment).get_order(order_id)["status"] == "pending"
+
+
+def test_a_pending_buy_that_has_a_venue_id_still_goes_to_the_venue(deployment) -> None:
+    """The local path is for a row with NO venue id only; one the venue issued an id for is
+    cancelled AT the venue exactly as before, whatever the operator types."""
+    order_id = _stuck(deployment, **{"raw_response": '{"order_id": "venue-1"}'})
+
+    result = _run(deployment, ["orders", "cancel", str(order_id)], stdin="yes\n")
+
+    assert result.exit_code == 0, result.output
+    assert "Coinbase app" not in result.output
+    assert deployment[2].cancelled == ["venue-1"]
+    assert "cancelled order" in result.output and "at the venue" in result.output
+
+
+def test_a_SELL_with_no_venue_id_is_not_offered_the_local_cancel(deployment) -> None:
+    """Narrow on purpose: an exit or a protective leg marked canceled locally would have
+    reconcile re-place protection over it. Only an ENTRY with no venue id takes this path."""
+    repo = _book(deployment)
+    order_id = _order(repo, side="sell", raw_response=None)
+    repo._conn.close()  # noqa: SLF001
+
+    phrase = orders_mod.CANCEL_EXIT_PHRASE.format(order_id=order_id)
+    result = _run(deployment, ["orders", "cancel", str(order_id)], stdin=phrase + "\n")
+
+    assert result.exit_code != 0
+    assert "the venue did not cancel" in result.output
+    assert _book(deployment).get_order(order_id)["status"] == "pending"

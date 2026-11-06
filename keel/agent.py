@@ -1321,7 +1321,7 @@ def _skipped_dca_buys(
     - the whole cycle's entries were withheld (`entries_allowed` is false -- some product's gating
       bar was not ready), so it was never evaluated;
     - a resting BUY of the rule blocks it (`DcaCatchUp.in_flight`): reported with the local order
-      id and what to do, because nothing else will ever say so.
+      id and the command that resolves it (`blocked_by`), because nothing else will ever say so.
 
     The caller runs this on a LIVE cycle only. A rule with no `rules.id` is skipped: the
     notification is per rule.
@@ -1337,6 +1337,7 @@ def _skipped_dca_buys(
         if not isinstance(rule, Dca) or rule.rule_id is None:
             continue
         cadence_days = int(rule.params["cadence_days"])
+        blocked_by: tuple[int, ...] = ()
         signal = signals_by_rule.get(rule.rule_id)
         window_day: int | None
         reason: str | None
@@ -1360,10 +1361,16 @@ def _skipped_dca_buys(
                 lagging = ", ".join(sorted({f"{b.product} ({b.reason})" for b in blocked_entries}))
                 reason = f"entries withheld this cycle (gating bar not ready: {lagging})"
             elif rule.catch_up is not None and rule.catch_up.in_flight:
-                ids = ", ".join(f"#{i}" for i in rule.catch_up.resting_order_ids)
+                blocked_by = rule.catch_up.resting_order_ids
+                ids = ", ".join(f"#{i}" for i in blocked_by)
+                commands = "; ".join(f"`keel orders cancel {i}`" for i in blocked_by)
+                # The one command that resolves it either way (#1010 F1): a row with a venue id is
+                # cancelled AT the venue, one with none -- a placement that raised -- is marked
+                # canceled locally after a typed `yes`. Reconcile settles the first kind on its
+                # own; nothing settles the second.
                 reason = (
-                    f"previous DCA order {ids} still pending at the venue; "
-                    "resolve it (reconcile or cancel) to resume buying"
+                    f"previous DCA order {ids} is still pending; nothing is bought until it is "
+                    f"resolved ({commands})"
                 )
             else:
                 continue  # due, not blocked, no signal: nothing this function can name
@@ -1375,6 +1382,7 @@ def _skipped_dca_buys(
                 retry_until=(
                     None if window_day is None else _epoch_day_date(window_day + cadence_days)
                 ),
+                blocked_by=blocked_by,
             )
         )
     return skipped
@@ -1404,7 +1412,13 @@ def _post_skipped_buys(
         if repo.get_state(key) == today:
             continue
         message = f"{skip.product} (rule {skip.rule_id}): {skip.reason[:_SKIP_REASON_MAX_CHARS]}."
-        if skip.retry_until is not None:
+        if skip.blocked_by:
+            # Blocked, not retrying: the rule buys nothing until the order is resolved, so a
+            # "Retrying daily" promise would be false (#1010 F4). Outside the reason's cut, so
+            # the command always reaches the banner.
+            commands = "; ".join(f"keel orders cancel {i}" for i in skip.blocked_by)
+            message += f" Blocked until that order is resolved: {commands}."
+        elif skip.retry_until is not None:
             message += f" Retrying daily until {skip.retry_until}."
         if post(SKIPPED_BUY_TITLE, message):
             repo.set_state(key, today)
@@ -1428,11 +1442,15 @@ def _dca_fires_today(
     the buy was vetoed or withheld (the day is still a buy day, and a sale beside it would be
     the round trip the exclusion exists to prevent); the ledger answers it for a buy that went out
     under a rule this cycle did not load. A DCA whose `detect` RAISES counts as firing -- the
-    refusal is the direction that costs nothing.
+    refusal is the direction that costs nothing. So does one with a BUY still in flight
+    (`DcaCatchUp.in_flight`, #1010): `detect` answers `None` for it, but a sale beside a buy
+    that may yet fill is the same round trip.
     """
     for rule in product_rules:
         if not isinstance(rule, Dca):
             continue
+        if rule.catch_up is not None and rule.catch_up.in_flight:
+            return True
         try:
             if rule.detect(candles_by_tf) is not None:
                 return True
@@ -2380,6 +2398,11 @@ class SkippedBuy:
     product: str
     reason: str
     retry_until: str | None = None
+    #: The local `orders.id`s of a resting BUY blocking the rule (`DcaCatchUp.in_flight`). A
+    #: blocked rule does NOT retry daily -- it buys nothing until the order is resolved -- so the
+    #: banner says that instead of `retry_until`'s "Retrying daily until" (#1010 F4). `()` for
+    #: every other skip.
+    blocked_by: tuple[int, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -2619,13 +2642,6 @@ def run_once(
         # real executor `mode`; only what we surface to the user changes.
         reported_mode = "paper" if paper_trader is not None else mode
         log_event(logger, logging.INFO, "agent.mode_resolved", mode=reported_mode)
-        # DCA catch-up (#1010): each `Dca` reads THIS cycle's ledger -- the `orders.mode` the
-        # cycle writes: "paper" on the paper path, and "live" for BOTH executor modes
-        # (`executor._order_row`), never `mode`/`reported_mode`'s "confirm"/"autonomous" -- before
-        # `engine.evaluate` and `_dca_fires_today` (sleeve reductions) call its `detect`.
-        _attach_dca_catch_up(
-            repo, rules, rule_rows, mode="paper" if paper_trader is not None else "live"
-        )
         max_age_sec = config.auto_trade.interval_sec * FEED_STALENESS_CYCLES
         finest = _finest_granularity(granularities)
 
@@ -2660,6 +2676,17 @@ def run_once(
         # optional: the rail refuses to PLACE into an empty holding, and this cancels what is
         # already resting. Neither subsumes the other.)
         reconcile.sweep_orphan_brackets(broker, repo, now_ts)
+
+        # DCA catch-up (#1010): each `Dca` reads THIS cycle's ledger -- the `orders.mode` the
+        # cycle writes: "paper" on the paper path, and "live" for BOTH executor modes
+        # (`executor._order_row`), never `mode`/`reported_mode`'s "confirm"/"autonomous" -- before
+        # `engine.evaluate` and `_dca_fires_today` (sleeve reductions) call its `detect`. AFTER
+        # the three reconcile passes above, which never call `detect`: a BUY that filled since the
+        # last cycle is booked there, and read before it the settled row would count as in flight
+        # and block (and report) a buy that is free to go out.
+        _attach_dca_catch_up(
+            repo, rules, rule_rows, mode="paper" if paper_trader is not None else "live"
+        )
 
         # Rail 11's inputs, refreshed BEFORE any entry this cycle. `poll_once` above has already
         # written the candles, so every product's latest price is readable here -- and it has to

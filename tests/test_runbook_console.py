@@ -148,7 +148,20 @@ def test_the_runbook_states_the_capability_count_the_registry_declares() -> None
     mirror nothing, the same rule the `keel/web` prose is held to."""
     from keel.capabilities import CAPABILITIES
 
-    words = ["zero", "one", "two", "three", "four", "five", "six", "seven", "eight", "nine", "ten"]
+    words = [
+        "zero",
+        "one",
+        "two",
+        "three",
+        "four",
+        "five",
+        "six",
+        "seven",
+        "eight",
+        "nine",
+        "ten",
+        "eleven",
+    ]
     stated = re.findall(r"`keel capabilities` lists all (\w+)", _section())
     assert len(stated) == 1, stated
     assert stated[0] in words, stated

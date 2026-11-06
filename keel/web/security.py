@@ -38,8 +38,8 @@ Five independent layers, none of which is sufficient alone:
    machine with no terminal has to be able to create a deployment somehow), and it routes through
    `keel.commands.setup.ACTIONS`, every member of which is a step declared `MECHANICAL`, is
    idempotent and is never destructive, or through the gate table (`/api/gates/*`: the halt and
-   the two Tier 1 releases, see `gates_token` and `halt_token` below). Of the ten
-   capability-increasing actions in `keel/capabilities.py`, eight are unreachable and the other
+   the two Tier 1 releases, see `gates_token` and `halt_token` below). Of the eleven
+   capability-increasing actions in `keel/capabilities.py`, nine are unreachable and the other
    two are reachable only as that table declares them, and a test asserts it. That is a narrower
    guarantee than "no POST at all" was, and a more useful one: "no POST" would have been
    satisfied by a server that could not set anything up, while this is satisfied only by one

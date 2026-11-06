@@ -7287,6 +7287,43 @@ def test_catch_up_day_counts_as_dca_day_for_sleeve_exclusion(repo, monkeypatch):
     assert (row["decision"], row["rails"]["sleeve"]) == ("vetoed", "same_day_dca")
 
 
+def test_an_in_flight_dca_buy_still_counts_as_a_dca_day_for_sleeve_exclusion(repo, monkeypatch):
+    """F2, spec §3.4: a DCA BUY of the rule still resting makes `detect` answer `None`, but the
+    day is still a DCA day -- a same-day sale beside an in-flight buy is the round trip the
+    exclusion exists to prevent."""
+    _seed_rules(
+        repo,
+        monkeypatch,
+        (Dca(product_id=PRODUCT, cadence_days=7), "live"),
+        (_AlwaysReduceRule(PRODUCT), "live"),
+    )
+    repo._conn.execute("UPDATE rules SET created_at = 0")
+    repo._conn.commit()
+    [dca_row] = [row for row in repo.get_rules("live") if row["kind"] == "dca"]
+    repo.insert_order(
+        {
+            "mode": "live",
+            "product_id": PRODUCT,
+            "side": Side.BUY.value,
+            "order_type": "market",
+            "qty": Decimal("0.5"),
+            "status": "pending",
+            "rule_id": dca_row["id"],
+            "created_at": 37 * DAY + 3_600,
+            "updated_at": 37 * DAY + 3_600,
+        }
+    )
+    _held_since_day_0(repo)
+    now = _history(repo, 41)
+    broker = _HoldingBroker()
+
+    result = run_once(broker, repo, _config(), now_ts=now)
+
+    assert result.enter_signals == [], "fixture: the in-flight buy blocks the rule"
+    [row] = repo.get_sell_proposals()
+    assert (row["decision"], row["rails"]["sleeve"]) == ("vetoed", "same_day_dca")
+
+
 # -- a macOS notification for every skipped live DCA buy (#1010) ---------------------------------
 
 
@@ -7478,8 +7515,126 @@ def test_an_in_flight_order_blocking_a_due_buy_is_a_skip_naming_the_order(repo, 
     [skip] = result.skipped_buys
     assert (skip.rule_id, skip.product) == (rule_id, PRODUCT)
     assert f"#{order_id}" in skip.reason
-    assert "resolve" in skip.reason
+    assert f"keel orders cancel {order_id}" in skip.reason, "the reason names the way out (F1)"
+    assert skip.blocked_by == (order_id,)
     assert skip.retry_until == "1970-01-22"
+
+
+def test_a_blocked_skip_says_blocked_and_an_ordinary_skip_says_retrying(repo):
+    """F4: a rule blocked by a resting order does NOT retry daily -- it buys nothing until the
+    order is resolved -- so its banner must not promise a retry. Every other skip keeps it."""
+    posted: list[str] = []
+
+    def _ok(_title: str, message: str) -> bool:
+        posted.append(message)
+        return True
+
+    blocked = agent.SkippedBuy(
+        7, PRODUCT, "previous DCA order #5 is still pending", "1970-01-22", blocked_by=(5,)
+    )
+    vetoed = agent.SkippedBuy(8, PRODUCT, "max_per_day", "1970-01-22")
+
+    assert agent._post_skipped_buys(repo, [blocked, vetoed], 15 * DAY, post=_ok) == 2
+    assert posted[0] == (
+        f"{PRODUCT} (rule 7): previous DCA order #5 is still pending. "
+        "Blocked until that order is resolved: keel orders cancel 5."
+    )
+    assert "Retrying" not in posted[0]
+    assert posted[1] == f"{PRODUCT} (rule 8): max_per_day. Retrying daily until 1970-01-22."
+
+
+def test_a_stuck_order_cancelled_locally_lets_the_rule_catch_up_next_cycle(repo, monkeypatch):
+    """F1: a placement that raised leaves a `pending` row with no venue id, which blocks the rule.
+    After `keel orders cancel N` marks it canceled locally, the NEXT cycle buys the window."""
+    import json
+
+    from keel.commands import orders as orders_mod
+
+    _spy_post(monkeypatch)
+    rule_id = _live_dca_rule(repo)
+    stuck = repo.insert_order(
+        {
+            "mode": "live",
+            "product_id": PRODUCT,
+            "side": Side.BUY.value,
+            "order_type": "market",
+            "qty": Decimal("0.5"),
+            "status": "pending",
+            "rule_id": rule_id,
+            "raw_response": None,
+            "created_at": 15 * DAY + 3_600,
+            "updated_at": 15 * DAY + 3_600,
+        }
+    )
+    series = _dca_series(16)
+    _seed_history(repo, series)
+    broker = FakeBroker(series={(PRODUCT, Granularity.ONE_DAY): series})
+
+    blocked = run_once(broker, repo, _config(), now_ts=16 * DAY + 3_600)
+    assert broker.place_calls == [] and [s.blocked_by for s in blocked.skipped_buys] == [
+        (stuck,)
+    ], "fixture: the stuck row blocks the rule"
+
+    # What `keel orders cancel N` writes on the local-only path (`orders._cancel_locally`).
+    repo.update_order(
+        stuck,
+        status="canceled",
+        raw_response=json.dumps({"local_cancel": orders_mod.LOCAL_CANCEL_NOTE}),
+        updated_at=16 * DAY + 7_200,
+    )
+    series = _dca_series(17)
+    _seed_history(repo, series)
+    broker = FakeBroker(series={(PRODUCT, Granularity.ONE_DAY): series})
+
+    result = run_once(broker, repo, _config(), now_ts=17 * DAY + 3_600)
+
+    assert [s.setup.context["catch_up"] for s in result.enter_signals] == [True]
+    assert [r.placed for r in result.enter_results] == [True]
+    assert len(broker.place_calls) == 1
+    assert result.skipped_buys == []
+
+
+def test_a_pending_buy_reconcile_fills_this_cycle_is_not_counted_in_flight(repo, monkeypatch):
+    """F3: catch-up reads the ledger AFTER reconcile. The previous window's BUY was still
+    `pending` when the cycle began, and the venue says it FILLED; reconcile books that at the top
+    of the cycle, so this cycle's window-14 buy goes out -- read before reconcile, the settled row
+    would have blocked the rule and reported an in-flight skip."""
+    _spy_post(monkeypatch)
+    rule_id = _live_dca_rule(repo)
+    order_id = repo.insert_order(
+        {
+            "mode": "live",
+            "product_id": PRODUCT,
+            "side": Side.BUY.value,
+            "order_type": "market",
+            "qty": Decimal("0.5"),
+            "status": "pending",
+            "rule_id": rule_id,
+            "raw_response": '{"order_id": "venue-prev"}',
+            "created_at": 8 * DAY + 3_600,
+            "updated_at": 8 * DAY + 3_600,
+        }
+    )
+    series = _dca_series(14)
+    _seed_history(repo, series)
+
+    class _FilledAtVenue(FakeBroker):
+        def get_order(self, native_id: str) -> OrderStatus:
+            return OrderStatus(
+                order_id=native_id,
+                status="FILLED",
+                filled_size=Decimal("0.5"),
+                average_filled_price=Decimal("100"),
+                total_fees=Decimal("0.45"),
+            )
+
+    broker = _FilledAtVenue(series={(PRODUCT, Granularity.ONE_DAY): series})
+
+    result = run_once(broker, repo, _config(), now_ts=15 * DAY + 3_600)
+
+    assert repo.get_order(order_id)["status"] == "filled", "fixture: reconcile settled it"
+    assert result.skipped_buys == []
+    assert [r.placed for r in result.enter_results] == [True]
 
 
 def test_withheld_entries_make_every_due_dca_rule_a_skip(repo, monkeypatch):
