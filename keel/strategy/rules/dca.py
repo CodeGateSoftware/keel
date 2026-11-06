@@ -74,11 +74,15 @@ class DcaCatchUp:
       cycle's mode, or `None` when it has none.
     - `in_flight`: a BUY of the rule is still resting (`executor.RESTING_STATUSES`); it blocks
       every buy of the rule, so two are never in flight.
+    - `resting_order_ids`: the local `orders.id`s behind `in_flight`, for the operator-facing
+      reason a blocked buy is reported with. Defaulted, and never read by `detect`, so every
+      caller that builds a `DcaCatchUp` without it keeps its meaning.
     """
 
     since_day: int | None
     filled_window_day: int | None
     in_flight: bool
+    resting_order_ids: tuple[int, ...] = ()
 
 
 class Dca(Rule):
@@ -233,13 +237,31 @@ class Dca(Rule):
             ts=latest.ts,
         )
 
-    def _due(self, day: int, window_day: int) -> bool:
+    def due_window(
+        self, candles_by_tf: dict[Granularity, list[Candle]], *, ignore_in_flight: bool = False
+    ) -> int | None:
+        """Pure. The window (its opening epoch day) `detect` would buy on these candles, or
+        `None` when it would not. `ignore_in_flight` answers "would it buy but for a resting
+        order?" -- the question the cycle asks to report a BLOCKED buy rather than stay silent
+        about it. The same `_due` decision `detect` makes, so the two cannot drift."""
+        candles = completed_days(candles_by_tf)
+        if not candles:
+            return None
+        day = candles[-1].ts // _SECONDS_PER_DAY
+        window_day = window_start_day(day, self.params["cadence_days"])
+        if self._due(day, window_day, ignore_in_flight=ignore_in_flight):
+            return window_day
+        return None
+
+    def _due(self, day: int, window_day: int, *, ignore_in_flight: bool = False) -> bool:
         """`detect`'s buy-or-not decision for bar `day` in window `window_day` (its docstring
         has the order). `day == window_day` is `is_cadence_day`'s expression on that bar."""
         catch_up = self.catch_up
         if catch_up is None:
             return day == window_day  # backtests/sim: the window-open day only
-        if catch_up.in_flight or catch_up.filled_window_day == window_day:
+        if (catch_up.in_flight and not ignore_in_flight) or (
+            catch_up.filled_window_day == window_day
+        ):
             return False
         if day == window_day:
             return True

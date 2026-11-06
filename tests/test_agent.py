@@ -7285,3 +7285,238 @@ def test_catch_up_day_counts_as_dca_day_for_sleeve_exclusion(repo, monkeypatch):
     assert [r.placed for r in result.enter_results] == [False], "fixture: the buy must be vetoed"
     [row] = repo.get_sell_proposals()
     assert (row["decision"], row["rails"]["sleeve"]) == ("vetoed", "same_day_dca")
+
+
+# -- a macOS notification for every skipped live DCA buy (#1010) ---------------------------------
+
+
+def _spy_post(monkeypatch) -> list[list[agent.SkippedBuy]]:
+    """Replace the cycle's notifier so no test posts anything; records what it was handed."""
+    seen: list[list[agent.SkippedBuy]] = []
+
+    def _record(repo, skipped, now_ts, **_kw):
+        seen.append(list(skipped))
+        return 0
+
+    monkeypatch.setattr(agent, "_post_skipped_buys", _record)
+    return seen
+
+
+def _live_dca_rule(repo) -> int:
+    return repo.insert_rule(
+        "dca", {"product_id": PRODUCT, "cadence_days": 7}, status="live", now_ts=0
+    )
+
+
+def test_skipped_live_dca_buy_posts_once_per_rule_per_day(repo):
+    """Review Focus 5. Once per rule per UTC day -- NOT #793's once-per-window `unreported()`,
+    which would silence every repeat -- and a failed post is not remembered as said."""
+    posted: list[tuple[str, str]] = []
+
+    def _ok(title: str, message: str) -> bool:
+        posted.append((title, message))
+        return True
+
+    reason = "withdrawal_capability: UNKNOWN (venue down)"
+    skip = agent.SkippedBuy(9, "PAXG-USD", reason, retry_until="1970-01-22")
+    now = 15 * DAY + 3_600
+
+    assert agent._post_skipped_buys(repo, [skip, skip], now, post=_ok) == 1
+    assert agent._post_skipped_buys(repo, [skip], now + 3_600, post=_ok) == 0
+    assert len(posted) == 1
+    assert posted[0] == (
+        "keel-live: DCA buy skipped",
+        f"PAXG-USD (rule 9): {reason}. Retrying daily until 1970-01-22.",
+    )
+    assert repo.get_state("dca_skip_notified:9") == "1970-01-16"
+
+    assert agent._post_skipped_buys(repo, [skip], now + DAY, post=_ok) == 1
+    assert len(posted) == 2
+
+    other = agent.SkippedBuy(10, "BTC-USD", "max_per_day")
+    assert agent._post_skipped_buys(repo, [other], now + DAY, post=_ok) == 1
+
+
+def test_skipped_buy_reason_is_cut_to_180_characters(repo):
+    posted: list[str] = []
+    skip = agent.SkippedBuy(1, "BTC-USD", "x" * 500, retry_until="1970-01-22")
+    agent._post_skipped_buys(repo, [skip], DAY, post=lambda t, m: posted.append(m) or True)
+    assert posted == ["BTC-USD (rule 1): " + "x" * 180 + ". Retrying daily until 1970-01-22."]
+
+
+def test_a_failed_post_is_not_remembered_so_the_next_cycle_tries_again(repo):
+    skip = agent.SkippedBuy(1, "BTC-USD", "max_per_day")
+    assert agent._post_skipped_buys(repo, [skip], DAY, post=lambda t, m: False) == 0
+    assert repo.get_state("dca_skip_notified:1") is None
+    assert agent._post_skipped_buys(repo, [skip], DAY + 60, post=lambda t, m: True) == 1
+
+
+def test_cycle_with_vetoed_dca_records_skipped_buy(repo, monkeypatch):
+    seen = _spy_post(monkeypatch)
+    rule_id = _live_dca_rule(repo)
+    series = _dca_series(14)
+    _seed_history(repo, series)
+    broker = FakeBroker(
+        series={(PRODUCT, Granularity.ONE_DAY): series},
+        withdrawals_raises=RuntimeError("venue down"),
+    )
+
+    result = run_once(broker, repo, _config(), now_ts=15 * DAY + 3_600)
+
+    assert [r.placed for r in result.enter_results] == [False], "fixture: the buy is vetoed"
+    [skip] = result.skipped_buys
+    assert (skip.rule_id, skip.product) == (rule_id, PRODUCT)
+    assert skip.reason.startswith("withdrawal_capability:")
+    assert skip.retry_until == "1970-01-22", "the next window (day 21) opens on 1970-01-22"
+    assert seen == [[skip]], "the cycle hands its skipped buys to the notifier"
+
+
+def test_a_placed_dca_buy_records_no_skipped_buy(repo, monkeypatch):
+    seen = _spy_post(monkeypatch)
+    _live_dca_rule(repo)
+    series = _dca_series(14)
+    _seed_history(repo, series)
+    broker = FakeBroker(series={(PRODUCT, Granularity.ONE_DAY): series})
+
+    result = run_once(broker, repo, _config(), now_ts=15 * DAY + 3_600)
+
+    assert [r.placed for r in result.enter_results] == [True], "fixture: the buy places"
+    assert result.skipped_buys == []
+    assert seen in ([], [[]])
+
+
+def test_a_day_the_rule_is_not_due_records_no_skipped_buy(repo, monkeypatch):
+    _spy_post(monkeypatch)
+    _live_dca_rule(repo)
+    series = _dca_series(17)  # day 17 is mid-window and the window-14 buy has filled
+    _seed_history(repo, series)
+    broker = FakeBroker(series={(PRODUCT, Granularity.ONE_DAY): series})
+    run_once(broker, repo, _config(), now_ts=15 * DAY + 3_600)  # window 14 fills
+    assert len(broker.place_calls) == 1, "fixture: the window filled"
+
+    result = run_once(broker, repo, _config(), now_ts=18 * DAY + 3_600)
+
+    assert result.enter_signals == [] and result.skipped_buys == []
+
+
+def test_paper_cycle_records_no_skipped_buys(repo, monkeypatch):
+    seen = _spy_post(monkeypatch)
+    repo.insert_rule("dca", {"product_id": PRODUCT, "cadence_days": 7}, status="paper", now_ts=0)
+    series = _dca_series(14)
+    _seed_history(repo, series)
+    broker = _MarketDataOnlyBroker(series={(PRODUCT, Granularity.ONE_DAY): series})
+    # No synthetic equity -> the paper buy is skipped (placed False): live would record it.
+    cfg = _paper_config(paper=PaperConfig(starting_equity_usd=Decimal("0.01")))
+
+    result = run_once(broker, repo, cfg, now_ts=15 * DAY + 3_600)
+
+    assert [s.setup.context["window_start_day"] for s in result.enter_signals] == [14]
+    assert result.skipped_buys == []
+    assert all(batch == [] for batch in seen)
+
+
+def test_notifier_failure_does_not_fail_cycle(repo, monkeypatch, caplog):
+    def _explode(*_a, **_k):
+        raise RuntimeError("notification centre on fire")
+
+    monkeypatch.setattr(agent, "_post_skipped_buys", _explode)
+    _live_dca_rule(repo)
+    series = _dca_series(14)
+    _seed_history(repo, series)
+    broker = FakeBroker(
+        series={(PRODUCT, Granularity.ONE_DAY): series},
+        withdrawals_raises=RuntimeError("venue down"),
+    )
+
+    result = run_once(broker, repo, _config(), now_ts=15 * DAY + 3_600)
+
+    assert len(result.skipped_buys) == 1
+    assert "agent.skipped_buy_notify_failed" in [r.getMessage() for r in caplog.records]
+
+
+def test_building_the_skipped_buys_failing_does_not_fail_cycle(repo, monkeypatch):
+    def _explode(*_a, **_k):
+        raise RuntimeError("cannot build")
+
+    monkeypatch.setattr(agent, "_skipped_dca_buys", _explode)
+    _live_dca_rule(repo)
+    series = _dca_series(14)
+    _seed_history(repo, series)
+    broker = FakeBroker(series={(PRODUCT, Granularity.ONE_DAY): series})
+
+    result = run_once(broker, repo, _config(), now_ts=15 * DAY + 3_600)
+
+    assert [r.placed for r in result.enter_results] == [True]
+    assert result.skipped_buys == []
+
+
+def test_an_in_flight_order_blocking_a_due_buy_is_a_skip_naming_the_order(repo, monkeypatch):
+    """Controller ruling 1: a due buy blocked by a resting order is NOT silent. The reason names
+    the local order id and says to resolve it, and it notifies every day like any other skip."""
+    _spy_post(monkeypatch)
+    rule_id = _live_dca_rule(repo)
+    order_id = repo.insert_order(
+        {
+            "mode": "live",
+            "product_id": PRODUCT,
+            "side": Side.BUY.value,
+            "order_type": "market",
+            "qty": Decimal("0.5"),
+            "status": "pending",
+            "rule_id": rule_id,
+            "created_at": 8 * DAY + 3_600,
+            "updated_at": 8 * DAY + 3_600,
+        }
+    )
+    series = _dca_series(14)
+    _seed_history(repo, series)
+    broker = FakeBroker(series={(PRODUCT, Granularity.ONE_DAY): series})
+
+    result = run_once(broker, repo, _config(), now_ts=15 * DAY + 3_600)
+
+    assert result.enter_signals == [] and broker.place_calls == [], "fixture: the buy is blocked"
+    [skip] = result.skipped_buys
+    assert (skip.rule_id, skip.product) == (rule_id, PRODUCT)
+    assert f"#{order_id}" in skip.reason
+    assert "resolve" in skip.reason
+    assert skip.retry_until == "1970-01-22"
+
+
+def test_withheld_entries_make_every_due_dca_rule_a_skip(repo, monkeypatch):
+    """Controller ruling 2: the whole cycle's entries are withheld (a lagging product's bar), and
+    the due DCA rule beside it is a skip with that reason -- the very silence the operator hit."""
+    _spy_post(monkeypatch)
+    config = _blocked_cycle_config()
+    now_ts = 11 * DAY
+    ready_id = repo.insert_rule("dca", {"product_id": PRODUCT, "cadence_days": 1}, status="live")
+    repo.upsert_candles(PRODUCT, Granularity.ONE_DAY, [_candle(10 * DAY, "100")])
+    repo.insert_rule("dca", {"product_id": _XLM, "cadence_days": 1}, status="live")
+    repo.upsert_candles(_XLM, Granularity.ONE_DAY, [_candle(9 * DAY, "100")])
+    broker = FakeBroker(
+        series={
+            (PRODUCT, Granularity.ONE_DAY): [_candle(10 * DAY, "100")],
+            (_XLM, Granularity.ONE_DAY): [_candle(9 * DAY, "100")],
+        }
+    )
+
+    result = run_once(broker, repo, config, now_ts=now_ts)
+
+    assert result.enter_signals == [], "fixture: entries are withheld"
+    by_product = {s.product: s for s in result.skipped_buys}
+    assert PRODUCT in by_product and by_product[PRODUCT].rule_id == ready_id
+    assert "withheld" in by_product[PRODUCT].reason
+
+
+def test_a_stale_feed_makes_the_due_dca_rule_a_skip(repo, monkeypatch):
+    _spy_post(monkeypatch)
+    _live_dca_rule(repo)
+    series = _dca_series(14)
+    _seed_history(repo, series)
+    broker = FakeBroker(series={(PRODUCT, Granularity.ONE_DAY): series})
+
+    # 30 days later the stored series is long stale (interval_sec=50_000 -> ~42h tolerance).
+    result = run_once(broker, repo, _config(), now_ts=45 * DAY + 3_600)
+
+    assert PRODUCT in result.stale_products, "fixture: the product is stale"
+    [skip] = result.skipped_buys
+    assert PRODUCT == skip.product and "stale" in skip.reason

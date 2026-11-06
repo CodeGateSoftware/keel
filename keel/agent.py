@@ -66,10 +66,12 @@ import logging
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field, replace
+from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Any, Literal
 
 from keel_broker_api.results import MarketSchedule, SessionState
+from keel_core import macos_notify
 from keel_core.products import quote_currency_of
 from keel_core.telemetry import (
     bind_cycle,
@@ -1240,12 +1242,16 @@ def _dca_catch_up_state(
     filled_bar_days = [
         _dca_order_bar_day(order, mode=mode) for order in buys if order["status"] == "filled"
     ]
+    resting = tuple(
+        int(order["id"]) for order in buys if order["status"] in executor.RESTING_STATUSES
+    )
     return DcaCatchUp(
         since_day=since_day,
         filled_window_day=(
             window_start_day(max(filled_bar_days), cadence_days) if filled_bar_days else None
         ),
-        in_flight=any(order["status"] in executor.RESTING_STATUSES for order in buys),
+        in_flight=bool(resting),
+        resting_order_ids=resting,
     )
 
 
@@ -1279,6 +1285,134 @@ def _attach_dca_catch_up(
                 rule_id=rule.rule_id,
                 mode=mode,
             )
+
+
+#: Characters of a skip reason that reach the notification banner; the full reason is in the
+#: cycle's log line.
+_SKIP_REASON_MAX_CHARS = 180
+
+#: The notification title for a skipped buy.
+SKIPPED_BUY_TITLE = "keel-live: DCA buy skipped"
+
+
+def _epoch_day_date(day: int) -> str:
+    return datetime.fromtimestamp(day * _DAY, tz=UTC).strftime("%Y-%m-%d")
+
+
+def _skipped_dca_buys(
+    rules: list[Rule],
+    granularities: list[Granularity],
+    candles_by_tf_by_product: dict[str, dict[Granularity, list[Any]]],
+    repo: Repository,
+    *,
+    enter_signals: list[Signal],
+    enter_results: list[ExecutionResult],
+    stale_products: list[str],
+    blocked_entries: list[BlockedEntry],
+    entries_allowed: bool,
+) -> list[SkippedBuy]:
+    """Every LIVE DCA buy that was due this cycle and did not go out, one per rule (#1010).
+
+    "Due" is `Dca`'s own decision, so a rule that is simply between windows (or whose window
+    already filled) is never reported. Four ways a due buy fails to go out, each a skip:
+
+    - it was signalled and not placed: the rails that vetoed it (`vetoed_by`, verbatim -- rail
+      17's `withdrawal_capability: ...` names the wallet or the unreadable venue), else the
+      executor's `reason`;
+    - the product's feed was stale, so it was never evaluated;
+    - the whole cycle's entries were withheld (`entries_allowed` is false -- some product's gating
+      bar was not ready), so it was never evaluated;
+    - a resting BUY of the rule blocks it (`DcaCatchUp.in_flight`): reported with the local order
+      id and what to do, because nothing else will ever say so.
+
+    The caller runs this on a LIVE cycle only. A rule with no `rules.id` is skipped: the
+    notification is per rule.
+    """
+    signal_result = {
+        sig.rule_id: res
+        for sig, res in zip(enter_signals, enter_results, strict=False)
+        if sig.rule_id is not None
+    }
+    signals_by_rule = {sig.rule_id: sig for sig in enter_signals if sig.rule_id is not None}
+    skipped: list[SkippedBuy] = []
+    for rule in rules:
+        if not isinstance(rule, Dca) or rule.rule_id is None:
+            continue
+        cadence_days = int(rule.params["cadence_days"])
+        signal = signals_by_rule.get(rule.rule_id)
+        window_day: int | None
+        reason: str | None
+        if signal is not None:
+            result = signal_result[rule.rule_id]
+            if result.placed:
+                continue
+            reason = "; ".join(result.vetoed_by) or result.reason
+            window_day = (
+                signal.setup.context.get("window_start_day") if signal.setup is not None else None
+            )
+        else:
+            candles_by_tf = candles_by_tf_by_product.get(rule.product_id)
+            if candles_by_tf is None:  # a stale product's series was never loaded
+                candles_by_tf = {g: repo.get_candles(rule.product_id, g) for g in granularities}
+            window_day = rule.due_window(candles_by_tf, ignore_in_flight=True)
+            if window_day is None:
+                continue
+            if rule.product_id in stale_products:
+                reason = f"{rule.product_id} feed is stale; the buy was not evaluated"
+            elif not entries_allowed:
+                lagging = ", ".join(sorted({f"{b.product} ({b.reason})" for b in blocked_entries}))
+                reason = f"entries withheld this cycle (gating bar not ready: {lagging})"
+            elif rule.catch_up is not None and rule.catch_up.in_flight:
+                ids = ", ".join(f"#{i}" for i in rule.catch_up.resting_order_ids)
+                reason = (
+                    f"previous DCA order {ids} still pending at the venue; "
+                    "resolve it (reconcile or cancel) to resume buying"
+                )
+            else:
+                continue  # due, not blocked, no signal: nothing this function can name
+        skipped.append(
+            SkippedBuy(
+                rule_id=rule.rule_id,
+                product=rule.product_id,
+                reason=reason,
+                retry_until=(
+                    None if window_day is None else _epoch_day_date(window_day + cadence_days)
+                ),
+            )
+        )
+    return skipped
+
+
+def _post_skipped_buys(
+    repo: Repository,
+    skipped: list[SkippedBuy],
+    now_ts: int,
+    *,
+    post: Callable[[str, str], bool] = macos_notify.post,
+) -> int:
+    """Post a macOS notification for each skipped buy, at most once per rule per UTC day.
+    Returns how many were posted (#1010).
+
+    "Once per rule per day, repeating every day the buy stays skipped" is the spec, so this is
+    deliberately NOT #793's `unreported()` once-per-window dedupe, which would go quiet after the
+    first alert. The memory is `agent_state` `dca_skip_notified:<rule_id>` = the UTC date it was
+    last said; nothing reads it but this function, so a wrong value costs one repeat or one
+    silent day. It is written only after a SUCCESSFUL post: a banner that never showed is not
+    "said", and the next cycle that day tries again.
+    """
+    today = datetime.fromtimestamp(now_ts, tz=UTC).strftime("%Y-%m-%d")
+    posted = 0
+    for skip in skipped:
+        key = f"dca_skip_notified:{skip.rule_id}"
+        if repo.get_state(key) == today:
+            continue
+        message = f"{skip.product} (rule {skip.rule_id}): {skip.reason[:_SKIP_REASON_MAX_CHARS]}."
+        if skip.retry_until is not None:
+            message += f" Retrying daily until {skip.retry_until}."
+        if post(SKIPPED_BUY_TITLE, message):
+            repo.set_state(key, today)
+            posted += 1
+    return posted
 
 
 def _dca_fires_today(
@@ -2236,6 +2370,22 @@ def _slot_market_closed(repo: Repository, config: Config, now_ts: int, venue: st
 
 
 @dataclass(frozen=True)
+class SkippedBuy:
+    """A live DCA buy that was due this cycle and did not go out (#1010), and why.
+
+    `reason` is for the operator's screen: the rails that vetoed it verbatim, or the executor's
+    own reason, or what withheld it before an order was ever built. `retry_until` is the UTC date
+    (`YYYY-MM-DD`) the rule's NEXT window opens -- the day the daily retries stop -- or `None`
+    when the cycle could not say.
+    """
+
+    rule_id: int
+    product: str
+    reason: str
+    retry_until: str | None = None
+
+
+@dataclass(frozen=True)
 class LoopResult:
     """The outcome of one `run_once` cycle."""
 
@@ -2272,6 +2422,10 @@ class LoopResult:
     paper_equity: Decimal | None = None
     drawdown_total_pct: Decimal | None = None
     drawdown_weekly_pct: Decimal | None = None
+    # #1010: the live DCA buys that were due this cycle and did not go out, one per rule. Always
+    # empty on a paper cycle (nothing there can be "skipped" in a way the operator must hear
+    # about). Defaulted so every existing `LoopResult(...)` construction stays valid.
+    skipped_buys: list[SkippedBuy] = field(default_factory=list)
 
 
 def _effective_mode(
@@ -2985,6 +3139,26 @@ def run_once(
         except Exception:  # noqa: BLE001 -- the monitor must never cost the cycle
             log_exception(logger, "agent.exit_watch_failed")
 
+        # #1010: the live DCA buys due this cycle that did not go out. LIVE only -- a paper cycle
+        # has no operator to tell. Wrapped: building the list is a diagnostic, and a failure there
+        # must cost neither the cycle nor (below) the notification of nothing.
+        skipped_buys: list[SkippedBuy] = []
+        if paper_trader is None:
+            try:
+                skipped_buys = _skipped_dca_buys(
+                    rules,
+                    granularities,
+                    candles_by_tf_by_product,
+                    repo,
+                    enter_signals=enter_signals,
+                    enter_results=enter_results,
+                    stale_products=stale_products,
+                    blocked_entries=blocked_entries,
+                    entries_allowed=entries_allowed,
+                )
+            except Exception:  # noqa: BLE001 -- a diagnostic must never cost the cycle
+                log_exception(logger, "agent.skipped_buys_failed")
+
         cycle_result = LoopResult(
             ts=now_ts,
             skipped=False,
@@ -3003,6 +3177,7 @@ def run_once(
             paper_equity=result_paper_equity,
             drawdown_total_pct=result_drawdown_total_pct,
             drawdown_weekly_pct=result_drawdown_weekly_pct,
+            skipped_buys=skipped_buys,
         )
 
         # Post-cycle notifications (#444): derive the opted-in events from the same seams
@@ -3014,6 +3189,15 @@ def run_once(
         from keel.notifications import notify_after_cycle
 
         notify_after_cycle(repo, config, cycle_result, now_ts)
+
+        # Then the macOS banner for each skipped live DCA buy (#1010) -- the channel that reaches
+        # the operator on a zero-exit cycle, which `notify_after_cycle` does not on a deployment
+        # with no webhook. LAST, so nothing above waits on it, and wrapped on its own: a
+        # notification failure (the post, or the dedupe write) never fails the cycle.
+        try:
+            _post_skipped_buys(repo, cycle_result.skipped_buys, now_ts)
+        except Exception:  # noqa: BLE001 -- a notification must never cost the cycle
+            log_exception(logger, "agent.skipped_buy_notify_failed")
 
         return cycle_result
     finally:
