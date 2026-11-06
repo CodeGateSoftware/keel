@@ -29,6 +29,7 @@ from keel.commands.status import OpenPositionStatus, WithdrawalAttestationStatus
 from keel.commands.trading import KILL_ENGAGED_LINE
 from keel.data.db import connect, migrate
 from keel.data.repository import Repository
+from keel.types import Side
 from tests.commands.test_activity import _line, _quiet_cycle_lines, _rail_veto_cycle_lines
 from tests.commands.test_dca_plan import _insert_dca
 from tests.web.test_payload import _status_report
@@ -237,6 +238,47 @@ def test_next_dca_is_today_when_today_is_a_cadence_day() -> None:
     assert len(rules) == 1  # the row reached the reader
     report = build_pulse(_status_report(), _today_feed(), rules, now_ts=105 * _DAY + 5)
     assert report.next_dca[0].next_cadence_day_ts == 105 * _DAY
+
+
+def _live_since_day_0(repo: Repository) -> int:
+    rule_id = _insert_dca(repo, "BTC-USD", "live")
+    repo._conn.execute("UPDATE rules SET created_at = 0, promoted_at = 0")  # noqa: SLF001
+    repo._conn.commit()  # noqa: SLF001
+    return rule_id
+
+
+def test_next_dca_shows_a_pending_catch_up_as_the_next_cycle(valid_config_path: Path) -> None:
+    """F8: window 98 (days 98-104) never filled and the rule was live before it opened, so the
+    next cycle buys bar 99 as a catch-up -- "next DCA buy" must say day 99 (placed by the first
+    cycle after day 99's bar closes), not the next cadence day 105."""
+    repo = _repo()
+    _live_since_day_0(repo)
+    config = load_config(str(valid_config_path))
+
+    [buy] = gather_pulse(repo, config, _today_feed(), now_ts=NOW).next_dca
+
+    assert buy.next_cadence_day_ts == 99 * _DAY
+
+
+def test_next_dca_is_the_next_cadence_day_once_the_window_filled(valid_config_path: Path) -> None:
+    repo = _repo()
+    rule_id = _live_since_day_0(repo)
+    repo.insert_order(
+        {
+            "mode": "live",
+            "product_id": "BTC-USD",
+            "side": Side.BUY.value,
+            "qty": Decimal("0.1"),
+            "status": "filled",
+            "rule_id": rule_id,
+            "created_at": 99 * _DAY + 3600,  # the day-99 cycle bought bar 98, window 98
+        }
+    )
+    config = load_config(str(valid_config_path))
+
+    [buy] = gather_pulse(repo, config, _today_feed(), now_ts=NOW).next_dca
+
+    assert buy.next_cadence_day_ts == 105 * _DAY
 
 
 # -- unbracketed roll-call ----------------------------------------------------------------------

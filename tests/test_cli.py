@@ -2409,11 +2409,11 @@ def test_show_says_no_wallet_for_an_unheld_asset(tmp_path, valid_config_path, mo
 
 
 def test_show_reports_unreadable_venue_without_failing(tmp_path, valid_config_path, monkeypatch):
-    broker = FakeBroker(withdrawals_raises=RuntimeError("boom"))
+    broker = FakeBroker(withdrawals_raises=TimeoutError("boom"))
     result, _built, _db = _withdrawals_show(tmp_path, valid_config_path, monkeypatch, broker)
 
     assert result.exit_code == 0, result.output
-    assert "venue unreadable" in result.output
+    assert "venue unreadable: TimeoutError" in result.output, "F6: say what failed"
     assert "manual suspension: off" in result.output
 
 
@@ -2423,7 +2423,7 @@ def test_show_reports_unbuildable_broker_without_failing(tmp_path, valid_config_
     )
 
     assert result.exit_code == 0, result.output
-    assert "venue unreadable" in result.output
+    assert "venue unreadable: RuntimeError" in result.output
 
 
 def test_show_names_a_manual_suspension(tmp_path, valid_config_path, monkeypatch):

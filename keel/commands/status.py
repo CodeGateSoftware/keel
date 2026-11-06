@@ -4,7 +4,7 @@ The paper-mode-fidelity spec explicitly deferred a dedicated status command as a
 ("A dedicated `keel status` command is deferred as a follow-up"); this is that follow-up. Its
 job is narrow: let an operator running a paper-forward see the agent's state at a glance,
 **purely from the local DB and config** -- mode, kill-switch, autonomy, Rail 11 drawdown/equity
-state, rail 17's withdrawal-attestation freshness, open positions, rule counts, and per-product
+state, rail 17's manual withdrawal suspension, open positions, rule counts, and per-product
 data freshness. It NEVER calls the broker; that is the whole point (`monitor`/`agent` are the
 commands that touch the network).
 
@@ -627,9 +627,10 @@ def _report_to_jsonable(report: StatusReport) -> dict[str, Any]:
 def status_cmd(ctx: click.Context, as_json: bool) -> None:
     """Operator-observability snapshot of the agent's state -- read-only, no broker call.
 
-    Shows mode, the kill-switch, autonomy, Rail 11 drawdown/equity state, rail 17's
-    withdrawal-attestation state (fresh with time remaining, or EXPIRED with how long ago and
-    the command that re-attests), open positions, rule counts, and per-product data freshness,
+    Shows mode, the kill-switch, autonomy, Rail 11 drawdown/equity state, rail 17's manual
+    withdrawal suspension (off, ON with the command that clears it, or unknown -- rail 17 itself
+    reads the venue's withdrawal flag on every live buy, so there is no expiry to show), open
+    positions, rule counts, and per-product data freshness,
     all read straight from the local DB and config. This is the interim of the deferred
     `keel status` TUI: same underlying report (`--json` is its forward-compatible shape), just
     rendered to the terminal.

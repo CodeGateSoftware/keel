@@ -2,7 +2,7 @@
 
 A VIEW over `StatusReport`, `ActivityFeed` and `existing_dca_rules`: it reads nothing the CLI
 cannot and computes only what no existing report holds -- today's sums, the why-not list, the
-next DCA cadence day, the unbracketed roll-call. The halt is not here: `keel/web/gates.py` owns
+next DCA buy day, the unbracketed roll-call. The halt is not here: `keel/web/gates.py` owns
 it ("stopping must never be slower than starting"), and this module only names the command that
 undoes it (`RESUME_COMMAND`), so the client never has to.
 
@@ -24,8 +24,12 @@ that bar, and when that cycle runs is the scheduler's business, which this modul
 
 from __future__ import annotations
 
+import logging
+from collections.abc import Mapping
 from dataclasses import dataclass
 from decimal import Decimal
+
+from keel_core.telemetry import log_exception
 
 from keel.commands.activity import ActivityFeed
 from keel.commands.dca_plan import ExistingDcaRule, existing_dca_rules
@@ -39,7 +43,11 @@ from keel.commands.status import (
 from keel.commands.trading import KILL_ENGAGED_LINE
 from keel.config import Config
 from keel.data.repository import Repository
-from keel.strategy.rules.dca import next_cadence_day_ts
+from keel.strategy.rules.dca import Dca, DcaCatchUp, next_cadence_day_ts
+
+logger = logging.getLogger(__name__)
+
+_DAY = 86_400
 
 #: What undoes a halt. The CLI's own command name; the console shows it and never performs it.
 RESUME_COMMAND = "keel resume"
@@ -80,7 +88,10 @@ class NextDcaBuy:
     product_id: str
     cadence_days: int
     budget_usd: Decimal
-    #: 00:00 UTC of the cadence day (`dca.next_cadence_day_ts`) -- a day, not an order time.
+    #: 00:00 UTC of the daily BAR the rule's next buy is off -- a day, not an order time: the buy
+    #: is placed by the first cycle after that bar closes. A pending catch-up (#1010) is the
+    #: next cycle's bar (yesterday's, or today's); otherwise the next cadence day
+    #: (`dca.next_cadence_day_ts`). See `_next_buy_day_ts`.
     next_cadence_day_ts: int
     #: `ExistingDcaRule.budget_inferred`, carried through: the budget is the rule's default, not
     #: one the row stored.
@@ -208,19 +219,66 @@ def _why_not(status: StatusReport, feed: ActivityFeed) -> tuple[str, ...]:
     return tuple(reasons)
 
 
-def _next_dca(rules: tuple[ExistingDcaRule, ...], now_ts: int) -> tuple[NextDcaBuy, ...]:
+def _next_buy_day_ts(rule: ExistingDcaRule, catch_up: DcaCatchUp | None, now_ts: int) -> int:
+    """00:00 UTC of the bar the rule's next buy is off, by `Dca.due_window` on the CLOCK (#1010).
+
+    The cycle on day `D` buys bar `D - 1`, so with the ledger's `catch_up` in hand: bar
+    `today - 1` when it is due (the next cycle buys it -- a catch-up, or a window-open bar not yet
+    bought), else bar `today` when it is due (tomorrow's cycle), else the next cadence day. The
+    same `_due` decision the engine makes, so the console cannot promise a day the engine skips.
+    Without `catch_up` (an unreadable ledger, or a caller that passed none) it is the cadence
+    day alone, which is all a window-open-only rule ever had.
+    """
+    if catch_up is not None:
+        dca = Dca(rule.product_id, cadence_days=rule.cadence_days)
+        dca.catch_up = catch_up
+        today = now_ts // _DAY
+        for day in (today - 1, today):
+            if dca.due_window(day) is not None:
+                return day * _DAY
+    return next_cadence_day_ts(now_ts, rule.cadence_days)
+
+
+def _next_dca(
+    rules: tuple[ExistingDcaRule, ...],
+    now_ts: int,
+    catch_up: Mapping[int, DcaCatchUp] | None = None,
+) -> tuple[NextDcaBuy, ...]:
+    catch_up = catch_up or {}
     return tuple(
         NextDcaBuy(
             rule_id=r.rule_id,
             product_id=r.product_id,
             cadence_days=r.cadence_days,
             budget_usd=r.budget_usd,
-            next_cadence_day_ts=next_cadence_day_ts(now_ts, r.cadence_days),
+            next_cadence_day_ts=_next_buy_day_ts(r, catch_up.get(r.rule_id), now_ts),
             budget_inferred=r.budget_inferred,
         )
         for r in rules
         if r.status == "live"
     )
+
+
+def _dca_catch_ups(repo: Repository, rules: tuple[ExistingDcaRule, ...]) -> dict[int, DcaCatchUp]:
+    """The live ledger's `DcaCatchUp` per LIVE DCA rule, by the cycle's own reader
+    (`agent._dca_catch_up_state`, mode `"live"`: a `live`-status rule is traded by a live cycle).
+    A rule whose ledger read raises is left out -- its next buy falls back to the cadence day --
+    and logged, never costing the view."""
+    from keel import agent
+
+    rows = {row.get("id"): row for row in repo.get_rules("live")}
+    found: dict[int, DcaCatchUp] = {}
+    for rule in rules:
+        row = rows.get(rule.rule_id)
+        if rule.status != "live" or row is None:
+            continue
+        try:
+            dca = Dca(rule.product_id, cadence_days=rule.cadence_days)
+            dca.rule_id = rule.rule_id
+            found[rule.rule_id] = agent._dca_catch_up_state(repo, dca, row, mode="live")
+        except Exception:  # noqa: BLE001 -- a view degrades to the cadence day, never fails
+            log_exception(logger, "pulse.dca_catch_up_unreadable", rule_id=rule.rule_id)
+    return found
 
 
 def build_pulse(
@@ -229,6 +287,7 @@ def build_pulse(
     dca_rules: tuple[ExistingDcaRule, ...],
     *,
     now_ts: int,
+    catch_up: Mapping[int, DcaCatchUp] | None = None,
 ) -> PulseReport:
     """`gather_pulse`'s composition over inputs already in hand. PURE."""
     # `bracket_verdict` decides, as it does for `keel status` and the bracket cells: paper never
@@ -256,7 +315,7 @@ def build_pulse(
         no_cycles_line="" if feed.cycles else _NO_CYCLES_LINE[basis],
         last_cycle_ts=_last_cycle_ts(feed),
         why_not=_why_not(status, feed),
-        next_dca=_next_dca(dca_rules, now_ts),
+        next_dca=_next_dca(dca_rules, now_ts, catch_up),
         unbracketed=unbracketed,
         unbracketed_count=len(unbracketed),
         resume_command=RESUME_COMMAND if status.kill_switch_engaged else "",
@@ -281,6 +340,11 @@ def gather_pulse(
 ) -> PulseReport:
     """The Pulse view's report: `gather_status` and `existing_dca_rules` read from the ledger,
     `feed` (scoped to "today" by the caller) read from the log. No broker, no network."""
+    dca_rules = existing_dca_rules(repo)
     return build_pulse(
-        gather_status(repo, config, now_ts), feed, existing_dca_rules(repo), now_ts=now_ts
+        gather_status(repo, config, now_ts),
+        feed,
+        dca_rules,
+        now_ts=now_ts,
+        catch_up=_dca_catch_ups(repo, dca_rules),
     )

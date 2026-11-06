@@ -1537,6 +1537,16 @@ def test_rail17_messages_carry_the_venue_detail_and_no_attestation_advice(
         assert "attest" not in msg
 
 
+def test_rail17_unknown_promises_a_retry_only_to_a_dca_buy(repo: Repository) -> None:
+    """F5: catch-up is DCA-only. A DCA buy refused on an unreadable venue is retried within its
+    window; any other BUY is not, so its message must not say it is."""
+    for is_dca, promised in ((True, True), (False, False)):
+        intent = _intent(withdrawals_enabled=None, withdrawals_detail="venue down", is_dca=is_dca)
+        result = check(intent, repo, _config(), NOW_TS)
+        (msg,) = [v for v in result.violations if v.startswith("withdrawal_capability")]
+        assert ("retried" in msg) is promised, msg
+
+
 def test_rail17_passes_when_withdrawals_are_attested_enabled(repo: Repository) -> None:
     result = check(_intent(withdrawals_enabled=True), repo, _config(), NOW_TS)
     assert "withdrawal_capability" not in _keys(result)

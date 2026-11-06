@@ -99,12 +99,26 @@ def test_doctor_rail17_warns_when_the_store_is_unreadable() -> None:
     assert "unreadable" in (rail17.headline + rail17.detail).lower()
 
 
-def test_doctor_never_reads_the_old_attestation_timestamp() -> None:
-    import inspect
-
-    from keel.commands import doctor
-
-    assert '"withdrawals_attested_at"' not in inspect.getsource(doctor)
+def test_doctor_rail17_ignores_a_garbage_or_expired_old_attestation_timestamp(
+    tmp_path, valid_config_path
+) -> None:
+    """F7, by behaviour rather than a source scan: rail 17 has no clock (#1010). A leftover
+    `withdrawals_attested_at` -- unparseable, or a week and more in the past, which the old
+    expiry would have failed -- changes nothing: with no suspension the finding passes."""
+    config = load_config(valid_config_path)
+    seen: list[tuple[str, str, str]] = []
+    for leftover in ("not-a-timestamp", NOW - 30 * DAY):
+        repo = _seeded_repo(tmp_path / f"keel-{len(seen)}.db")
+        repo.set_state("withdrawals_enabled", True)
+        repo.set_state("withdrawals_attested_at", leftover)
+        assert repo.get_state("withdrawals_attested_at") == leftover, "fixture reached the store"
+        (rail17,) = [
+            f for f in gather_findings(repo, config, [], NOW) if f.name == "attest.withdrawals"
+        ]
+        seen.append((rail17.status, rail17.headline, rail17.detail))
+    baseline = _rail17(False)
+    assert seen == [(baseline.status, baseline.headline, baseline.detail)] * 2
+    assert baseline.status == OK
 
 
 def test_rail14_absent_fails_naming_the_venue() -> None:

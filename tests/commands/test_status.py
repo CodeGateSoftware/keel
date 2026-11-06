@@ -634,3 +634,18 @@ def test_status_command_json_flag_emits_parseable_json(tmp_path, valid_config_pa
     assert "open_positions" in payload
     assert "rule_counts" in payload
     assert "data_freshness" in payload
+
+
+def test_status_help_describes_the_venue_read_and_the_manual_suspension() -> None:
+    """F9: rail 17 has no expiry since #1010, so `keel status --help` must not promise a
+    "fresh with time remaining, or EXPIRED" state; it shows the manual suspension."""
+    from click.testing import CliRunner
+
+    from keel.cli import cli
+
+    result = CliRunner().invoke(cli, ["status", "--help"])
+    text = " ".join(result.output.split())
+
+    assert result.exit_code == 0, result.output
+    assert "EXPIRED" not in text and "time remaining" not in text
+    assert "manual withdrawal suspension" in text

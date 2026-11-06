@@ -125,10 +125,15 @@ def withdrawals_show(ctx: click.Context) -> None:
         config = _load_cfg(ctx)
         broker = _build_broker(config, timeout=SHOW_VENUE_TIMEOUT_SEC, repo=repo)
         answers = broker.withdrawals_allowed(_wallet_currencies(repo))
-    except Exception:
+    except Exception as exc:
         # A viewer, not a gate: a venue that cannot be asked is reported, never raised, so the
-        # operator can still read the manual-suspension line above it.
-        click.echo("venue unreadable -- rail 17 refuses entries while it cannot read the venue")
+        # operator can still read the manual-suspension line above it. The exception TYPE, as
+        # the rail's own veto says it (`venue unreadable: <ExcType>`), and not its message --
+        # an adapter's message can carry a request URL or a credential name.
+        click.echo(
+            f"venue unreadable: {type(exc).__name__} -- rail 17 refuses entries while it cannot "
+            "read the venue"
+        )
         return
     for currency, allowed in answers.items():
         click.echo(f"  {currency:<8}{_WALLET_WORDS[allowed]}")

@@ -915,11 +915,17 @@ def check(
     #     Fails CLOSED on None, like rails 12/13 — silence is not evidence of possession.
     if is_buy and not offline:
         if intent.withdrawals_enabled is None:
+            # Catch-up (#1010) is DCA-only: only a DCA buy is retried within its window, so only
+            # its message says so.
+            retry = (
+                " Buy skipped; it is retried next cycle within its window."
+                if intent.is_dca
+                else " Buy skipped."
+            )
             violations.append(
                 f"withdrawal_capability: UNKNOWN ({intent.withdrawals_detail}). Under §65.4 "
                 "possession requires that nothing prevents withdrawal on demand; an unverified "
-                "state is not evidence that it holds. Buy skipped; it is retried next cycle "
-                "within its window."
+                f"state is not evidence that it holds.{retry}"
             )
         elif intent.withdrawals_enabled is False:
             violations.append(

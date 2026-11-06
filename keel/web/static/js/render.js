@@ -861,7 +861,7 @@ function pulseNextDca(data) {
         { label: "cadence", numeric: false },
         { label: "budget", numeric: true },
         { label: "budget basis", numeric: false },
-        { label: "next cadence day (UTC)", numeric: false },
+        { label: "next buy day (UTC)", numeric: false },
       ],
       data.next_dca.map(
         /** @param {any} row */ (row) => [

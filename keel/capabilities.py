@@ -191,8 +191,9 @@ CAPABILITIES: tuple[Capability, ...] = (
         surface="cli",
         invocation="keel withdrawals attest --enabled",
         increases=(
-            "rail 17 stops vetoing: the operator attests that withdrawals are possible at the "
-            "venue, which is what makes holding a balance there permissible rather than assumed"
+            "rail 17's manual suspension is cleared, so new entries are no longer halted by the "
+            "operator's own brake; rail 17 still reads the venue's withdrawal flag on every live "
+            "buy and vetoes it when the venue says no or cannot be read"
         ),
     ),
     Capability(
