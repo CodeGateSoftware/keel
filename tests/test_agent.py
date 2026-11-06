@@ -7263,6 +7263,113 @@ def test_catch_up_since_day_prefers_promoted_at_and_never_guesses_a_missing_one(
     assert agent._dca_catch_up_state(repo, rule, row, mode="live").since_day is None
 
 
+# Ported from #1013 (its window-ledger tests) onto `catch_up`: the hazards they pinned outlive the
+# ledger they were written against.
+
+
+def _promoted_live_dca(repo: Repository, promoted_at: int) -> int:
+    """A live 7-day DCA rule created on day 0 and promoted at `promoted_at`."""
+    rule_id = repo.insert_rule(
+        "dca", {"product_id": PRODUCT, "cadence_days": 7}, status="live", now_ts=0
+    )
+    repo._conn.execute("UPDATE rules SET promoted_at = ? WHERE id = ?", (promoted_at, rule_id))
+    repo._conn.commit()
+    return rule_id
+
+
+def _live_buy(repo: Repository, rule_id: int, status: str, created_at: int, mode: str = "live"):
+    return repo.insert_order(
+        {
+            "mode": mode,
+            "product_id": PRODUCT,
+            "side": Side.BUY.value,
+            "order_type": "market",
+            "qty": Decimal("0.5"),
+            "status": status,
+            "rule_id": rule_id,
+            "created_at": created_at,
+            "updated_at": created_at,
+        }
+    )
+
+
+def test_a_partially_filled_buy_blocks_its_windows_catch_up(repo):
+    """Ported from #1013 (#1015): reconcile leaves a part-executed DCA buy `partially_filled`.
+    Money is already spent in that window, so no later cycle of the window may buy again --
+    neither while the row rests nor after reconcile moves it to `filled`."""
+    rule_id = repo.insert_rule(
+        "dca", {"product_id": PRODUCT, "cadence_days": 7}, status="live", now_ts=0
+    )
+    order_id = _live_buy(repo, rule_id, "partially_filled", 15 * DAY + 3_600)  # bought bar 14
+    [row] = [r for r in repo.get_rules() if r["id"] == rule_id]
+    state = agent._dca_catch_up_state(repo, _build_rule(row), row, mode="live")
+    assert state.in_flight is True, "fixture: the partial fill must reach the ledger reader"
+    series = _dca_series(15)
+    _seed_history(repo, series)
+    broker = FakeBroker(series={(PRODUCT, Granularity.ONE_DAY): series})
+
+    resting = run_once(broker, repo, _config(), now_ts=16 * DAY + 3_600)
+
+    assert resting.enter_signals == [] and broker.place_calls == []
+
+    repo.update_order(order_id, status="filled", updated_at=16 * DAY + 7_200)
+    series.append(_candle(16 * DAY, "100"))
+    settled = run_once(broker, repo, _config(), now_ts=17 * DAY + 3_600)
+
+    assert settled.enter_signals == [] and broker.place_calls == []
+    assert len(repo.get_orders(mode="live", product_id=PRODUCT)) == 1
+
+
+def test_paper_era_activity_does_not_make_a_live_window_due(repo):
+    """Ported from #1013 (R13): a promoted rule keeps its id, so its paper-era rows sit beside its
+    live ones. A paper fill for window 14 must neither fill nor open that window live: promoted
+    on day 16, after the window's buying cycle (day 15), the rule waits for window 21. (#1013
+    also seeded a paper-era signal; `catch_up` reads no signals, so that row would prove nothing.)
+    """
+    rule_id = _promoted_live_dca(repo, 16 * DAY + 36_000)
+    _live_buy(repo, rule_id, "filled", 14 * DAY, mode="paper")
+    assert len(repo.get_orders(mode="paper")) == 1, "fixture: the paper-era fill is stored"
+    series = _dca_series(16)
+    _seed_history(repo, series)
+    broker = FakeBroker(series={(PRODUCT, Granularity.ONE_DAY): series})
+
+    result = run_once(broker, repo, _config(), now_ts=17 * DAY + 3_600)
+
+    assert result.enter_signals == [] and broker.place_calls == []
+    assert repo.get_orders(mode="live") == []
+
+
+def test_a_rule_promoted_on_its_window_open_day_catches_that_window_up(repo):
+    """Ported from #1013 (R13, lower edge): promoted on day 14 at 10:00, a cadence day. Window 14
+    is bought by the day-15 cycle, which runs after the promotion, so it is the rule's own live
+    window and a missed buy of it is caught up."""
+    _promoted_live_dca(repo, 14 * DAY + 36_000)
+    series = _dca_series(15)
+    _seed_history(repo, series)
+    broker = FakeBroker(series={(PRODUCT, Granularity.ONE_DAY): series})
+
+    result = run_once(broker, repo, _config(), now_ts=16 * DAY + 3_600)
+
+    assert [s.setup.context["catch_up"] for s in result.enter_signals] == [True]
+    assert len(broker.place_calls) == 1
+
+
+def test_a_rule_promoted_on_its_windows_buying_day_catches_that_window_up(repo):
+    """#1013's R13 floor left this window unbought; `catch_up` buys it. Promoted on day 15 at
+    10:00, after that day's cycle bought (or would have bought) bar 14: `since_day` is 15 and
+    the window's buying day is 15, which is not BEFORE the promotion, so the day-16 cycle catches
+    window 14 up -- the rule's first live buy, and its only one for the window."""
+    _promoted_live_dca(repo, 15 * DAY + 36_000)
+    series = _dca_series(15)
+    _seed_history(repo, series)
+    broker = FakeBroker(series={(PRODUCT, Granularity.ONE_DAY): series})
+
+    result = run_once(broker, repo, _config(), now_ts=16 * DAY + 3_600)
+
+    assert [s.setup.context["catch_up"] for s in result.enter_signals] == [True]
+    assert len(broker.place_calls) == 1
+
+
 def test_catch_up_day_counts_as_dca_day_for_sleeve_exclusion(repo, monkeypatch):
     """Spec §3.4 + catch-up: day 40 is no 7-day window-open day (window 35), but window 35 never
     filled, so day 40 is a DCA buy day -- even when rail 17 vetoes that buy, the same-day sale

@@ -74,7 +74,8 @@ been validly possessed at all — so **acquiring more of it** is the thing to st
 
 ## A skipped buy is retried
 
-A rail-17 veto skips that day's DCA buy. DCA catch-up retries a buy that was due and did not fill
+DCA buys are **not** exempt from this rail: a DCA buy is an acquisition like any other. A rail-17
+veto skips that day's DCA buy. DCA catch-up retries a buy that was due and did not fill
 on each later daily cycle until it fills or the rule's next window opens, so a short freeze does
 not cost the window. A manual suspension is different: it is retried the same way, but nothing
 clears it except `keel withdrawals attest --enabled`. A skipped live DCA buy also posts a macOS notification ("keel-live: DCA buy
