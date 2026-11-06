@@ -7505,6 +7505,7 @@ def test_withheld_entries_make_every_due_dca_rule_a_skip(repo, monkeypatch):
     by_product = {s.product: s for s in result.skipped_buys}
     assert PRODUCT in by_product and by_product[PRODUCT].rule_id == ready_id
     assert "withheld" in by_product[PRODUCT].reason
+    assert by_product[PRODUCT].retry_until == "1970-01-12", "cadence 1: day 10's next window is 11"
 
 
 def test_a_stale_feed_makes_the_due_dca_rule_a_skip(repo, monkeypatch):
@@ -7520,3 +7521,27 @@ def test_a_stale_feed_makes_the_due_dca_rule_a_skip(repo, monkeypatch):
     assert PRODUCT in result.stale_products, "fixture: the product is stale"
     [skip] = result.skipped_buys
     assert PRODUCT == skip.product and "stale" in skip.reason
+    # Judged by TODAY, not by the stale series: cycle day 45 buys bar 44, window 42, next 49.
+    assert skip.retry_until == "1970-02-19"
+
+
+def test_a_stale_feed_whose_last_bar_window_already_filled_still_reports_the_current_window(
+    repo, monkeypatch
+):
+    """The last stored bar (day 17) sits in window 14, which FILLED -- judged by that bar the rule
+    is not due and the skip would go silent for as long as the feed stays stale. The cycle on day
+    22 is due for window 21, so it must report that, with window 21's next-window date."""
+    _spy_post(monkeypatch)
+    _live_dca_rule(repo)
+    series = _dca_series(17)
+    _seed_history(repo, series)
+    broker = FakeBroker(series={(PRODUCT, Granularity.ONE_DAY): series})
+    run_once(broker, repo, _config(), now_ts=15 * DAY + 3_600)
+    assert len(broker.place_calls) == 1, "fixture: window 14 filled"
+
+    result = run_once(broker, repo, _config(), now_ts=22 * DAY + 3_600)
+
+    assert PRODUCT in result.stale_products, "fixture: the product is stale"
+    [skip] = result.skipped_buys
+    assert "stale" in skip.reason
+    assert skip.retry_until == "1970-01-29", "window 21 -> the next window opens on day 28"

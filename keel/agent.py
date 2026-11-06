@@ -1301,9 +1301,7 @@ def _epoch_day_date(day: int) -> str:
 
 def _skipped_dca_buys(
     rules: list[Rule],
-    granularities: list[Granularity],
-    candles_by_tf_by_product: dict[str, dict[Granularity, list[Any]]],
-    repo: Repository,
+    now_ts: int,
     *,
     enter_signals: list[Signal],
     enter_results: list[ExecutionResult],
@@ -1351,10 +1349,9 @@ def _skipped_dca_buys(
                 signal.setup.context.get("window_start_day") if signal.setup is not None else None
             )
         else:
-            candles_by_tf = candles_by_tf_by_product.get(rule.product_id)
-            if candles_by_tf is None:  # a stale product's series was never loaded
-                candles_by_tf = {g: repo.get_candles(rule.product_id, g) for g in granularities}
-            window_day = rule.due_window(candles_by_tf, ignore_in_flight=True)
+            # By the CLOCK, not the stored series: a stale feed's last bar would judge a window
+            # that closed long ago (silent skip, past retry date). The cycle on day D buys bar D-1.
+            window_day = rule.due_window(now_ts // _DAY - 1, ignore_in_flight=True)
             if window_day is None:
                 continue
             if rule.product_id in stale_products:
@@ -3147,9 +3144,7 @@ def run_once(
             try:
                 skipped_buys = _skipped_dca_buys(
                     rules,
-                    granularities,
-                    candles_by_tf_by_product,
-                    repo,
+                    now_ts,
                     enter_signals=enter_signals,
                     enter_results=enter_results,
                     stale_products=stale_products,

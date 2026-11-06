@@ -237,17 +237,14 @@ class Dca(Rule):
             ts=latest.ts,
         )
 
-    def due_window(
-        self, candles_by_tf: dict[Granularity, list[Candle]], *, ignore_in_flight: bool = False
-    ) -> int | None:
-        """Pure. The window (its opening epoch day) `detect` would buy on these candles, or
-        `None` when it would not. `ignore_in_flight` answers "would it buy but for a resting
-        order?" -- the question the cycle asks to report a BLOCKED buy rather than stay silent
-        about it. The same `_due` decision `detect` makes, so the two cannot drift."""
-        candles = completed_days(candles_by_tf)
-        if not candles:
-            return None
-        day = candles[-1].ts // _SECONDS_PER_DAY
+    def due_window(self, day: int, *, ignore_in_flight: bool = False) -> int | None:
+        """Pure. The window (its opening epoch day) a buy off the daily bar of epoch day `day`
+        would be due for, or `None` when it would not be. `ignore_in_flight` answers "would it buy
+        but for a resting order?". The same `_due` decision `detect` makes, so they cannot drift.
+
+        Takes a DAY, not candles: the cycle asks it for the last completed day by the CLOCK, to
+        report a buy it never evaluated (stale feed, withheld entries, resting order) -- reading
+        the stored series there would judge a stale feed by its stale last bar."""
         window_day = window_start_day(day, self.params["cadence_days"])
         if self._due(day, window_day, ignore_in_flight=ignore_in_flight):
             return window_day
