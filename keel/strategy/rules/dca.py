@@ -70,8 +70,9 @@ class DcaCatchUp:
     - `since_day`: the epoch day the rule went to its current status (`promoted_at // 86400`,
       else `created_at // 86400`). `None` when the row has neither: catch-up is OFF for that
       rule (window-open day only) -- a missing timestamp is never read as "since forever".
-    - `filled_window_day`: `window_start_day` of the rule's most recent FILLED BUY in the
-      cycle's mode, or `None` when it has none.
+    - `filled_window_day`: `window_start_day` of the rule's most recent BUY in the cycle's mode
+      that executed anything (`filled`, or a cancelled partial: `agent._buy_executed`), or
+      `None` when it has none.
     - `in_flight`: a BUY of the rule is still resting (`executor.RESTING_STATUSES`); it blocks
       every buy of the rule, so two are never in flight.
     - `resting_order_ids`: the local `orders.id`s behind `in_flight`, for the operator-facing

@@ -7277,7 +7277,14 @@ def _promoted_live_dca(repo: Repository, promoted_at: int) -> int:
     return rule_id
 
 
-def _live_buy(repo: Repository, rule_id: int, status: str, created_at: int, mode: str = "live"):
+def _live_buy(
+    repo: Repository,
+    rule_id: int,
+    status: str,
+    created_at: int,
+    mode: str = "live",
+    filled_quantity: Decimal | None = None,
+):
     return repo.insert_order(
         {
             "mode": mode,
@@ -7286,6 +7293,7 @@ def _live_buy(repo: Repository, rule_id: int, status: str, created_at: int, mode
             "order_type": "market",
             "qty": Decimal("0.5"),
             "status": status,
+            "filled_quantity": filled_quantity,
             "rule_id": rule_id,
             "created_at": created_at,
             "updated_at": created_at,
@@ -7318,6 +7326,61 @@ def test_a_partially_filled_buy_blocks_its_windows_catch_up(repo):
 
     assert settled.enter_signals == [] and broker.place_calls == []
     assert len(repo.get_orders(mode="live", product_id=PRODUCT)) == 1
+
+
+def test_a_canceled_buy_that_executed_part_fills_its_window(repo):
+    """A `partially_filled` DCA BUY cancelled through `keel orders cancel` ends `canceled` with
+    its executed `filled_quantity` still on the row (`orders.py` writes the terminal status after
+    the fill readback). Money was spent in window 14, so no later cycle of that window may buy
+    again; window 21 still opens as an ordinary buy."""
+    rule_id = repo.insert_rule(
+        "dca", {"product_id": PRODUCT, "cadence_days": 7}, status="live", now_ts=0
+    )
+    _live_buy(repo, rule_id, "canceled", 15 * DAY + 3_600, filled_quantity=Decimal("0.2"))
+    series = _dca_series(15)
+    _seed_history(repo, series)
+    broker = FakeBroker(series={(PRODUCT, Granularity.ONE_DAY): series})
+
+    in_window = run_once(broker, repo, _config(), now_ts=16 * DAY + 3_600)
+
+    assert in_window.enter_signals == [] and broker.place_calls == []
+
+    series.extend(_candle(d * DAY, "100") for d in range(16, 22))
+    next_window = run_once(broker, repo, _config(), now_ts=22 * DAY + 3_600)
+
+    assert [s.setup.context["catch_up"] for s in next_window.enter_signals] == [False]
+    assert len(broker.place_calls) == 1
+
+
+@pytest.mark.parametrize("status", ["canceled", "rejected"])
+@pytest.mark.parametrize("executed", [None, Decimal("0")])
+def test_a_buy_that_executed_nothing_leaves_its_window_to_catch_up(repo, status, executed):
+    """The other side of the rule above: a terminal BUY that executed nothing spent nothing, so
+    the window is still owed and the next cycle catches it up."""
+    rule_id = repo.insert_rule(
+        "dca", {"product_id": PRODUCT, "cadence_days": 7}, status="live", now_ts=0
+    )
+    _live_buy(repo, rule_id, status, 15 * DAY + 3_600, filled_quantity=executed)
+    assert len(repo.get_orders(mode="live")) == 1, "fixture: the row reaches the ledger"
+    series = _dca_series(15)
+    _seed_history(repo, series)
+    broker = FakeBroker(series={(PRODUCT, Granularity.ONE_DAY): series})
+
+    result = run_once(broker, repo, _config(), now_ts=16 * DAY + 3_600)
+
+    assert [s.setup.context["catch_up"] for s in result.enter_signals] == [True]
+    assert len(broker.place_calls) == 1
+
+
+def test_bought_today_counts_a_canceled_buy_that_executed_part(repo):
+    """The same-day-sale exclusion reads the same fact: a cancelled BUY that executed part of its
+    size bought today; one that executed nothing did not."""
+    rule_id = repo.insert_rule("dca", {"product_id": PRODUCT}, status="live", now_ts=0)
+    now = 15 * DAY + 7_200
+    _live_buy(repo, rule_id, "canceled", 15 * DAY + 3_600, filled_quantity=Decimal("0"))
+    assert agent._bought_today(repo, PRODUCT, now, mode="live") is False
+    _live_buy(repo, rule_id, "canceled", 15 * DAY + 3_600, filled_quantity=Decimal("0.2"))
+    assert agent._bought_today(repo, PRODUCT, now, mode="live") is True
 
 
 def test_paper_era_activity_does_not_make_a_live_window_due(repo):

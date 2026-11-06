@@ -1180,13 +1180,31 @@ _WARMUP_LOGGED_PRODUCTS: set[str] = set()
 _DAY = 86_400
 
 
+def _buy_executed(order: dict[str, Any]) -> bool:
+    """Whether an order row bought anything: `filled`, or any status with a venue-observed
+    `filled_quantity` above zero.
+
+    A `partially_filled` BUY cancelled through `keel orders cancel` ends `canceled` with its
+    executed quantity still on the row, and reconcile's dead-order path writes `filled` only when
+    the venue reports the fill. Reading `status == "filled"` alone would call that window unbought
+    and buy it a second time. A terminal row that executed nothing (`filled_quantity` absent or
+    zero) spent nothing, so its window is still owed."""
+    if order["status"] == "filled":
+        return True
+    executed = order.get("filled_quantity")
+    return executed is not None and Decimal(executed) > 0
+
+
 def _bought_today(repo: Repository, product_id: str, now_ts: int, *, mode: str) -> bool:
-    """Whether a `mode` BUY of `product_id` FILLED on this UTC day -- the half of "DCA fires
-    today" the ledger can see once the cycle's own buy has gone out (reductions run after it)."""
+    """Whether a `mode` BUY of `product_id` executed on this UTC day (`_buy_executed`) -- the
+    half of "DCA fires today" the ledger can see once the cycle's own buy has gone out
+    (reductions run after it)."""
     start = now_ts - now_ts % _DAY
     return any(
-        order["side"] == Side.BUY.value and int(order["created_at"]) >= start
-        for order in repo.get_orders(mode=mode, product_id=product_id, status="filled")
+        order["side"] == Side.BUY.value
+        and int(order["created_at"]) >= start
+        and _buy_executed(order)
+        for order in repo.get_orders(mode=mode, product_id=product_id)
     )
 
 
@@ -1223,8 +1241,9 @@ def _dca_catch_up_state(
 
     - `since_day`: `promoted_at // 86400`, else `created_at // 86400`, else `None` (catch-up
       off: a row that cannot say when it went live is never read as "live since forever").
-    - `filled_window_day`: the window of the rule's most recent FILLED BUY, by the bar it
-      bought (`_dca_order_bar_day`), not by row order.
+    - `filled_window_day`: the window of the rule's most recent BUY that executed anything
+      (`_buy_executed`: `filled`, or a cancelled partial), by the bar it bought
+      (`_dca_order_bar_day`), not by row order.
     - `in_flight`: a BUY of the rule in `executor.RESTING_STATUSES`.
 
     Raises on an unreadable ledger; `_attach_dca_catch_up` turns that into "catch-up off".
@@ -1240,7 +1259,7 @@ def _dca_catch_up_state(
         if order.get("rule_id") == rule.rule_id and order["side"] == Side.BUY.value
     ]
     filled_bar_days = [
-        _dca_order_bar_day(order, mode=mode) for order in buys if order["status"] == "filled"
+        _dca_order_bar_day(order, mode=mode) for order in buys if _buy_executed(order)
     ]
     resting = tuple(
         int(order["id"]) for order in buys if order["status"] in executor.RESTING_STATUSES
