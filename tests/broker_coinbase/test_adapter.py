@@ -998,3 +998,13 @@ def test_withdrawals_allowed_treats_non_bool_flag_as_unreadable(row: dict[str, A
 
 def test_coinbase_adapter_satisfies_withdrawal_reader():
     assert isinstance(CoinbaseAdapter(FakeTransport()), WithdrawalReader)
+
+
+@pytest.mark.parametrize("flags", [(True, False), (False, True)])
+def test_withdrawals_allowed_duplicate_wallets_false_wins(flags: tuple[bool, bool]):
+    rows = [
+        {"id": f"a{i}", "currency": {"code": "USDC"}, "allow_withdrawals": f}
+        for i, f in enumerate(flags)
+    ]
+    transport = FakeTransport(v2_pages=[_v2_page(rows)])
+    assert CoinbaseAdapter(transport).withdrawals_allowed(["USDC"]) == {"USDC": False}

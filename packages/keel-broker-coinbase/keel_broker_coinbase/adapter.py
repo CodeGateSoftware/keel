@@ -409,11 +409,12 @@ class CoinbaseAdapter:
         does not affect this one.
 
         **Fails closed, unlike `verify_cash_account`, and for the opposite reason.** That check
-        can only refute, so silence is harmless; this one is asked to AFFIRM that withdrawals
-        are off-limits to the key, so a read that did not happen proves nothing. Every failure
-        raises: transport errors propagate, a flag that is not a real bool on a wallet we were
-        asked about raises `ValueError` (a string `"yes"` is not an answer), and so does still
-        paginating after 20 pages -- the caller decides what an unreadable venue means.
+        can only refute, so silence is harmless; this one is asked to AFFIRM the wallet is not
+        frozen (`True` is the passing answer), so a read that did not happen proves
+        nothing. Every failure raises: transport errors propagate, a flag that is not a real
+        bool on a wallet we were asked about raises `ValueError` (a string `"yes"` is not an
+        answer), and so does still paginating after 20 pages --
+        the caller decides what an unreadable venue means.
 
         Pages of 100 wallets, following `pagination.next_starting_after` via `starting_after`.
         """
@@ -437,9 +438,9 @@ class CoinbaseAdapter:
                     raise ValueError(
                         f"Coinbase wallet {code} has an unreadable allow_withdrawals: {flag!r}"
                     )
-                # Several wallets for one code is not expected; if it happens, any wallet
-                # that can withdraw makes the code withdrawable.
-                found[code] = found.get(code, False) or flag
+                # Several wallets for one code is not expected; if it happens, a False wins:
+                # one frozen wallet vetoes the code, because this read fails closed.
+                found[code] = found.get(code, True) and flag
             starting_after = _field(_field(response, "pagination"), "next_starting_after")
             if not starting_after:
                 return {c: found.get(c.upper()) for c in currencies}
