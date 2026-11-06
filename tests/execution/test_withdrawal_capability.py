@@ -46,6 +46,25 @@ def test_manual_suspension_vetoes_without_reading_the_venue(repo):
     assert broker.withdrawals_calls == 0
 
 
+def test_unreadable_suspension_state_fails_closed_without_asking_the_venue(repo):
+    """Not knowing whether a suspension is stored is not evidence that none is."""
+
+    class _BrokenRead:
+        def __getattr__(self, name):
+            return getattr(repo, name)
+
+        def get_state(self, key, *a, **k):
+            if key == "withdrawals_enabled":
+                raise RuntimeError("db gone")
+            return repo.get_state(key, *a, **k)
+
+    broker = FakeBroker()
+    result = _buy(_BrokenRead(), broker)
+    _assert_vetoed(result, broker, "suspension state unreadable")
+    assert "UNKNOWN" in result.vetoed_by[0]
+    assert broker.withdrawals_calls == 0
+
+
 def test_adapter_without_the_read_is_UNKNOWN(repo):
     class _NoReader(FakeBroker):
         withdrawals_allowed = None  # type: ignore[assignment]

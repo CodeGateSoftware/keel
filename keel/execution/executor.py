@@ -509,20 +509,27 @@ def _withdrawals_enabled(repo: Any, now_ts: int) -> bool | None:
     return bool(enabled)
 
 
-def manual_withdrawal_suspension(repo: Any) -> bool:
-    """Has the operator frozen entries with `keel withdrawals attest --suspended`?
+def _stored_suspension(repo: Any) -> bool | None:
+    """The operator's stored `--suspended` brake: `True` (set), `False` (not set), `None` (unreadable).
 
     `True` iff the stored `withdrawals_enabled` is exactly `False`. No timestamp is read: the
-    attestation no longer carries a TTL (#1010) because the VENUE, not the operator, is now the
-    source of truth for whether withdrawals work -- this flag is only the one-way brake that
-    reduces capability. An unreadable repo is NOT a suspension (it is not evidence of one), so
-    this returns `False` and the venue read decides.
+    attestation no longer carries a TTL (#1010) because the VENUE is the source of truth for
+    whether withdrawals work -- this flag is only the one-way brake that reduces capability.
     """
     try:
         return repo.get_state("withdrawals_enabled", default=None) is False
     except Exception:
         log_exception(logger, "executor.withdrawal_attestation_read_failed")
-        return False
+        return None
+
+
+def manual_withdrawal_suspension(repo: Any) -> bool:
+    """Display helper: is a manual suspension stored? An unreadable store reads as `False` here.
+
+    NOT for the rail path: there, not knowing whether a suspension is stored is not evidence
+    that none is, so `_withdrawal_capability` fails closed on an unreadable store itself.
+    """
+    return _stored_suspension(repo) is True
 
 
 def _withdrawal_capability(broker: Any, repo: Any, product_id: str) -> tuple[bool | None, str]:
@@ -542,7 +549,10 @@ def _withdrawal_capability(broker: Any, repo: Any, product_id: str) -> tuple[boo
 
     `detail` says why, for the veto message; it is `""` on a pass.
     """
-    if manual_withdrawal_suspension(repo):
+    suspended = _stored_suspension(repo)
+    if suspended is None:
+        return None, "suspension state unreadable"
+    if suspended:
         return False, "manual suspension (keel withdrawals attest --suspended)"
 
     reader = getattr(broker, "withdrawals_allowed", None)
