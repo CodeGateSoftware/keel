@@ -7384,10 +7384,11 @@ def test_bought_today_counts_a_canceled_buy_that_executed_part(repo):
 
 
 def test_paper_era_activity_does_not_make_a_live_window_due(repo):
-    """Ported from #1013 (R13): a promoted rule keeps its id, so its paper-era rows sit beside its
-    live ones. A paper fill for window 14 must neither fill nor open that window live: promoted
-    on day 16, after the window's buying cycle (day 15), the rule waits for window 21. (#1013
-    also seeded a paper-era signal; `catch_up` reads no signals, so that row would prove nothing.)
+    """Ported from #1013 (R13), promotion-boundary half: promoted on day 16, after window 14's
+    buying cycle (day 15), the rule does not catch window 14 up and waits for window 21. The
+    paper-era fill is seeded for realism only -- `since_day` alone decides this case, so it does
+    not prove mode isolation; `test_paper_missed_window_catches_up_from_the_paper_ledger` and the
+    state-level mode test do. (#1013 also seeded a paper-era signal; `catch_up` reads no signals.)
     """
     rule_id = _promoted_live_dca(repo, 16 * DAY + 36_000)
     _live_buy(repo, rule_id, "filled", 14 * DAY, mode="paper")

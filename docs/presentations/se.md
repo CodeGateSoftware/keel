@@ -316,9 +316,10 @@ Four design decisions worth discussing:
 
 **Rail 17 is the one to dwell on.** Constructive possession — "the ability to dispose, not
 physical custody" — is tested by asking whether the asset can be withdrawn from the venue. If it
-cannot, you do not effectively possess it, so acquiring more is stopped. The attestation expires
-after 7 days (`WITHDRAWAL_ATTESTATION_TTL_SEC`) because "a stale attestation is no better than
-none". A classical contract rule, expressed as a TTL.
+cannot, you do not effectively possess it, so acquiring more is stopped. Before every live buy
+keel asks the venue itself (Coinbase's per-wallet `allow_withdrawals`) and refuses the buy when
+the answer is no or cannot be read. A classical contract rule, expressed as a check the venue
+answers on every order.
 
 ### 6.6 `keel/execution/executor.py` — placing it
 
