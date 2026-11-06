@@ -14,10 +14,19 @@ the per-asset concentration cap (rail 6). It remains bounded by the halal allowl
 kill-switch and every other rail -- among them the per-order, per-day, correlated-size, cash and
 monthly-buy rails (2, 3, 5, 13, 14). `execution/guards.py`'s module docstring is the authoritative
 list; this rule (like every Phase 2 rule) only emits *intents*.
+
+**Catch-up until the next window (#1010).** A buy that was due and did not fill -- any rail
+veto, a failed cycle, a venue error, the machine being off -- is attempted again on every later
+daily cycle until it fills or the rule's next window opens, with at most one fill per rule per
+window. The window arithmetic stays here and pure; WHAT the ledger says (`DcaCatchUp`) is read
+by the live/paper cycle (`agent._dca_catch_up_state`) and set on the instance as `catch_up`.
+Backtests, the account sim and research never set it, so they keep the window-open-day-only
+behaviour exactly.
 """
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from decimal import Decimal
 
 from keel.strategy.rules.base import Rule, Setup, completed_days
@@ -44,6 +53,32 @@ def next_cadence_day_ts(now_ts: int, cadence_days: int) -> int:
     day = now_ts // _SECONDS_PER_DAY
     remainder = day % cadence_days
     return (day if remainder == 0 else day + cadence_days - remainder) * _SECONDS_PER_DAY
+
+
+def window_start_day(day: int, cadence_days: int) -> int:
+    """The epoch day the cadence window containing `day` opened on: the last cadence day on or
+    before it (`is_cadence_day`'s expression, solved for the window rather than tested)."""
+    if cadence_days <= 0:
+        raise ValueError("cadence_days must be positive")
+    return day - day % cadence_days
+
+
+@dataclass(frozen=True)
+class DcaCatchUp:
+    """What the cycle's own ledger says about one DCA rule, for `Dca.detect`'s catch-up (#1010).
+
+    - `since_day`: the epoch day the rule went to its current status (`promoted_at // 86400`,
+      else `created_at // 86400`). `None` when the row has neither: catch-up is OFF for that
+      rule (window-open day only) -- a missing timestamp is never read as "since forever".
+    - `filled_window_day`: `window_start_day` of the rule's most recent FILLED BUY in the
+      cycle's mode, or `None` when it has none.
+    - `in_flight`: a BUY of the rule is still resting (`executor.RESTING_STATUSES`); it blocks
+      every buy of the rule, so two are never in flight.
+    """
+
+    since_day: int | None
+    filled_window_day: int | None
+    in_flight: bool
 
 
 class Dca(Rule):
@@ -83,6 +118,10 @@ class Dca(Rule):
     #: (`_is_dca_setup`) and rests nothing behind the buy. Declared so the bracket column reads
     #: "no stop by design" for its tranches rather than WARNing on every one (#961).
     places_bracket = False
+    #: The ledger's answer for catch-up (`DcaCatchUp`), set per cycle by the live/paper agent.
+    #: `None` -- the class default, and all a backtest, the sim or research ever sees -- is the
+    #: window-open-day-only behaviour this rule always had.
+    catch_up: DcaCatchUp | None = None
 
     def __init__(
         self,
@@ -123,6 +162,19 @@ class Dca(Rule):
     def detect(self, candles_by_tf: dict[Granularity, list[Candle]]) -> Setup | None:
         """Pure. On a cadence boundary, a market-buy long `Setup` sized to `budget_usd` (scaled
         up on dips); off-cadence (or with no daily candles), `None`.
+
+        With `catch_up` set (live/paper only), on the latest completed bar's day `d` and its
+        window `w = window_start_day(d, cadence_days)`, in this order:
+
+        1. a BUY in flight -> `None` (never two buys in flight);
+        2. the ledger already filled window `w` -> `None` -- the window-open day too, so a cycle
+           that re-runs after the buy filled never re-buys it;
+        3. `d == w` -> the ordinary window-open buy (`context["catch_up"]` False);
+        4. no `since_day`, or the window's buying cycle (day `w + 1`, which buys bar `w`) ran
+           before the rule went to its status (`w + 1 < since_day`) -> `None`: a rule promoted
+           mid-window waits for the next one;
+        5. otherwise -> a catch-up buy (`context["catch_up"]` True), sized from bar `d`, not the
+           window-opening bar.
         """
         # COMPLETED days only (#821): the account sim's last daily bar is the still-forming day,
         # stored with the completed day's OHLC -- reading it from hour 0 bought at a close that
@@ -134,8 +186,10 @@ class Dca(Rule):
 
         latest = candles[-1]
         cadence_days = self.params["cadence_days"]
-        if not is_cadence_day(latest.ts, cadence_days):
-            return None  # off-cadence: no buy today
+        day = latest.ts // _SECONDS_PER_DAY
+        window_day = window_start_day(day, cadence_days)
+        if not self._due(day, window_day):
+            return None
 
         budget_usd: Decimal = self.params["budget_usd"]
         dip_bonus_pct: Decimal = self.params["dip_bonus_pct"]
@@ -161,6 +215,8 @@ class Dca(Rule):
             "recent_high": recent_high,
             "size_usd": size_usd,
             "no_stop": True,
+            "catch_up": day != window_day,
+            "window_start_day": window_day,
         }
 
         return Setup(
@@ -176,6 +232,18 @@ class Dca(Rule):
             context=context,
             ts=latest.ts,
         )
+
+    def _due(self, day: int, window_day: int) -> bool:
+        """`detect`'s buy-or-not decision for bar `day` in window `window_day` (its docstring
+        has the order). `day == window_day` is `is_cadence_day`'s expression on that bar."""
+        catch_up = self.catch_up
+        if catch_up is None:
+            return day == window_day  # backtests/sim: the window-open day only
+        if catch_up.in_flight or catch_up.filled_window_day == window_day:
+            return False
+        if day == window_day:
+            return True
+        return catch_up.since_day is not None and window_day + 1 >= catch_up.since_day
 
     def exit_signal(self, held: Setup, candles_by_tf: dict[Granularity, list[Candle]]) -> bool:
         """DCA never exits on a signal -- it's accumulation, not a risk-defined trade."""

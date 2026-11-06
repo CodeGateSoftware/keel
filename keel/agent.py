@@ -94,7 +94,7 @@ from keel.strategy.reduction import Reduction
 from keel.strategy.rules import sleeve_exit as sleeve_exit_rule
 from keel.strategy.rules.base import Action, Rule, Setup, Signal, completed_days
 from keel.strategy.rules.cusum_event import CusumEvent
-from keel.strategy.rules.dca import Dca
+from keel.strategy.rules.dca import Dca, DcaCatchUp, window_start_day
 from keel.strategy.rules.profit_take import ProfitTake
 from keel.strategy.rules.pullback_continuation import PullbackContinuation
 from keel.strategy.rules.reverse_dca import ReverseDca
@@ -1186,6 +1186,99 @@ def _bought_today(repo: Repository, product_id: str, now_ts: int, *, mode: str) 
         order["side"] == Side.BUY.value and int(order["created_at"]) >= start
         for order in repo.get_orders(mode=mode, product_id=product_id, status="filled")
     )
+
+
+def _dca_order_bar_day(order: dict[str, Any], *, mode: str) -> int:
+    """The epoch day of the daily BAR a DCA BUY row in the `mode` ledger bought.
+
+    The two writers stamp `created_at` differently, so the bar is read per mode: a live row is
+    stamped with the cycle's clock (`executor._order_row`'s `now_ts`), and the cycle on day
+    `d + 1` buys bar `d` (`Dca.detect` reads the latest COMPLETED bar, and the stale-bar gate
+    withholds every entry whose bar is not the one just closed) -- so `created_at // 86400 - 1`.
+    A paper row is stamped with the signal's own ts (`PaperTrader._enter`), which IS the bar's
+    -- so `created_at // 86400`. Reading a paper fill with the live offset would put a
+    window-open buy in the previous window and buy the window again the next day.
+
+    A row with no `created_at` raises: the ledger cannot say which window it filled, and a
+    catch-up is never fired on a ledger the cycle cannot read (`_attach_dca_catch_up`).
+    """
+    created_at = order.get("created_at")
+    if created_at is None:
+        raise ValueError(f"order {order.get('id')} has no created_at; its window is unknown")
+    day = int(created_at) // _DAY
+    return day if mode == "paper" else day - 1
+
+
+def _dca_catch_up_state(
+    repo: Repository, rule: Dca, rule_row: dict[str, Any], *, mode: str
+) -> DcaCatchUp:
+    """What `mode`'s own ledger says about DCA `rule` for its catch-up (#1010; `DcaCatchUp`).
+
+    `mode` is the `orders.mode` value this cycle WRITES -- `"live"` for a live cycle (whatever
+    its executor mode: `executor._order_row` always writes `"live"`), `"paper"` for a paper one
+    (`PaperTrader._enter`) -- so a paper rehearsal of a rule never reads the live fills as its
+    own, nor the reverse. Only this rule's (`orders.rule_id`) BUYs count.
+
+    - `since_day`: `promoted_at // 86400`, else `created_at // 86400`, else `None` (catch-up
+      off: a row that cannot say when it went live is never read as "live since forever").
+    - `filled_window_day`: the window of the rule's most recent FILLED BUY, by the bar it
+      bought (`_dca_order_bar_day`), not by row order.
+    - `in_flight`: a BUY of the rule in `executor.RESTING_STATUSES`.
+
+    Raises on an unreadable ledger; `_attach_dca_catch_up` turns that into "catch-up off".
+    """
+    stamp = rule_row.get("promoted_at")
+    if stamp is None:
+        stamp = rule_row.get("created_at")
+    since_day = None if stamp is None else int(stamp) // _DAY
+    cadence_days = int(rule.params["cadence_days"])
+    buys = [
+        order
+        for order in repo.get_orders(mode=mode)
+        if order.get("rule_id") == rule.rule_id and order["side"] == Side.BUY.value
+    ]
+    filled_bar_days = [
+        _dca_order_bar_day(order, mode=mode) for order in buys if order["status"] == "filled"
+    ]
+    return DcaCatchUp(
+        since_day=since_day,
+        filled_window_day=(
+            window_start_day(max(filled_bar_days), cadence_days) if filled_bar_days else None
+        ),
+        in_flight=any(order["status"] in executor.RESTING_STATUSES for order in buys),
+    )
+
+
+def _attach_dca_catch_up(
+    repo: Repository, rules: list[Rule], rule_rows: list[dict[str, Any]], *, mode: str
+) -> None:
+    """Set `catch_up` on every loaded `Dca` from `mode`'s ledger, before this cycle's
+    `engine.evaluate` and `_dca_fires_today` read `Dca.detect` (#1010).
+
+    Set on EVERY cycle, `None` included, so an instance reused across cycles never carries a
+    previous cycle's answer. A rule with no `rules.id` gets `None` (it has no ledger to read).
+    A lookup that raises costs that rule its catch-up THIS cycle -- `None`, the window-open day
+    only -- and is logged; it never fires a catch-up on a ledger it could not read, and never
+    costs the cycle or another rule's buy.
+    """
+    rows_by_id = {row.get("id"): row for row in rule_rows}
+    for rule in rules:
+        if not isinstance(rule, Dca):
+            continue
+        rule.catch_up = None
+        row = rows_by_id.get(rule.rule_id)
+        if rule.rule_id is None or row is None:
+            continue
+        try:
+            rule.catch_up = _dca_catch_up_state(repo, rule, row, mode=mode)
+        except Exception:  # noqa: BLE001 -- an unreadable ledger disables catch-up, not the cycle
+            log_exception(
+                logger,
+                "agent.dca_catch_up_unreadable",
+                product=rule.product_id,
+                rule_id=rule.rule_id,
+                mode=mode,
+            )
 
 
 def _dca_fires_today(
@@ -2314,13 +2407,10 @@ def run_once(
         # row is built, and loaded on their own by `_sleeve_rules` (which also reads `paper`
         # rows in a live cycle, R16). Their products join the poll set, so the reduction step
         # at the end of the cycle has candles to decide on.
+        rule_rows = [row for row in repo.get_rules(rule_status) if not _is_sleeve_kind(row["kind"])]
         rules = [
             rule
-            for rule in (
-                _build_rule(row)
-                for row in repo.get_rules(rule_status)
-                if not _is_sleeve_kind(row["kind"])
-            )
+            for rule in (_build_rule(row) for row in rule_rows)
             if promotion.promotion_class_of(rule) != promotion.SLEEVE_SELL
         ]
         # `_sleeve_rules` reads `repo.get_rules("paper")` even in a LIVE cycle (R16), and a
@@ -2378,6 +2468,13 @@ def run_once(
         # real executor `mode`; only what we surface to the user changes.
         reported_mode = "paper" if paper_trader is not None else mode
         log_event(logger, logging.INFO, "agent.mode_resolved", mode=reported_mode)
+        # DCA catch-up (#1010): each `Dca` reads THIS cycle's ledger -- the `orders.mode` the
+        # cycle writes: "paper" on the paper path, and "live" for BOTH executor modes
+        # (`executor._order_row`), never `mode`/`reported_mode`'s "confirm"/"autonomous" -- before
+        # `engine.evaluate` and `_dca_fires_today` (sleeve reductions) call its `detect`.
+        _attach_dca_catch_up(
+            repo, rules, rule_rows, mode="paper" if paper_trader is not None else "live"
+        )
         max_age_sec = config.auto_trade.interval_sec * FEED_STALENESS_CYCLES
         finest = _finest_granularity(granularities)
 
