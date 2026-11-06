@@ -510,7 +510,7 @@ def _withdrawals_enabled(repo: Any, now_ts: int) -> bool | None:
 
 
 def _stored_suspension(repo: Any) -> bool | None:
-    """The operator's stored `--suspended` brake: `True` (set), `False` (not set), `None` (unreadable).
+    """The stored `--suspended` brake: `True` (set), `False` (not set), `None` (unreadable).
 
     `True` iff the stored `withdrawals_enabled` is exactly `False`. No timestamp is read: the
     attestation no longer carries a TTL (#1010) because the VENUE is the source of truth for
