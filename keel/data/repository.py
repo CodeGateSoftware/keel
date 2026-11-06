@@ -788,6 +788,23 @@ class Repository:
         rows = self._conn.execute(query, params).fetchall()
         return [self._order_row_to_dict(row) for row in rows]
 
+    def last_live_buy_created_at(self, rule_id: int) -> int | None:
+        """`created_at` of the rule's newest COUNTED live BUY, or `None` (#1010).
+
+        Counted means `status IN ('filled', 'pending', 'partially_filled')`. A DCA market order is
+        written `pending` at insert and `filled` on success, so a `pending` row is one whose
+        outcome nobody has observed yet; treating it as unfilled is exactly the double-buy hazard
+        a window retry must avoid. Reconcile moves a part-executed order to the non-terminal
+        `partially_filled`, which is the same hazard: money is already spent in that window.
+        `rejected` and `canceled` do not count, so that window is retried.
+        """
+        row = self._conn.execute(
+            "SELECT MAX(created_at) FROM orders WHERE mode = 'live' AND side = 'BUY' "
+            "AND rule_id = ? AND status IN ('filled', 'pending', 'partially_filled')",
+            (rule_id,),
+        ).fetchone()
+        return None if row is None or row[0] is None else int(row[0])
+
     def _order_row_to_dict(self, row: sqlite3.Row) -> dict[str, Any]:
         d = dict(row)
         for field in _ORDER_MONEY_FIELDS:
@@ -860,6 +877,20 @@ class Repository:
         self._conn.commit()
         assert cursor.lastrowid is not None
         return cursor.lastrowid
+
+    def signal_ts_since(self, rule_id: int, since_ts: int) -> list[int]:
+        """Bar timestamps of the rule's signals with `ts >= since_ts`, oldest first (#1010).
+
+        Inclusive, and per rule. It knows nothing about promotion: `signals` has no mode column
+        and a promoted rule keeps its id, so the caller (the live agent's DCA ledger) passes a
+        `since_ts` already raised to the start of the day the rule was promoted, which keeps a
+        paper-era signal from proving a live window was due.
+        """
+        rows = self._conn.execute(
+            "SELECT ts FROM signals WHERE rule_id = ? AND ts >= ? ORDER BY ts",
+            (rule_id, since_ts),
+        ).fetchall()
+        return [int(row[0]) for row in rows]
 
     # -- agent_state (KV) -----------------------------------------------------
 

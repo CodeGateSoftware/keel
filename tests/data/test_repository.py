@@ -1013,3 +1013,61 @@ def test_reattesting_a_cash_posture_overwrites_the_posture_ITSELF(repo):
 
     repo.upsert_venue_cash_posture(_posture(attested_ts=3_000, attested_posture="SPOT_CASH"))
     assert repo.get_venue_cash_posture("coinbase").attested_posture == "SPOT_CASH"
+
+
+# -- DCA window ledger reads (#1010) ---------------------------------------
+
+
+def _dca_order(
+    rule_id: int,
+    created_at: int,
+    status: str = "filled",
+    side: str = "BUY",
+    mode: str = "live",
+) -> dict[str, Any]:
+    return _order(
+        mode=mode,
+        side=side,
+        order_type="market",
+        status=status,
+        rule_id=rule_id,
+        created_at=created_at,
+        updated_at=created_at,
+    )
+
+
+def test_last_live_buy_created_at_counts_filled_and_pending_buys_of_that_rule_only(repo):
+    rid = repo.insert_rule("dca", {"product_id": "BTC-USD"}, status="live")
+    other = repo.insert_rule("dca", {"product_id": "ETH-USD"}, status="live")
+    assert repo.last_live_buy_created_at(rid) is None
+    repo.insert_order(_dca_order(rid, 100))
+    repo.insert_order(_dca_order(rid, 200, status="pending"))
+    repo.insert_order(_dca_order(rid, 900, status="rejected"))
+    repo.insert_order(_dca_order(rid, 901, status="canceled"))
+    repo.insert_order(_dca_order(rid, 902, side="SELL"))
+    repo.insert_order(_dca_order(rid, 903, mode="paper"))
+    repo.insert_order(_dca_order(other, 904))
+    # the fixture reached the reader: the other rule's newer buy is there and not counted
+    assert len(repo.get_orders()) == 7
+    assert repo.last_live_buy_created_at(rid) == 200
+    assert repo.last_live_buy_created_at(other) == 904
+
+
+def test_last_live_buy_created_at_counts_a_partially_filled_buy(repo):
+    # reconcile moves a part-executed order to the non-terminal `partially_filled`; it is
+    # still that window's buy, or the next fresh bar retries and buys twice (#1015)
+    rid = repo.insert_rule("dca", {"product_id": "BTC-USD"}, status="live")
+    repo.insert_order(_dca_order(rid, 100))
+    repo.insert_order(_dca_order(rid, 300, status="partially_filled"))
+    assert len(repo.get_orders(status="partially_filled")) == 1
+    assert repo.last_live_buy_created_at(rid) == 300
+
+
+def test_signal_ts_since_is_inclusive_ordered_and_per_rule(repo):
+    rid = repo.insert_rule("dca", {"product_id": "BTC-USD"}, status="live")
+    other = repo.insert_rule("dca", {"product_id": "ETH-USD"}, status="live")
+    for rule_id, ts in ((rid, 300), (rid, 100), (rid, 200), (other, 250)):
+        repo.insert_signal({"rule_id": rule_id, "product_id": "BTC-USD", "ts": ts, "fired": 1})
+    assert repo.signal_ts_since(rid, 200) == [200, 300]
+    assert repo.signal_ts_since(rid, 301) == []
+    assert repo.signal_ts_since(other, 0) == [250]
