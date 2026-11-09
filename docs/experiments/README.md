@@ -23,6 +23,15 @@ Bulk sweep output is **not** committed — it is derived data, regenerated from 
 
 Index is **newest first**, by the date each document carries in its filename.
 
+## 2026-11
+
+- [`2026-11-09-paxg-last-two-digits.md`](2026-11-09-paxg-last-two-digits.md) — Do the last two
+  digits of PAXG's price at a 4-hour window's open predict that window's direction?
+  **Pre-registered** (driver pushed before the run). **No:** in-sample permutation p 0.10 to 0.74,
+  out-of-sample hit rate 48.9 to 49.2% against shuffled-label nulls, on Coinbase (dollars and
+  cents) and five years of Binance. The median 4-hour move of 0.2% is a ninth of the 1.8% taker
+  round trip anyway. Driver `2026-11-09-paxg-last-two-digits.py`, data `.jsonl`.
+
 ## 2026-09
 
 - [`2026-09-27-accumulation-policy.md`](2026-09-27-accumulation-policy.md) — Static DCA vs
