@@ -48,3 +48,39 @@ each will always produce a few digits that look like they "work" by chance.
   friend's exact mapping, stated in advance and scored only on windows after it was written.
 - The Binance and Coinbase samples overlap from 2025-05 to 2026-07. The replication is not
   fully independent there.
+
+## ⚠️ Erratum (2026-11-09, after merge)
+Review of PR #1019 found the errors below. They were merged unfixed. The verdict, the table and
+the driver are unaffected. The driver is left byte-identical to the pre-registered commit
+(30dbe5b), so its docstring corrections are recorded here rather than edited in.
+
+1. **Gross return per "up" call, cents arm.** The Economics section reads "+0.015%". The jsonl
+   gives `mean_gross_up_call` = −0.000149, so the figures are **−0.009%, −0.015% and +0.010%**
+   (Coinbase dollar digits, Coinbase cents, Binance).
+2. **Net return per "up" call.** It reads "−1.80% on all three". The arms give **−1.80%, −1.81%
+   and −1.78%**.
+3. **"Why one would expect this" is backwards for the dollar digits.** An $8 move covers 8% of
+   their $100 cycle, so it doesn't wrap them. Only the cents ($1 cycle) wrap, about eight times.
+   The correct argument: the digit a window starts on is effectively random from one window to
+   the next, and direction could depend on it only through some structure near particular
+   levels. The round-number clustering ("…00") is the known candidate. `is_round_number`'s
+   scale problem is in [`2026-08-11-round-number-scale.md`](2026-08-11-round-number-scale.md).
+4. **Overclaim.** "So a null here also rules out every specific rule" (and the driver
+   docstring's matching sentence) goes too far, as the Limits section says. A null shows no
+   broad dependence. It does not exclude a narrow rule with a small edge.
+5. **Fee argument scope.** "No direction-prediction edge on this horizon can pay keel's fees"
+   rests on the median move. Read it as "no predictor that fires on typical windows". A selective
+   predictor firing only before large moves isn't covered by that arithmetic.
+6. **Driver docstring wording.**
+   - Fee citation: the docstring names `keel-advanced-trade-is-not-fee-free`, which is not a repo
+     document. The reference is issue #836.
+   - Shared random stream: both permutation tests in an arm draw from one `random.Random(1109)`
+     stream, so the out-of-sample null depends on the 2,000 chi-square shuffles before it. The
+     stream is reseeded per arm, so `usd_dollars` and `usd_cents` (same windows) share outcome
+     shuffles and have correlated nulls. Bonferroni holds under any dependence.
+   - Even train split: if the train set's up/down split were exactly even, tied and unseen
+     digits would map to "down". It wasn't, in this run.
+7. **Method check, now committed.** Before the real run, the driver's `run_arm` was tested on
+   synthetic data: pure noise gave p 0.29 (chi-square) and 0.047 (out of sample), both above the 0.0167 bar; a planted 56/44 split by
+   digit gave p 0.003 on both tests (dependence found). The script is
+   `2026-11-09-paxg-last-two-digits-method-check.py`.
